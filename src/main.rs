@@ -62,10 +62,12 @@ fn run(args: Cli) -> Result<()> {
     let pb = spinner("Analyzing genomic reads in streaming...");
 
     let is_gz = args.input.extension().is_some_and(|ext| ext == "gz");
-    let file = File::open(&args.input).map_err(|e| FastDnaError::Io {
-        path: args.input.clone(),
-        source: e,
-    })?;
+    let file = File::open(&args.input)
+        .map_err(|e| FastDnaError::Io {
+            path: args.input.clone(),
+            source: e,
+        })
+        .inspect_err(|_| pb.abandon())?;
 
     let buf_reader: Box<dyn BufRead + Send + 'static> = if is_gz {
         Box::new(BufReader::new(MultiGzDecoder::new(file)))
@@ -88,7 +90,8 @@ fn run(args: Cli) -> Result<()> {
         config,
         &args.input,
         Some(&on_progress),
-    )?;
+    )
+    .inspect_err(|_| pb.abandon())?;
 
     let elapsed = start_time.elapsed().as_secs_f64();
     pb.finish_with_message(format!("Processing completed in {elapsed:.2}s"));
@@ -107,9 +110,11 @@ fn run(args: Cli) -> Result<()> {
 
     let output_str = args.output.to_string_lossy();
     let records_written = if output_str.ends_with(".parquet") {
-        export::export_parquet(&counter, &args.output, args.kmer_size, args.min_count)?
+        export::export_parquet(&counter, &args.output, args.kmer_size, args.min_count)
+            .inspect_err(|_| pb_export.abandon())?
     } else {
-        export::export_csv(&counter, &args.output, args.kmer_size, args.min_count)?
+        export::export_csv(&counter, &args.output, args.kmer_size, args.min_count)
+            .inspect_err(|_| pb_export.abandon())?
     };
 
     let export_elapsed = export_start.elapsed().as_secs_f64();
