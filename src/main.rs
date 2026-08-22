@@ -57,7 +57,15 @@ fn main() {
 
     let fastq_reader = FastqReader::new(buf_reader);
 
-    let (counter, qc, _total_reads) = process_stream_parallel(fastq_reader, config);
+    let (counter, qc, _total_reads) =
+        match process_stream_parallel(fastq_reader, config, &args.input, None) {
+            Ok(v) => v,
+            Err(e) => {
+                pb.abandon();
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
     
     let elapsed = start_time.elapsed().as_secs_f64();
     pb.finish_with_message(format!("✔ Processing completed in {:.2}s", elapsed));

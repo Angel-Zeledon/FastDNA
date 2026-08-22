@@ -34,7 +34,9 @@ fn pipeline_resets_kmer_window_on_ambiguous_base() {
     // An implementation that does not reset on 'N' reports 6.
     let fastq = "@r1\nACGTNACGT\n+\nIIIIIIIII\n";
 
-    let (counter, _qc, total_reads) = process_stream_parallel(reader_for(fastq), config(4));
+    let (counter, _qc, total_reads) =
+        process_stream_parallel(reader_for(fastq), config(4), std::path::Path::new("<memory>"), None)
+            .expect("valid input");
 
     assert_eq!(total_reads, 1);
     assert_eq!(
@@ -51,7 +53,9 @@ fn pipeline_merges_forward_and_reverse_complement_strands() {
     // single canonical k-mer AACG (the lexicographic minimum of the pair).
     let fastq = "@r1\nAACG\n+\nIIII\n@r2\nCGTT\n+\nIIII\n";
 
-    let (counter, _qc, total_reads) = process_stream_parallel(reader_for(fastq), config(4));
+    let (counter, _qc, total_reads) =
+        process_stream_parallel(reader_for(fastq), config(4), std::path::Path::new("<memory>"), None)
+            .expect("valid input");
 
     assert_eq!(total_reads, 2);
     assert_eq!(counter.total_kmers(), 2);
@@ -70,7 +74,9 @@ fn pipeline_merges_forward_and_reverse_complement_strands() {
 fn pipeline_yields_nothing_for_reads_shorter_than_k() {
     let fastq = "@r1\nACG\n+\nIII\n";
 
-    let (counter, _qc, total_reads) = process_stream_parallel(reader_for(fastq), config(4));
+    let (counter, _qc, total_reads) =
+        process_stream_parallel(reader_for(fastq), config(4), std::path::Path::new("<memory>"), None)
+            .expect("valid input");
 
     assert_eq!(total_reads, 1);
     assert_eq!(counter.total_kmers(), 0);
@@ -93,7 +99,59 @@ fn pipeline_agrees_with_kmer_module_across_a_batch() {
         .map(|r| kmer::extract_canonical_kmers(r.as_bytes(), k).len())
         .sum();
 
-    let (counter, _qc, _) = process_stream_parallel(reader_for(&fastq), config(k));
+    let (counter, _qc, _) =
+        process_stream_parallel(reader_for(&fastq), config(k), std::path::Path::new("<memory>"), None)
+            .expect("valid input");
 
     assert_eq!(counter.total_kmers(), expected_total as u64);
+}
+
+#[test]
+fn progress_callback_receives_a_final_event() {
+    use std::sync::{Arc, Mutex};
+    use fastdna::progress::Progress;
+
+    let mut fastq = String::new();
+    for i in 0..50 {
+        fastq.push_str(&format!("@r{}\nACGTACGTAC\n+\nIIIIIIIIII\n", i));
+    }
+
+    let seen: Arc<Mutex<Vec<Progress>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let callback = move |e: Progress| sink.lock().unwrap().push(e);
+
+    let (_counter, _qc, reads) = process_stream_parallel(
+        reader_for(&fastq),
+        config(5),
+        std::path::Path::new("<memory>"),
+        Some(&callback),
+    )
+    .expect("valid input");
+
+    let events = seen.lock().unwrap();
+    assert_eq!(
+        events.last(),
+        Some(&Progress::Finished { reads }),
+        "the last event must report the final read count"
+    );
+}
+
+#[test]
+fn silent_and_observed_runs_agree() {
+    let fastq = "@r1\nACGTACGTAC\n+\nIIIIIIIIII\n@r2\nTTGCAACGTT\n+\nIIIIIIIIII\n";
+    let noop = |_: fastdna::progress::Progress| {};
+
+    let (silent, _, _) =
+        process_stream_parallel(reader_for(fastq), config(5), std::path::Path::new("<memory>"), None)
+            .expect("valid");
+    let (observed, _, _) = process_stream_parallel(
+        reader_for(fastq),
+        config(5),
+        std::path::Path::new("<memory>"),
+        Some(&noop),
+    )
+    .expect("valid");
+
+    assert_eq!(silent.total_kmers(), observed.total_kmers());
+    assert_eq!(silent.distinct_kmers(), observed.distinct_kmers());
 }

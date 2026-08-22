@@ -1,13 +1,17 @@
 // src/pipeline.rs
 
 use std::io::BufRead;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::prelude::*;
 
 use crate::counter::KmerCounter;
+use crate::error::{FastDnaError, Result};
 use crate::fastq::{FastqReader, FastqRecord};
 use crate::kmer;
+use crate::progress::{Progress, ProgressFn, PROGRESS_INTERVAL};
 use crate::qc::QcSummary;
 
 pub struct PipelineConfig {
@@ -32,19 +36,30 @@ impl Default for PipelineConfig {
 
 type RecordBatch = Vec<FastqRecord>;
 
+/// Streams a FASTQ source and returns its canonical k-mer counts.
+///
+/// `source` names the input for error messages only; in-memory callers pass
+/// `Path::new("<memory>")`. `progress` is optional; `None` means silence.
 pub fn process_stream_parallel<R: BufRead + Send + 'static>(
     reader: FastqReader<R>,
     config: PipelineConfig,
-) -> (KmerCounter, QcSummary, u64) {
+    source: &Path,
+    progress: ProgressFn<'_>,
+) -> Result<(KmerCounter, QcSummary, u64)> {
+    if config.k == 0 || config.k > 32 {
+        return Err(FastDnaError::InvalidK { k: config.k });
+    }
+
     let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(64);
 
     let batch_size = config.batch_size;
     let k = config.k;
     let min_qual = config.min_quality;
     let qual_win = config.quality_window;
+    let source_owned: PathBuf = source.to_path_buf();
 
-    // 1. Producer Thread
-    let reader_handle = thread::spawn(move || {
+    // 1. Producer thread. Returns the read count, or the record it choked on.
+    let reader_handle = thread::spawn(move || -> Result<u64> {
         let mut reader = reader;
         let mut current_batch = Vec::with_capacity(batch_size);
         let mut total_reads: u64 = 0;
@@ -56,16 +71,20 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
                     total_reads += 1;
 
                     if current_batch.len() >= batch_size {
-                        let batch_to_send = std::mem::replace(&mut current_batch, Vec::with_capacity(batch_size));
+                        let batch_to_send =
+                            std::mem::replace(&mut current_batch, Vec::with_capacity(batch_size));
                         if sender.send(batch_to_send).is_err() {
                             break;
                         }
                     }
                 }
-                Ok(None) => break, // EOF reached
+                Ok(None) => break,
                 Err(err) => {
-                    eprintln!("\n[FASTQ Stream Error at record #{}] {}", total_reads + 1, err);
-                    break;
+                    return Err(FastDnaError::MalformedFastq {
+                        path: source_owned,
+                        record: total_reads + 1,
+                        reason: err.to_string(),
+                    });
                 }
             }
         }
@@ -74,10 +93,19 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
             let _ = sender.send(current_batch);
         }
 
-        total_reads
+        Ok(total_reads)
     });
 
-    // 2. Parallel Consumer Worker Pool
+    // Shared across workers so `ReadsProcessed` is genuinely cumulative.
+    // A per-worker counter would report roughly reads/num_threads and jump
+    // around non-monotonically. This cannot live in the producer thread
+    // instead: `thread::spawn` demands `'static` and `ProgressFn<'a>` is a
+    // borrow, so the callback can only be used from the rayon closures, which
+    // borrow rather than move.
+    let reads_seen = AtomicU64::new(0);
+
+    // 2. Parallel consumer pool. Each worker owns private state, so the hot
+    //    path has no locks and no shared hashmap.
     let results: Vec<(KmerCounter, QcSummary)> = (0..config.num_threads)
         .into_par_iter()
         .map(|_| {
@@ -88,12 +116,19 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
                 for record in &mut batch {
                     local_qc.observe_record(record);
                     record.quality_trim_end(min_qual, qual_win);
-                    
+
                     // Canonical k-mers: 2-bit packed, O(1) rolling window, and
                     // ambiguous bases ('N') reset the window rather than
                     // producing corrupt k-mers.
                     let canon_kmers = kmer::extract_canonical_kmers(&record.seq, k);
                     local_counter.insert_batch(&canon_kmers);
+
+                    if let Some(emit) = progress {
+                        let seen = reads_seen.fetch_add(1, Ordering::Relaxed) + 1;
+                        if seen % PROGRESS_INTERVAL == 0 {
+                            emit(Progress::ReadsProcessed(seen));
+                        }
+                    }
                 }
             }
 
@@ -101,20 +136,25 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
         })
         .collect();
 
-    let total_reads = reader_handle.join().unwrap_or(0);
+    let total_reads = reader_handle
+        .join()
+        .map_err(|_| FastDnaError::Internal { detail: "FASTQ reader thread panicked".to_string() })??;
 
-    // 3. Map-Reduce Combine Phase
-    let (master_counter, mut master_qc) = results
-        .into_par_iter()
-        .reduce(
-            || (KmerCounter::new(), QcSummary::default()),
-            |(mut acc_cnt, mut acc_qc), (local_cnt, local_qc)| {
-                acc_cnt.merge(local_cnt);
-                acc_qc.merge(&local_qc);
-                (acc_cnt, acc_qc)
-            },
-        );
+    // 3. Map-reduce combine phase.
+    let (master_counter, mut master_qc) = results.into_par_iter().reduce(
+        || (KmerCounter::new(), QcSummary::default()),
+        |(mut acc_cnt, mut acc_qc), (local_cnt, local_qc)| {
+            acc_cnt.merge(local_cnt);
+            acc_qc.merge(&local_qc);
+            (acc_cnt, acc_qc)
+        },
+    );
 
     master_qc.finalize();
-    (master_counter, master_qc, total_reads)
+
+    if let Some(emit) = progress {
+        emit(Progress::Finished { reads: total_reads });
+    }
+
+    Ok((master_counter, master_qc, total_reads))
 }

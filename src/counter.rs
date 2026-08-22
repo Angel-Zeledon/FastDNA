@@ -11,7 +11,7 @@ pub struct PruneStats {
 }
 
 /// In-memory frequency table for canonical 64-bit k-mers.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct KmerCounter {
     table: FxHashMap<u64, u32>,
     total_kmers: u64,
