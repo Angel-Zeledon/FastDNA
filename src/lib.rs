@@ -10,5 +10,4 @@ pub mod pipeline;
 pub mod qc;
 pub mod simd;
 pub mod sketch;
-pub mod bio;
 pub mod wasm;
