@@ -8,6 +8,7 @@ pub mod export;
 pub mod fastq;
 pub mod kmer;
 pub mod pipeline;
+pub mod progress;
 pub mod qc;
 pub mod sketch;
 pub mod wasm;
