@@ -81,10 +81,18 @@ fn main() {
 
     let export_start = Instant::now();
     let output_str = args.output.to_string_lossy();
-    let records_written = if output_str.ends_with(".parquet") {
-        export::export_parquet(&counter, &args.output, args.kmer_size, args.min_count).unwrap()
+    let export_result = if output_str.ends_with(".parquet") {
+        export::export_parquet(&counter, &args.output, args.kmer_size, args.min_count)
     } else {
-        export::export_csv(&counter, &args.output, args.kmer_size, args.min_count).unwrap()
+        export::export_csv(&counter, &args.output, args.kmer_size, args.min_count)
+    };
+    let records_written = match export_result {
+        Ok(n) => n,
+        Err(e) => {
+            pb_export.abandon();
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     };
 
     let export_elapsed = export_start.elapsed().as_secs_f64();

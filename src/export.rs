@@ -13,15 +13,28 @@ use parquet::file::properties::WriterProperties;
 use rustc_hash::FxHashMap;
 
 use crate::counter::KmerCounter;
+use crate::error::{FastDnaError, Result};
 use crate::kmer;
+
+/// Wraps any writer failure as an I/O error naming the destination.
+fn io_err<E: std::fmt::Display>(path: &Path, err: E) -> FastDnaError {
+    FastDnaError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(err.to_string()),
+    }
+}
 
 pub fn export_counts_parquet<P: AsRef<Path>>(
     counter: &KmerCounter,
     output_path: P,
     k: usize,
     min_count: u32,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let file = File::create(output_path)?;
+) -> Result<usize> {
+    let path = output_path.as_ref();
+    let file = File::create(path).map_err(|e| FastDnaError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     let schema = Arc::new(Schema::new(vec![
         Field::new("kmer_u64", DataType::UInt64, false),
         Field::new("kmer_sequence", DataType::Utf8, false),
@@ -32,7 +45,8 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
         .set_compression(Compression::SNAPPY)
         .build();
 
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+        .map_err(|e| io_err(path, e))?;
     let chunk_size = 131_072;
     let mut total_written = 0;
 
@@ -47,7 +61,7 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
             freq_chunk.push(count);
 
             if u64_chunk.len() >= chunk_size {
-                write_chunk(&mut writer, &schema, &u64_chunk, &seq_chunk, &freq_chunk)?;
+                write_chunk(&mut writer, &schema, &u64_chunk, &seq_chunk, &freq_chunk, path)?;
                 total_written += u64_chunk.len();
                 u64_chunk.clear();
                 seq_chunk.clear();
@@ -58,10 +72,10 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
 
     if !u64_chunk.is_empty() {
         total_written += u64_chunk.len();
-        write_chunk(&mut writer, &schema, &u64_chunk, &seq_chunk, &freq_chunk)?;
+        write_chunk(&mut writer, &schema, &u64_chunk, &seq_chunk, &freq_chunk, path)?;
     }
 
-    writer.close()?;
+    writer.close().map_err(|e| io_err(path, e))?;
     Ok(total_written)
 }
 
@@ -70,7 +84,7 @@ pub fn export_parquet<P: AsRef<Path>>(
     output_path: P,
     k: usize,
     min_count: u32,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<usize> {
     export_counts_parquet(counter, output_path, k, min_count)
 }
 
@@ -80,13 +94,15 @@ fn write_chunk(
     u64s: &[u64],
     seqs: &[String],
     freqs: &[u32],
-) -> Result<(), Box<dyn std::error::Error>> {
+    path: &Path,
+) -> Result<()> {
     let u64_arr: ArrayRef = Arc::new(UInt64Array::from(u64s.to_vec()));
     let seq_arr: ArrayRef = Arc::new(StringArray::from_iter_values(seqs.iter().map(|s| s.as_str())));
     let freq_arr: ArrayRef = Arc::new(UInt32Array::from(freqs.to_vec()));
 
-    let batch = RecordBatch::try_new(schema.clone(), vec![u64_arr, seq_arr, freq_arr])?;
-    writer.write(&batch)?;
+    let batch = RecordBatch::try_new(schema.clone(), vec![u64_arr, seq_arr, freq_arr])
+        .map_err(|e| io_err(path, e))?;
+    writer.write(&batch).map_err(|e| io_err(path, e))?;
     Ok(())
 }
 
@@ -95,19 +111,24 @@ pub fn export_counts_csv<P: AsRef<Path>>(
     output_path: P,
     k: usize,
     min_count: u32,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let file = File::create(output_path)?;
+) -> Result<usize> {
+    let path = output_path.as_ref();
+    let file = File::create(path).map_err(|e| FastDnaError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     let mut writer = BufWriter::with_capacity(512 * 1024, file);
-    writeln!(writer, "kmer_u64,kmer_sequence,frequency")?;
+    writeln!(writer, "kmer_u64,kmer_sequence,frequency").map_err(|e| io_err(path, e))?;
 
     let mut written = 0;
     for (&kmer_bits, &count) in counter.iter() {
         if count >= min_count {
-            writeln!(writer, "{},{},{}", kmer_bits, kmer::decode_kmer(kmer_bits, k), count)?;
+            writeln!(writer, "{},{},{}", kmer_bits, kmer::decode_kmer(kmer_bits, k), count)
+                .map_err(|e| io_err(path, e))?;
             written += 1;
         }
     }
-    writer.flush()?;
+    writer.flush().map_err(|e| io_err(path, e))?;
     Ok(written)
 }
 
@@ -116,17 +137,21 @@ pub fn export_csv<P: AsRef<Path>>(
     output_path: P,
     k: usize,
     min_count: u32,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<usize> {
     export_counts_csv(counter, output_path, k, min_count)
 }
 
 pub fn export_histogram_csv<P: AsRef<Path>>(
     counter: &KmerCounter,
     output_path: P,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::create(output_path)?;
+) -> Result<()> {
+    let path = output_path.as_ref();
+    let file = File::create(path).map_err(|e| FastDnaError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     let mut writer = BufWriter::with_capacity(64 * 1024, file);
-    writeln!(writer, "coverage_depth,kmer_distinct_count")?;
+    writeln!(writer, "coverage_depth,kmer_distinct_count").map_err(|e| io_err(path, e))?;
 
     let mut hist_map: FxHashMap<u32, u64> = FxHashMap::default();
     for &count in counter.iter().map(|(_, c)| c) {
@@ -137,8 +162,8 @@ pub fn export_histogram_csv<P: AsRef<Path>>(
     sorted.sort_unstable_by_key(|&(cov, _)| cov);
 
     for (coverage, count) in sorted {
-        writeln!(writer, "{},{}", coverage, count)?;
+        writeln!(writer, "{},{}", coverage, count).map_err(|e| io_err(path, e))?;
     }
-    writer.flush()?;
+    writer.flush().map_err(|e| io_err(path, e))?;
     Ok(())
 }
