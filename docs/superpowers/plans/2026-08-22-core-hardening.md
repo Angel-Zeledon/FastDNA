@@ -269,7 +269,7 @@ pub mod simd;
 - [ ] **Step 3: Verify the build is clean**
 
 Run: `cargo test`
-Expected: PASS, 7 tests, no warnings.
+Expected: PASS, 11 tests, no warnings.
 
 Run: `cargo check --all-targets`
 Expected: no output beyond the `Finished` line.
@@ -446,7 +446,7 @@ Run: `cargo test --lib counter`
 Expected: PASS, 5 tests.
 
 Run: `cargo test`
-Expected: PASS, 12 tests total, no warnings.
+Expected: PASS, 16 tests total, no warnings.
 
 - [ ] **Step 5: Commit**
 
@@ -536,7 +536,7 @@ Run: `cargo test --test cli_args`
 Expected: PASS, 4 tests.
 
 Run: `cargo test`
-Expected: PASS, 16 tests total.
+Expected: PASS, 20 tests total.
 
 - [ ] **Step 5: Commit**
 
@@ -846,6 +846,7 @@ Replace the whole body of `src/pipeline.rs` with:
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::prelude::*;
@@ -939,14 +940,21 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
         Ok(total_reads)
     });
 
+    // Shared across workers so `ReadsProcessed` is genuinely cumulative.
+    // A per-worker counter would report roughly reads/num_threads and jump
+    // around non-monotonically. This cannot live in the producer thread
+    // instead: `thread::spawn` demands `'static` and `ProgressFn<'a>` is a
+    // borrow, so the callback can only be used from the rayon closures, which
+    // borrow rather than move.
+    let reads_seen = AtomicU64::new(0);
+
     // 2. Parallel consumer pool. Each worker owns private state, so the hot
     //    path has no locks and no shared hashmap.
-    let results: Vec<(KmerCounter, QcSummary, u64)> = (0..config.num_threads)
+    let results: Vec<(KmerCounter, QcSummary)> = (0..config.num_threads)
         .into_par_iter()
         .map(|_| {
             let mut local_counter = KmerCounter::with_capacity(131_072);
             let mut local_qc = QcSummary::default();
-            let mut local_reads: u64 = 0;
 
             while let Ok(mut batch) = receiver.recv() {
                 for record in &mut batch {
@@ -959,16 +967,16 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
                     let canon_kmers = kmer::extract_canonical_kmers(&record.seq, k);
                     local_counter.insert_batch(&canon_kmers);
 
-                    local_reads += 1;
                     if let Some(emit) = progress {
-                        if local_reads % PROGRESS_INTERVAL == 0 {
-                            emit(Progress::ReadsProcessed(local_reads));
+                        let seen = reads_seen.fetch_add(1, Ordering::Relaxed) + 1;
+                        if seen % PROGRESS_INTERVAL == 0 {
+                            emit(Progress::ReadsProcessed(seen));
                         }
                     }
                 }
             }
 
-            (local_counter, local_qc, local_reads)
+            (local_counter, local_qc)
         })
         .collect();
 
@@ -977,12 +985,12 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
         .map_err(|_| FastDnaError::Internal { detail: "FASTQ reader thread panicked".to_string() })??;
 
     // 3. Map-reduce combine phase.
-    let (master_counter, mut master_qc, _) = results.into_par_iter().reduce(
-        || (KmerCounter::new(), QcSummary::default(), 0u64),
-        |(mut acc_cnt, mut acc_qc, acc_reads), (local_cnt, local_qc, local_reads)| {
+    let (master_counter, mut master_qc) = results.into_par_iter().reduce(
+        || (KmerCounter::new(), QcSummary::default()),
+        |(mut acc_cnt, mut acc_qc), (local_cnt, local_qc)| {
             acc_cnt.merge(local_cnt);
             acc_qc.merge(&local_qc);
-            (acc_cnt, acc_qc, acc_reads + local_reads)
+            (acc_cnt, acc_qc)
         },
     );
 
@@ -1026,7 +1034,7 @@ Run: `cargo test --test error_handling`
 Expected: PASS, 3 tests.
 
 Run: `cargo test`
-Expected: PASS, 25 tests total.
+Expected: PASS, 27 tests total.
 
 Run: `grep -n "eprintln!\|println!\|unwrap()\|expect(" src/pipeline.rs`
 Expected: no output.
@@ -1222,7 +1230,7 @@ Run: `cargo test --test export_errors`
 Expected: PASS, 3 tests.
 
 Run: `cargo test`
-Expected: PASS, 28 tests total.
+Expected: PASS, 30 tests total.
 
 Run: `grep -n "Box<dyn" src/export.rs`
 Expected: no output.
@@ -1438,7 +1446,7 @@ fn run(args: Cli) -> Result<()> {
 - [ ] **Step 4: Verify the fix**
 
 Run: `cargo test`
-Expected: PASS, 29 tests total, no warnings.
+Expected: PASS, 31 tests total, no warnings.
 
 Run:
 ```bash
@@ -1482,7 +1490,7 @@ all, so the flags silently did nothing."
 
 After all eight tasks:
 
-- [ ] `cargo test` — 29 tests pass
+- [ ] `cargo test` — 31 tests pass
 - [ ] `cargo check --all-targets` — no warnings
 - [ ] `grep -rn "println!\|eprintln!\|unwrap()\|expect(" src/ --include=*.rs | grep -v "^src/main.rs" | grep -v "#\[cfg(test)\]"` — the only remaining hits should be inside `#[cfg(test)]` modules and `ProgressStyle::with_template(...).unwrap_or_else(...)` which is not an unwrap
 - [ ] `ls src/` — no `bio.rs`, no `simd.rs`
