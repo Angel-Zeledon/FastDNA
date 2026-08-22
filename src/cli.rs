@@ -26,6 +26,10 @@ pub struct Cli {
     #[arg(short = 'm', long, default_value_t = 1)]
     pub min_count: u32,
 
+    /// Filter out k-mers with frequency above this cutoff (repetitive regions)
+    #[arg(short = 'M', long, value_name = "COUNT")]
+    pub max_count: Option<u32>,
+
     /// Number of worker threads
     #[arg(short, long)]
     pub threads: Option<usize>,
