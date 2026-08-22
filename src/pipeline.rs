@@ -90,22 +90,22 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
                     record.quality_trim_end(min_qual, qual_win);
                     
                     // ==========================================
-                    // FEATURE 1: Lógica Canónica (Reverso Complementario)
+                    // FEATURE 1: Canonical logic (reverse complement)
                     // ==========================================
                     let mut canon_kmers = Vec::new();
-                    
-                    // Verificamos que la lectura sea al menos tan grande como K
+
+                    // Check that the read is at least as long as K
                     if record.seq.len() >= k {
-                        // Deslizamos la "ventana" de tamaño K sobre toda la secuencia de ADN
+                        // Slide a window of size K across the whole DNA sequence
                         for i in 0..=record.seq.len() - k {
                             let window = &record.seq[i..i + k];
-                            // Extraemos la versión biológica correcta (la menor alfabéticamente)
-                            let canonico = crate::bio::canonical_kmer(window);
-                            canon_kmers.push(canonico);
+                            // Take the biologically correct form (the lexicographic minimum)
+                            let canonical = crate::bio::canonical_kmer(window);
+                            canon_kmers.push(canonical);
                         }
                     }
-                    
-                    // Insertamos el lote de k-mers canónicos puros en la memoria
+
+                    // Insert the batch of canonical k-mers into memory
                     local_counter.insert_batch(&canon_kmers);
                 }
             }

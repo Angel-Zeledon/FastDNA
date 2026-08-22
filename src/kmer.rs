@@ -1,8 +1,8 @@
 // src/kmer.rs
 
-/// Convierte un nucleótido ASCII a su representación binaria de 2 bits.
+/// Converts an ASCII nucleotide to its 2-bit representation.
 /// A/a = 00, C/c = 01, G/g = 10, T/t/U/u = 11.
-/// Retorna `None` para caracteres no válidos o ambiguos (como 'N').
+/// Returns `None` for invalid or ambiguous characters (such as 'N').
 #[inline(always)]
 pub fn base_to_bits(base: u8) -> Option<u64> {
     match base {
@@ -14,8 +14,8 @@ pub fn base_to_bits(base: u8) -> Option<u64> {
     }
 }
 
-/// Calcula el reverso complementario de un k-mer codificado en u64 en tiempo O(1)
-/// mediante operaciones a nivel de registros de CPU.
+/// Computes the reverse complement of a u64-encoded k-mer in O(1)
+/// using CPU register-level bit operations.
 #[inline(always)]
 pub fn reverse_complement_u64(kmer: u64, k: usize) -> u64 {
     let mut v = !kmer;
@@ -25,15 +25,17 @@ pub fn reverse_complement_u64(kmer: u64, k: usize) -> u64 {
     v >> (64 - (2 * k))
 }
 
-/// Retorna el k-mer canónico (mínimo lexicográfico entre la secuencia y su reverso complementario).
+/// Returns the canonical k-mer (the lexicographic minimum of the k-mer and its
+/// reverse complement).
 #[inline(always)]
 pub fn canonical_kmer_u64(kmer: u64, k: usize) -> u64 {
     let rc = reverse_complement_u64(kmer, k);
     kmer.min(rc)
 }
 
-/// Extrae todos los k-mers canónicos de una secuencia de ADN usando una ventana deslizante O(1) por base.
-/// Las secuencias con bases ambiguas ('N') reinician la ventana automáticamente sin generar k-mers corruptos.
+/// Extracts every canonical k-mer from a DNA sequence using an O(1)-per-base
+/// rolling window. Ambiguous bases ('N') reset the window automatically instead
+/// of producing corrupt k-mers.
 pub fn extract_canonical_kmers(seq: &[u8], k: usize) -> Vec<u64> {
     if seq.len() < k || k == 0 || k > 32 {
         return Vec::new();
@@ -62,7 +64,7 @@ pub fn extract_canonical_kmers(seq: &[u8], k: usize) -> Vec<u64> {
     kmers
 }
 
-/// Decodifica un entero u64 a su representación en string ASCII de longitud k.
+/// Decodes a u64 into its ASCII string representation of length k.
 pub fn decode_kmer(mut kmer: u64, k: usize) -> String {
     let mut chars = vec![b'A'; k];
     for i in (0..k).rev() {
@@ -88,14 +90,14 @@ mod tests {
         let k = 4;
         let kmers = extract_canonical_kmers(seq.as_bytes(), k);
         assert_eq!(kmers.len(), 1);
-        
+
         let decoded = decode_kmer(kmers[0], k);
         assert!(decoded == "ACGT" || decoded == "ACGT");
     }
 
     #[test]
     fn test_reverse_complement_symmetry() {
-        // "AACG" (00 00 01 10) -> RC es "CGTT" (01 10 11 11)
+        // "AACG" (00 00 01 10) -> its reverse complement is "CGTT" (01 10 11 11)
         let k = 4;
         let original: u64 = 0b00_00_01_10;
         let rc = reverse_complement_u64(original, k);

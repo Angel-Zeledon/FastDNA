@@ -12,25 +12,25 @@ name = "fastdna"
 path = "src/main.rs"
 
 [dependencies]
-# Dependencias base
+# Base dependencies
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 indicatif = "0.17"
 
-# Concurrencia y Estructuras de Datos
+# Concurrency and data structures
 rayon = "1.10"
 crossbeam-channel = "0.5"
 dashmap = "5.5"
 rustc-hash = "2.0"
 ahash = "0.8"
 
-# Procesamiento de Archivos y ML
+# File processing and ML
 flate2 = "1.0"
 parquet = { version = "53.4", default-features = false, features = ["flate2", "arrow", "snap"] }
 arrow = "53.4"
 
-# Dependencias opcionales (WebAssembly)
+# Optional dependencies (WebAssembly)
 wasm-bindgen = { version = "0.2", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 

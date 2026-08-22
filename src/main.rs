@@ -30,7 +30,7 @@ fn main() {
     let config = PipelineConfig {
         k: args.kmer_size,
         quality_window: 4, 
-        min_quality: args.min_quality as f64, // Corregido a f64
+        min_quality: args.min_quality as f64, // coerced to f64
         batch_size: 10000,
         num_threads: threads,
     };
