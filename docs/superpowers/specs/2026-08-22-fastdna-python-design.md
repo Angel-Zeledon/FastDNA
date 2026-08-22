@@ -286,6 +286,31 @@ footer de metadata crece por columna y por row-group), no de los datos. Cuando
 la entrega es Arrow en memoria hacia Python, ese techo no aplica. Parquet queda
 como formato de exportación opcional, no como mecanismo de transporte.
 
+### 7.8 Proyección sobre un vocabulario fijo
+
+Primitivo adicional, requerido por `KmerVectorizer.transform` (§9.6):
+
+```rust
+pub fn count_projected(
+    samples: &[SampleFiles],
+    vocabulary: &[u64],     // ordenado, define el orden de columnas
+    opts: &CountOpts,
+) -> Result<CohortMatrix, FastDnaError>
+```
+
+Cuenta muestras nuevas y las proyecta sobre un vocabulario **suministrado desde
+fuera**, en lugar de derivarlo de las propias muestras. Los k-mers ausentes del
+vocabulario se descartan; las columnas del vocabulario que la muestra no tiene
+quedan en 0.
+
+Es más simple que `count_cohort`: no hay pasada de prevalencia, no hay selección
+de features, y por tanto **no hay spill** — cada muestra se cuenta, se proyecta y
+se libera. Una sola pasada, memoria acotada por el tamaño del vocabulario.
+
+Sin este primitivo no hay `transform`, y sin `transform` no hay integración con
+sklearn ni prevención estructural de la fuga de datos. Es el habilitador del
+nivel 2 completo.
+
 ---
 
 ## 8. Feature 4 — Comparación MinHash / Jaccard
@@ -308,39 +333,267 @@ fastdna.compare("virus1.fastq", "virus2.fastq", k=21, sketch_size=1000)  # -> 0.
    selecciona por valor numérico, así que la calidad de la mezcla afecta
    directamente la precisión del estimador de Jaccard.
 
+Se añade también `containment` junto a `jaccard`: Jaccard castiga la diferencia
+de tamaño entre genomas, y la pregunta clínica frecuente —*¿está este patógeno
+presente dentro de esta muestra metagenómica?*— es de contención, no de
+similitud. Son ~5 líneas sobre el mismo sketch.
+
 Se conserva el assert de `k` idéntico entre sketches — comparar sketches con `k`
 distinto no tiene significado biológico.
 
-### Fuera de alcance
+### Persistencia del sketch
 
-Comparación N×N de un directorio completo. Se pidió comparar dos archivos.
+`Sketch` se serializa a disco (ya deriva `Serialize`/`Deserialize`). Esto elimina
+el recálculo: comparar N muestras por pares con `compare(a, b)` haría O(N²)
+lecturas de FASTQ; con sketches persistentes son N.
+
+Como consecuencia, **la comparación N×N sale del "fuera de alcance"**: estaba
+excluida porque implicaba un motor nuevo en Rust, y con sketches persistentes son
+cinco líneas de Python sobre primitivas existentes (`fastdna.compare_all`).
 
 ---
 
 ## 9. Superficie pública de Python
 
+### 9.0 Estructura del paquete: mixto Rust + Python
+
+```
+fastdna/
+├── src/                       # núcleo Rust
+├── python/fastdna/
+│   ├── __init__.py            # API pública
+│   ├── _core.{pyd,so}         # extensión PyO3 (privada, prefijo _)
+│   ├── sklearn.py             # KmerVectorizer
+│   ├── normalize.py           # CPM, CLR, log1p
+│   └── spectrum.py            # detección del valle
+└── pyproject.toml             # maturin, python-source = "python"
+```
+
+**La frontera FFI se mantiene deliberadamente pequeña.** Todo lo que sea
+ergonomía —integración con sklearn, normalización, conversión a pandas— vive en
+Python puro sobre `_core`. Razones:
+
+1. Cada función que cruza la frontera hay que compilarla y probarla en 5
+   plataformas. Cada función que vive en Python se prueba una vez.
+2. Iterar sobre la API en Python no requiere recompilar nada.
+3. `_core` con guion bajo señala que es privado: si mañana cambia la frontera,
+   la API pública no se mueve.
+
+Maturin soporta este layout nativamente vía `python-source`.
+
+---
+
+### 9.1 Nivel 1 — Núcleo (Rust vía PyO3)
+
 ```python
 import fastdna
 
-# Una muestra
-r = fastdna.count("muestra.fastq.gz", k=31, min_count=5, max_count=10_000)
-r.table          # pyarrow.Table (kmer_u64, kmer_sequence, frequency)
-r.qc             # dict de métricas de calidad
-r.total_kmers
+fastdna.count(paths, *, k=31, min_count=1, max_count=None,
+              min_quality=20.0, threads=None, progress=None)  -> KmerCounts
+fastdna.count_cohort(directory, *, k=31, min_count=1, max_count=None,
+                     format="wide", top_features=10_000,
+                     threads=None, progress=None)             -> Cohort
+fastdna.sketch(path, *, k=21, sketch_size=1000)               -> Sketch
+fastdna.peek(path, *, n_reads=10_000)                         -> Preview
+fastdna.build_info()                                          -> dict
+```
 
-# Cohorte
-c = fastdna.count_cohort("./pacientes/", k=31, min_count=5,
-                         format="wide", top_features=10_000, threads=16)
-c.matrix         # pyarrow.Table
-c.samples        # pyarrow.Table de SampleMeta — profundidad por muestra
-c.dropped        # qué se filtró y por qué
+`progress` acepta `None` (silencio), `True` (tqdm si está disponible), o un
+callable propio. El default es silencio: una librería no escribe en stdout sin
+que se lo pidan.
 
-# Comparación
-fastdna.compare("virus1.fastq", "virus2.fastq", k=21)
+`build_info()` reporta versión, `k` máximo, y **si AVX2 está activo en esta
+CPU**. Sin eso, un "me va lento en el Mac" es indiagnosticable a distancia.
+
+---
+
+### 9.2 `KmerCounts`
+
+```python
+r = fastdna.count("muestra.fastq.gz", k=31, min_count=5)
+
+r.table                  # pyarrow.Table (kmer_u64, kmer_sequence, frequency)
+r.to_pandas()            # DataFrame
+r.qc                     # dict de métricas de calidad
+r.total_kmers            # base de normalización
+r.distinct_kmers
+r.top(20)                # los 20 k-mers más frecuentes
+
+r.spectrum()             # {profundidad: nº de k-mers distintos}
+r.suggest_min_count()    # -> int, detectado del espectro
+
+r.save("muestra.counts.parquet")
+fastdna.load_counts("muestra.counts.parquet")
+
+len(r)                   # k-mers distintos
+repr(r)                  # KmerCounts(k=31, distinct=104_882, total=8_931_204)
+```
+
+**`suggest_min_count()` merece explicación porque es la que más dolor evita.**
+El espectro de frecuencias de una muestra secuenciada tiene dos picos: uno enorme
+en frecuencia 1-2 (errores de máquina) y otro en la profundidad real de
+cobertura. Entre ambos hay un valle. El umbral correcto está en ese valle, y
+**depende de cada muestra** — no es un 5 universal.
+
+Hoy tu usuario elegiría `min_count` a ojo. Con esto lo elige a partir de sus
+datos, que es la diferencia entre tirar ruido y tirar señal. El motor ya calcula
+el histograma (`KmerCounter::generate_histogram`); solo faltaba exponerlo y
+poner la detección del mínimo local encima, en Python.
+
+---
+
+### 9.3 `Cohort`
+
+```python
+c = fastdna.count_cohort("./pacientes/", k=31, min_count=5, top_features=10_000)
+
+c.matrix                 # pyarrow.Table
+c.samples                # pyarrow.Table de SampleMeta — profundidad por muestra
+c.vocabulary             # los k-mers elegidos como columnas
+c.dropped                # qué se filtró y por qué
+
+c.to_pandas()            # DataFrame (format="wide")
+c.to_numpy()             # ndarray (format="wide")
+c.to_scipy()             # csr_matrix (cualquier format)
+
+c.normalize("cpm")       # -> Cohort normalizado; también "clr", "log1p", "relative"
+
+c.save("cohorte.parquet")
+fastdna.load_cohort("cohorte.parquet")
+
+repr(c)                  # Cohort(500 muestras × 10_000 k-mers, k=31, format='wide')
 ```
 
 `c.samples` viaja pegado a `c.matrix` y no como archivo suelto: es más difícil
-normalizar mal cuando la profundidad está en el mismo objeto que los conteos.
+normalizar mal cuando la profundidad está en el mismo objeto que los conteos. Por
+eso `c.normalize()` no necesita argumentos extra — ya tiene lo que necesita.
+
+`save`/`load_cohort` existen porque una cohorte de 500 muestras tarda decenas de
+minutos. Perder eso al reiniciar el kernel de Jupyter es inaceptable.
+
+`c.vocabulary` no es decorativo: es lo que permite proyectar muestras nuevas
+sobre la misma base de features (§7.8), y es lo que hace posible el nivel 2.
+
+---
+
+### 9.4 `Sketch` — comparación como objeto, no como función
+
+```python
+s1 = fastdna.sketch("virus1.fastq", k=21)
+s2 = fastdna.sketch("virus2.fastq", k=21)
+
+s1.jaccard(s2)           # 0.998 — similitud simétrica
+s1.containment(s2)       # ¿cuánto de s1 está dentro de s2? — asimétrico
+
+s1.save("virus1.sig")
+fastdna.load_sketch("virus1.sig")
+
+fastdna.compare("a.fastq", "b.fastq", k=21)   # azúcar sobre lo anterior
+fastdna.compare_all(["a.fastq", "b.fastq", "c.fastq"])  # matriz N×N
+```
+
+Convertir el sketch en objeto de primera clase resuelve dos cosas de golpe:
+
+**No se recomputa.** `compare(a, b)` recalcula ambos sketches cada vez. Con N
+muestras y comparaciones por pares eso es O(N²) lecturas de FASTQ cuando bastan
+N. Sketch persistente = se lee cada archivo una vez.
+
+**La comparación N×N deja de ser trabajo de Rust.** Estaba fuera de alcance
+porque implicaba un motor nuevo; con sketches persistentes son cinco líneas de
+Python sobre primitivas que ya existen. Pasa a estar dentro de alcance gratis.
+
+`containment` responde una pregunta distinta a Jaccard y que en clínica se hace
+mucho: *¿está este virus presente dentro de esta muestra metagenómica?* Jaccard
+castiga la diferencia de tamaño entre genomas; containment no. Son ~5 líneas
+sobre el mismo sketch.
+
+---
+
+### 9.5 `Preview` — inspección antes de comprometerse
+
+```python
+p = fastdna.peek("muestra.fastq.gz", n_reads=10_000)
+
+p.n_reads_sampled
+p.read_length            # (min, mediana, max)
+p.mean_quality_by_position
+p.gc_content
+p.estimated_distinct_kmers
+p.suggest_k()
+```
+
+Lee solo las primeras N lecturas: es cuestión de milisegundos.
+
+Su razón de ser: `k=31` es el default de todo el mundo, y está mal para lecturas
+cortas — con lecturas de 50 bp, `k=31` deja 20 k-mers por lectura y amplifica el
+efecto de cada error. `peek` responde "¿qué k tiene sentido para *estos* datos?"
+antes de lanzar un trabajo de 40 minutos, no después.
+
+---
+
+### 9.6 Nivel 2 — Integración con scikit-learn (Python puro)
+
+```python
+from fastdna.sklearn import KmerVectorizer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import cross_val_score
+from xgboost import XGBClassifier
+
+pipe = Pipeline([
+    ("kmers", KmerVectorizer(k=31, min_count=5, top_features=10_000)),
+    ("clf",   XGBClassifier()),
+])
+
+scores = cross_val_score(pipe, fastq_paths, y, cv=5)
+```
+
+`KmerVectorizer` implementa la API de estimador de sklearn:
+
+- `fit(paths, y=None)` — cuenta las muestras de entrenamiento, selecciona el
+  vocabulario por prevalencia, lo guarda en `self.vocabulary_`.
+- `transform(paths)` — proyecta las muestras sobre el vocabulario **ya aprendido**
+  (§7.8). Los k-mers no vistos en `fit` se ignoran; los ausentes van a 0.
+- `get_feature_names_out()` — devuelve las secuencias de k-mer.
+
+**Esta es la pieza más importante de toda la API**, por una razón que no es de
+comodidad sino de corrección estadística.
+
+En §3 quedó anotado que seleccionar features mirando la cohorte completa infla la
+métrica de validación, y que había que tener cuidado. Con `KmerVectorizer` ese
+cuidado deja de depender de la disciplina de quien lo usa: dentro de un
+`Pipeline`, sklearn llama a `fit` **solo sobre el fold de entrenamiento** en cada
+iteración de la validación cruzada. El vocabulario nunca ve el fold de test.
+**La fuga pasa de ser un riesgo documentado a ser estructuralmente imposible.**
+
+Y `get_feature_names_out()` tiene un premio biológico: emparejado con
+`model.feature_importances_`, te da las secuencias de ADN concretas que están
+impulsando la predicción. Eso se puede meter en BLAST y preguntar a qué gen
+pertenecen. Sin eso, tu modelo es una caja negra que acierta; con eso, es un
+resultado publicable.
+
+---
+
+### 9.7 Nivel 3 — Helpers (Python puro)
+
+```python
+fastdna.normalize(matrix, samples, method="cpm")   # "cpm" | "clr" | "log1p" | "relative"
+fastdna.spectrum_valley(hist)                      # detección del mínimo local
+```
+
+Viven en Python porque son aritmética sobre arrays que numpy ya hace bien, y
+porque congelarlas en Rust sería justo el error que evitamos al decidir emitir
+conteos crudos.
+
+---
+
+### 9.8 Qué queda fuera
+
+- Soporte de manifiesto CSV (se eligió detección R1/R2).
+- Iteración perezosa por muestra sobre una cohorte.
+- Reanudación de cohortes interrumpidas.
+- Alineamiento, ensamblado, o cualquier cosa que no sea conteo de k-mers.
+
+---
 
 ### Frontera PyO3
 
@@ -474,16 +727,38 @@ cohorte de 500 archivos, "parse error" sin ubicación es inservible.
 - pytest contra el wheel construido: tipos de las columnas Arrow, round-trip a
   pandas, que las excepciones sean las clases correctas, y que el GIL se libera
   (un hilo de Python sigue avanzando durante una llamada larga).
+- Round-trip de persistencia: `save` → `load` devuelve datos idénticos para
+  `KmerCounts`, `Cohort` y `Sketch`.
+- `suggest_min_count()` sobre un espectro sintético con valle conocido.
+- `containment` asimétrico: con A ⊂ B, `A.containment(B) ≈ 1.0` mientras
+  `A.jaccard(B)` es bajo. Es el test que demuestra por qué existen las dos.
+
+**`KmerVectorizer` — la garantía anti-fuga**
+
+Es la propiedad más importante que se puede testear, y se puede hacer directamente:
+
+- `check_estimator` de sklearn sobre el transformador.
+- `fit` sobre las muestras A,B,C y `transform` sobre D: los k-mers exclusivos de
+  D **no** aparecen en la salida, y las columnas son exactamente
+  `vocabulary_`, en el mismo orden.
+- Dentro de un `Pipeline` con `cross_val_score`, registrar qué rutas recibe
+  `fit` en cada fold y afirmar que **ninguna** pertenece al fold de test. Esto
+  convierte la garantía de §9.6 en un test ejecutable, no en una nota al pie.
+- `get_feature_names_out()` devuelve secuencias ACGT válidas de longitud `k`.
 
 ---
 
 ## 14. Fuera de alcance (YAGNI)
 
 - Pre-pasada con Count-Min Sketch para bajar el pico de RAM por muestra.
-- Normalización dentro de Rust.
-- Comparación N×N de directorios.
+- Normalización **dentro de Rust** (sí existe como helper en Python, §9.7).
 - Selección de features supervisada.
 - Reanudación / checkpointing de cohortes interrumpidas.
+- Manifiesto CSV de muestras.
+- Alineamiento, ensamblado, o cualquier análisis que no sea conteo de k-mers.
+
+*Movido a dentro de alcance:* comparación N×N — dejó de requerir trabajo en Rust
+al hacer `Sketch` persistente (§8).
 
 ---
 
@@ -494,11 +769,18 @@ cohorte de 500 archivos, "parse error" sin ubicación es inservible.
 | **0** | Arreglar build; borrar `bio.rs` | — |
 | **A** | Extraer núcleo; `Result` en todo; callback de progreso | 0 |
 | **B** | Filtros de frecuencia (`prune`, `--max-count`) | A |
-| **C** | PyO3 + maturin + wheels en CI | A |
-| **D** | Motor de cohorte | A, B |
-| **E** | `compare` por streaming | A |
-| **F** | Corregir o borrar `simd.rs` | A |
+| **C** | PyO3 + maturin + wheels en CI; `count` + `peek` expuestos | A |
+| **D** | `KmerCounts`, espectro, `suggest_min_count`, save/load | C |
+| **E** | Motor de cohorte + `Cohort` | A, B, C |
+| **F** | `count_projected` + `KmerVectorizer` (sklearn) | E |
+| **G** | `Sketch` por streaming, persistencia, `compare_all` | C |
+| **H** | Corregir o borrar `simd.rs` | A |
 
 La fase C va deliberadamente pronto: es el criterio de éxito principal, y es
 mejor descubrir los problemas de empaquetado multiplataforma con dos funciones
-expuestas que con seis.
+expuestas que con nueve.
+
+La fase F depende de E porque `KmerVectorizer` necesita la selección de features
+por prevalencia que vive en el motor de cohorte. Es la fase con más valor
+por línea de código: convierte la librería de "genera matrices" en "es un
+componente de scikit-learn".
