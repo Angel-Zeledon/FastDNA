@@ -9,6 +9,5 @@ pub mod fastq;
 pub mod kmer;
 pub mod pipeline;
 pub mod qc;
-pub mod simd;
 pub mod sketch;
 pub mod wasm;
