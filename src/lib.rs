@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod cms;
 pub mod counter;
+pub mod error;
 pub mod export;
 pub mod fastq;
 pub mod kmer;
