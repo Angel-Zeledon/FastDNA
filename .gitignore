@@ -1,6 +1,9 @@
 /target
 
-# Salidas generadas por el CLI
+# Generated CLI outputs
 counts.parquet
 qc_report.json
 hist.csv
+
+# Subagent-driven development scratch workspace
+.superpowers/
