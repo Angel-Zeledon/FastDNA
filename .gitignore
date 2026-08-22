@@ -1,0 +1,6 @@
+/target
+
+# Salidas generadas por el CLI
+counts.parquet
+qc_report.json
+hist.csv

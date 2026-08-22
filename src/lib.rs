@@ -1,0 +1,14 @@
+// src/lib.rs
+
+pub mod cli;
+pub mod cms;
+pub mod counter;
+pub mod export;
+pub mod fastq;
+pub mod kmer;
+pub mod pipeline;
+pub mod qc;
+pub mod simd;
+pub mod sketch;
+pub mod bio;
+pub mod wasm;
