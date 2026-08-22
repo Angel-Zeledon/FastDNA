@@ -31,3 +31,17 @@ fn existing_short_flags_are_unchanged() {
     assert_eq!(cli.min_quality, 30.0);
     assert_eq!(cli.min_count, 5);
 }
+
+#[test]
+fn qc_and_histogram_paths_are_available_to_the_binary() {
+    let cli = Cli::parse_from([
+        "fastdna", "--input", "s.fastq",
+        "--qc", "my_qc.json",
+        "--histogram", "my_hist.csv",
+    ]);
+    assert_eq!(cli.qc.to_string_lossy(), "my_qc.json");
+    assert_eq!(
+        cli.histogram.as_ref().map(|p| p.to_string_lossy().to_string()),
+        Some("my_hist.csv".to_string())
+    );
+}
