@@ -1,6 +1,6 @@
 //! The pipeline must fail loudly and locate the failure, never print and continue.
 
-use std::io::Cursor;
+use std::io::{BufRead, Cursor, Read};
 use std::path::Path;
 
 use fastdna::error::FastDnaError;
@@ -9,6 +9,39 @@ use fastdna::pipeline::{process_stream_parallel, PipelineConfig};
 
 fn reader_for(fastq: &str) -> FastqReader<Cursor<Vec<u8>>> {
     FastqReader::new(Cursor::new(fastq.as_bytes().to_vec()))
+}
+
+/// A `BufRead` shim that behaves like a normal in-memory reader for a fixed
+/// number of `fill_buf` calls, then fails every call after that. Since a
+/// `Cursor`'s `fill_buf` always hands back the whole remaining buffer in one
+/// call, and `next_record` performs exactly one `read_until` per FASTQ line,
+/// each successful call here corresponds to exactly one line. Three full
+/// records is 12 successful calls; the 13th (the header line of record 4)
+/// fails, which is what pins the 1-based record arithmetic in
+/// `malformed_record_reports_the_1_based_record_number`.
+struct FailAfterN {
+    inner: Cursor<Vec<u8>>,
+    remaining_ok_calls: usize,
+}
+
+impl Read for FailAfterN {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl BufRead for FailAfterN {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.remaining_ok_calls == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "simulated read failure"));
+        }
+        self.remaining_ok_calls -= 1;
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
 }
 
 fn config(k: usize) -> PipelineConfig {
@@ -53,4 +86,40 @@ fn a_valid_stream_still_succeeds() {
     let (counter, _qc, reads) = result.expect("valid input must succeed");
     assert_eq!(reads, 1);
     assert_eq!(counter.total_kmers(), 5);
+}
+
+#[test]
+fn malformed_record_reports_the_1_based_record_number() {
+    // Three good records (12 successful lines), then the reader fails on the
+    // very first line of what would be record 4.
+    let mut fastq = String::new();
+    for i in 0..3 {
+        fastq.push_str(&format!("@r{i}\nACGT\n+\nIIII\n"));
+    }
+
+    let shim = FailAfterN { inner: Cursor::new(fastq.into_bytes()), remaining_ok_calls: 12 };
+    let reader = FastqReader::new(shim);
+
+    let result = process_stream_parallel(reader, config(4), Path::new("cohort/sample.fastq"), None);
+
+    match result {
+        Err(FastDnaError::MalformedFastq { path, record, .. }) => {
+            assert_eq!(record, 4, "must report the 1-based index of the record that failed");
+            assert_eq!(path, Path::new("cohort/sample.fastq"));
+        }
+        other => panic!("expected MalformedFastq, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_panicking_progress_callback_becomes_an_internal_error() {
+    let fastq = "@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nTTGCAACG\n+\nIIIIIIII\n";
+    let panics = |_: fastdna::progress::Progress| panic!("progress callback exploded");
+
+    let result = process_stream_parallel(reader_for(fastq), config(4), Path::new("sample.fastq"), Some(&panics));
+
+    match result {
+        Err(FastDnaError::Internal { .. }) => {}
+        other => panic!("expected Internal, got {other:?}"),
+    }
 }
