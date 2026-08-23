@@ -100,6 +100,7 @@ fn run(args: Cli) -> Result<()> {
         config,
         &args.input,
         Some(&on_progress),
+        None, // the CLI has no way to cancel a running call yet
     )
     .inspect_err(|_| pb.abandon())?;
 

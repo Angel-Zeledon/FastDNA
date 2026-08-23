@@ -3,7 +3,8 @@
 use std::io::BufRead;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::prelude::*;
@@ -62,11 +63,20 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 ///
 /// `source` names the input for error messages only; in-memory callers pass
 /// `Path::new("<memory>")`. `progress` is optional; `None` means silence.
+///
+/// `cancel`, if given, lets a caller interrupt a long-running call: setting
+/// the flag causes this function to return `Err(FastDnaError::Cancelled)`
+/// rather than partial counts. It is `Arc`, not a borrow like `ProgressFn`,
+/// because the producer thread -- which is `'static` (see below) -- must be
+/// able to see it too: if only the worker pool checked it, cancelling would
+/// leave the producer blocked forever on a full channel with no one left to
+/// drain it, the same deadlock item A guards against for `num_threads == 0`.
 pub fn process_stream_parallel<R: BufRead + Send + 'static>(
     reader: FastqReader<R>,
     config: PipelineConfig,
     source: &Path,
     progress: ProgressFn<'_>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(KmerCounter, QcSummary, u64)> {
     if config.k == 0 || config.k > 32 {
         return Err(FastDnaError::InvalidK { k: config.k });
@@ -90,12 +100,17 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
     let qual_win = config.quality_window;
     let progress_interval = config.progress_interval;
     let source_owned: PathBuf = source.to_path_buf();
+    // Cloned before the move below: the reader thread needs its own 'static
+    // owned handle to the flag, distinct from the one the rayon workers
+    // check (see the function doc comment for why this must be Arc).
+    let cancel_for_reader = cancel.clone();
 
     // 1. Producer thread. Returns the read count, or the record it choked on.
     let reader_handle = thread::spawn(move || -> Result<u64> {
         let mut reader = reader;
         let mut current_batch = Vec::with_capacity(batch_size);
         let mut total_reads: u64 = 0;
+        let mut cancelled = false;
 
         loop {
             match reader.next_record() {
@@ -104,6 +119,17 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
                     total_reads += 1;
 
                     if current_batch.len() >= batch_size {
+                        // Checked once per batch dispatch, not per record: an
+                        // atomic load in the per-record hot path would cost
+                        // measurable throughput for no benefit -- a human
+                        // pressing Ctrl-C does not need sub-batch latency.
+                        if let Some(tok) = &cancel_for_reader {
+                            if tok.load(Ordering::Relaxed) {
+                                cancelled = true;
+                                break;
+                            }
+                        }
+
                         let batch_to_send =
                             std::mem::replace(&mut current_batch, Vec::with_capacity(batch_size));
                         if sender.send(batch_to_send).is_err() {
@@ -122,7 +148,12 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
             }
         }
 
-        if !current_batch.is_empty() {
+        // On cancellation, drop the leftover batch instead of sending it:
+        // the whole result is discarded by the Cancelled check below, so
+        // there is no point handing workers more to chew through. `sender`
+        // is dropped when this closure returns either way, which disconnects
+        // the channel and lets any worker still consuming exit its loop.
+        if !cancelled && !current_batch.is_empty() {
             let _ = sender.send(current_batch);
         }
 
@@ -159,6 +190,17 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
     //    returns and drops its `Sender`). This keeps throughput flowing for
     //    any surviving workers and guarantees the function returns instead
     //    of hanging, regardless of how many workers panicked or when.
+    //
+    //    Cancellation is checked once per batch received (not per record,
+    //    same reasoning as the producer side). The same drain-and-discard
+    //    applies here as in the panic case, and for the same reason: the
+    //    producer checks its own copy of the flag only once per batch
+    //    dispatch, so it may already be blocked trying to send into a full
+    //    channel (or about to be) by the time a worker notices cancellation.
+    //    If every worker simply stopped consuming, that send -- and the
+    //    producer thread it lives on -- would block forever, the same
+    //    deadlock item A guards against. Draining keeps the channel moving
+    //    until the producer itself notices the flag and drops `Sender`.
     let results: Vec<WorkerOutcome> = (0..config.num_threads)
         .into_par_iter()
         .map(|_| {
@@ -167,6 +209,12 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
                 let mut local_qc = QcSummary::default();
 
                 while let Ok(mut batch) = receiver.recv() {
+                    if let Some(tok) = &cancel {
+                        if tok.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+
                     // Computed before the record loop below consumes the
                     // batch, per the batch-granularity progress accounting.
                     let n = batch.len() as u64;
@@ -201,7 +249,20 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
             }));
 
             match outcome {
-                Ok(v) => Ok(v),
+                Ok(v) => {
+                    // If cancelled, this worker's loop above may have broken
+                    // out with batches still in flight; drain them so the
+                    // producer (or another worker mid-send) never blocks.
+                    // Cheap when there is nothing to do: if the run was not
+                    // cancelled the flag check below is false and this is
+                    // skipped entirely; if it was cancelled but this worker's
+                    // loop instead ended because the channel had already
+                    // disconnected, the drain call returns immediately.
+                    if cancel.as_ref().is_some_and(|tok| tok.load(Ordering::Relaxed)) {
+                        while receiver.recv().is_ok() {}
+                    }
+                    Ok(v)
+                }
                 Err(payload) => {
                     // Drain (and discard) whatever is left so the bounded
                     // channel never backs up and blocks the producer, even
@@ -229,8 +290,19 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
             }
         }
     }
+    // A worker panic is an actual bug and takes priority over reporting
+    // cancellation: if one worker panicked while others simply noticed the
+    // cancel flag and stopped, the panic is the thing the caller needs to
+    // know about, not that the run also happened to be cancelled.
     if let Some(detail) = worker_panic {
         return Err(FastDnaError::Internal { detail });
+    }
+
+    // Checked after the join and after the panic check: a cancelled run
+    // must not look like a successful one with fewer reads, so this takes
+    // priority over returning partial counts.
+    if cancel.as_ref().is_some_and(|tok| tok.load(Ordering::Relaxed)) {
+        return Err(FastDnaError::Cancelled);
     }
 
     // 3. Map-reduce combine phase.

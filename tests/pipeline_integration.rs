@@ -40,7 +40,7 @@ fn pipeline_resets_kmer_window_on_ambiguous_base() {
     let fastq = "@r1\nACGTNACGT\n+\nIIIIIIIII\n";
 
     let (counter, _qc, total_reads) =
-        process_stream_parallel(reader_for(fastq), config(4), std::path::Path::new("<memory>"), None)
+        process_stream_parallel(reader_for(fastq), config(4), std::path::Path::new("<memory>"), None, None)
             .expect("valid input");
 
     assert_eq!(total_reads, 1);
@@ -59,7 +59,7 @@ fn pipeline_merges_forward_and_reverse_complement_strands() {
     let fastq = "@r1\nAACG\n+\nIIII\n@r2\nCGTT\n+\nIIII\n";
 
     let (counter, _qc, total_reads) =
-        process_stream_parallel(reader_for(fastq), config(4), std::path::Path::new("<memory>"), None)
+        process_stream_parallel(reader_for(fastq), config(4), std::path::Path::new("<memory>"), None, None)
             .expect("valid input");
 
     assert_eq!(total_reads, 2);
@@ -80,7 +80,7 @@ fn pipeline_yields_nothing_for_reads_shorter_than_k() {
     let fastq = "@r1\nACG\n+\nIII\n";
 
     let (counter, _qc, total_reads) =
-        process_stream_parallel(reader_for(fastq), config(4), std::path::Path::new("<memory>"), None)
+        process_stream_parallel(reader_for(fastq), config(4), std::path::Path::new("<memory>"), None, None)
             .expect("valid input");
 
     assert_eq!(total_reads, 1);
@@ -105,7 +105,7 @@ fn pipeline_agrees_with_kmer_module_across_a_batch() {
         .sum();
 
     let (counter, _qc, _) =
-        process_stream_parallel(reader_for(&fastq), config(k), std::path::Path::new("<memory>"), None)
+        process_stream_parallel(reader_for(&fastq), config(k), std::path::Path::new("<memory>"), None, None)
             .expect("valid input");
 
     assert_eq!(counter.total_kmers(), expected_total as u64);
@@ -146,6 +146,7 @@ fn progress_callback_receives_a_final_event() {
         low_interval_config,
         std::path::Path::new("<memory>"),
         Some(&callback),
+        None,
     )
     .expect("valid input");
 
@@ -175,13 +176,14 @@ fn silent_and_observed_runs_agree() {
     let noop = |_: fastdna::progress::Progress| {};
 
     let (silent, _, _) =
-        process_stream_parallel(reader_for(fastq), config(5), std::path::Path::new("<memory>"), None)
+        process_stream_parallel(reader_for(fastq), config(5), std::path::Path::new("<memory>"), None, None)
             .expect("valid");
     let (observed, _, _) = process_stream_parallel(
         reader_for(fastq),
         config(5),
         std::path::Path::new("<memory>"),
         Some(&noop),
+        None,
     )
     .expect("valid");
 

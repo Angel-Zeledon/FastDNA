@@ -44,10 +44,10 @@ fn crlf_and_lf_line_endings_produce_identical_counts() {
     }
 
     let (lf_counter, _lf_qc, lf_reads) =
-        process_stream_parallel(reader_for(lf.as_bytes()), config(5), std::path::Path::new("<memory>"), None)
+        process_stream_parallel(reader_for(lf.as_bytes()), config(5), std::path::Path::new("<memory>"), None, None)
             .expect("LF input must parse");
     let (crlf_counter, _crlf_qc, crlf_reads) =
-        process_stream_parallel(reader_for(crlf.as_bytes()), config(5), std::path::Path::new("<memory>"), None)
+        process_stream_parallel(reader_for(crlf.as_bytes()), config(5), std::path::Path::new("<memory>"), None, None)
             .expect("CRLF input must parse");
 
     assert_eq!(lf_reads, crlf_reads, "both encodings must yield the same read count");
@@ -61,7 +61,7 @@ fn crlf_and_lf_line_endings_produce_identical_counts() {
 
 #[test]
 fn empty_input_yields_a_clean_zero_count_result_not_an_error_or_hang() {
-    let result = process_stream_parallel(reader_for(b""), config(4), std::path::Path::new("<memory>"), None);
+    let result = process_stream_parallel(reader_for(b""), config(4), std::path::Path::new("<memory>"), None, None);
 
     let (counter, qc, reads) = result.expect("zero bytes of input must not be an error");
     assert_eq!(reads, 0);

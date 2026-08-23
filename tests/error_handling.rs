@@ -66,6 +66,7 @@ fn rejects_k_above_the_packing_limit_before_reading() {
         config(33),
         Path::new("sample.fastq"),
         None,
+        None,
     );
 
     match result {
@@ -81,6 +82,7 @@ fn rejects_k_of_zero() {
         config(0),
         Path::new("sample.fastq"),
         None,
+        None,
     );
     assert!(matches!(result, Err(FastDnaError::InvalidK { k: 0 })));
 }
@@ -91,6 +93,7 @@ fn a_valid_stream_still_succeeds() {
         reader_for("@r1\nACGTACGT\n+\nIIIIIIII\n"),
         config(4),
         Path::new("sample.fastq"),
+        None,
         None,
     );
 
@@ -111,7 +114,7 @@ fn malformed_record_reports_the_1_based_record_number() {
     let shim = FailAfterN { inner: Cursor::new(fastq.into_bytes()), remaining_ok_calls: 12 };
     let reader = FastqReader::new(shim);
 
-    let result = process_stream_parallel(reader, config(4), Path::new("cohort/sample.fastq"), None);
+    let result = process_stream_parallel(reader, config(4), Path::new("cohort/sample.fastq"), None, None);
 
     match result {
         Err(FastDnaError::MalformedFastq { path, record, .. }) => {
@@ -142,11 +145,138 @@ fn zero_threads_is_rejected_instead_of_hanging() {
         progress_interval: 100_000,
     };
 
-    let result = process_stream_parallel(reader_for(&fastq), bad_config, Path::new("sample.fastq"), None);
+    let result = process_stream_parallel(reader_for(&fastq), bad_config, Path::new("sample.fastq"), None, None);
 
     match result {
         Err(FastDnaError::InvalidConfig { parameter, .. }) => assert_eq!(parameter, "num_threads"),
         other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+}
+
+/// A token already set before the call starts must return `Cancelled`
+/// promptly, not process the whole input first. 50,000 reads at a
+/// batch_size of 8 is over 6,000 batches; if the cancel check were missing
+/// (or checked only, say, once at the very end) a non-cancelling run would
+/// clearly take much longer than the generous wall-clock budget asserted
+/// below, so a regression here shows up as a slow/failing test rather than
+/// a silent behavioural difference.
+#[test]
+fn cancel_set_before_the_call_returns_promptly() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let mut fastq = String::new();
+    for i in 0..50_000 {
+        fastq.push_str(&format!("@r{i}\nACGTACGT\n+\nIIIIIIII\n"));
+    }
+
+    let cancel = Arc::new(AtomicBool::new(true));
+    let large_config = PipelineConfig {
+        k: 4,
+        min_quality: 20.0,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 100_000,
+    };
+
+    let start = Instant::now();
+    let result =
+        process_stream_parallel(reader_for(&fastq), large_config, Path::new("sample.fastq"), None, Some(cancel));
+    let elapsed = start.elapsed();
+
+    match result {
+        Err(FastDnaError::Cancelled) => {}
+        other => panic!("expected Cancelled, got {other:?}"),
+    }
+    assert!(
+        elapsed.as_secs() < 5,
+        "a pre-cancelled call over 50,000 reads must return promptly, not process the input first: took {elapsed:?}"
+    );
+}
+
+/// A token that stays `false` for the whole run must behave identically to
+/// passing `None` -- same read count, same k-mer counts -- proving the
+/// cancellation plumbing costs nothing and changes nothing when unused.
+#[test]
+fn cancel_false_throughout_behaves_identically_to_none() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let mut fastq = String::new();
+    for i in 0..2_000 {
+        fastq.push_str(&format!("@r{i}\nACGTACGTAC\n+\nIIIIIIIIII\n"));
+    }
+
+    let (no_token_counter, _qc1, no_token_reads) =
+        process_stream_parallel(reader_for(&fastq), config(5), Path::new("sample.fastq"), None, None)
+            .expect("uncancelled run must succeed");
+
+    let never_cancelled = Arc::new(AtomicBool::new(false));
+    let (false_token_counter, _qc2, false_token_reads) = process_stream_parallel(
+        reader_for(&fastq),
+        config(5),
+        Path::new("sample.fastq"),
+        None,
+        Some(never_cancelled),
+    )
+    .expect("a token that is never set must not change the outcome");
+
+    assert_eq!(no_token_reads, false_token_reads);
+    assert_eq!(no_token_counter.total_kmers(), false_token_counter.total_kmers());
+    assert_eq!(no_token_counter.distinct_kmers(), false_token_counter.distinct_kmers());
+}
+
+/// Cancellation triggered mid-run (rather than pre-set before the call, as
+/// in `cancel_set_before_the_call_returns_promptly`) must still surface as
+/// `Cancelled`, never as a successful run reporting fewer reads than the
+/// input actually contains. The cancel flag is flipped from inside the
+/// progress callback itself, so real work has already happened and been
+/// reported by the time cancellation takes effect -- exactly the scenario
+/// where a naive implementation might be tempted to return whatever partial
+/// counts had accumulated instead of an error. That would be the same class
+/// of bug as the silent truncation this branch of work removed elsewhere.
+#[test]
+fn cancellation_mid_run_returns_cancelled_not_partial_counts() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let mut fastq = String::new();
+    for i in 0..5_000 {
+        fastq.push_str(&format!("@r{i}\nACGTACGT\n+\nIIIIIIII\n"));
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_for_callback = cancel.clone();
+    let trigger_cancel_on_first_progress_event = move |_: fastdna::progress::Progress| {
+        cancel_for_callback.store(true, Ordering::SeqCst);
+    };
+
+    let mid_run_config = PipelineConfig {
+        k: 4,
+        min_quality: 20.0,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 10,
+    };
+
+    let result = process_stream_parallel(
+        reader_for(&fastq),
+        mid_run_config,
+        Path::new("sample.fastq"),
+        Some(&trigger_cancel_on_first_progress_event),
+        Some(cancel),
+    );
+
+    match result {
+        Err(FastDnaError::Cancelled) => {}
+        Ok((_counter, _qc, reads)) => panic!(
+            "cancellation must not surface as a successful run with fewer reads \
+             than the input actually has (got reads = {reads})"
+        ),
+        other => panic!("expected Cancelled, got {other:?}"),
     }
 }
 
@@ -194,6 +324,7 @@ fn a_panic_in_a_worker_thread_progress_callback_becomes_internal_and_returns() {
         worker_config,
         Path::new("sample.fastq"),
         Some(&panic_on_first_reads_processed),
+        None,
     );
 
     match result {
@@ -207,7 +338,7 @@ fn a_panicking_progress_callback_becomes_an_internal_error() {
     let fastq = "@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nTTGCAACG\n+\nIIIIIIII\n";
     let panics = |_: fastdna::progress::Progress| panic!("progress callback exploded");
 
-    let result = process_stream_parallel(reader_for(fastq), config(4), Path::new("sample.fastq"), Some(&panics));
+    let result = process_stream_parallel(reader_for(fastq), config(4), Path::new("sample.fastq"), Some(&panics), None);
 
     match result {
         Err(FastDnaError::Internal { .. }) => {}

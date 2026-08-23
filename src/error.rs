@@ -26,6 +26,12 @@ pub enum FastDnaError {
     InvalidConfig { parameter: &'static str, reason: String },
     /// Serialization or writer failure while exporting results.
     Export { path: PathBuf, reason: String },
+    /// The caller asked to stop before the work finished.
+    ///
+    /// Not an error in the "something broke" sense -- it is a normal
+    /// outcome -- but it belongs in this type because it is how a
+    /// cancelled call returns early instead of completing.
+    Cancelled,
 }
 
 impl fmt::Display for FastDnaError {
@@ -71,6 +77,7 @@ impl fmt::Display for FastDnaError {
             FastDnaError::Export { path, reason } => {
                 write!(f, "export failed for {}: {reason}", path.display())
             }
+            FastDnaError::Cancelled => write!(f, "operation cancelled by caller"),
         }
     }
 }
