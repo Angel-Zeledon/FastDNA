@@ -446,6 +446,49 @@ mod tests {
         }
     }
 
+    /// Exercises the bounded-MinHash ceiling branch, which the only other
+    /// containment test (`containment_is_asymmetric_where_jaccard_is_low`)
+    /// never reaches: there, `other`'s sketch is built with
+    /// `sketch_size = 1_000` against only 500 k-mers, so it never fills,
+    /// `other.hashes.len() >= other.sketch_size` is always false, and
+    /// `ceiling` is always `u64::MAX` -- the bounded estimator silently
+    /// degenerates to plain membership testing, and this is precisely the
+    /// Mash-Screen-style behaviour (as opposed to a naive `|A∩B|/|A|`) that
+    /// the code exists to implement.
+    ///
+    /// Sketches are built directly from hand-picked hashes rather than
+    /// through `from_kmers`, so which hashes land above/below the ceiling
+    /// is controlled exactly instead of depending on `finalize_hash`'s
+    /// output order.
+    #[test]
+    fn containment_ceiling_excludes_hashes_the_other_sketch_could_not_have_kept() {
+        // `other` is full (hashes.len() == sketch_size), so it has
+        // provably discarded every hash above its current maximum (30):
+        // ceiling = 30.
+        let other = GenomeSketch { sketch_size: 3, k: 21, hashes: vec![10, 20, 30] };
+        // `self` is not full (hashes.len() < sketch_size), so nothing of
+        // its own is truncated; two of its five hashes (35, 45) exceed
+        // `other`'s ceiling and must be excluded from both the numerator
+        // and the denominator, not counted as misses.
+        let this = GenomeSketch { sketch_size: 10, k: 21, hashes: vec![10, 15, 25, 35, 45] };
+
+        let containment = this.containment(&other).expect("same k must not error");
+
+        // Only {10, 15, 25} are resolvable (<= ceiling 30); of those, only
+        // 10 is present in `other`. resolvable = 3, shared = 1.
+        assert_eq!(
+            containment,
+            1.0 / 3.0,
+            "expected 1 shared of 3 resolvable hashes, got {containment}"
+        );
+        // The naive (unbounded) alternative would divide by all 5 of
+        // self's hashes instead of just the 3 `other` can attest to,
+        // giving 1/5 = 0.2 -- a different, wrong answer. Asserting
+        // inequality here pins down that the ceiling logic is actually
+        // changing the result, not merely present and inert.
+        assert_ne!(containment, 1.0 / 5.0, "the ceiling exclusion must change the result versus the naive, unbounded estimator");
+    }
+
     #[test]
     fn save_then_load_round_trips_to_an_identical_sketch() {
         let kmers: Vec<u64> = (0..500).collect();
@@ -500,6 +543,49 @@ mod tests {
         assert_eq!(streamed.k, in_memory.k);
         assert_eq!(streamed.hashes, in_memory.hashes, "streaming and in-memory construction must select identical hashes");
         assert!(!streamed.hashes.is_empty(), "the test data must actually produce k-mers");
+    }
+
+    /// The rewrite-safety test above never exercises eviction:
+    /// `sketch_size = 1_000` against ~84 k-mers means the bottom-k working
+    /// set never fills, so `insert_bottom_k`'s eviction branch
+    /// (`min_set.insert(hash)` then `pop_last()` once already full) never
+    /// runs on either path. Bounded memory under truncation is the entire
+    /// reason `from_reader`'s streaming construction exists instead of
+    /// collecting every k-mer into a `Vec` first, so that branch needs its
+    /// own equivalence check, with a `sketch_size` well below the distinct
+    /// k-mer count so the sketch is forced to fill and then keep evicting.
+    #[test]
+    fn streaming_construction_matches_in_memory_path_when_truncated_by_eviction() {
+        let k = 5;
+        let sketch_size = 8;
+        let reads = ["ACGTACGGTTACAGTCAGTCAGCATCGATCGACTAGCATGGGTTAACCGGTT", "TTGGCCAATTGGCCTAGCTAGCTAGGGCATCGATCGATCG"];
+
+        let mut kmers: Vec<u64> = Vec::new();
+        for seq in &reads {
+            kmers.extend(kmer::extract_canonical_kmers(seq.as_bytes(), k));
+        }
+        assert!(
+            kmers.len() > sketch_size,
+            "test data must produce more k-mers ({}) than sketch_size ({sketch_size}), or eviction never triggers",
+            kmers.len()
+        );
+
+        let in_memory = GenomeSketch::from_kmers(&kmers, sketch_size, k);
+        assert_eq!(
+            in_memory.hashes.len(),
+            sketch_size,
+            "the sketch must be full (truncated) for this test to actually exercise eviction"
+        );
+
+        let reader = reader_over(&reads);
+        let streamed = GenomeSketch::from_reader(reader, sketch_size, k, Path::new("<memory>"))
+            .expect("streaming build must succeed");
+
+        assert_eq!(streamed.hashes.len(), sketch_size);
+        assert_eq!(
+            streamed.hashes, in_memory.hashes,
+            "streaming and in-memory construction must select identical hashes even under repeated eviction"
+        );
     }
 
     #[test]
