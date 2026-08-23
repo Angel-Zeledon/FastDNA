@@ -533,10 +533,10 @@ mod tests {
         let kmers: Vec<u64> = (0..500).collect();
         let original = GenomeSketch::from_kmers(&kmers, 128, 21);
 
-        let path = std::env::temp_dir().join("fastdna_sketch_save_load_roundtrip_test.sig");
+        let dir = tempfile::tempdir().expect("failed to create temp dir for test");
+        let path = dir.path().join("fastdna_sketch_save_load_roundtrip_test.sig");
         original.save(&path).expect("save must succeed");
         let loaded = GenomeSketch::load(&path).expect("load must succeed");
-        let _ = std::fs::remove_file(&path);
 
         assert_eq!(loaded.sketch_size, original.sketch_size);
         assert_eq!(loaded.k, original.k);
@@ -545,8 +545,8 @@ mod tests {
 
     #[test]
     fn load_of_a_missing_file_is_an_io_error() {
-        let path = std::env::temp_dir().join("fastdna_sketch_does_not_exist_test.sig");
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().expect("failed to create temp dir for test");
+        let path = dir.path().join("fastdna_sketch_does_not_exist_test.sig");
 
         match GenomeSketch::load(&path) {
             Err(FastDnaError::Io { .. }) => {}
@@ -560,13 +560,11 @@ mod tests {
     /// *loading* is what actually failed.
     #[test]
     fn load_of_a_corrupt_file_is_a_load_error_not_an_export_error() {
-        let path = std::env::temp_dir().join("fastdna_sketch_corrupt_test.sig");
+        let dir = tempfile::tempdir().expect("failed to create temp dir for test");
+        let path = dir.path().join("fastdna_sketch_corrupt_test.sig");
         std::fs::write(&path, b"not valid json { at all").unwrap();
 
-        let err = GenomeSketch::load(&path);
-        let _ = std::fs::remove_file(&path);
-
-        match err {
+        match GenomeSketch::load(&path) {
             Err(FastDnaError::Load { .. }) => {}
             other => panic!("expected Err(Load), got {other:?}"),
         }
@@ -580,14 +578,12 @@ mod tests {
     /// wrong.
     #[test]
     fn load_rejects_a_sketch_with_more_hashes_than_sketch_size() {
-        let path = std::env::temp_dir().join("fastdna_sketch_oversized_test.sig");
+        let dir = tempfile::tempdir().expect("failed to create temp dir for test");
+        let path = dir.path().join("fastdna_sketch_oversized_test.sig");
         let bad = GenomeSketch { sketch_size: 2, k: 21, hashes: vec![1, 2, 3] };
         std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
 
-        let err = GenomeSketch::load(&path);
-        let _ = std::fs::remove_file(&path);
-
-        match err {
+        match GenomeSketch::load(&path) {
             Err(FastDnaError::Load { reason, .. }) => {
                 assert!(reason.contains("sketch_size"), "reason should explain the mismatch: {reason}");
             }
@@ -601,14 +597,12 @@ mod tests {
     /// back a sketch that estimators will misuse.
     #[test]
     fn load_rejects_a_sketch_with_unsorted_hashes() {
-        let path = std::env::temp_dir().join("fastdna_sketch_unsorted_test.sig");
+        let dir = tempfile::tempdir().expect("failed to create temp dir for test");
+        let path = dir.path().join("fastdna_sketch_unsorted_test.sig");
         let bad = GenomeSketch { sketch_size: 10, k: 21, hashes: vec![5, 1, 3] };
         std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
 
-        let err = GenomeSketch::load(&path);
-        let _ = std::fs::remove_file(&path);
-
-        match err {
+        match GenomeSketch::load(&path) {
             Err(FastDnaError::Load { reason, .. }) => {
                 assert!(reason.contains("sorted"), "reason should explain the ordering violation: {reason}");
             }
@@ -691,16 +685,14 @@ mod tests {
 
     #[test]
     fn from_path_reports_malformed_fastq_with_a_record_number() {
-        let dir = std::env::temp_dir().join("fastdna_sketch_malformed_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("bad.fastq");
+        let dir = tempfile::tempdir().expect("failed to create temp dir for test");
+        let path = dir.path().join("bad.fastq");
 
         let mut bytes = fastq_bytes(&["ACGTACGT"]);
         bytes.extend_from_slice(b"not-a-header-line\n");
         std::fs::write(&path, &bytes).unwrap();
 
         let err = GenomeSketch::from_path(&path, 256, 5).unwrap_err();
-        let _ = std::fs::remove_file(&path);
 
         match err {
             FastDnaError::MalformedFastq { record, .. } => assert_eq!(record, 2),
