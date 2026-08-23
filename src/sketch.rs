@@ -7,8 +7,14 @@
 //! minutes to compare exactly can be compared in milliseconds this way.
 
 use std::collections::BTreeSet;
+use std::io::BufRead;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::error::{FastDnaError, Result};
+use crate::fastq::{FastqReadError, FastqReader};
+use crate::kmer;
 
 /// MinHash sketch representation for rapid genomic distance estimation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,9 +45,11 @@ fn finalize_hash(kmer: u64) -> u64 {
 }
 
 /// Folds one already-finalized hash into a bottom-`sketch_size` working set,
-/// evicting the current maximum once the set is full. Extracted out of
-/// `from_kmers` so a later streaming construction path can share exactly
-/// this selection logic.
+/// evicting the current maximum once the set is full. Shared by `from_kmers`
+/// (in-memory) and `from_reader` (streaming) so both construction paths run
+/// through identical selection logic -- see
+/// `streaming_construction_matches_in_memory_path` below, which exists
+/// specifically to prove that sharing pays off.
 #[inline]
 fn insert_bottom_k(min_set: &mut BTreeSet<u64>, sketch_size: usize, hash: u64) {
     if sketch_size == 0 {
@@ -61,6 +69,12 @@ impl GenomeSketch {
         Self { sketch_size, k, hashes: Vec::with_capacity(sketch_size) }
     }
 
+    /// Builds a sketch from every k-mer already held in memory as a slice.
+    /// Peak memory is `O(kmers.len())` for the input plus `O(sketch_size)`
+    /// for the working set -- fine for small inputs or when the k-mers are
+    /// already materialized for another reason, but see `from_reader`/
+    /// `from_path` for large FASTQ files, where materializing every k-mer
+    /// up front would defeat the point of sketching.
     pub fn from_kmers(kmers: &[u64], sketch_size: usize, k: usize) -> Self {
         let mut min_set: BTreeSet<u64> = BTreeSet::new();
 
@@ -69,6 +83,63 @@ impl GenomeSketch {
         }
 
         Self { sketch_size, k, hashes: min_set.into_iter().collect() }
+    }
+
+    /// Builds a sketch by streaming a FASTQ file record by record,
+    /// transparently decompressing `.gz` inputs. Memory stays bounded by
+    /// `sketch_size` regardless of file size: unlike `from_kmers`, no
+    /// intermediate list of every k-mer in the file is ever built.
+    pub fn from_path<P: AsRef<Path>>(path: P, sketch_size: usize, k: usize) -> Result<Self> {
+        let path_ref = path.as_ref();
+        let reader = FastqReader::from_path(path_ref)
+            .map_err(|e| FastDnaError::Io { path: path_ref.to_path_buf(), source: e })?;
+        Self::from_reader(reader, sketch_size, k, path_ref)
+    }
+
+    /// The streaming construction logic itself, over any `BufRead` -- kept
+    /// separate from `from_path` so it is testable against an in-memory
+    /// buffer without touching the filesystem (same split as
+    /// `preview::peek`/`peek_from_reader`).
+    ///
+    /// `source` is used only to attribute I/O and parse errors to a path;
+    /// `FastqReader` itself has no path of its own and tracks no record
+    /// count across calls (see the doc comment on `FastqReadError`), so the
+    /// caller supplies both.
+    fn from_reader<R: BufRead>(
+        mut reader: FastqReader<R>,
+        sketch_size: usize,
+        k: usize,
+        source: &Path,
+    ) -> Result<Self> {
+        let mut min_set: BTreeSet<u64> = BTreeSet::new();
+        let mut record_count: u64 = 0;
+
+        loop {
+            match reader.next_record() {
+                Ok(Some(record)) => {
+                    record_count += 1;
+                    for kmer in kmer::extract_canonical_kmers(&record.seq, k) {
+                        insert_bottom_k(&mut min_set, sketch_size, finalize_hash(kmer));
+                    }
+                }
+                Ok(None) => break,
+                // A genuine I/O failure, not a data problem -- see the
+                // matching branch in `preview::peek_from_reader` and
+                // `pipeline::process_stream_parallel`, which this mirrors.
+                Err(FastqReadError::Io(source_err)) => {
+                    return Err(FastDnaError::Io { path: source.to_path_buf(), source: source_err });
+                }
+                Err(FastqReadError::Malformed(reason)) => {
+                    return Err(FastDnaError::MalformedFastq {
+                        path: source.to_path_buf(),
+                        record: record_count + 1,
+                        reason,
+                    });
+                }
+            }
+        }
+
+        Ok(Self { sketch_size, k, hashes: min_set.into_iter().collect() })
     }
 
     pub fn jaccard_similarity(&self, other: &GenomeSketch) -> f64 {
@@ -107,6 +178,19 @@ impl GenomeSketch {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    fn fastq_bytes(reads: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for (i, seq) in reads.iter().enumerate() {
+            buf.extend_from_slice(format!("@r{i}\n{seq}\n+\n{}\n", "I".repeat(seq.len())).as_bytes());
+        }
+        buf
+    }
+
+    fn reader_over(reads: &[&str]) -> FastqReader<Cursor<Vec<u8>>> {
+        FastqReader::new(Cursor::new(fastq_bytes(reads)))
+    }
 
     #[test]
     fn identical_inputs_give_jaccard_one() {
@@ -169,6 +253,55 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for kmer in 0u64..10_000 {
             assert!(seen.insert(finalize_hash(kmer)), "collision at input {kmer}");
+        }
+    }
+
+    /// The rewrite-safety test: proves the streaming construction path
+    /// (`from_reader`, over a `FastqReader`) selects exactly the same
+    /// bottom-k hashes as the in-memory path (`from_kmers`, over a
+    /// pre-extracted slice) when fed the same underlying k-mers. This is
+    /// what guarantees the streaming rewrite -- done to bound memory by
+    /// `sketch_size` instead of input size -- did not change behaviour.
+    #[test]
+    fn streaming_construction_matches_in_memory_path() {
+        let k = 5;
+        let sketch_size = 1_000; // Larger than the distinct k-mer count below, so nothing is truncated and this is an exact equivalence check, not an approximate one.
+        let reads = ["ACGTACGGTTACAGTCAGTCAGCATCGATCGACTAGCATGGGTTAACCGGTT", "TTGGCCAATTGGCCTAGCTAGCTAGGGCATCGATCGATCG"];
+
+        // The same k-mers, taken through both extraction paths, so the
+        // comparison isolates the bottom-k selection logic itself.
+        let mut kmers: Vec<u64> = Vec::new();
+        for seq in &reads {
+            kmers.extend(kmer::extract_canonical_kmers(seq.as_bytes(), k));
+        }
+        let in_memory = GenomeSketch::from_kmers(&kmers, sketch_size, k);
+
+        let reader = reader_over(&reads);
+        let streamed =
+            GenomeSketch::from_reader(reader, sketch_size, k, Path::new("<memory>")).expect("streaming build must succeed");
+
+        assert_eq!(streamed.sketch_size, in_memory.sketch_size);
+        assert_eq!(streamed.k, in_memory.k);
+        assert_eq!(streamed.hashes, in_memory.hashes, "streaming and in-memory construction must select identical hashes");
+        assert!(!streamed.hashes.is_empty(), "the test data must actually produce k-mers");
+    }
+
+    #[test]
+    fn from_path_reports_malformed_fastq_with_a_record_number() {
+        let dir = std::env::temp_dir().join("fastdna_sketch_malformed_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.fastq");
+
+        let mut bytes = fastq_bytes(&["ACGTACGT"]);
+        bytes.extend_from_slice(b"not-a-header-line\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = GenomeSketch::from_path(&path, 256, 5).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+
+        match err {
+            FastDnaError::MalformedFastq { record, .. } => assert_eq!(record, 2),
+            other => panic!("expected MalformedFastq, got {other:?}"),
         }
     }
 }
