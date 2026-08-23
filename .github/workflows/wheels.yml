@@ -1,0 +1,165 @@
+# Builds abi3 wheels for the five platforms FastDNA ships to:
+# manylinux x86_64, manylinux aarch64, macOS x86_64, macOS arm64, Windows x86_64.
+#
+# `pyo3/abi3-py38` (see Cargo.toml) compiles against CPython's stable ABI, so a
+# single wheel per platform covers CPython 3.8 through 3.13+ -- five artifacts
+# instead of one per (platform x Python version). Nothing in this file is
+# trustworthy on that point by itself: the "Assert abi3 tag" step below fails
+# the build if a produced wheel filename does not contain `abi3`, so a
+# regression (e.g. someone dropping the abi3-py38 feature, or maturin falling
+# back to a version-specific build because no matching interpreter was found)
+# is caught here rather than discovered later as ~30 unexpected artifacts.
+#
+# This workflow only builds and tests wheels. It intentionally has no publish
+# step -- this phase is risk retirement for the packaging story, not a release.
+#
+# This file never runs `cargo build`/`cargo test` with `--features python` or
+# `--all-features`, and never will, on any OS. `pyo3/extension-module` tells
+# the crate not to link `libpython` -- correct for the cdylib maturin builds,
+# but on Linux and macOS (unlike Windows, where pythonXY.lib gets linked
+# regardless) that genuinely suppresses the libpython link, so any target
+# that links the rlib and pulls in the `ffi` module -- a plain `cargo
+# build --features python`, run outside maturin -- fails there with undefined
+# `Py_*` symbols. `maturin build --release --features python` below is the one
+# safe way to build this feature: maturin builds `--lib` as a cdylib and never
+# turns the feature on for the `[[bin]]`. A separate "run the Rust tests" job,
+# if one is ever added to this file, must use bare `cargo test` (no features)
+# -- the existing 50-test suite -- never `--all-features` or `--features python`.
+
+name: Wheels
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: manylinux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+            testable: true
+          # Cross-compiled via maturin-action's manylinux aarch64 container
+          # and QEMU. The runner itself is x86_64, so the produced wheel
+          # cannot be imported or exercised here -- there is no aarch64 CPU
+          # to run it on. It is built and uploaded, not tested. Do not add a
+          # test step for this leg; it would silently no-op or fail for the
+          # wrong reason (architecture mismatch, not a real bug).
+          - name: manylinux-aarch64
+            os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            manylinux: auto
+            testable: false
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            manylinux: ""
+            testable: true
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            manylinux: ""
+            testable: true
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: ""
+            testable: true
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Needed for the "install into a clean venv and test" step below, on
+      # every platform. The Linux build itself happens inside maturin-action's
+      # manylinux Docker container and does not use this interpreter; the
+      # macOS and Windows builds run on the host and do use it, since abi3
+      # only needs one compatible interpreter present to link against.
+      #
+      # Deliberately 3.11, not 3.8, even though the wheel is tagged
+      # cp38-abi3 and pyproject.toml declares requires-python = ">=3.8".
+      # python/tests/test_api.py (owned by another agent -- not edited here)
+      # annotates a helper with `list[str]`, a builtin-generic subscript that
+      # is a TypeError at `def` time before Python 3.9; a 3.8 runner would
+      # fail to even import the test module. The wheel-test matrix is pinned
+      # to 3.9+ for now, so the wheel's claimed 3.8 support is unverified by
+      # this workflow -- flagged in the Task 5 report, not silently assumed.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --features python --out dist
+
+      - name: Assert abi3 wheel tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -eq 0 ]; then
+            echo "::error::No wheel found in dist/ for ${{ matrix.name }}" >&2
+            exit 1
+          fi
+          for whl in "${wheels[@]}"; do
+            echo "Built: $whl"
+            case "$(basename "$whl")" in
+              *abi3*) ;;
+              *)
+                echo "::error::$whl does not carry an abi3 tag. This means the" \
+                     "abi3-py38 pyo3 feature was not honored for this build --" \
+                     "instead of one wheel covering Python 3.8-3.13+, this" \
+                     "platform would need a separate wheel per Python version." >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      # manylinux-aarch64 is cross-compiled (see the matrix comment above) and
+      # has no test step: there is no aarch64 interpreter on this x86_64
+      # runner to import the wheel with.
+      - name: Install wheel into a clean venv and run tests
+        if: matrix.testable
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv-test
+          if [ -f .venv-test/bin/python ]; then
+            venv_py=.venv-test/bin/python
+          else
+            venv_py=.venv-test/Scripts/python.exe
+          fi
+          "$venv_py" -m pip install --upgrade pip
+          # Installs from the built wheel only -- not a source/dev build --
+          # so this is the same artifact a `pip install fastdna` user gets.
+          # pyarrow comes along automatically as a wheel-declared dependency
+          # (pyproject.toml `project.dependencies`).
+          "$venv_py" -m pip install dist/*.whl pytest
+          "$venv_py" -m pytest python/tests -v
+
+      - name: Note untested cross-compiled wheel
+        if: ${{ !matrix.testable }}
+        shell: bash
+        run: |
+          echo "::notice::${{ matrix.name }} is cross-compiled; it is built and" \
+               "uploaded but not imported or tested on this runner (no aarch64" \
+               "CPU available here)."
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/*.whl
+          if-no-files-found: error
