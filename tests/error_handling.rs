@@ -153,6 +153,37 @@ fn zero_threads_is_rejected_instead_of_hanging() {
     }
 }
 
+/// `progress_interval: 0` must be rejected before any batch is processed.
+/// If the guard were removed, `prev / progress_interval` inside the worker
+/// loop would divide by zero the first time a progress callback is supplied,
+/// which `catch_unwind` would report as `FastDnaError::Internal` -- a
+/// caller mistake mislabeled as a bug in FastDNA.
+#[test]
+fn zero_progress_interval_is_rejected_as_invalid_config() {
+    let bad_config = PipelineConfig {
+        k: 4,
+        min_quality: 20.0,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 0,
+    };
+
+    let noop = |_: fastdna::progress::Progress| {};
+    let result = process_stream_parallel(
+        reader_for("@r1\nACGT\n+\nIIII\n"),
+        bad_config,
+        Path::new("sample.fastq"),
+        Some(&noop),
+        None,
+    );
+
+    match result {
+        Err(FastDnaError::InvalidConfig { parameter, .. }) => assert_eq!(parameter, "progress_interval"),
+        other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+}
+
 /// A token already set before the call starts must return `Cancelled`
 /// promptly, not process the whole input first. 50,000 reads at a
 /// batch_size of 8 is over 6,000 batches; if the cancel check were missing

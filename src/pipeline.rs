@@ -92,6 +92,19 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
         });
     }
 
+    // `prev / progress_interval` below divides by this value on every batch
+    // a progress callback is supplied; zero panics unconditionally the first
+    // time that division runs. Rejected here, at the same entry-point
+    // validation point as `num_threads`, rather than only when `progress`
+    // is `Some`, so a caller cannot leave a latent panic in a config value
+    // that merely isn't exercised by today's call but might be by tomorrow's.
+    if config.progress_interval == 0 {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "progress_interval",
+            reason: "must be at least 1".to_string(),
+        });
+    }
+
     let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(64);
 
     let batch_size = config.batch_size;
