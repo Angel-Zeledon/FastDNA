@@ -119,6 +119,44 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
         });
     }
 
+    // The producer loop only ships a batch once `current_batch.len() >=
+    // batch_size`; with `batch_size == 0` that is trivially true after every
+    // single record, so each read crosses the `bounded(64)` channel in its
+    // own one-element `Vec`. That is not a hang or a wrong answer, but a
+    // severe throughput cliff plus per-record allocation churn from a
+    // plausible caller mistake (e.g. an off-by-one default), so it is
+    // rejected here rather than left to silently degrade every run.
+    if config.batch_size == 0 {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "batch_size",
+            reason: "must be at least 1".to_string(),
+        });
+    }
+
+    // `quality_trim_end` decides where to stop trimming with
+    // `avg_qual >= min_qual`. Every comparison against `NaN` is `false`, so a
+    // `NaN` `min_quality` never breaks the loop early and silently trims
+    // every read down to `window_size - 1` bases -- the run still completes
+    // and returns near-zero counts, with no panic and no error, which is
+    // exactly the silent-wrong-answer class this validation block exists to
+    // rule out. `+-inf` are rejected too: `+inf` behaves like `NaN` here
+    // (every average is `< +inf`, so nothing ever breaks the loop), while
+    // `-inf` makes every comparison `true` and trims nothing at all --
+    // a different wrong answer, not a safe one.
+    //
+    // This guard and the `quality_window` guard above protect each other and
+    // neither should be removed on its own: this NaN/`+-inf` loop only
+    // terminates safely today *because* `quality_window >= 1` is guaranteed.
+    // With `window_size == 0` the same non-finite comparison instead loops
+    // forever (see the `quality_window` guard's comment for why). Do not
+    // drop either guard as "defensive noise" without re-checking the other.
+    if !config.min_quality.is_finite() {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "min_quality",
+            reason: "must be a finite number (not NaN or infinite)".to_string(),
+        });
+    }
+
     let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(64);
 
     let batch_size = config.batch_size;

@@ -257,6 +257,157 @@ fn zero_quality_window_is_rejected_as_invalid_config() {
     }
 }
 
+/// `batch_size: 0` must be rejected before the producer thread starts. If
+/// the guard were removed, `current_batch.len() >= batch_size` would be
+/// trivially true after every single record, so every read would cross the
+/// `bounded(64)` channel in its own one-element `Vec` instead of a real
+/// batch -- a severe throughput cliff, not a hang or a wrong answer, so this
+/// only checks the error variant and parameter, not behaviour under load.
+#[test]
+fn zero_batch_size_is_rejected_as_invalid_config() {
+    let bad_config = PipelineConfig {
+        k: 4,
+        min_quality: 20.0,
+        quality_window: 4,
+        batch_size: 0,
+        num_threads: 2,
+        progress_interval: 100_000,
+    };
+
+    let result = process_stream_parallel(
+        reader_for("@r1\nACGT\n+\nIIII\n"),
+        bad_config,
+        Path::new("sample.fastq"),
+        None,
+        None,
+    );
+
+    match result {
+        Err(FastDnaError::InvalidConfig { parameter, .. }) => assert_eq!(parameter, "batch_size"),
+        other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+}
+
+/// `min_quality: NaN` must be rejected before any read is trimmed. If the
+/// guard were removed, `quality_trim_end`'s `avg_qual >= min_qual` check
+/// would be `false` for every window (all comparisons against `NaN` are
+/// `false`), so the loop would never break early and every read would be
+/// silently trimmed down to `window_size - 1` bases. That is the
+/// silent-wrong-answer failure this guard exists to rule out, so this test
+/// proves it the strong way: it counts a known input and asserts the exact
+/// k-mer total a healthy (non-NaN) run would produce. Without the guard,
+/// every 8-base read here would be trimmed to 3 bases (`window_size - 1`
+/// with `quality_window: 4`), which is shorter than `k = 4` and yields zero
+/// k-mers per read -- so this assertion would fail loudly (0, not 5) rather
+/// than merely accepting any error.
+#[test]
+fn nan_min_quality_is_rejected_and_would_silently_zero_out_counts_if_not() {
+    let bad_config = PipelineConfig {
+        k: 4,
+        min_quality: f64::NAN,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 100_000,
+    };
+
+    let result = process_stream_parallel(
+        reader_for("@r1\nACGTACGT\n+\nIIIIIIII\n"),
+        bad_config,
+        Path::new("sample.fastq"),
+        None,
+        None,
+    );
+
+    match result {
+        Err(FastDnaError::InvalidConfig { parameter, .. }) => assert_eq!(parameter, "min_quality"),
+        other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+
+    // Demonstrate what the guard prevents: the same input with a *valid*
+    // min_quality of 0.0 (which every real quality score is `>=`, so
+    // trimming never engages) must yield the full, un-degraded k-mer count.
+    // This is the number that a NaN `min_quality` would silently replace
+    // with near-zero if the guard above did not exist.
+    let healthy_config = PipelineConfig {
+        k: 4,
+        min_quality: 0.0,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 100_000,
+    };
+    let (counter, _qc, reads) = process_stream_parallel(
+        reader_for("@r1\nACGTACGT\n+\nIIIIIIII\n"),
+        healthy_config,
+        Path::new("sample.fastq"),
+        None,
+        None,
+    )
+    .expect("a finite min_quality must succeed");
+    assert_eq!(reads, 1);
+    assert_eq!(counter.total_kmers(), 5, "an untrimmed 8-base read must yield 5 canonical 4-mers");
+}
+
+/// `min_quality: +inf` must be rejected for the same reason as `NaN`: no
+/// real quality average is ever `>= +inf`, so the trim loop never breaks
+/// early and every read is silently trimmed down to `window_size - 1`
+/// bases.
+#[test]
+fn positive_infinity_min_quality_is_rejected_as_invalid_config() {
+    let bad_config = PipelineConfig {
+        k: 4,
+        min_quality: f64::INFINITY,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 100_000,
+    };
+
+    let result = process_stream_parallel(
+        reader_for("@r1\nACGT\n+\nIIII\n"),
+        bad_config,
+        Path::new("sample.fastq"),
+        None,
+        None,
+    );
+
+    match result {
+        Err(FastDnaError::InvalidConfig { parameter, .. }) => assert_eq!(parameter, "min_quality"),
+        other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+}
+
+/// `min_quality: -inf` must also be rejected, but it is worth its own case:
+/// unlike `NaN`/`+inf`, every quality average is `>= -inf`, so this makes
+/// the trim loop break on its very first check and trim *nothing at all* --
+/// the opposite wrong behaviour from `NaN`'s "trim everything", caught by
+/// the same guard.
+#[test]
+fn negative_infinity_min_quality_is_rejected_as_invalid_config() {
+    let bad_config = PipelineConfig {
+        k: 4,
+        min_quality: f64::NEG_INFINITY,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 100_000,
+    };
+
+    let result = process_stream_parallel(
+        reader_for("@r1\nACGT\n+\nIIII\n"),
+        bad_config,
+        Path::new("sample.fastq"),
+        None,
+        None,
+    );
+
+    match result {
+        Err(FastDnaError::InvalidConfig { parameter, .. }) => assert_eq!(parameter, "min_quality"),
+        other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+}
+
 /// A token already set before the call starts must return `Cancelled`
 /// promptly, not process the whole input first. 50,000 reads at a
 /// batch_size of 8 is over 6,000 batches; if the cancel check were missing
