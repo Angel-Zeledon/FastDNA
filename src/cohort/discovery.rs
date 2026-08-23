@@ -65,12 +65,26 @@ const PAIR_SUFFIXES: [(&str, Role); 8] = [
     (".2", Role::Reverse),
 ];
 
+/// Case-insensitive `str::strip_suffix`: if the trailing bytes of `s` match
+/// `suffix` ignoring ASCII case, returns the remainder before it. Used for
+/// both FASTQ extensions and pair suffixes -- filesystems and sequencing
+/// pipelines alike are inconsistent about case (`.FASTQ`, `.FQ.GZ`,
+/// `_r1`), and treating those as unrecognized would silently drop files or
+/// split pairs into two unsuffixed, unpaired, non-orphan-warned samples.
+fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let split_at = s.len().checked_sub(suffix.len())?;
+    let (head, tail) = s.split_at(split_at);
+    tail.eq_ignore_ascii_case(suffix).then_some(head)
+}
+
 /// Strips a recognized FASTQ extension from a filename, returning the
-/// remaining stem. Returns `None` for anything else (a `.txt`, a
-/// `README`, a directory name) so callers can skip it silently.
+/// remaining stem. Matches case-insensitively (`.FASTQ`, `.Fq.Gz`, ... are
+/// all recognized, not just the lowercase canonical form). Returns `None`
+/// for anything else (a `.txt`, a `README`, a directory name) so callers
+/// can skip it silently.
 fn strip_fastq_extension(filename: &str) -> Option<&str> {
     for ext in EXTENSIONS {
-        if let Some(stem) = filename.strip_suffix(ext) {
+        if let Some(stem) = strip_suffix_ci(filename, ext) {
             if !stem.is_empty() {
                 return Some(stem);
             }
@@ -99,16 +113,33 @@ fn strip_fastq_extension(filename: &str) -> Option<&str> {
 /// `pat_R1_extra` (a non-numeric trailing part) does not match, and is left
 /// to the generic rules below, which also do not match it (it does not end
 /// in `_R1`), so it correctly stays single-end sample `pat_R1_extra`.
+///
+/// Matches the marker case-insensitively (`_r1_` is recognized, not just
+/// `_R1_`), same rationale as `strip_suffix_ci`.
 fn illumina_pair_role(stem: &str) -> Option<(&str, Role)> {
+    let bytes = stem.as_bytes();
     for (marker, role) in [("_R1_", Role::Forward), ("_R2_", Role::Reverse)] {
-        if let Some(idx) = stem.rfind(marker) {
-            let prefix = &stem[..idx];
-            let trailing = &stem[idx + marker.len()..];
-            if !prefix.is_empty()
-                && !trailing.is_empty()
-                && trailing.bytes().all(|b| b.is_ascii_digit())
-            {
-                return Some((prefix, role));
+        let marker_bytes = marker.as_bytes();
+        if marker_bytes.len() > bytes.len() {
+            continue;
+        }
+        // Case-insensitive rightmost match: markers are pure ASCII, so
+        // comparing raw bytes with `eq_ignore_ascii_case` never matches
+        // inside a multi-byte UTF-8 sequence (its continuation bytes are
+        // all >= 0x80, none of which equal an ASCII marker byte), so
+        // every match found this way lands on a valid `&str` slice
+        // boundary.
+        for start in (0..=bytes.len() - marker_bytes.len()).rev() {
+            if bytes[start..start + marker_bytes.len()].eq_ignore_ascii_case(marker_bytes) {
+                let prefix = &stem[..start];
+                let trailing = &stem[start + marker_bytes.len()..];
+                if !prefix.is_empty()
+                    && !trailing.is_empty()
+                    && trailing.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Some((prefix, role));
+                }
+                break;
             }
         }
     }
@@ -118,15 +149,16 @@ fn illumina_pair_role(stem: &str) -> Option<(&str, Role)> {
 /// Splits a stem into its sample id and, if the stem carries a recognized
 /// pair marker, which read of the pair it is. Tries the Illumina-specific
 /// form first (see `illumina_pair_role`), then falls back to the generic
-/// trailing-suffix rules. A stem matching neither is single-end and keeps
-/// its id unchanged.
+/// trailing-suffix rules (matched case-insensitively, so `_r1`/`.R2`/etc.
+/// are recognized the same as their canonical case). A stem matching
+/// neither is single-end and keeps its id unchanged.
 fn split_sample_id(stem: &str) -> (&str, Option<Role>) {
     if let Some((base, role)) = illumina_pair_role(stem) {
         return (base, Some(role));
     }
 
     for (suffix, role) in PAIR_SUFFIXES {
-        if let Some(base) = stem.strip_suffix(suffix) {
+        if let Some(base) = strip_suffix_ci(stem, suffix) {
             if !base.is_empty() {
                 return (base, Some(role));
             }
@@ -302,6 +334,42 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].sample_id, "pat_001");
         assert_eq!(s[0].files.len(), 1);
+    }
+
+    #[test]
+    fn uppercase_extensions_are_recognized_not_silently_ignored() {
+        let d = fixture(&["pat_001.FASTQ", "pat_002.FQ.GZ"]);
+        let mut samples = discover_samples(d.path()).expect("valid");
+        samples.sort_by(|a, b| a.sample_id.cmp(&b.sample_id));
+        assert_eq!(samples.len(), 2, "got {:?}", samples);
+        assert_eq!(samples[0].sample_id, "pat_001");
+        assert_eq!(samples[1].sample_id, "pat_002");
+    }
+
+    #[test]
+    fn lowercase_pair_suffix_still_pairs_and_does_not_silently_split_the_cohort() {
+        // Before case-insensitive matching, "_r1"/"_r2" (lowercase) matched
+        // no recognized suffix, so these became two single-end samples with
+        // different ids ("pat_r1" and "pat_r2") and no orphan warning --
+        // silent cohort corruption on a perfectly plausible input.
+        let d = fixture(&["pat_r1.fastq", "pat_r2.fastq"]);
+        let s = discover_samples(d.path()).expect("valid");
+        assert_eq!(s.len(), 1, "got {:?}", s);
+        assert_eq!(s[0].sample_id, "pat");
+        assert_eq!(s[0].files.len(), 2);
+        assert!(s[0].orphan_warning.is_empty());
+        assert!(s[0].files[0].ends_with("pat_r1.fastq"), "R1 must be files[0]: {:?}", s[0].files);
+        assert!(s[0].files[1].ends_with("pat_r2.fastq"), "R2 must be files[1]: {:?}", s[0].files);
+    }
+
+    #[test]
+    fn lowercase_illumina_marker_still_matches_the_illumina_form() {
+        let d = fixture(&["sample_s1_l001_r1_001.fastq.gz", "sample_s1_l001_r2_001.fastq.gz"]);
+        let s = discover_samples(d.path()).expect("valid");
+        assert_eq!(s.len(), 1, "got {:?}", s);
+        assert_eq!(s[0].sample_id, "sample_s1_l001");
+        assert_eq!(s[0].files.len(), 2);
+        assert!(s[0].orphan_warning.is_empty());
     }
 
     #[test]
