@@ -417,6 +417,46 @@ already done.
 
 ---
 
+## Limitations
+
+**FastDNA is not competitive with dedicated k-mer counters at production
+scale, and the benchmarks above should not be read as suggesting otherwise.**
+They measure a 65 MB file against Python baselines. That is the regime FastDNA
+is built for; it is not the regime KMC3, FASTK or Gerbil are built for.
+
+The reason is architectural and visible in the source. `KmerCounter`
+(`src/counter.rs`) is an in-memory `FxHashMap<u64, u32>`: every distinct k-mer
+in the sample lives in RAM simultaneously, and there is no minimizer-based
+partitioning and no spill to disk. That is essentially the design Jellyfish
+used in 2011. KMC2 onward (2013), KMC3, and Gerbil all partition k-mers into
+disk-backed buckets by minimizer, which is what lets them process inputs far
+larger than available memory. `src/cms.rs` contains a Count-Min Sketch that
+would support a bounded-memory mode, but it is not wired to anything today.
+
+Three practical consequences:
+
+- **Peak memory scales with the number of *distinct* k-mers**, not with file
+  size. A high-diversity sample — a metagenome, or any data with a heavy
+  sequencing-error tail — can exhaust RAM on an input that a partitioned
+  counter would handle comfortably.
+- **There is no out-of-core path.** When the table does not fit, the run fails
+  or swaps; it does not degrade to disk.
+- **A preliminary multi-gigabyte comparison had FastDNA several times slower
+  than FASTK and KMC3** on the same input. Those figures were measured under
+  possible CPU contention and are deliberately not published here as a table
+  until they can be reproduced in isolation — but the direction is not in
+  doubt, and it follows from the architecture above.
+
+`max_k` is 32, imposed by the 2-bit-per-base `u64` packing. Analyses that need
+longer k-mers are out of scope.
+
+**What FastDNA is for**, and where the comparison that matters is the one in
+[Benchmarks](#benchmarks): getting k-mer counts out of FASTQ files and into
+Python — as Arrow, in-process, without a serialization step or a subprocess —
+for sample sizes that fit in memory. If you need to count a human genome at
+production scale, use KMC3 or FASTK; they are excellent and this is not trying
+to replace them.
+
 ## Command-line interface
 
 FastDNA also ships a standalone CLI (installed separately from the crate --
