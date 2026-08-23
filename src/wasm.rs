@@ -19,12 +19,32 @@ pub fn analyze_fastq_wasm(fastq_text: &str, k: usize) -> Result<JsValue, JsValue
     let mut reader = FastqReader::new(Cursor::new(fastq_text.as_bytes()));
     let mut counter = KmerCounter::with_capacity(4096);
     let mut qc = QcSummary::default();
+    let mut records_read: u64 = 0;
 
-    while let Ok(Some(mut record)) = reader.next_record() {
-        qc.observe_record(&record);
-        record.quality_trim_end(20.0, 4);
-        let kmers = kmer::extract_canonical_kmers(&record.seq, k);
-        counter.insert_batch(&kmers);
+    loop {
+        match reader.next_record() {
+            Ok(Some(mut record)) => {
+                records_read += 1;
+                qc.observe_record(&record);
+                record.quality_trim_end(20.0, 4);
+                let kmers = kmer::extract_canonical_kmers(&record.seq, k);
+                counter.insert_batch(&kmers);
+            }
+            Ok(None) => break,
+            // Any structural violation -- a missing '@'/'+' marker, a
+            // sequence/quality length mismatch, or a file that ends
+            // mid-record -- must end the analysis with a real error rather
+            // than silently truncating the count returned to the browser.
+            // There is no `path` to attach here (the input is an in-memory
+            // string, not a file), so the record number and reason are all
+            // the context available.
+            Err(e) => {
+                return Err(JsValue::from_str(&format!(
+                    "malformed FASTQ at record {}: {e}",
+                    records_read + 1
+                )));
+            }
+        }
     }
 
     qc.finalize();
