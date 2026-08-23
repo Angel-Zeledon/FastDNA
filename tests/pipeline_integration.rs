@@ -115,9 +115,16 @@ fn pipeline_agrees_with_kmer_module_across_a_batch() {
 fn progress_callback_receives_a_final_event() {
     use std::sync::{Arc, Mutex};
     use fastdna::progress::Progress;
+    use fastdna::pipeline::PipelineConfig;
 
+    // Exactly 250 reads, asserted below as a literal -- not derived from the
+    // pipeline's own report of itself, which would make the assertion
+    // tautological (it previously ran 50 reads against a 100,000 interval,
+    // so no ReadsProcessed ever fired and this test only proved the
+    // pipeline agrees with itself).
+    const READ_COUNT: usize = 250;
     let mut fastq = String::new();
-    for i in 0..50 {
+    for i in 0..READ_COUNT {
         fastq.push_str(&format!("@r{}\nACGTACGTAC\n+\nIIIIIIIIII\n", i));
     }
 
@@ -125,19 +132,40 @@ fn progress_callback_receives_a_final_event() {
     let sink = seen.clone();
     let callback = move |e: Progress| sink.lock().unwrap().push(e);
 
+    let low_interval_config = PipelineConfig {
+        k: 5,
+        min_quality: 20.0,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 20,
+    };
+
     let (_counter, _qc, reads) = process_stream_parallel(
         reader_for(&fastq),
-        config(5),
+        low_interval_config,
         std::path::Path::new("<memory>"),
         Some(&callback),
     )
     .expect("valid input");
 
+    assert_eq!(reads, READ_COUNT as u64, "the pipeline must report the true read count");
+
     let events = seen.lock().unwrap();
+    let reads_processed_count = events
+        .iter()
+        .filter(|e| matches!(e, Progress::ReadsProcessed(_)))
+        .count();
+    assert!(
+        reads_processed_count > 0,
+        "with 250 reads against a progress_interval of 20, at least one \
+         ReadsProcessed event must have fired: {events:?}"
+    );
+
     assert_eq!(
         events.last(),
-        Some(&Progress::Finished { reads }),
-        "the last event must report the final read count"
+        Some(&Progress::Finished { reads: READ_COUNT as u64 }),
+        "the last event must report the true, literal read count"
     );
 }
 
