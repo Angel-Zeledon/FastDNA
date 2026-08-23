@@ -279,20 +279,59 @@ impl GenomeSketch {
     /// `error.rs` renders as "export failed for {path}", telling a caller
     /// that writing failed when what actually failed was reading. `Load`
     /// names the operation honestly instead.
+    ///
+    /// Also validates the two invariants `jaccard` and `containment`
+    /// silently assume on `hashes` -- see `validate_sketch_invariants` --
+    /// since serde will happily deserialize a `Vec<u64>` that violates
+    /// either one, and neither estimator checks for it on every call (that
+    /// would mean re-validating on every comparison instead of once, at
+    /// the file boundary, which is where a hand-edited or corrupted file
+    /// can actually introduce the problem).
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
+        let load_err = |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason };
 
         let file = File::open(path).map_err(to_err)?;
         let reader = BufReader::new(file);
-        serde_json::from_reader(reader).map_err(|e| {
+        let sketch: GenomeSketch = serde_json::from_reader(reader).map_err(|e| {
             if e.is_io() {
                 FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
             } else {
-                FastDnaError::Load { path: path.to_path_buf(), reason: e.to_string() }
+                load_err(e.to_string())
             }
-        })
+        })?;
+
+        validate_sketch_invariants(&sketch).map_err(load_err)?;
+
+        Ok(sketch)
     }
+}
+
+/// Verifies the two invariants `jaccard`'s merge walk and `containment`'s
+/// binary search both silently assume about `hashes`: it is sorted in
+/// strictly ascending order, and it holds no more than `sketch_size`
+/// entries. `save` always produces data meeting both -- `from_kmers` and
+/// `from_reader` build `hashes` from a `BTreeSet` capped at `sketch_size`,
+/// which is deduplicated, ordered, and bounded by construction -- but
+/// `load` reads arbitrary JSON, and serde will happily deserialize a
+/// hand-edited or corrupted file that violates either one. Without this
+/// check, an unsorted vector silently breaks `jaccard`'s merge-walk
+/// early-termination logic, and an oversized one means `containment`'s
+/// `hashes.last()` is not actually the sketch's true ceiling -- both
+/// return quiet nonsense instead of an error.
+fn validate_sketch_invariants(sketch: &GenomeSketch) -> std::result::Result<(), String> {
+    if sketch.hashes.len() > sketch.sketch_size {
+        return Err(format!(
+            "hashes has {} entries, more than sketch_size ({})",
+            sketch.hashes.len(),
+            sketch.sketch_size
+        ));
+    }
+    if !sketch.hashes.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err("hashes is not sorted in strictly ascending order".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -529,6 +568,50 @@ mod tests {
 
         match err {
             Err(FastDnaError::Load { .. }) => {}
+            other => panic!("expected Err(Load), got {other:?}"),
+        }
+    }
+
+    /// `jaccard`'s merge walk and `containment`'s binary search both
+    /// assume `hashes` holds at most `sketch_size` entries. A hand-edited
+    /// or otherwise corrupted file can violate that even though it is
+    /// well-formed JSON, so this must be caught explicitly rather than
+    /// silently producing a sketch whose `containment` ceiling logic is
+    /// wrong.
+    #[test]
+    fn load_rejects_a_sketch_with_more_hashes_than_sketch_size() {
+        let path = std::env::temp_dir().join("fastdna_sketch_oversized_test.sig");
+        let bad = GenomeSketch { sketch_size: 2, k: 21, hashes: vec![1, 2, 3] };
+        std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
+
+        let err = GenomeSketch::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        match err {
+            Err(FastDnaError::Load { reason, .. }) => {
+                assert!(reason.contains("sketch_size"), "reason should explain the mismatch: {reason}");
+            }
+            other => panic!("expected Err(Load), got {other:?}"),
+        }
+    }
+
+    /// `jaccard`'s merge walk depends on `hashes` being sorted ascending;
+    /// an unsorted vector breaks its early-termination logic silently
+    /// (wrong, not a crash), so `load` must reject it instead of handing
+    /// back a sketch that estimators will misuse.
+    #[test]
+    fn load_rejects_a_sketch_with_unsorted_hashes() {
+        let path = std::env::temp_dir().join("fastdna_sketch_unsorted_test.sig");
+        let bad = GenomeSketch { sketch_size: 10, k: 21, hashes: vec![5, 1, 3] };
+        std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
+
+        let err = GenomeSketch::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        match err {
+            Err(FastDnaError::Load { reason, .. }) => {
+                assert!(reason.contains("sorted"), "reason should explain the ordering violation: {reason}");
+            }
             other => panic!("expected Err(Load), got {other:?}"),
         }
     }
