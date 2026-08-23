@@ -68,16 +68,12 @@ pub fn extract_canonical_kmers(seq: &[u8], k: usize) -> Vec<u64> {
 pub fn decode_kmer(mut kmer: u64, k: usize) -> String {
     let mut chars = vec![b'A'; k];
     for i in (0..k).rev() {
-        chars[i] = match kmer & 0b11 {
-            0b00 => b'A',
-            0b01 => b'C',
-            0b10 => b'G',
-            0b11 => b'T',
-            _ => unreachable!(),
-        };
+        chars[i] = b"ACGT"[(kmer & 0b11) as usize];
         kmer >>= 2;
     }
-    String::from_utf8(chars).unwrap()
+    // All four possible byte values above come from the b"ACGT" literal,
+    // which is valid ASCII/UTF-8 by construction, so this cannot fail.
+    String::from_utf8(chars).unwrap_or_default()
 }
 
 #[cfg(test)]
