@@ -614,10 +614,34 @@ deciding to emit raw counts.
 - **Progress via optional callback**; without one, total silence. `indicatif` does
   not cross the boundary — its ANSI codes are visual garbage in a Jupyter cell.
 - **Zero-copy Arrow** via the `arrow` crate's `pyarrow` feature (C Data Interface).
-- **Ctrl-C works.** The binding spawns a watcher that calls `PyErr_CheckSignals` and
-  sets the cancellation token; the core returns `Cancelled`, which the binding raises
-  as `KeyboardInterrupt`. Without this, releasing the GIL means the interpreter
-  records the signal and can do nothing with it until the call returns.
+- **Ctrl-C works, and the obvious design for it does not.** Without cancellation,
+  releasing the GIL means the interpreter records the signal and can do nothing
+  with it until the call returns.
+
+  The natural approach — spawn a background watcher thread that polls
+  `PyErr_CheckSignals` and sets the cancellation token — **was specified here,
+  implemented, and empirically disproven** on 2026-08-23. `PyErr_CheckSignals()`
+  is a silent no-op when called from any thread other than the one CPython
+  regards as its main thread: it returns 0 without ever observing a pending
+  signal. A `std::thread::spawn` watcher is never that thread, so the watcher
+  detected nothing and a real Ctrl-C only took effect once the call had finished
+  on its own. This was isolated with a minimal `ctypes` probe outside the crate
+  before the design was changed.
+
+  **The working design inverts which thread does what.** The heavy
+  `process_stream_parallel` call moves to a worker thread; the *calling* thread —
+  the real Python main thread in normal usage — stays free to poll for the
+  worker's result and to call `check_signals` itself, setting the token when a
+  signal is pending. Measured interrupt latency is 50-80 ms.
+
+  **Known limitation, which must be documented wherever cancellation is
+  promised:** this only works when the call originates on the interpreter's main
+  thread. Called from a `threading.Thread`, `check_signals` is a no-op there too,
+  so the count completes normally and Ctrl-C does nothing. It degrades safely,
+  but silently.
+
+  Do not reintroduce the watcher-thread design. It is recorded here precisely
+  because it is the approach a reasonable implementer reaches for first.
 
 ### Callback contract — binding authors must read this
 

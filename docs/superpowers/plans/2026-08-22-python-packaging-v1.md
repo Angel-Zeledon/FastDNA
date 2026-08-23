@@ -293,7 +293,11 @@ The two things that make a long call usable from a notebook, and the two most li
 2. `ReadsProcessed` values **arrive out of order** — a worker can cross 200_000, be preempted, and have another's 300_000 delivered first. `tqdm` is not thread-safe. The Python adapter serializes events with a lock and ignores any count lower than the highest seen.
 3. A panic in the callback is caught by the worker's `catch_unwind` and returned as `Internal`.
 
-**Cancellation** — spawn a watcher that periodically calls `PyErr_CheckSignals` (via `Python::check_signals`) while the GIL is released, and sets the `AtomicBool` when it returns an error. The core returns `Cancelled`, which maps to `KeyboardInterrupt`.
+**Cancellation** — the core takes `Option<Arc<AtomicBool>>`, checked once per batch, and returns `Cancelled`, which maps to `KeyboardInterrupt`.
+
+> **Corrected 2026-08-23.** This task originally specified a background watcher thread polling `Python::check_signals`. That design does not work and was disproven empirically: `PyErr_CheckSignals()` is a silent no-op off CPython's main thread, so the watcher never observed a pending signal and a real Ctrl-C only landed after the call finished by itself.
+>
+> The implemented design inverts it: the heavy `process_stream_parallel` call runs on a worker thread while the **calling** thread — the real Python main thread in normal usage — polls for the result and calls `check_signals` itself. Measured interrupt latency 50-80 ms. See spec §PyO3 boundary for the full account, and do not reintroduce the watcher.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -332,7 +336,7 @@ Expected: `TypeError: count() got an unexpected keyword argument 'progress'`.
 
 - [ ] **Step 3: Implement**
 
-Rust side: accept an optional `PyObject`, wrap it in a closure that does `Python::with_gil(|py| callback.call1(py, (event,)))`, pass it as `ProgressFn`. Build the cancel token as `Arc<AtomicBool>` and hand a clone to the signal watcher.
+Rust side: accept an optional `PyObject`, wrap it in a closure that does `Python::with_gil(|py| callback.call1(py, (event,)))`, pass it as `ProgressFn`. Build the cancel token as `Arc<AtomicBool>` and hand a clone to the worker thread; the calling thread keeps the other and sets it when `check_signals` reports a pending signal.
 
 Python side (`_progress.py`): a small adapter holding a `threading.Lock` and the highest count seen, forwarding to `tqdm` when `progress=True` and tqdm is importable, to a user callable when one is given, and dropping everything when `None`.
 
@@ -353,7 +357,7 @@ The callback is invoked concurrently from rayon workers, so each invocation
 re-acquires the GIL and the Python adapter serializes events -- worker
 counts arrive out of order and tqdm is not thread-safe.
 
-Ctrl-C now works: a watcher calls PyErr_CheckSignals while the GIL is
+Ctrl-C now works: the heavy call runs on a worker thread while the calling
 released and sets the cancellation token, which surfaces as
 KeyboardInterrupt instead of a four-minute wait."
 ```
