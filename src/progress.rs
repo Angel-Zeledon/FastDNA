@@ -24,6 +24,29 @@ pub enum Progress {
 ///
 /// `None` means silence, which is the default for library use. The callback is
 /// invoked from worker threads, hence `Send + Sync`.
+///
+/// # Contract for implementers
+///
+/// This matters more once the consumer is Python code behind a PyO3 binding,
+/// not just a Rust closure:
+///
+/// - **Concurrent and re-entrant.** The callback is invoked from multiple
+///   worker threads at once, and a single thread may re-enter it across
+///   successive batches. It must be safe to call from more than one thread
+///   simultaneously; if it touches shared state, it must synchronize that
+///   access itself.
+/// - **`ReadsProcessed` can arrive out of order.** The cumulative counter is
+///   updated with an atomic `fetch_add`, but delivery to the callback is not
+///   serialized relative to that update: a worker can cross, say, 200,000
+///   reads, be preempted before calling `emit`, and have another worker's
+///   300,000 delivered first. Callers must not assume `ReadsProcessed` values
+///   are non-decreasing. A consumer that is not itself thread-safe (`tqdm`,
+///   for example) must serialize its own access to these events; the core
+///   makes no such guarantee on its behalf.
+/// - **A panic aborts the run.** If the callback panics, FastDNA catches the
+///   unwind (it must not cross the FFI boundary into Python, which is
+///   undefined behaviour) and the whole call returns
+///   `Err(FastDnaError::Internal { .. })` instead of completing.
 pub type ProgressFn<'a> = Option<&'a (dyn Fn(Progress) + Send + Sync)>;
 
 #[cfg(test)]
