@@ -150,6 +150,58 @@ fn zero_threads_is_rejected_instead_of_hanging() {
     }
 }
 
+/// Exercises the worker-side `catch_unwind` specifically: a panic inside
+/// `emit` while a worker thread is still draining the channel (as opposed to
+/// the earlier test, which uses only 2 reads and so only ever reaches the
+/// main-thread guard around the final `Finished` emit). This is the guard
+/// standing between a panicking Python callback and undefined behaviour
+/// across the FFI boundary once a PyO3 binding exists, and it previously had
+/// zero coverage. A low progress_interval (made possible by item E) lets a
+/// small, fast-running test actually cross the interval from a worker.
+#[test]
+fn a_panic_in_a_worker_thread_progress_callback_becomes_internal_and_returns() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut fastq = String::new();
+    for i in 0..500 {
+        fastq.push_str(&format!("@r{i}\nACGTACGT\n+\nIIIIIIII\n"));
+    }
+
+    let already_panicked = AtomicBool::new(false);
+    let panic_on_first_reads_processed = move |event: fastdna::progress::Progress| {
+        if matches!(event, fastdna::progress::Progress::ReadsProcessed(_))
+            && !already_panicked.swap(true, Ordering::SeqCst)
+        {
+            panic!("worker-side progress callback exploded");
+        }
+    };
+
+    let worker_config = PipelineConfig {
+        k: 4,
+        min_quality: 20.0,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 10,
+    };
+
+    // If the worker-side catch_unwind were missing, this call would either
+    // hang (the panicked worker stops draining, backing up the channel) or
+    // unwind out of process_stream_parallel entirely, so simply returning
+    // an Err at all is itself part of what this test proves.
+    let result = process_stream_parallel(
+        reader_for(&fastq),
+        worker_config,
+        Path::new("sample.fastq"),
+        Some(&panic_on_first_reads_processed),
+    );
+
+    match result {
+        Err(FastDnaError::Internal { .. }) => {}
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_panicking_progress_callback_becomes_an_internal_error() {
     let fastq = "@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nTTGCAACG\n+\nIIIIIIII\n";
