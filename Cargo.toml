@@ -44,6 +44,11 @@ default = []
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen"]
 python = ["dep:pyo3", "arrow/pyarrow"]
 
+[dev-dependencies]
+# Test-only: used to build throwaway sample-discovery fixture directories.
+# Must never appear under [dependencies], or it would ship in the wheel.
+tempfile = "3.14"
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

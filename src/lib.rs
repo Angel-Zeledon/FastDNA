@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod cms;
+pub mod cohort;
 pub mod counter;
 pub mod error;
 pub mod export;
