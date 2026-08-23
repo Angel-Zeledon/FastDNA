@@ -116,8 +116,8 @@ fn quality_shorter_than_sequence_is_malformed_fastq_not_a_panic() {
     match result {
         Err(FastDnaError::MalformedFastq { reason, .. }) => {
             assert!(
-                reason.contains('8') && reason.contains('3'),
-                "reason should state both lengths: {reason}"
+                reason.contains("length 8") && reason.contains("length 3"),
+                "reason should state both full lengths, not just a digit that could match anywhere: {reason}"
             );
         }
         other => panic!("expected MalformedFastq, got {other:?}"),
@@ -142,6 +142,49 @@ fn file_truncated_mid_record_is_malformed_fastq_not_a_silent_short_record() {
     }
 }
 
+/// The same truncation check as above, but caught at the second of the
+/// three EOF points `next_record` guards: the file ends after the sequence
+/// line, with no separator line following.
+#[test]
+fn file_truncated_after_sequence_line_is_malformed_fastq_not_a_silent_short_record() {
+    // A complete first record, then a second record that stops after its
+    // sequence line -- no separator or quality line follows.
+    let fastq = b"@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nACGT\n";
+    let result = process_stream_parallel(reader_for(fastq), config(4), Path::new("<memory>"), None, None);
+
+    match result {
+        Err(FastDnaError::MalformedFastq { record, reason, .. }) => {
+            assert_eq!(record, 2, "must report the record that was cut short");
+            assert!(
+                reason.contains("separator"),
+                "reason must name what line was missing: {reason}"
+            );
+        }
+        other => panic!("expected MalformedFastq, got {other:?}"),
+    }
+}
+
+/// The same truncation check again, at the third and final EOF point: the
+/// file ends after the separator line, with no quality line following.
+#[test]
+fn file_truncated_after_separator_line_is_malformed_fastq_not_a_silent_short_record() {
+    // A complete first record, then a second record that stops after its
+    // separator line -- no quality line follows.
+    let fastq = b"@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nACGT\n+\n";
+    let result = process_stream_parallel(reader_for(fastq), config(4), Path::new("<memory>"), None, None);
+
+    match result {
+        Err(FastDnaError::MalformedFastq { record, reason, .. }) => {
+            assert_eq!(record, 2, "must report the record that was cut short");
+            assert!(
+                reason.contains("quality"),
+                "reason must name what line was missing: {reason}"
+            );
+        }
+        other => panic!("expected MalformedFastq, got {other:?}"),
+    }
+}
+
 /// IUPAC ambiguity codes beyond 'N' (R, Y, S, W, K, M, ...) are legitimate
 /// FASTQ content and must not be rejected by structural validation, which
 /// checks only the four-line shape -- never the sequence alphabet.
@@ -150,9 +193,9 @@ fn file_truncated_mid_record_is_malformed_fastq_not_a_silent_short_record() {
 /// that span the ambiguous positions.
 #[test]
 fn iupac_ambiguity_codes_parse_fine_and_yield_no_kmers_spanning_them() {
-    // "ACGT" + all six non-N IUPAC codes + "ACGT": 8 raw 4-base windows,
-    // but only the two windows fully inside a run of unambiguous bases
-    // ("ACGT" at each end) produce a k-mer.
+    // "ACGT" + all six non-N IUPAC codes + "ACGT": a 14-base read has 11
+    // raw 4-base windows, but only the two windows fully inside a run of
+    // unambiguous bases ("ACGT" at each end) produce a k-mer.
     let fastq = b"@r1\nACGTRYSWKMACGT\n+\nIIIIIIIIIIIIII\n";
     let result = process_stream_parallel(reader_for(fastq), config(4), Path::new("<memory>"), None, None);
 
