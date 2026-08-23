@@ -66,6 +66,16 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
         return Err(FastDnaError::InvalidK { k: config.k });
     }
 
+    // With zero consumer tasks, `receiver` is never dropped, the channel never
+    // disconnects, and the producer thread blocks forever once the bounded
+    // channel fills up -- this must be caught before the channel even exists.
+    if config.num_threads == 0 {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "num_threads",
+            reason: "must be at least 1".to_string(),
+        });
+    }
+
     let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(64);
 
     let batch_size = config.batch_size;

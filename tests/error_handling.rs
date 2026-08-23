@@ -111,6 +111,33 @@ fn malformed_record_reports_the_1_based_record_number() {
     }
 }
 
+/// `num_threads: 0` must be rejected before the channel is created. If the
+/// guard were removed, zero consumer tasks would spawn, the bounded(64)
+/// channel would fill up, and the producer thread would block forever with
+/// no one left to drain it -- this test would hang rather than fail.
+#[test]
+fn zero_threads_is_rejected_instead_of_hanging() {
+    let mut fastq = String::new();
+    for i in 0..5_000 {
+        fastq.push_str(&format!("@r{i}\nACGTACGT\n+\nIIIIIIII\n"));
+    }
+
+    let bad_config = PipelineConfig {
+        k: 4,
+        min_quality: 20.0,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 0,
+    };
+
+    let result = process_stream_parallel(reader_for(&fastq), bad_config, Path::new("sample.fastq"), None);
+
+    match result {
+        Err(FastDnaError::InvalidConfig { parameter, .. }) => assert_eq!(parameter, "num_threads"),
+        other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_panicking_progress_callback_becomes_an_internal_error() {
     let fastq = "@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nTTGCAACG\n+\nIIIIIIII\n";

@@ -22,6 +22,8 @@ pub enum FastDnaError {
     MismatchedK { left: usize, right: usize },
     /// A worker thread panicked. This indicates a bug in FastDNA.
     Internal { detail: String },
+    /// A configuration value supplied by the caller is not usable.
+    InvalidConfig { parameter: &'static str, reason: String },
 }
 
 impl fmt::Display for FastDnaError {
@@ -60,6 +62,9 @@ impl fmt::Display for FastDnaError {
             }
             FastDnaError::Internal { detail } => {
                 write!(f, "internal error (this is a bug in FastDNA): {detail}")
+            }
+            FastDnaError::InvalidConfig { parameter, reason } => {
+                write!(f, "invalid configuration for {parameter}: {reason}")
             }
         }
     }
