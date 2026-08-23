@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "fastdna"
+requires-python = ">=3.8"
+dependencies = ["pyarrow>=14"]
+# Not in the plan's original snippet: this maturin release (1.14.1) refuses
+# to build without either a static `project.version` or this `dynamic`
+# declaration. `dynamic` is used, so the version stays sourced from
+# Cargo.toml's `[package] version` alone -- the same value `ffi.rs` reports
+# to Python via `env!("CARGO_PKG_VERSION")` -- rather than duplicating it.
+dynamic = ["version"]
+
+[tool.maturin]
+features = ["python"]
+module-name = "fastdna._core"
+python-source = "python"

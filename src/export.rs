@@ -35,6 +35,19 @@ fn io_err(path: &Path, err: std::io::Error) -> FastDnaError {
     FastDnaError::Io { path: path.to_path_buf(), source: err }
 }
 
+/// The schema shared by every k-mer count table FastDNA produces -- the
+/// Parquet files this module writes and the in-memory Arrow table the
+/// Python binding hands back (`ffi.rs`). Defined once here so the two
+/// never drift apart: a user who writes one and reads the other must see
+/// identical columns.
+pub fn counts_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("kmer_u64", DataType::UInt64, false),
+        Field::new("kmer_sequence", DataType::Utf8, false),
+        Field::new("frequency", DataType::UInt32, false),
+    ]))
+}
+
 pub fn export_counts_parquet<P: AsRef<Path>>(
     counter: &KmerCounter,
     output_path: P,
@@ -46,11 +59,7 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
         path: path.to_path_buf(),
         source: e,
     })?;
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("kmer_u64", DataType::UInt64, false),
-        Field::new("kmer_sequence", DataType::Utf8, false),
-        Field::new("frequency", DataType::UInt32, false),
-    ]));
+    let schema = counts_schema();
 
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)

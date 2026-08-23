@@ -7,3 +7,11 @@ hist.csv
 
 # Subagent-driven development scratch workspace
 .superpowers/
+
+# maturin develop / pytest artifacts left inside python/fastdna
+python/fastdna/*.pyd
+python/fastdna/*.so
+python/fastdna/*.pdb
+__pycache__/
+*.pyc
+.pytest_cache/
