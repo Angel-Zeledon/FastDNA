@@ -11,7 +11,7 @@ use rayon::prelude::*;
 
 use crate::counter::KmerCounter;
 use crate::error::{FastDnaError, Result};
-use crate::fastq::{FastqReader, FastqRecord};
+use crate::fastq::{FastqReadError, FastqReader, FastqRecord};
 use crate::kmer;
 use crate::progress::{Progress, ProgressFn, PROGRESS_INTERVAL};
 use crate::qc::QcSummary;
@@ -165,11 +165,21 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
                     }
                 }
                 Ok(None) => break,
-                Err(err) => {
+                // A genuine I/O failure (a corrupt gzip member, an NFS read
+                // error) is not a data problem, so it must not be reported
+                // as MalformedFastq -- that would blame the bytes for a
+                // hardware/transport fault and attach a record number that
+                // means nothing for it.
+                Err(FastqReadError::Io(source_err)) => {
+                    return Err(FastDnaError::Io { path: source_owned, source: source_err });
+                }
+                // A structural violation in the bytes themselves: attach the
+                // path and the 1-based index of the record that failed.
+                Err(FastqReadError::Malformed(reason)) => {
                     return Err(FastDnaError::MalformedFastq {
                         path: source_owned,
                         record: total_reads + 1,
-                        reason: err.to_string(),
+                        reason,
                     });
                 }
             }

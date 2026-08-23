@@ -21,8 +21,8 @@ fn reader_for(fastq: &str) -> FastqReader<Cursor<Vec<u8>>> {
 /// call, and `next_record` performs exactly one `read_until` per FASTQ line,
 /// each successful call here corresponds to exactly one line. Three full
 /// records is 12 successful calls; the 13th (the header line of record 4)
-/// fails, which is what pins the 1-based record arithmetic in
-/// `malformed_record_reports_the_1_based_record_number`.
+/// fails, which is what `io_read_failure_surfaces_as_io_not_malformed_fastq`
+/// uses to prove a genuine I/O failure is never reported as `MalformedFastq`.
 struct FailAfterN {
     inner: Cursor<Vec<u8>>,
     remaining_ok_calls: usize,
@@ -102,8 +102,17 @@ fn a_valid_stream_still_succeeds() {
     assert_eq!(counter.total_kmers(), 5);
 }
 
+/// A genuine I/O failure from the underlying reader (a corrupt gzip member,
+/// an NFS read error, or -- as simulated here -- any `read` call that
+/// returns `Err`) must surface as `FastDnaError::Io`, never `MalformedFastq`.
+/// Reporting it as `MalformedFastq` would blame the bytes for a
+/// hardware/transport fault and attach a record number that means nothing
+/// for it. This is the exact scenario item 4(b) of the core-hardening pass
+/// closed: before that fix, every error out of `next_record` -- I/O failures
+/// included -- was mapped to `MalformedFastq`, making `FastDnaError::Io`
+/// unreachable from the pipeline.
 #[test]
-fn malformed_record_reports_the_1_based_record_number() {
+fn io_read_failure_surfaces_as_io_not_malformed_fastq() {
     // Three good records (12 successful lines), then the reader fails on the
     // very first line of what would be record 4.
     let mut fastq = String::new();
@@ -117,9 +126,33 @@ fn malformed_record_reports_the_1_based_record_number() {
     let result = process_stream_parallel(reader, config(4), Path::new("cohort/sample.fastq"), None, None);
 
     match result {
-        Err(FastDnaError::MalformedFastq { path, record, .. }) => {
+        Err(FastDnaError::Io { path, .. }) => {
+            assert_eq!(path, Path::new("cohort/sample.fastq"), "must name the source that failed to read");
+        }
+        other => panic!("expected Io, got {other:?}"),
+    }
+}
+
+/// A structural violation -- as opposed to the I/O failure covered by
+/// `io_read_failure_surfaces_as_io_not_malformed_fastq` -- must report
+/// `MalformedFastq` with the 1-based index of the record that failed.
+#[test]
+fn malformed_record_reports_the_1_based_record_number() {
+    // Three good records, then a fourth whose header is missing the
+    // required '@' marker.
+    let mut fastq = String::new();
+    for i in 0..3 {
+        fastq.push_str(&format!("@r{i}\nACGT\n+\nIIII\n"));
+    }
+    fastq.push_str("r3\nACGT\n+\nIIII\n");
+
+    let result = process_stream_parallel(reader_for(&fastq), config(4), Path::new("cohort/sample.fastq"), None, None);
+
+    match result {
+        Err(FastDnaError::MalformedFastq { path, record, reason }) => {
             assert_eq!(record, 4, "must report the 1-based index of the record that failed");
             assert_eq!(path, Path::new("cohort/sample.fastq"));
+            assert!(!reason.is_empty(), "reason must say what was wrong");
         }
         other => panic!("expected MalformedFastq, got {other:?}"),
     }

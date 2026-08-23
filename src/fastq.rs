@@ -1,5 +1,6 @@
 // src/fastq.rs
 
+use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
@@ -44,6 +45,64 @@ impl FastqRecord {
     }
 }
 
+/// The two ways `next_record` can fail: the underlying source could not be
+/// read, or bytes were read successfully but do not form a structurally
+/// valid FASTQ record.
+///
+/// Kept as its own small type rather than `crate::error::Result` directly:
+/// the reader has no path of its own (that lives with the caller -- see
+/// `process_stream_parallel`'s `source` parameter) and does not track a
+/// record number across calls (the caller already does, via its own read
+/// count, so re-deriving one here would just duplicate that state). The
+/// caller attaches both when it converts this into a `FastDnaError`.
+#[derive(Debug)]
+pub enum FastqReadError {
+    /// Reading from the underlying source failed. Not a data problem.
+    Io(io::Error),
+    /// The bytes read do not form a structurally valid FASTQ record: a
+    /// missing `@`/`+` marker, a sequence/quality length mismatch, or a
+    /// file that ends before a record is complete.
+    Malformed(String),
+}
+
+impl fmt::Display for FastqReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FastqReadError::Io(e) => write!(f, "{e}"),
+            FastqReadError::Malformed(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+impl std::error::Error for FastqReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FastqReadError::Io(e) => Some(e),
+            FastqReadError::Malformed(_) => None,
+        }
+    }
+}
+
+impl From<io::Error> for FastqReadError {
+    fn from(e: io::Error) -> Self {
+        FastqReadError::Io(e)
+    }
+}
+
+/// Crate-local result alias for `FastqReader::next_record`.
+pub type ReadResult<T> = std::result::Result<T, FastqReadError>;
+
+/// Strips a single trailing `\n`, and a preceding `\r` if present, from a
+/// line buffer read by `read_until(b'\n', ..)`.
+fn strip_newline(buf: &mut Vec<u8>) {
+    if buf.ends_with(b"\n") {
+        buf.pop();
+    }
+    if buf.ends_with(b"\r") {
+        buf.pop();
+    }
+}
+
 /// Streaming FASTQ reader supporting both plain-text and gzip files.
 pub struct FastqReader<R: BufRead> {
     reader: R,
@@ -77,29 +136,69 @@ impl<R: BufRead> FastqReader<R> {
         }
     }
 
-    pub fn next_record(&mut self) -> io::Result<Option<FastqRecord>> {
+    /// Reads the next four-line FASTQ record, validating its structure.
+    ///
+    /// Checks performed: the header line starts with `@`, the separator
+    /// line starts with `+`, and the sequence and quality lines are the
+    /// same length. A file that ends before all four lines of a record are
+    /// present is reported as malformed rather than silently returning a
+    /// short record. The sequence alphabet itself is not validated here --
+    /// IUPAC ambiguity codes beyond `N` are legitimate FASTQ content, and
+    /// `kmer::extract_canonical_kmers` already treats any non-ACGT byte as
+    /// a window reset.
+    pub fn next_record(&mut self) -> ReadResult<Option<FastqRecord>> {
         self.line_buf.clear();
         if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
             return Ok(None);
         }
-        if self.line_buf.ends_with(b"\n") { self.line_buf.pop(); }
-        if self.line_buf.ends_with(b"\r") { self.line_buf.pop(); }
+        strip_newline(&mut self.line_buf);
+        if !self.line_buf.starts_with(b"@") {
+            return Err(FastqReadError::Malformed(format!(
+                "header line must start with '@', got {:?}",
+                String::from_utf8_lossy(&self.line_buf)
+            )));
+        }
         let id = self.line_buf.clone();
 
         self.line_buf.clear();
-        self.reader.read_until(b'\n', &mut self.line_buf)?;
-        if self.line_buf.ends_with(b"\n") { self.line_buf.pop(); }
-        if self.line_buf.ends_with(b"\r") { self.line_buf.pop(); }
+        if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
+            return Err(FastqReadError::Malformed(
+                "file ends mid-record: missing sequence line after header".to_string(),
+            ));
+        }
+        strip_newline(&mut self.line_buf);
         let seq = self.line_buf.clone();
 
         self.line_buf.clear();
-        self.reader.read_until(b'\n', &mut self.line_buf)?;
+        if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
+            return Err(FastqReadError::Malformed(
+                "file ends mid-record: missing separator line after sequence".to_string(),
+            ));
+        }
+        strip_newline(&mut self.line_buf);
+        if !self.line_buf.starts_with(b"+") {
+            return Err(FastqReadError::Malformed(format!(
+                "separator line must start with '+', got {:?}",
+                String::from_utf8_lossy(&self.line_buf)
+            )));
+        }
 
         self.line_buf.clear();
-        self.reader.read_until(b'\n', &mut self.line_buf)?;
-        if self.line_buf.ends_with(b"\n") { self.line_buf.pop(); }
-        if self.line_buf.ends_with(b"\r") { self.line_buf.pop(); }
+        if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
+            return Err(FastqReadError::Malformed(
+                "file ends mid-record: missing quality line after separator".to_string(),
+            ));
+        }
+        strip_newline(&mut self.line_buf);
         let qual = self.line_buf.clone();
+
+        if seq.len() != qual.len() {
+            return Err(FastqReadError::Malformed(format!(
+                "sequence length {} does not match quality length {}",
+                seq.len(),
+                qual.len()
+            )));
+        }
 
         Ok(Some(FastqRecord { id, seq, qual }))
     }
