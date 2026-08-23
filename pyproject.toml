@@ -17,8 +17,14 @@ dynamic = ["version"]
 # `python/tests/test_api.py`, used on the zero-threads regression test so a
 # reintroduced hang fails the test instead of blocking the suite forever.
 # Not a runtime dependency of the `fastdna` package itself.
+# `polars` and `duckdb` back `python/tests/test_arrow_interop.py`, which
+# verifies `.table` (a zero-copy pyarrow.Table) is consumed without friction
+# by the Arrow-native tools people actually reach for -- not just pyarrow
+# itself. Neither is a runtime dependency of the `fastdna` package itself;
+# that test module uses `pytest.importorskip` so their absence skips rather
+# than fails.
 [project.optional-dependencies]
-test = ["pytest>=7", "pytest-timeout>=2.1"]
+test = ["pytest>=7", "pytest-timeout>=2.1", "polars>=1.0", "duckdb>=1.0"]
 
 [tool.maturin]
 features = ["python"]
