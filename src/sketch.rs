@@ -342,13 +342,18 @@ mod tests {
     /// exactly 50,000, giving a true Jaccard of 50,000 / 150,000 = 1/3. With
     /// `sketch_size = 512`, the bottom-k Jaccard estimator's standard error
     /// is approximately `sqrt(J * (1-J) / sketch_size)`
-    /// = `sqrt((1/3) * (2/3) / 512)` ~= 2.08%. The tolerance below is set to
-    /// roughly 4 standard errors (~8.3%, rounded up to 9 percentage points)
-    /// -- tight enough that a broken or heavily biased estimator (the old
-    /// bare `wrapping_mul` finalizer, or a bug that always returns zero or
-    /// one) would fail this test, but loose enough that it is not testing
-    /// for bit-for-bit reproduction of a single hash draw, which is the
-    /// wrong thing to demand of a probabilistic estimator.
+    /// = `sqrt((1/3) * (2/3) / 512)` ~= 2.08%.
+    ///
+    /// The tolerance is 0.05 (~2.4 standard errors), chosen to actually
+    /// discriminate between the current splitmix64-style finalizer and the
+    /// bare `wrapping_mul` (linear congruential) finalizer it replaced, not
+    /// merely to bound a probabilistic estimator loosely. Measured directly
+    /// against this exact test: the current finalizer's estimate is
+    /// 0.298828125, |diff| = 0.0345 from the true 1/3, comfortably under
+    /// 0.05; the old bare-`wrapping_mul` finalizer's estimate is
+    /// 0.275390625, |diff| = 0.0579, which *fails* at 0.05. The tolerance
+    /// used to be 0.09, under which both finalizers pass and this test
+    /// cannot distinguish the improvement from a revert of it.
     #[test]
     fn known_overlap_estimates_jaccard_within_a_stated_tolerance() {
         let a_kmers: Vec<u64> = (0..100_000).collect();
@@ -360,7 +365,7 @@ mod tests {
 
         let estimate = a.jaccard(&b).expect("same k must not error");
         let true_jaccard = 50_000.0 / 150_000.0;
-        let tolerance = 0.09;
+        let tolerance = 0.05;
 
         assert!(
             (estimate - true_jaccard).abs() < tolerance,
@@ -494,16 +499,64 @@ mod tests {
         }
     }
 
+    /// Replaces a previous test (`finalize_hash_is_a_bijection_on_a_sample_of_inputs`)
+    /// whose rationale was factually wrong and whose assertion was vacuous.
+    /// It claimed the old bare-`wrapping_mul` finalizer "can map distinct
+    /// inputs to the same output when they share low bits with the
+    /// multiplier"; measured directly, it cannot -- `0x517cc1b727220a95` is
+    /// odd, so multiplying by it modulo 2^64 is a bijection on `u64` with
+    /// exactly zero collisions, confirmed here over `0..10_000`. A
+    /// bijection check can never distinguish a linear step from a real
+    /// mixer, because both are bijections.
+    ///
+    /// What actually separates them is avalanche: flipping one input bit
+    /// should flip roughly half of the 64 output bits, for every input bit
+    /// position. Multiplication by an odd constant does not have this
+    /// property -- a bit flip at input position `i` only affects output
+    /// bits `>= i` (there is no carry propagation downward), so flipping
+    /// the top input bit (63) can only ever change output bit 63. Measured
+    /// directly against these exact finalizers over 64 sample inputs: the
+    /// current splitmix64-style finalizer flips ~31.9 output bits on
+    /// average per input-bit flip (minimum per-bit average ~31.0, close to
+    /// the ideal 32); the old bare-`wrapping_mul` finalizer flips ~17.6 on
+    /// average, and its worst input bit (63) flips only 1.0 output bits on
+    /// average -- it does not mix at all for that bit. The thresholds below
+    /// sit well clear of both measurements in both directions.
     #[test]
-    fn finalize_hash_is_a_bijection_on_a_sample_of_inputs() {
-        // A weak/linear finalizer (the original `wrapping_mul`) can map
-        // distinct inputs to the same output when they share low bits with
-        // the multiplier; splitmix64's mixer must not, over a reasonably
-        // sized sample. This directly targets the failure mode the task
-        // calls out: "a weak hash clusters values and biases the estimate".
-        let mut seen = std::collections::HashSet::new();
-        for kmer in 0u64..10_000 {
-            assert!(seen.insert(finalize_hash(kmer)), "collision at input {kmer}");
+    fn finalize_hash_has_strong_avalanche_bit_diffusion() {
+        let samples: Vec<u64> =
+            (0u64..64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1)).collect();
+
+        let mut total_flipped: u64 = 0;
+        let mut comparisons: u64 = 0;
+        let mut min_per_bit_avg = f64::INFINITY;
+
+        for bit in 0u32..64 {
+            let mut flipped_for_bit: u64 = 0;
+            for &x in &samples {
+                let base = finalize_hash(x);
+                let perturbed = finalize_hash(x ^ (1u64 << bit));
+                flipped_for_bit += (base ^ perturbed).count_ones() as u64;
+            }
+            total_flipped += flipped_for_bit;
+            comparisons += samples.len() as u64;
+            let bit_avg = flipped_for_bit as f64 / samples.len() as f64;
+            if bit_avg < min_per_bit_avg {
+                min_per_bit_avg = bit_avg;
+            }
         }
+
+        let overall_avg = total_flipped as f64 / comparisons as f64;
+
+        assert!(
+            overall_avg > 28.0,
+            "overall avalanche too weak: {overall_avg} flipped bits/flip on average (want > 28, ideal 32)"
+        );
+        assert!(
+            min_per_bit_avg > 20.0,
+            "at least one input bit position diffuses poorly: {min_per_bit_avg} flipped bits/flip \
+             on average (want > 20) -- a linear finalizer leaves some input bits (e.g. the top bit) \
+             barely affecting the output"
+        );
     }
 }
