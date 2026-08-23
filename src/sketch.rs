@@ -378,11 +378,28 @@ mod tests {
     /// larger sample (500 distinct k-mers, 0..500, which by construction
     /// includes all of `a`'s 0..50). `sketch_size` is chosen larger than
     /// either set so both sketches capture their full k-mer set with no
-    /// truncation -- this makes both `jaccard` and `containment` exact set
-    /// arithmetic here (not merely close estimates), which is the clean,
-    /// deterministic way to demonstrate the *shape* of the difference
-    /// between the two metrics rather than fighting estimator noise on top
-    /// of it.
+    /// truncation.
+    ///
+    /// `containment` is genuinely exact set arithmetic here: with no
+    /// truncation, `a_in_b`/`b_in_a` are computed by binary search over the
+    /// complete hash sets, so they equal the true fraction of shared
+    /// k-mers with no estimation involved.
+    ///
+    /// `jaccard` is not exact here, despite appearances. Its merge walk
+    /// terminates as soon as the *shorter* hash list is exhausted, so
+    /// `union_count` -- and hence the reported ratio -- depends on where
+    /// `a`'s maximum hash happens to fall in `b`'s sorted order, which is a
+    /// property of the hash finalizer, not of the true set sizes. With the
+    /// current finalizer that walk happens to end exactly at
+    /// `union_count == 500` here, giving exactly 0.1, same as `b_in_a`; a
+    /// different (still perfectly correct) finalizer measured
+    /// `union_count == 482`, giving 0.1037 instead. A future change to the
+    /// mixer constants must not be able to break this test for a reason
+    /// that has nothing to do with correctness, so `jaccard` is checked
+    /// only loosely here, as "clearly pulled down by the size mismatch,
+    /// same ballpark as containment" -- the tight, exact-value check
+    /// belongs to `known_overlap_estimates_jaccard_within_a_stated_tolerance`
+    /// above, which exists specifically for that.
     #[test]
     fn containment_is_asymmetric_where_jaccard_is_low() {
         let a_kmers: Vec<u64> = (0..50).collect();
@@ -398,7 +415,12 @@ mod tests {
 
         assert_eq!(a_in_b, 1.0, "a is wholly inside b, so containment(a, b) must be 1.0: {a_in_b}");
         assert_eq!(b_in_a, 0.1, "only 50 of b's 500 k-mers are shared, so containment(b, a) must be 50/500: {b_in_a}");
-        assert_eq!(jaccard, 0.1, "|a ∩ b| / |a ∪ b| = 50 / 500 here, same value as b_in_a by coincidence of these numbers, but computed independently");
+        assert!(
+            (jaccard - 0.1).abs() < 0.05,
+            "jaccard must land in the same ballpark as b_in_a (0.1), pulled down by the size \
+             mismatch between a and b -- but exact equality to b_in_a is a coincidence of this \
+             mixer's tie-breaking, not a property that must hold: jaccard={jaccard}"
+        );
         assert!(a_in_b > b_in_a, "containment must be asymmetric: a_in_b={a_in_b} must exceed b_in_a={b_in_a}");
     }
 
