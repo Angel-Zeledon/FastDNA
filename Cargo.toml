@@ -41,3 +41,12 @@ unwrap_used = "deny"
 expect_used = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
+
+[profile.release]
+# Required, not cosmetic: catch_unwind is a no-op under panic = "abort".
+# The pipeline relies on catch_unwind to convert a panicking worker -- including a
+# panicking Python progress callback -- into FastDnaError::Internal instead of
+# unwinding across the FFI boundary, which is undefined behaviour. Setting abort
+# here would make a worker panic kill the host Python process with no traceback,
+# and no test would fail, because the suite does not run under this profile.
+panic = "unwind"
