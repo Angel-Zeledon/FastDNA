@@ -75,15 +75,47 @@ python scripts/bench/generate_reads.py 1000000 30 150 bench_small.fastq 1337
 # -> a 65.8 MB FASTQ file
 ```
 
-**Correctness cross-check**, `k=31`, canonical k-mers, before any timing was
-recorded: FastDNA reports **1,423,950** distinct canonical 31-mers across
-**23,999,892** total; all three independent Python implementations below
-(which do not apply quality trimming -- see their docstrings) agree at
-**1,423,964** distinct across **24,000,000** total. The 14-k-mer, 0.001%
-difference is exactly what FastDNA's quality trimming removing a handful of
-low-quality read tails would produce, not a counting discrepancy -- four
-independently-written implementations landing within 0.001% of each other is
-itself a correctness check worth having.
+**Correctness cross-check**, `k=31`, canonical k-mers: this is not a
+remembered observation -- it's asserted by a script,
+[`scripts/bench/crosscheck.py`](scripts/bench/crosscheck.py), specifically
+so "fast because it does less work" has something checking for it every
+time this claim gets re-published, not just the one time someone eyeballed
+a table.
+
+```bash
+python scripts/bench/crosscheck.py
+```
+
+This regenerates the same dataset the benchmark table below was measured
+against (same generator, same seed) and runs all four implementations --
+FastDNA plus the three Python baselines -- against it, printing each one's
+distinct/total counts and asserting the spread between them stays within a
+stated tolerance (0.05% by default), exiting non-zero if it doesn't. Its
+actual output, from this machine:
+
+```
+  fastdna       distinct=   1423950  total=    23999892
+  naive_python  distinct=   1423964  total=    24000000
+  biopython     distinct=   1423964  total=    24000000
+  numpy         distinct=   1423964  total=    24000000
+
+distinct spread: 0.0010%  |  total spread: 0.0004%  (tolerance: 0.05%)
+
+OK: all four implementations agree within tolerance.
+```
+
+The 14-k-mer, 0.001% difference between FastDNA and the three Python
+baselines (which do not apply quality trimming -- see their docstrings) is
+exactly what FastDNA's quality trimming removing a handful of low-quality
+read tails would produce, not a counting discrepancy -- four
+independently-written implementations landing within 0.001% of each other
+is itself a correctness check worth having, and now one that runs on
+demand rather than one that was merely true once. The full run above takes
+on the order of minutes (the two slower Python baselines are O(reads x k)
+pure-Python loops over the full 200,000-read file); pass `--quick` for a
+small generated file and a sanity check in seconds instead -- see the
+script's own `--help` for that and its other options
+(`--file`/`--k`/`--tolerance-pct`).
 
 ### Counting speed: FastDNA vs. three ways to write this in Python
 
