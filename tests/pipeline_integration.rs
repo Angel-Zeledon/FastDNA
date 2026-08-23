@@ -29,6 +29,7 @@ fn config(k: usize) -> PipelineConfig {
         quality_window: 4,
         batch_size: 8,
         num_threads: 2,
+        progress_interval: 100_000,
     }
 }
 

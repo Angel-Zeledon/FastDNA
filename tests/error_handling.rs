@@ -49,7 +49,14 @@ impl BufRead for FailAfterN {
 }
 
 fn config(k: usize) -> PipelineConfig {
-    PipelineConfig { k, min_quality: 20.0, quality_window: 4, batch_size: 8, num_threads: 2 }
+    PipelineConfig {
+        k,
+        min_quality: 20.0,
+        quality_window: 4,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 100_000,
+    }
 }
 
 #[test]
@@ -132,6 +139,7 @@ fn zero_threads_is_rejected_instead_of_hanging() {
         quality_window: 4,
         batch_size: 8,
         num_threads: 0,
+        progress_interval: 100_000,
     };
 
     let result = process_stream_parallel(reader_for(&fastq), bad_config, Path::new("sample.fastq"), None);

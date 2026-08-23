@@ -21,6 +21,11 @@ pub struct PipelineConfig {
     pub quality_window: usize,
     pub batch_size: usize,
     pub num_threads: usize,
+    /// How often `ReadsProcessed` is emitted, in reads. Defaults to
+    /// `PROGRESS_INTERVAL`. Small samples (or tests) should lower this --
+    /// otherwise a run of fewer than the interval never emits a single
+    /// `ReadsProcessed` event, only `Finished` at the end.
+    pub progress_interval: u64,
 }
 
 impl Default for PipelineConfig {
@@ -31,6 +36,7 @@ impl Default for PipelineConfig {
             quality_window: 4,
             batch_size: 8192,
             num_threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+            progress_interval: PROGRESS_INTERVAL,
         }
     }
 }
@@ -82,6 +88,7 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
     let k = config.k;
     let min_qual = config.min_quality;
     let qual_win = config.quality_window;
+    let progress_interval = config.progress_interval;
     let source_owned: PathBuf = source.to_path_buf();
 
     // 1. Producer thread. Returns the read count, or the record it choked on.
@@ -176,15 +183,15 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
                     }
 
                     // Accounted once per batch, not once per record: at
-                    // production batch sizes (~10k) against a 100k
-                    // PROGRESS_INTERVAL, per-record fetch_add would hammer a
+                    // production batch sizes (~10k) against a 100k default
+                    // progress_interval, per-record fetch_add would hammer a
                     // shared cache line on every worker for no observable
                     // benefit. Firing on interval *crossing* (rather than
                     // exact modulo) is required because a batched counter
                     // will rarely land exactly on a multiple.
                     if let Some(emit) = progress {
                         let prev = reads_seen.fetch_add(n, Ordering::Relaxed);
-                        if prev / PROGRESS_INTERVAL != (prev + n) / PROGRESS_INTERVAL {
+                        if prev / progress_interval != (prev + n) / progress_interval {
                             emit(Progress::ReadsProcessed(prev + n));
                         }
                     }

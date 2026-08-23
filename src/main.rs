@@ -52,7 +52,10 @@ fn run(args: Cli) -> Result<()> {
     println!("k-mer Size:     {}", args.kmer_size);
     println!("Quality Cutoff: Q >= {}", args.min_quality);
 
-    let threads = args.threads.unwrap_or(8);
+    // A single source of truth for the thread-count default: PipelineConfig's
+    // own Default impl, not a hardcoded number duplicated here.
+    let default_config = PipelineConfig::default();
+    let threads = args.threads.unwrap_or(default_config.num_threads);
     println!("Worker Threads: {threads}");
     println!("--------------------------------------------------");
 
@@ -62,6 +65,7 @@ fn run(args: Cli) -> Result<()> {
         min_quality: args.min_quality,
         batch_size: 10_000,
         num_threads: threads,
+        progress_interval: default_config.progress_interval,
     };
 
     let start_time = Instant::now();
