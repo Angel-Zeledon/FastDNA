@@ -447,7 +447,10 @@ Counts canonical k-mers in a single FASTQ or FASTQ.gz file.
   to handle that itself.
 - `progress_interval` -- how often, in reads, `ReadsProcessed` fires.
 - Pressing **Ctrl-C** during a call raises `KeyboardInterrupt` promptly, not
-  after the run finishes.
+  after the run finishes -- but only when `count()` is called from the
+  interpreter's main thread; `PyErr_CheckSignals` is a no-op on any other
+  thread, so calling `count()` from a `threading.Thread` makes Ctrl-C do
+  nothing until the run completes on its own.
 
 `KmerCounts` (the return value):
 

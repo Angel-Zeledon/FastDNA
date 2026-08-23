@@ -107,7 +107,10 @@ def count(
     emits a single event.
 
     Pressing Ctrl-C during a call raises `KeyboardInterrupt` promptly
-    rather than waiting for the run to finish.
+    rather than waiting for the run to finish -- but only when `count()` is
+    called from the interpreter's main thread; `PyErr_CheckSignals` is a
+    no-op anywhere else, so calling this from a `threading.Thread` makes
+    Ctrl-C do nothing until the run finishes on its own.
     """
     adapter = make_progress_adapter(progress)
     raw = _core.count(
