@@ -184,6 +184,36 @@ fn zero_progress_interval_is_rejected_as_invalid_config() {
     }
 }
 
+/// `quality_window: 0` must be rejected before any read is trimmed. If the
+/// guard were removed, `quality_trim_end` would loop forever: the empty
+/// window makes `sum / 0` produce `NaN`, `NaN >= min_qual` is always
+/// `false` so the loop never breaks, and `end_pos -= 1` underflows once
+/// `end_pos` reaches zero.
+#[test]
+fn zero_quality_window_is_rejected_as_invalid_config() {
+    let bad_config = PipelineConfig {
+        k: 4,
+        min_quality: 20.0,
+        quality_window: 0,
+        batch_size: 8,
+        num_threads: 2,
+        progress_interval: 100_000,
+    };
+
+    let result = process_stream_parallel(
+        reader_for("@r1\nACGT\n+\nIIII\n"),
+        bad_config,
+        Path::new("sample.fastq"),
+        None,
+        None,
+    );
+
+    match result {
+        Err(FastDnaError::InvalidConfig { parameter, .. }) => assert_eq!(parameter, "quality_window"),
+        other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+}
+
 /// A token already set before the call starts must return `Cancelled`
 /// promptly, not process the whole input first. 50,000 reads at a
 /// batch_size of 8 is over 6,000 batches; if the cancel check were missing

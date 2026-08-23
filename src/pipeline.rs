@@ -105,6 +105,20 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
         });
     }
 
+    // `quality_trim_end` bounds its trim window by `window_size` but never
+    // validates it: with `window_size == 0` the loop condition
+    // `end_pos >= window_size` is always true, the empty window makes
+    // `sum / 0` produce `NaN` (so the `>= min_qual` break never fires), and
+    // `end_pos -= 1` underflows once `end_pos` reaches zero. Rejected here
+    // rather than inside `quality_trim_end` itself, which runs once per read
+    // and must stay branch-free for this.
+    if config.quality_window == 0 {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "quality_window",
+            reason: "must be at least 1".to_string(),
+        });
+    }
+
     let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(64);
 
     let batch_size = config.batch_size;
