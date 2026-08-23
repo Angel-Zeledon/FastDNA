@@ -7,7 +7,8 @@
 //! minutes to compare exactly can be compared in milliseconds this way.
 
 use std::collections::BTreeSet;
-use std::io::BufRead;
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -248,6 +249,50 @@ impl GenomeSketch {
             Ok(shared as f64 / resolvable as f64)
         }
     }
+
+    /// Persists the sketch as JSON. This is what makes N-sample comparison
+    /// stop being O(N^2) FASTQ reads: compute each sample's sketch once,
+    /// save it, and every later comparison loads two small files instead of
+    /// re-reading two large ones.
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
+
+        let file = File::create(path).map_err(to_err)?;
+        let mut writer = BufWriter::new(file);
+        // Mirrors `QcSummary::export_json`: `serde_json::Error` conflates a
+        // propagated I/O failure (`is_io()` true) with a genuine
+        // serialization failure, and only the former belongs in `Io`.
+        serde_json::to_writer_pretty(&mut writer, self).map_err(|e| {
+            if e.is_io() {
+                FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
+            } else {
+                FastDnaError::Export { path: path.to_path_buf(), reason: e.to_string() }
+            }
+        })?;
+        writer.flush().map_err(to_err)?;
+        Ok(())
+    }
+
+    /// Loads a sketch previously written by `save`. Uses `FastDnaError::Export`
+    /// for a corrupt/foreign file, the same variant `save` uses for a
+    /// serialization failure -- there is no dedicated "read" error taxonomy
+    /// entry, and this is the closest existing one to "the JSON layer
+    /// failed for a reason that is not a bare I/O error".
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
+
+        let file = File::open(path).map_err(to_err)?;
+        let reader = BufReader::new(file);
+        serde_json::from_reader(reader).map_err(|e| {
+            if e.is_io() {
+                FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
+            } else {
+                FastDnaError::Export { path: path.to_path_buf(), reason: e.to_string() }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -371,6 +416,32 @@ mod tests {
                 assert_eq!(right, 31);
             }
             other => panic!("expected Err(MismatchedK), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_to_an_identical_sketch() {
+        let kmers: Vec<u64> = (0..500).collect();
+        let original = GenomeSketch::from_kmers(&kmers, 128, 21);
+
+        let path = std::env::temp_dir().join("fastdna_sketch_save_load_roundtrip_test.sig");
+        original.save(&path).expect("save must succeed");
+        let loaded = GenomeSketch::load(&path).expect("load must succeed");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.sketch_size, original.sketch_size);
+        assert_eq!(loaded.k, original.k);
+        assert_eq!(loaded.hashes, original.hashes);
+    }
+
+    #[test]
+    fn load_of_a_missing_file_is_an_io_error() {
+        let path = std::env::temp_dir().join("fastdna_sketch_does_not_exist_test.sig");
+        let _ = std::fs::remove_file(&path);
+
+        match GenomeSketch::load(&path) {
+            Err(FastDnaError::Io { .. }) => {}
+            other => panic!("expected Err(Io), got {other:?}"),
         }
     }
 
