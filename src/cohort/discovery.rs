@@ -376,6 +376,23 @@ mod tests {
         assert_eq!(samples[1].sample_id, "pat_002");
     }
 
+    // `.fq` and `.fq.gz` are listed in `EXTENSIONS` alongside `.fastq` and
+    // `.fastq.gz`, but every other test in this suite happens to use
+    // `.fastq`/`.fastq.gz` (or, above, their uppercase forms) -- so the
+    // plain lowercase `.fq`/`.fq.gz` branch itself was never exercised by
+    // any test.
+    #[test]
+    fn fq_and_fq_gz_extensions_are_recognized() {
+        let d = fixture(&["pat_001.fq", "pat_002.fq.gz"]);
+        let mut samples = discover_samples(d.path()).expect("valid");
+        samples.sort_by(|a, b| a.sample_id.cmp(&b.sample_id));
+        assert_eq!(samples.len(), 2, "got {:?}", samples);
+        assert_eq!(samples[0].sample_id, "pat_001");
+        assert_eq!(samples[0].files.len(), 1);
+        assert_eq!(samples[1].sample_id, "pat_002");
+        assert_eq!(samples[1].files.len(), 1);
+    }
+
     #[test]
     fn lowercase_pair_suffix_still_pairs_and_does_not_silently_split_the_cohort() {
         // Before case-insensitive matching, "_r1"/"_r2" (lowercase) matched
