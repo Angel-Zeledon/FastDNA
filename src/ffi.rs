@@ -160,12 +160,17 @@ impl PyKmerCounts {
             None => {
                 let built = py.allow_threads(|| build_record_batch(&self.counter, self.k))?;
                 // `OnceLock::set` can in general lose a race to a
-                // concurrent initializer. That cannot happen here -- a
-                // single Python object accessed under the GIL only ever
-                // has one caller in this method at a time -- but using
-                // `built` regardless of whether `set` won keeps this
-                // correct on its own terms rather than relying on that
-                // single-threaded assumption remaining true forever.
+                // concurrent initializer, and that race is real here, not
+                // hypothetical: `py.allow_threads` above releases the GIL
+                // for the whole build, which is exactly what lets a second
+                // Python thread call `.table` on this same object and enter
+                // this method concurrently -- the GIL alone does not
+                // serialize callers the way it would if it stayed held for
+                // this method's whole body. Using `built` regardless of
+                // whether `set` won is what makes this correct on its own
+                // terms even so: whichever build actually landed in the
+                // cache, this call still returns the (equal) batch it just
+                // computed rather than trusting that it must have won.
                 let _ = self.table_cache.set(built.clone());
                 built
             }
@@ -520,8 +525,8 @@ impl PyPreview {
     }
 
     #[getter]
-    fn estimated_distinct_kmers(&self) -> usize {
-        self.inner.estimated_distinct_kmers
+    fn sample_distinct_kmers(&self) -> usize {
+        self.inner.sample_distinct_kmers
     }
 
     /// The largest odd `k` at most `median_read_length / 3`, clamped to
@@ -545,10 +550,17 @@ impl PyPreview {
 /// read-length geometry, GC content, and a suggested `k` -- in milliseconds,
 /// without reading the rest of the file. Its reason to exist: `k=31` is
 /// everyone's default and it is wrong for short reads (design doc §9.5).
+///
+/// Released under `py.allow_threads` like `count()`'s own I/O-bound work:
+/// `n_reads` is caller-controlled (`preview::MAX_N_READS` rejects only the
+/// clearly unreasonable values), and an ordinary-looking but large request
+/// against a large file could otherwise run for a while holding the GIL,
+/// freezing the calling interpreter with no way to interrupt it -- the same
+/// problem `count()`'s own GIL release and Ctrl-C polling exist to avoid.
 #[pyfunction]
 #[pyo3(signature = (path, n_reads=10_000))]
-fn peek(path: String, n_reads: usize) -> PyResult<PyPreview> {
-    let inner = preview::peek(PathBuf::from(path), n_reads)?;
+fn peek(py: Python<'_>, path: String, n_reads: usize) -> PyResult<PyPreview> {
+    let inner = py.allow_threads(|| preview::peek(PathBuf::from(path), n_reads))?;
     Ok(PyPreview { inner })
 }
 

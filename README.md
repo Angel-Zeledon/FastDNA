@@ -461,6 +461,12 @@ Counts canonical k-mers in a single FASTQ or FASTQ.gz file.
   (`fastdna._progress`) first, so neither `tqdm` nor your own callback has
   to handle that itself.
 - `progress_interval` -- how often, in reads, `ReadsProcessed` fires.
+  Setting it below the core's default batch size (8,192) also shrinks the
+  internal batch size to match -- a batch bigger than the interval would
+  coarsen progress regardless of what interval was asked for -- so a
+  smaller interval means smaller, more frequent batches crossing the
+  internal channel. A smoother bar is a small throughput trade, not a free
+  knob; the default interval leaves the default batch size untouched.
 - Pressing **Ctrl-C** during a call raises `KeyboardInterrupt` promptly, not
   after the run finishes -- but only when `count()` is called from the
   interpreter's main thread; `PyErr_CheckSignals` is a no-op on any other
@@ -474,10 +480,10 @@ Counts canonical k-mers in a single FASTQ or FASTQ.gz file.
 | `.table` | `pyarrow.Table` | zero-copy; columns `kmer_u64` (`uint64`), `kmer_sequence` (`string`), `frequency` (`uint32`) -- identical schema to the Parquet files the CLI writes |
 | `.qc` | `dict` | read/base-level QC: `total_reads`, `total_bases`, `q20_bases`, `q30_bases`, `gc_bases`, `gc_content_pct`, `q20_pct`, `q30_pct` |
 | `.total_kmers` | `int` | total k-mer instances counted (the normalization basis) |
-| `.distinct_kmers` | `int` | distinct canonical k-mers kept after `min_count`/`max_count` |
+| `.distinct_kmers` | `int` | distinct canonical k-mers kept after `min_count`/`max_count` -- also `len(result)` |
 | `.k` | `int` | the `k` this result was built with |
 | `.spectrum()` | `dict` | `{depth: number of distinct k-mers observed at that depth}` -- the frequency histogram |
-| `.suggest_min_count()` | `int` | the `min_count` detected from *this sample's own* frequency spectrum (see below) -- also `len(result)` for `.distinct_kmers` |
+| `.suggest_min_count()` | `int` | the `min_count` detected from *this sample's own* frequency spectrum (see below) |
 
 **Why `suggest_min_count()` exists**: a sequenced sample's frequency
 spectrum has two peaks -- a large one at frequency 1-2 (sequencing errors)
@@ -511,14 +517,17 @@ clean = fastdna.count("sample.fastq.gz", k=31, min_count=r.suggest_min_count())
 
 Samples just the first `n_reads` records -- milliseconds, without reading
 the rest of the file -- and reports enough to pick a sane `k` *before*
-committing to a long run:
+committing to a long run. `n_reads` above a generous ceiling (10,000,000)
+**raises `ValueError`**: `peek` exists for a quick preview, not a full
+read, so a value that large is rejected rather than silently turning into
+one.
 
 | Member | |
 |---|---|
 | `.n_reads_sampled` | reads actually read (may be less than `n_reads` on a short file) |
 | `.read_length` | `(min, median, max)` among the sampled reads |
 | `.gc_content` | fraction, `0.0..=1.0` |
-| `.estimated_distinct_kmers` | distinct canonical k-mers within the sample itself, at `suggest_k()` |
+| `.sample_distinct_kmers` | distinct canonical k-mers within the sample itself, at `suggest_k()` -- an exact count of the sample, not an extrapolation to the whole file |
 | `.suggest_k()` | the largest **odd** `k` at most `median_read_length / 3`, clamped to `1..=32` |
 
 Why this matters: `k=31` is everyone's default, and it's wrong for short

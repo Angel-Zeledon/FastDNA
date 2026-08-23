@@ -15,7 +15,6 @@ python/fastdna/*.pdb
 __pycache__/
 *.pyc
 .pytest_cache/
-.venv/
 
 # Local virtualenvs used for wheel testing
 .venv/

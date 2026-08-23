@@ -139,8 +139,16 @@ def test_peek_reports_read_geometry(tmp_path):
     assert p.n_reads_sampled == 50
     assert p.read_length == (20, 20, 20)
     assert 0.0 <= p.gc_content <= 1.0
-    assert 1 <= p.suggest_k() <= 32
-    assert p.suggest_k() % 2 == 1
+    # median_read_length=20 -> 20 // 3 = 6, clamped to 1..=32 (no-op), then
+    # rounded down to the nearest odd value since 6 itself is even: 5. This
+    # is deterministic for this input, not merely "some odd k in range".
+    assert p.suggest_k() == 5
+
+
+def test_peek_rejects_an_unreasonable_n_reads(tmp_path):
+    path = write_fastq(tmp_path, ["ACGTACGTAC"] * 5)
+    with pytest.raises(ValueError):
+        fastdna.peek(str(path), n_reads=10_000_001)
 
 
 def test_peek_stops_before_reading_the_whole_file(tmp_path):

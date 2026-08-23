@@ -104,7 +104,13 @@ def count(
     `progress_interval` controls how often (in reads) `ReadsProcessed` is
     emitted. The default matches the core's own default; tests and small
     inputs should lower it, since a run shorter than the interval never
-    emits a single event.
+    emits a single event. Lowering it below the core's default batch size
+    (8,192) also shrinks the internal batch size to match: a batch larger
+    than `progress_interval` would coarsen progress no matter how small the
+    interval asked for, so a smaller interval means a smaller batch --
+    which means more, smaller batches crossing the internal channel. A
+    smoother progress bar therefore trades a little throughput for it; the
+    default interval leaves the default batch size untouched.
 
     Pressing Ctrl-C during a call raises `KeyboardInterrupt` promptly
     rather than waiting for the run to finish -- but only when `count()` is

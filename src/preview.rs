@@ -26,8 +26,12 @@ pub struct PreviewStats {
     /// `suggest_k()`'s recommended k. This is a property of the sample, not
     /// an extrapolation to the whole file -- extrapolating would need
     /// assumptions `peek` has no basis for, since it deliberately never
-    /// learns the file's true size.
-    pub estimated_distinct_kmers: usize,
+    /// learns the file's true size. Named `sample_distinct_kmers`, not
+    /// `estimated_distinct_kmers`: it is an exact count of the sample's own
+    /// k-mers, not an estimate of anything, and "estimated" reads as "an
+    /// extrapolation to the whole file" -- exactly the thing this field
+    /// does not do.
+    pub sample_distinct_kmers: usize,
 }
 
 impl PreviewStats {
@@ -58,10 +62,29 @@ fn suggest_k_for_median(median_read_length: usize) -> usize {
     }
 }
 
+/// The largest `n_reads` this function accepts. `peek`'s entire reason to
+/// exist is a "milliseconds, without reading the rest of the file" preview
+/// (see the module doc comment); a caller-supplied value far beyond any
+/// legitimate preview size (a typo, a value meant for a different
+/// parameter) would silently turn that into a long, ordinary full read
+/// instead -- and, called from Python, without releasing the GIL for
+/// something that size, would freeze the interpreter for the duration with
+/// no way to interrupt it. Rejected outright instead, the same way
+/// `process_stream_parallel` rejects `num_threads == 0` rather than letting
+/// a bad value degrade silently.
+pub const MAX_N_READS: usize = 10_000_000;
+
 /// Reads at most `n_reads` records from `path`, transparently
 /// decompressing `.gz` inputs (`FastqReader::from_path` already applies the
 /// same extension rule the CLI and `ffi.rs` use).
 pub fn peek<P: AsRef<Path>>(path: P, n_reads: usize) -> Result<PreviewStats> {
+    if n_reads > MAX_N_READS {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "n_reads",
+            reason: format!("must be at most {MAX_N_READS} (got {n_reads}); peek() is meant for a quick preview, not a full read"),
+        });
+    }
+
     let path_ref = path.as_ref();
     let reader = FastqReader::from_path(path_ref)
         .map_err(|e| FastDnaError::Io { path: path_ref.to_path_buf(), source: e })?;
@@ -128,7 +151,7 @@ fn peek_from_reader<R: BufRead>(mut reader: FastqReader<R>, n_reads: usize, sour
         n_reads_sampled: records.len(),
         read_length: (min_len, median_len, max_len),
         gc_content,
-        estimated_distinct_kmers: kmer_seen.len(),
+        sample_distinct_kmers: kmer_seen.len(),
     })
 }
 
