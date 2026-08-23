@@ -127,10 +127,14 @@ README shipped with):
 | **FastDNA, 4 threads** | **2.54 s** (median of 5) | | |
 | **FastDNA, 8 threads (default)** | **1.99 s** (median of 5) | | |
 
-That puts FastDNA at roughly **20-25x faster than any of the three Python
-approaches on a single thread**, and **45-60x faster using the 8 threads
-this laptop has** -- against a NumPy implementation that is itself already
-vectorized, not naive. The honest reason the NumPy baseline doesn't win is
+Against the **fastest** Python baseline in this table (`Counter`, 88.13 s --
+comparing against the slowest baseline would flatter the result), that puts
+FastDNA at roughly **18-25x faster on a single thread** (88.13 / 4.94 s =
+17.8x, up to 125.57 / 4.94 s = 25.4x against the slowest run recorded, the
+Biopython run at 125.57 s), and **44-63x faster using the 8 threads this
+laptop has** (88.13 / 1.99 s = 44.3x, up to 125.57 / 1.99 s = 63.1x) --
+against a NumPy implementation that is itself already vectorized, not
+naive. The honest reason the NumPy baseline doesn't win is
 worth stating plainly: it still runs a Python-level loop once per *read*
 (200,000 iterations), and inside each iteration a k=31-deep chain of small
 array operations to build that read's k-mer windows. NumPy's per-call
@@ -150,7 +154,8 @@ scales further on larger files, where that fixed cost amortizes away.
 
 **Run-to-run variance**: this machine is a laptop under normal desktop load
 (IDE, language servers, browser), not a dedicated benchmark rig, and the
-numbers above show it -- e.g. the two `Counter` runs differ by 22%. That
+numbers above show it -- e.g. the two `Counter` runs differ by 29% (88.13 s
+vs. 113.41 s). That
 variance is disclosed rather than hidden: re-run the scripts and expect
 figures in the same range, not bit-identical ones.
 
