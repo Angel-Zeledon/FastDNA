@@ -90,7 +90,7 @@ impl From<io::Error> for FastqReadError {
 }
 
 /// Crate-local result alias for `FastqReader::next_record`.
-pub type ReadResult<T> = std::result::Result<T, FastqReadError>;
+pub(crate) type ReadResult<T> = std::result::Result<T, FastqReadError>;
 
 /// Strips a single trailing `\n`, and a preceding `\r` if present, from a
 /// line buffer read by `read_until(b'\n', ..)`.
@@ -100,6 +100,29 @@ fn strip_newline(buf: &mut Vec<u8>) {
     }
     if buf.ends_with(b"\r") {
         buf.pop();
+    }
+}
+
+/// Maximum number of characters of a malformed line quoted into an error
+/// message. `read_until(b'\n', ..)` has no length cap, and a FASTA file
+/// handed to this FASTQ reader by mistake -- a routine user error -- has no
+/// early newline at all: its first "line" can be the entire file. Without a
+/// cap, the error message becomes a second full copy of that content,
+/// propagated through `FastDnaError::MalformedFastq` and across the FFI
+/// boundary into a Python exception string.
+const MAX_ERROR_PREVIEW_CHARS: usize = 80;
+
+/// Renders a line buffer for embedding in an error message, truncated to at
+/// most `MAX_ERROR_PREVIEW_CHARS` characters (not bytes, so a multi-byte
+/// UTF-8 sequence is never split) with a trailing ellipsis when truncated.
+fn preview_for_error(buf: &[u8]) -> String {
+    let lossy = String::from_utf8_lossy(buf);
+    let mut chars = lossy.chars();
+    let preview: String = chars.by_ref().take(MAX_ERROR_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
     }
 }
 
@@ -155,7 +178,7 @@ impl<R: BufRead> FastqReader<R> {
         if !self.line_buf.starts_with(b"@") {
             return Err(FastqReadError::Malformed(format!(
                 "header line must start with '@', got {:?}",
-                String::from_utf8_lossy(&self.line_buf)
+                preview_for_error(&self.line_buf)
             )));
         }
         let id = self.line_buf.clone();
@@ -179,7 +202,7 @@ impl<R: BufRead> FastqReader<R> {
         if !self.line_buf.starts_with(b"+") {
             return Err(FastqReadError::Malformed(format!(
                 "separator line must start with '+', got {:?}",
-                String::from_utf8_lossy(&self.line_buf)
+                preview_for_error(&self.line_buf)
             )));
         }
 
