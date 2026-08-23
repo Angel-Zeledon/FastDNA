@@ -249,6 +249,8 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].sample_id, "pat_001");
         assert_eq!(s[0].files.len(), 2);
+        assert!(s[0].files[0].ends_with("pat_001_R1.fastq.gz"), "R1 must be files[0]: {:?}", s[0].files);
+        assert!(s[0].files[1].ends_with("pat_001_R2.fastq.gz"), "R2 must be files[1]: {:?}", s[0].files);
     }
 
     #[test]
@@ -289,6 +291,8 @@ mod tests {
         let d = fixture(&["p-1.a_R1.fastq.gz", "p-1.a_R2.fastq.gz"]);
         let s = discover_samples(d.path()).expect("valid");
         assert_eq!(s.len(), 1, "got {:?}", s);
+        assert!(s[0].files[0].ends_with("p-1.a_R1.fastq.gz"), "R1 must be files[0]: {:?}", s[0].files);
+        assert!(s[0].files[1].ends_with("p-1.a_R2.fastq.gz"), "R2 must be files[1]: {:?}", s[0].files);
     }
 
     #[test]
@@ -314,9 +318,13 @@ mod tests {
         assert_eq!(samples[0].sample_id, "pat_a");
         assert_eq!(samples[0].files.len(), 2);
         assert!(samples[0].orphan_warning.is_empty());
+        assert!(samples[0].files[0].ends_with("pat_a_R1.fastq.gz"), "R1 must be files[0]: {:?}", samples[0].files);
+        assert!(samples[0].files[1].ends_with("pat_a_R2.fastq.gz"), "R2 must be files[1]: {:?}", samples[0].files);
         assert_eq!(samples[1].sample_id, "pat_b");
         assert_eq!(samples[1].files.len(), 2);
         assert!(samples[1].orphan_warning.is_empty());
+        assert!(samples[1].files[0].ends_with("pat_b_1.fastq.gz"), "_1 must be files[0]: {:?}", samples[1].files);
+        assert!(samples[1].files[1].ends_with("pat_b_2.fastq.gz"), "_2 must be files[1]: {:?}", samples[1].files);
     }
 
     #[test]
@@ -327,6 +335,33 @@ mod tests {
         assert_eq!(s[0].sample_id, "pat_001");
         assert_eq!(s[0].files.len(), 2);
         assert!(s[0].orphan_warning.is_empty());
+        assert!(s[0].files[0].ends_with("pat_001.R1.fastq.gz"), "R1 must be files[0]: {:?}", s[0].files);
+        assert!(s[0].files[1].ends_with("pat_001.R2.fastq.gz"), "R2 must be files[1]: {:?}", s[0].files);
+    }
+
+    /// The doc comment on `SampleFiles::files` promises a specific,
+    /// reproducible order within a sample -- R1 file(s), then R2, then
+    /// any single-end file(s) -- because matrix row order downstream
+    /// depends on it. Every other pairing test above only asserted
+    /// `files.len()`, so a regression that shuffled the vector (e.g. an
+    /// accidental `HashSet`, or swapping the `extend` order in
+    /// `discover_samples`) would go green everywhere. This test
+    /// exercises all three groups at once, and in a sample that mixes a
+    /// paired R1/R2 with an unsuffixed file for the same sample id (an
+    /// unsuffixed file and its `_R1`-suffixed sibling do resolve to the
+    /// same `sample_id`), so the full three-way order is checked, not
+    /// just the two-group case.
+    #[test]
+    fn files_within_a_sample_are_ordered_r1_then_r2_then_single_end() {
+        let d = fixture(&["multi_R1.fastq", "multi_R2.fastq", "multi.fastq"]);
+        let s = discover_samples(d.path()).expect("valid");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].sample_id, "multi");
+        assert_eq!(s[0].files.len(), 3);
+        assert!(s[0].orphan_warning.is_empty(), "both R1 and R2 are present, so no orphan warning is expected");
+        assert!(s[0].files[0].ends_with("multi_R1.fastq"), "R1 must be files[0]: {:?}", s[0].files);
+        assert!(s[0].files[1].ends_with("multi_R2.fastq"), "R2 must be files[1]: {:?}", s[0].files);
+        assert!(s[0].files[2].ends_with("multi.fastq"), "the unsuffixed file must be files[2], last: {:?}", s[0].files);
     }
 
     #[test]
