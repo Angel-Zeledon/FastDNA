@@ -16,8 +16,19 @@ pub fn base_to_bits(base: u8) -> Option<u64> {
 
 /// Computes the reverse complement of a u64-encoded k-mer in O(1)
 /// using CPU register-level bit operations.
+///
+/// `k` must be in `1..=32`: `k == 0` shifts by 64 (panics in debug, silently
+/// wrong in release) and `k > 32` overflows the `64 - (2 * k)` subtraction
+/// the same way. `extract_canonical_kmers` already guards its own calls, but
+/// this function is `pub` and reachable directly, so callers outside this
+/// module -- including a future Python binding -- get the same guarantee.
+/// A `debug_assert!` is used rather than a runtime branch because this
+/// function is `#[inline(always)]` on the k-mer extraction hot path, where a
+/// branch that always evaluates true still costs measurable throughput; the
+/// assert compiles to nothing in release builds.
 #[inline(always)]
 pub fn reverse_complement_u64(kmer: u64, k: usize) -> u64 {
+    debug_assert!((1..=32).contains(&k), "reverse_complement_u64: k must be in 1..=32, got {k}");
     let mut v = !kmer;
     v = ((v >> 2) & 0x3333_3333_3333_3333) | ((v & 0x3333_3333_3333_3333) << 2);
     v = ((v >> 4) & 0x0F0F_0F0F_0F0F_0F0F) | ((v & 0x0F0F_0F0F_0F0F_0F0F) << 4);
@@ -27,8 +38,11 @@ pub fn reverse_complement_u64(kmer: u64, k: usize) -> u64 {
 
 /// Returns the canonical k-mer (the lexicographic minimum of the k-mer and its
 /// reverse complement).
+///
+/// Same `k` constraint as `reverse_complement_u64`, which this delegates to.
 #[inline(always)]
 pub fn canonical_kmer_u64(kmer: u64, k: usize) -> u64 {
+    debug_assert!((1..=32).contains(&k), "canonical_kmer_u64: k must be in 1..=32, got {k}");
     let rc = reverse_complement_u64(kmer, k);
     kmer.min(rc)
 }
