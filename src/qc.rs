@@ -2,8 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
+use crate::error::{FastDnaError, Result};
 use crate::fastq::FastqRecord;
 
 /// Quality Control (QC) summary report for sequencing health.
@@ -54,11 +55,17 @@ impl QcSummary {
         }
     }
 
-    pub fn export_json<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
-        let file = File::create(path)?;
+    pub fn export_json<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
+
+        let file = File::create(path).map_err(to_err)?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, self)?;
-        writer.flush()?;
+        serde_json::to_writer_pretty(&mut writer, self).map_err(|e| FastDnaError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(e),
+        })?;
+        writer.flush().map_err(to_err)?;
         Ok(())
     }
 }

@@ -131,10 +131,7 @@ fn run(args: Cli) -> Result<()> {
     pb_export.finish_with_message(format!("Export completed in {export_elapsed:.2}s"));
 
     // Honour --qc and --histogram, which were previously parsed and ignored.
-    qc.export_json(&args.qc).map_err(|e| FastDnaError::Io {
-        path: args.qc.clone(),
-        source: e,
-    })?;
+    qc.export_json(&args.qc)?;
     println!("QC report written to: {}", args.qc.display());
 
     if let Some(histogram_path) = &args.histogram {
