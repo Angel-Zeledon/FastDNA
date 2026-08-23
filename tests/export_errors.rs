@@ -38,14 +38,37 @@ fn parquet_export_to_an_unwritable_path_names_the_path() {
     assert!(matches!(result, Err(FastDnaError::Io { .. })), "got {result:?}");
 }
 
+/// A scratch directory unique to this process and call, cleaned up on drop.
+///
+/// A fixed path reused across runs would let leftover state from one run
+/// (or a Windows `remove_dir_all` still pending delete, as antivirus or the
+/// search indexer can hold a brief handle on a newly written file) collide
+/// with the next; a unique path per run has nothing to collide with.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new(name: &str) -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = format!("{}_{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+        let dir = std::env::temp_dir().join(format!("{name}_{unique}"));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        Self(dir)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn successful_csv_export_reports_rows_written() {
-    let dir = std::env::temp_dir().join("fastdna_export_test");
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let out = dir.join("ok.csv");
+    let scratch = ScratchDir::new("fastdna_export_test");
+    let out = scratch.0.join("ok.csv");
 
     let written = export::export_csv(&small_counter(), &out, 4, 1).expect("must succeed");
 
     assert_eq!(written, 2);
-    let _ = std::fs::remove_file(&out);
 }

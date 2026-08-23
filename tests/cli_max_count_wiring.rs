@@ -12,13 +12,23 @@
 use std::io::Write;
 use std::process::Command;
 
-/// A fresh scratch directory per test run, cleaned up on drop.
+/// A scratch directory unique to this process and call, cleaned up on drop.
+///
+/// The name is `<pid>_<counter>` rather than a fixed name so that concurrent
+/// or successive test runs on the same machine never share a path. On
+/// Windows, `remove_dir_all` leaves the directory in a pending-delete state
+/// until every open handle (including ones held briefly by antivirus or the
+/// search indexer) closes; a fixed path reused across runs can therefore hit
+/// a `create_dir_all` that races that pending delete and fails with access
+/// denied. A unique path per run has nothing to race against.
 struct ScratchDir(std::path::PathBuf);
 
 impl ScratchDir {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("fastdna_cli_wiring_{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = format!("{}_{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+        let dir = std::env::temp_dir().join(format!("fastdna_cli_wiring_{name}_{unique}"));
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         Self(dir)
     }
