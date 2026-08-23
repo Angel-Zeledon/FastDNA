@@ -42,6 +42,7 @@ use crate::export;
 use crate::fastq::FastqReader;
 use crate::kmer;
 use crate::pipeline::{process_stream_parallel, PipelineConfig};
+use crate::preview;
 use crate::progress::Progress;
 use crate::qc::QcSummary;
 
@@ -151,6 +152,26 @@ impl PyKmerCounts {
     #[getter]
     fn distinct_kmers(&self) -> usize {
         self.counter.distinct_kmers()
+    }
+
+    /// `{depth: number of distinct k-mers observed at that depth}`.
+    ///
+    /// A method rather than a property, matching the design doc's
+    /// `r.spectrum()` (§9.2) -- unlike `.table`/`.qc`, which are cheap
+    /// accessors, this rebuilds the histogram on every call, which reads
+    /// as a call rather than a stored field.
+    ///
+    /// Exposes `KmerCounter::generate_histogram` so `suggest_min_count()`
+    /// (pure Python, `python/fastdna/spectrum.py`) can do local-minimum
+    /// detection over it: the correct `min_count` threshold sits in the
+    /// valley between the error peak (frequency 1-2) and the true coverage
+    /// peak, and differs per sample -- there is no universal default.
+    fn spectrum(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = PyDict::new_bound(py);
+        for (depth, count) in self.counter.generate_histogram() {
+            dict.set_item(depth, count)?;
+        }
+        Ok(dict.into())
     }
 }
 
@@ -326,10 +347,102 @@ fn count(
     Ok(PyKmerCounts { counter, qc, k })
 }
 
+/// The Python-visible result of `peek()`. Wraps `preview::PreviewStats`
+/// directly -- the sampling logic itself lives in `src/preview.rs`, with no
+/// PyO3 dependency, so it stays unit-testable via `cargo test` alone.
+#[pyclass(name = "Preview")]
+struct PyPreview {
+    inner: preview::PreviewStats,
+}
+
+#[pymethods]
+impl PyPreview {
+    #[getter]
+    fn n_reads_sampled(&self) -> usize {
+        self.inner.n_reads_sampled
+    }
+
+    /// `(min, median, max)` read length among the sampled reads.
+    #[getter]
+    fn read_length(&self) -> (usize, usize, usize) {
+        self.inner.read_length
+    }
+
+    #[getter]
+    fn gc_content(&self) -> f64 {
+        self.inner.gc_content
+    }
+
+    #[getter]
+    fn estimated_distinct_kmers(&self) -> usize {
+        self.inner.estimated_distinct_kmers
+    }
+
+    /// The largest odd `k` at most `median_read_length / 3`, clamped to
+    /// `1..=32`. See `preview::PreviewStats::suggest_k` for why odd matters.
+    fn suggest_k(&self) -> usize {
+        self.inner.suggest_k()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Preview(n_reads_sampled={}, read_length={:?}, gc_content={:.3}, suggested_k={})",
+            self.inner.n_reads_sampled,
+            self.inner.read_length,
+            self.inner.gc_content,
+            self.inner.suggest_k()
+        )
+    }
+}
+
+/// Samples the first `n_reads` records of a FASTQ(.gz) file and reports its
+/// read-length geometry, GC content, and a suggested `k` -- in milliseconds,
+/// without reading the rest of the file. Its reason to exist: `k=31` is
+/// everyone's default and it is wrong for short reads (design doc §9.5).
+#[pyfunction]
+#[pyo3(signature = (path, n_reads=10_000))]
+fn peek(path: String, n_reads: usize) -> PyResult<PyPreview> {
+    let inner = preview::peek(PathBuf::from(path), n_reads)?;
+    Ok(PyPreview { inner })
+}
+
+/// Reports facts a remote bug report cannot otherwise supply: the installed
+/// version, the maximum supported `k` (fixed by the 2-bit packing in
+/// `kmer.rs`), and whether AVX2 is live on *this* CPU right now. The last of
+/// these is a runtime check, not a compile-time one: the same wheel ships to
+/// AVX2 and non-AVX2 machines, so a compile-time-only answer would be wrong
+/// wherever it runs that differs from the build machine. Without it, "it's
+/// slow on my Mac" is undiagnosable remotely (design doc §9.1).
+#[pyfunction]
+fn build_info(py: Python<'_>) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("version", env!("CARGO_PKG_VERSION"))?;
+    dict.set_item("max_k", 32usize)?;
+    dict.set_item("avx2", avx2_is_live())?;
+    Ok(dict.into())
+}
+
+/// Runtime AVX2 detection, gated at compile time on the architecture only
+/// (never on `target_feature`, which would bake a single build's CPU into
+/// every wheel -- see design doc §11, "Fixing simd.rs").
+fn avx2_is_live() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PyKmerCounts>()?;
+    m.add_class::<PyPreview>()?;
     m.add_function(wrap_pyfunction!(count, m)?)?;
+    m.add_function(wrap_pyfunction!(peek, m)?)?;
+    m.add_function(wrap_pyfunction!(build_info, m)?)?;
     Ok(())
 }

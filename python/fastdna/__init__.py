@@ -9,6 +9,7 @@ the Rust/Python boundary, per the packaging design (docs/superpowers/specs/
 
 from . import _core
 from ._progress import make_progress_adapter
+from .spectrum import suggest_min_count as _suggest_min_count
 
 __version__ = _core.__version__
 
@@ -43,6 +44,24 @@ class KmerCounts:
     @property
     def distinct_kmers(self):
         return self._raw.distinct_kmers
+
+    def spectrum(self):
+        """`{depth: number of distinct k-mers observed at that depth}`.
+
+        Exposes the Rust core's `KmerCounter::generate_histogram` so
+        `suggest_min_count()` -- and any user code -- can work with the
+        frequency spectrum directly.
+        """
+        return dict(self._raw.spectrum())
+
+    def suggest_min_count(self):
+        """The `min_count` detected from this sample's own frequency
+        spectrum: the valley between the error peak (frequency 1-2) and the
+        true coverage peak. See `fastdna.spectrum.suggest_min_count` for why
+        a single universal default (e.g. 5) is wrong -- this differs per
+        sample.
+        """
+        return _suggest_min_count(self.spectrum())
 
     def __len__(self):
         return self.distinct_kmers
@@ -98,3 +117,24 @@ def count(
         progress_interval,
     )
     return KmerCounts(raw)
+
+
+def peek(path, *, n_reads=10_000):
+    """Samples the first `n_reads` records of a FASTQ(.gz) file and reports
+    read-length geometry, GC content, and a suggested `k` -- in
+    milliseconds, without reading the rest of the file.
+
+    `k=31` is everyone's default, and it is wrong for short reads: with
+    50 bp reads it leaves 20 k-mers per read and amplifies every sequencing
+    error. `peek` answers "what `k` suits *these* data?" before a long run
+    commits to a wrong one.
+    """
+    return _core.peek(str(path), n_reads)
+
+
+def build_info():
+    """Reports the installed version, the maximum supported k, and whether
+    AVX2 is live on *this* CPU -- without which "it's slow on my Mac" is
+    undiagnosable remotely.
+    """
+    return _core.build_info()

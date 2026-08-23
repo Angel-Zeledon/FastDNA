@@ -57,3 +57,19 @@ def test_a_panicking_callback_becomes_runtimeerror(tmp_path):
 
     with pytest.raises(RuntimeError):
         fastdna.count(str(path), k=5, progress=boom, progress_interval=10)
+
+
+def test_peek_reports_read_geometry(tmp_path):
+    path = write_fastq(tmp_path, ["ACGTACGTACGTACGTACGT"] * 50)
+    p = fastdna.peek(str(path))
+    assert p.n_reads_sampled == 50
+    assert p.read_length == (20, 20, 20)
+    assert 0.0 <= p.gc_content <= 1.0
+    assert 1 <= p.suggest_k() <= 32
+    assert p.suggest_k() % 2 == 1
+
+
+def test_build_info_reports_avx2(tmp_path):
+    info = fastdna.build_info()
+    assert "version" in info and "avx2" in info
+    assert isinstance(info["avx2"], bool)

@@ -10,6 +10,7 @@ pub mod fastq;
 pub mod ffi;
 pub mod kmer;
 pub mod pipeline;
+pub mod preview;
 pub mod progress;
 pub mod qc;
 pub mod sketch;
