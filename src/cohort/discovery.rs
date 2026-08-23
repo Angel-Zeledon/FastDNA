@@ -1,8 +1,8 @@
 // src/cohort/discovery.rs
 //! Sample discovery: given a directory of FASTQ files, figure out which
 //! files belong to which patient sample, pairing forward/reverse reads
-//! (`_R1`/`_R2`, `_1`/`_2`) into a single sample rather than counting them
-//! as two.
+//! (`_R1`/`_R2`, `_1`/`_2`, and Illumina's `_R1_001`/`_R2_001` demultiplexed
+//! form) into a single sample rather than counting them as two.
 //!
 //! Getting this wrong is silent and catastrophic: a directory of 500
 //! paired patients that gets treated as 1000 half-samples still produces a
@@ -47,7 +47,13 @@ const EXTENSIONS: [&str; 4] = [".fastq.gz", ".fq.gz", ".fastq", ".fq"];
 /// as an exact trailing match on the stem (the filename with its FASTQ
 /// extension already removed) -- never a `contains`, which would also
 /// match a sample id that merely has this text in its middle, such as
-/// `pat_R1_001`.
+/// `genome_R123` (contains the substring `_R1` inside `_R123`, but is not
+/// suffixed by it).
+///
+/// This list alone does not cover Illumina's own demultiplexing output
+/// (`sample_S1_L001_R1_001.fastq.gz`): that stem ends in `_001`, not
+/// `_R1`, so none of these suffixes match it. See `illumina_pair_role`,
+/// which is checked first in `split_sample_id` specifically for that shape.
 const PAIR_SUFFIXES: [(&str, Role); 8] = [
     ("_R1", Role::Forward),
     ("_R2", Role::Reverse),
@@ -73,10 +79,52 @@ fn strip_fastq_extension(filename: &str) -> Option<&str> {
     None
 }
 
-/// Splits a stem into its sample id and, if the stem ends in a
-/// recognized pair suffix, which read of the pair it is. A stem with no
-/// recognized trailing suffix is single-end and keeps its id unchanged.
+/// Recognizes Illumina's demultiplexed FASTQ naming convention --
+/// `<prefix>_R1_<digits>` / `<prefix>_R2_<digits>`, e.g.
+/// `sample_S1_L001_R1_001` -- and splits it into the sample id prefix and
+/// the pair role it names.
+///
+/// This is the single most common real-world FASTQ filename shape, and the
+/// generic trailing-suffix rules in `PAIR_SUFFIXES` cannot see it: the stem
+/// does not *end* in `_R1`/`_R2`, it ends in a numeric run (`_001`, the
+/// lane/set index Illumina's software appends) added after the pair
+/// marker. Without a dedicated rule, `_R1_001` and `_R2_001` files each
+/// fall through as unsuffixed, so they become two single-end samples with
+/// *different* ids and, because neither carries a recognized role, no
+/// orphan warning fires either -- a paired cohort silently becomes twice
+/// as many half-samples.
+///
+/// Deliberately narrow: the run after `_R1_`/`_R2_` must be non-empty and
+/// entirely ASCII digits, and there must be a non-empty prefix before it.
+/// `pat_R1_extra` (a non-numeric trailing part) does not match, and is left
+/// to the generic rules below, which also do not match it (it does not end
+/// in `_R1`), so it correctly stays single-end sample `pat_R1_extra`.
+fn illumina_pair_role(stem: &str) -> Option<(&str, Role)> {
+    for (marker, role) in [("_R1_", Role::Forward), ("_R2_", Role::Reverse)] {
+        if let Some(idx) = stem.rfind(marker) {
+            let prefix = &stem[..idx];
+            let trailing = &stem[idx + marker.len()..];
+            if !prefix.is_empty()
+                && !trailing.is_empty()
+                && trailing.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Some((prefix, role));
+            }
+        }
+    }
+    None
+}
+
+/// Splits a stem into its sample id and, if the stem carries a recognized
+/// pair marker, which read of the pair it is. Tries the Illumina-specific
+/// form first (see `illumina_pair_role`), then falls back to the generic
+/// trailing-suffix rules. A stem matching neither is single-end and keeps
+/// its id unchanged.
 fn split_sample_id(stem: &str) -> (&str, Option<Role>) {
+    if let Some((base, role)) = illumina_pair_role(stem) {
+        return (base, Some(role));
+    }
+
     for (suffix, role) in PAIR_SUFFIXES {
         if let Some(base) = stem.strip_suffix(suffix) {
             if !base.is_empty() {
@@ -284,12 +332,99 @@ mod tests {
     #[test]
     fn suffix_like_text_inside_the_sample_id_does_not_confuse_pairing() {
         // A naive `contains("_R1")` would wrongly treat this as an R1 file
-        // of sample "pat"; only a trailing suffix counts.
+        // of sample "pat"; only a trailing suffix (or the dedicated
+        // Illumina `_R1_<digits>` form, which this is not: "R123" has no
+        // separator after the digit) counts.
+        let d = fixture(&["genome_R123.fastq"]);
+        let s = discover_samples(d.path()).expect("valid");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].sample_id, "genome_R123");
+        assert_eq!(s[0].files.len(), 1);
+        assert!(s[0].orphan_warning.is_empty(), "not a pair suffix, so no orphan to report");
+    }
+
+    // `pat_R1_001.fastq` used to be this suite's example of "suffix-like
+    // text inside the sample id must not be mistaken for a pair suffix",
+    // asserting it was single-end sample `pat_R1_001`. That was the
+    // brief's own mistake, not a real requirement: `_R1_001` is exactly
+    // Illumina's real demultiplexed naming convention, and treating it as
+    // an opaque sample id is what silently turns every real Illumina pair
+    // into two half-samples with no orphan warning (see the module-level
+    // Illumina tests below). The claim is updated here, deliberately, to
+    // match the corrected behaviour: `pat_R1_001` alone is now sample
+    // `pat`, role R1, reported as an orphan because its `_R2_001` mate is
+    // missing.
+    #[test]
+    fn pat_r1_001_alone_is_now_an_orphan_r1_of_sample_pat() {
         let d = fixture(&["pat_R1_001.fastq"]);
         let s = discover_samples(d.path()).expect("valid");
         assert_eq!(s.len(), 1);
-        assert_eq!(s[0].sample_id, "pat_R1_001");
+        assert_eq!(s[0].sample_id, "pat");
         assert_eq!(s[0].files.len(), 1);
-        assert!(s[0].orphan_warning.is_empty(), "not a pair suffix, so no orphan to report");
+        assert!(!s[0].orphan_warning.is_empty(), "an R1 with no R2 mate must not be silent");
+    }
+
+    #[test]
+    fn illumina_r1_r2_001_form_pairs_into_one_sample() {
+        let d = fixture(&[
+            "sample_S1_L001_R1_001.fastq.gz",
+            "sample_S1_L001_R2_001.fastq.gz",
+        ]);
+        let s = discover_samples(d.path()).expect("valid");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].sample_id, "sample_S1_L001");
+        assert_eq!(s[0].files.len(), 2);
+        assert!(s[0].orphan_warning.is_empty());
+        assert!(
+            s[0].files[0].to_string_lossy().contains("_R1_"),
+            "R1 must sort first: {:?}",
+            s[0].files
+        );
+        assert!(
+            s[0].files[1].to_string_lossy().contains("_R2_"),
+            "R2 must sort second: {:?}",
+            s[0].files
+        );
+    }
+
+    #[test]
+    fn illumina_form_with_two_lanes_pairs_each_lane_independently() {
+        let d = fixture(&[
+            "sample_S1_L001_R1_001.fastq.gz",
+            "sample_S1_L001_R2_001.fastq.gz",
+            "sample_S1_L002_R1_001.fastq.gz",
+            "sample_S1_L002_R2_001.fastq.gz",
+        ]);
+        let samples = discover_samples(d.path()).expect("valid");
+        assert_eq!(samples.len(), 2, "got {:?}", samples);
+        assert_eq!(samples[0].sample_id, "sample_S1_L001");
+        assert_eq!(samples[0].files.len(), 2);
+        assert!(samples[0].orphan_warning.is_empty());
+        assert_eq!(samples[1].sample_id, "sample_S1_L002");
+        assert_eq!(samples[1].files.len(), 2);
+        assert!(samples[1].orphan_warning.is_empty());
+    }
+
+    #[test]
+    fn illumina_form_r1_with_no_r2_mate_produces_an_orphan_warning() {
+        let d = fixture(&["sample_S1_L001_R1_001.fastq.gz"]);
+        let s = discover_samples(d.path()).expect("valid");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].sample_id, "sample_S1_L001");
+        assert!(!s[0].orphan_warning.is_empty(), "an orphan must not be silent");
+    }
+
+    #[test]
+    fn illumina_like_but_non_numeric_trailing_part_is_still_single_end() {
+        // `_R1_extra` is not Illumina's `_R1_<digits>` form (the trailing
+        // part is not numeric), and it does not end in the generic `_R1`
+        // suffix either (it ends in `_extra`), so it must stay an opaque,
+        // unsuffixed single-end sample id.
+        let d = fixture(&["pat_R1_extra.fastq"]);
+        let s = discover_samples(d.path()).expect("valid");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].sample_id, "pat_R1_extra");
+        assert_eq!(s[0].files.len(), 1);
+        assert!(s[0].orphan_warning.is_empty(), "not a pair marker, so no orphan to report");
     }
 }
