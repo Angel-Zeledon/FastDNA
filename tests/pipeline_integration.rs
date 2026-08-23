@@ -5,6 +5,10 @@
 //! pipeline previously hand-rolled its own sliding window over a byte-string
 //! helper, which silently disagreed with that logic on `N` bases.
 
+// Integration tests legitimately use `.expect()`/`.unwrap()` to fail fast on
+// setup errors that are not the thing under test.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::io::Cursor;
 
 use fastdna::fastq::FastqReader;

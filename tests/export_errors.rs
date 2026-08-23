@@ -1,5 +1,9 @@
 //! Export failures must name the file that could not be written.
 
+// Integration tests legitimately use `.expect()`/`.unwrap()` to fail fast on
+// setup errors that are not the thing under test.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use fastdna::counter::KmerCounter;
 use fastdna::error::FastDnaError;
 use fastdna::export;

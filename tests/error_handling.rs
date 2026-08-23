@@ -1,5 +1,9 @@
 //! The pipeline must fail loudly and locate the failure, never print and continue.
 
+// Integration tests legitimately use `.expect()`/`.unwrap()` to fail fast on
+// setup errors that are not the thing under test.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::io::{BufRead, Cursor, Read};
 use std::path::Path;
 
@@ -33,7 +37,7 @@ impl Read for FailAfterN {
 impl BufRead for FailAfterN {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         if self.remaining_ok_calls == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "simulated read failure"));
+            return Err(std::io::Error::other("simulated read failure"));
         }
         self.remaining_ok_calls -= 1;
         self.inner.fill_buf()

@@ -27,6 +27,7 @@ pub enum Progress {
 pub type ProgressFn<'a> = Option<&'a (dyn Fn(Progress) + Send + Sync)>;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};

@@ -1,4 +1,10 @@
 // src/main.rs
+
+// main.rs legitimately owns all console output for the CLI binary; the
+// crate-wide clippy denials in Cargo.toml exist to keep the library core
+// silent, not this entry point.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::process::ExitCode;

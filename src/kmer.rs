@@ -88,7 +88,7 @@ mod tests {
         assert_eq!(kmers.len(), 1);
 
         let decoded = decode_kmer(kmers[0], k);
-        assert!(decoded == "ACGT" || decoded == "ACGT");
+        assert_eq!(decoded, "ACGT");
     }
 
     #[test]
