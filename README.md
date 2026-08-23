@@ -428,10 +428,19 @@ The reason is architectural and visible in the source. `KmerCounter`
 (`src/counter.rs`) is an in-memory `FxHashMap<u64, u32>`: every distinct k-mer
 in the sample lives in RAM simultaneously, and there is no minimizer-based
 partitioning and no spill to disk. That is essentially the design Jellyfish
-used in 2011. KMC2 onward (2013), KMC3, and Gerbil all partition k-mers into
-disk-backed buckets by minimizer, which is what lets them process inputs far
-larger than available memory. `src/cms.rs` contains a Count-Min Sketch that
-would support a bounded-memory mode, but it is not wired to anything today.
+used in 2011. `src/cms.rs` contains a Count-Min Sketch that would support a
+bounded-memory mode, but it is not wired to anything today.
+
+**The deeper reason is memory access, not hashing.** KMC2 onward (2013) bins
+k-mers into hundreds of disk-backed buckets by minimizer signature, so only one
+bucket is ever resident; KMC3 then radix-sorts each bucket. FASTK does not use a
+hash table at all — each thread sorts its share of 2-bit-packed k-mers into
+disk partitions and merges them. Both designs are *sequential* in their memory
+access. A large hash table is not: once it outgrows L3 cache, essentially every
+lookup is a cache miss, and no choice of hash function fixes that. FastDNA's
+counter is fast while the table stays cache-resident and degrades sharply once
+it does not — which is why the gap grows with input size rather than staying
+constant.
 
 Three practical consequences:
 
