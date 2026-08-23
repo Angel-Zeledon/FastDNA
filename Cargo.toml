@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "fastdna"
+name = "fastdna_core"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
@@ -32,9 +32,17 @@ arrow = "53.4"
 wasm-bindgen = { version = "0.2", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 
+# Optional dependency (Python). `extension-module` tells the crate not to
+# link libpython, which is correct for an extension module and fatal for the
+# [[bin]] target -- it must sit inside this optional dependency so only the
+# `python` feature (enabled by maturin, never by `cargo build` alone) pulls
+# it in.
+pyo3 = { version = "0.22", features = ["abi3-py38", "extension-module"], optional = true }
+
 [features]
 default = []
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen"]
+python = ["dep:pyo3", "arrow/pyarrow"]
 
 [lints.clippy]
 unwrap_used = "deny"

@@ -7,9 +7,9 @@
 use std::io::{BufRead, Cursor, Read};
 use std::path::Path;
 
-use fastdna::error::FastDnaError;
-use fastdna::fastq::FastqReader;
-use fastdna::pipeline::{process_stream_parallel, PipelineConfig};
+use fastdna_core::error::FastDnaError;
+use fastdna_core::fastq::FastqReader;
+use fastdna_core::pipeline::{process_stream_parallel, PipelineConfig};
 
 fn reader_for(fastq: &str) -> FastqReader<Cursor<Vec<u8>>> {
     FastqReader::new(Cursor::new(fastq.as_bytes().to_vec()))
@@ -202,7 +202,7 @@ fn zero_progress_interval_is_rejected_as_invalid_config() {
         progress_interval: 0,
     };
 
-    let noop = |_: fastdna::progress::Progress| {};
+    let noop = |_: fastdna_core::progress::Progress| {};
     let result = process_stream_parallel(
         reader_for("@r1\nACGT\n+\nIIII\n"),
         bad_config,
@@ -343,7 +343,7 @@ fn cancellation_mid_run_returns_cancelled_not_partial_counts() {
 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_callback = cancel.clone();
-    let trigger_cancel_on_first_progress_event = move |_: fastdna::progress::Progress| {
+    let trigger_cancel_on_first_progress_event = move |_: fastdna_core::progress::Progress| {
         cancel_for_callback.store(true, Ordering::SeqCst);
     };
 
@@ -392,8 +392,8 @@ fn a_panic_in_a_worker_thread_progress_callback_becomes_internal_and_returns() {
     }
 
     let already_panicked = AtomicBool::new(false);
-    let panic_on_first_reads_processed = move |event: fastdna::progress::Progress| {
-        if matches!(event, fastdna::progress::Progress::ReadsProcessed(_))
+    let panic_on_first_reads_processed = move |event: fastdna_core::progress::Progress| {
+        if matches!(event, fastdna_core::progress::Progress::ReadsProcessed(_))
             && !already_panicked.swap(true, Ordering::SeqCst)
         {
             panic!("worker-side progress callback exploded");
@@ -430,7 +430,7 @@ fn a_panic_in_a_worker_thread_progress_callback_becomes_internal_and_returns() {
 #[test]
 fn a_panicking_progress_callback_becomes_an_internal_error() {
     let fastq = "@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nTTGCAACG\n+\nIIIIIIII\n";
-    let panics = |_: fastdna::progress::Progress| panic!("progress callback exploded");
+    let panics = |_: fastdna_core::progress::Progress| panic!("progress callback exploded");
 
     let result = process_stream_parallel(reader_for(fastq), config(4), Path::new("sample.fastq"), Some(&panics), None);
 

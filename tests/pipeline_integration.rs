@@ -11,9 +11,9 @@
 
 use std::io::Cursor;
 
-use fastdna::fastq::FastqReader;
-use fastdna::kmer;
-use fastdna::pipeline::{process_stream_parallel, PipelineConfig};
+use fastdna_core::fastq::FastqReader;
+use fastdna_core::kmer;
+use fastdna_core::pipeline::{process_stream_parallel, PipelineConfig};
 
 /// Builds a reader over an in-memory FASTQ payload.
 fn reader_for(fastq: &str) -> FastqReader<Cursor<Vec<u8>>> {
@@ -114,8 +114,8 @@ fn pipeline_agrees_with_kmer_module_across_a_batch() {
 #[test]
 fn progress_callback_receives_a_final_event() {
     use std::sync::{Arc, Mutex};
-    use fastdna::progress::Progress;
-    use fastdna::pipeline::PipelineConfig;
+    use fastdna_core::progress::Progress;
+    use fastdna_core::pipeline::PipelineConfig;
 
     // Exactly 250 reads, asserted below as a literal -- not derived from the
     // pipeline's own report of itself, which would make the assertion
@@ -173,7 +173,7 @@ fn progress_callback_receives_a_final_event() {
 #[test]
 fn silent_and_observed_runs_agree() {
     let fastq = "@r1\nACGTACGTAC\n+\nIIIIIIIIII\n@r2\nTTGCAACGTT\n+\nIIIIIIIIII\n";
-    let noop = |_: fastdna::progress::Progress| {};
+    let noop = |_: fastdna_core::progress::Progress| {};
 
     let (silent, _, _) =
         process_stream_parallel(reader_for(fastq), config(5), std::path::Path::new("<memory>"), None, None)

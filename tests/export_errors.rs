@@ -4,9 +4,9 @@
 // setup errors that are not the thing under test.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use fastdna::counter::KmerCounter;
-use fastdna::error::FastDnaError;
-use fastdna::export;
+use fastdna_core::counter::KmerCounter;
+use fastdna_core::error::FastDnaError;
+use fastdna_core::export;
 
 fn small_counter() -> KmerCounter {
     let mut c = KmerCounter::new();

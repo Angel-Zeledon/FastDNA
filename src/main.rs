@@ -13,12 +13,12 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use flate2::read::MultiGzDecoder;
 
-use fastdna::cli::Cli;
-use fastdna::error::{FastDnaError, Result};
-use fastdna::export;
-use fastdna::fastq::FastqReader;
-use fastdna::pipeline::{process_stream_parallel, PipelineConfig};
-use fastdna::progress::Progress;
+use fastdna_core::cli::Cli;
+use fastdna_core::error::{FastDnaError, Result};
+use fastdna_core::export;
+use fastdna_core::fastq::FastqReader;
+use fastdna_core::pipeline::{process_stream_parallel, PipelineConfig};
+use fastdna_core::progress::Progress;
 
 fn main() -> ExitCode {
     let args = Cli::parse();

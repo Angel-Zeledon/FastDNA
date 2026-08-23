@@ -13,9 +13,9 @@
 use std::io::Cursor;
 use std::path::Path;
 
-use fastdna::error::FastDnaError;
-use fastdna::fastq::FastqReader;
-use fastdna::pipeline::{process_stream_parallel, PipelineConfig};
+use fastdna_core::error::FastDnaError;
+use fastdna_core::fastq::FastqReader;
+use fastdna_core::pipeline::{process_stream_parallel, PipelineConfig};
 
 fn reader_for(fastq: &[u8]) -> FastqReader<Cursor<Vec<u8>>> {
     FastqReader::new(Cursor::new(fastq.to_vec()))

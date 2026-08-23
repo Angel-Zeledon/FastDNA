@@ -6,6 +6,8 @@ pub mod counter;
 pub mod error;
 pub mod export;
 pub mod fastq;
+#[cfg(feature = "python")]
+pub mod ffi;
 pub mod kmer;
 pub mod pipeline;
 pub mod progress;

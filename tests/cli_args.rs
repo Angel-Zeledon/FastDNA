@@ -2,7 +2,7 @@
 //! binary, so they stay fast and need no extra dev-dependencies.
 
 use clap::Parser;
-use fastdna::cli::Cli;
+use fastdna_core::cli::Cli;
 
 #[test]
 fn max_count_defaults_to_no_upper_bound() {
