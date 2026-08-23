@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship FastDNA v1 — `pip install fastdna` works on Linux, macOS and Windows with no Rust toolchain, and `fastdna.count(...)` returns Arrow data in-process.
+**Goal:** Prove the packaging and the FFI boundary on five platforms. This phase is NOT the public v1 release — it is the risk-retirement step that must succeed before the cohort engine and KmerVectorizer are built on top of it. Nothing here is published to PyPI.
 
 **Architecture:** Add PyO3 behind an optional `python` Cargo feature (mirroring the existing `wasm` feature), expose a deliberately small FFI surface in `src/ffi.rs`, and put all ergonomics in a thin pure-Python package under `python/fastdna/`. Build abi3 wheels in GitHub Actions with `maturin-action`.
 
