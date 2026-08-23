@@ -241,6 +241,21 @@ pub fn discover_samples(dir: &Path) -> Result<Vec<SampleFiles>> {
                  processing as single-end",
                 group.reverse
             )
+        } else if group.forward.len() != group.reverse.len() {
+            // Both sides are non-empty here (the two branches above cover
+            // "one side empty"), but an unequal count -- e.g. 2 R1 files
+            // and 1 R2 -- means at least one R1/R2 file has no actual
+            // mate, even though neither list is empty. The two branches
+            // above alone would let this through with an empty
+            // orphan_warning, silently.
+            format!(
+                "sample '{sample_id}': found {} R1 file(s) {:?} and {} R2 file(s) {:?} -- \
+                 unequal counts, so not every file has a matching mate",
+                group.forward.len(),
+                group.forward,
+                group.reverse.len(),
+                group.reverse
+            )
         } else {
             String::new()
         };
@@ -299,6 +314,21 @@ mod tests {
         let s = discover_samples(d.path()).expect("valid");
         assert_eq!(s.len(), 1);
         assert!(!s[0].orphan_warning.is_empty(), "an orphan must not be silent");
+    }
+
+    #[test]
+    fn unequal_r1_r2_counts_are_warned_about_not_silently_accepted() {
+        // Two R1 files (same sample id, different extensions) and only one
+        // R2 file: neither "forward empty" nor "reverse empty" branch
+        // fires, since both lists are non-empty, so without an explicit
+        // count check this fell through to an empty orphan_warning even
+        // though one of the two R1 files provably has no mate.
+        let d = fixture(&["pat_001_R1.fastq", "pat_001_R1.fq.gz", "pat_001_R2.fastq"]);
+        let s = discover_samples(d.path()).expect("valid");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].sample_id, "pat_001");
+        assert_eq!(s[0].files.len(), 3);
+        assert!(!s[0].orphan_warning.is_empty(), "unequal R1/R2 counts must not be silent");
     }
 
     #[test]
