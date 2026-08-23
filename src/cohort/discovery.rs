@@ -207,9 +207,17 @@ pub fn discover_samples(dir: &Path) -> Result<Vec<SampleFiles>> {
             continue;
         };
         let (sample_id, role) = split_sample_id(stem);
-        if sample_id.is_empty() {
-            continue;
-        }
+        // `sample_id` can never be empty here and does not need a runtime
+        // check for it: `strip_fastq_extension` only ever returns a
+        // non-empty `stem`, and every return path in `split_sample_id`
+        // (the Illumina rule, each `PAIR_SUFFIXES` entry, and the
+        // unsuffixed fallback, which is `stem` itself) explicitly requires
+        // its result to be non-empty before returning it. The
+        // `debug_assert` documents that invariant and catches a future
+        // regression in either helper in tests/debug builds, without a
+        // dead `if sample_id.is_empty() { continue }` that can never
+        // actually run.
+        debug_assert!(!sample_id.is_empty(), "split_sample_id must never return an empty sample id");
 
         let group = groups.entry(sample_id.to_string()).or_default();
         match role {
