@@ -21,9 +21,7 @@ indicatif = "0.17"
 # Concurrency and data structures
 rayon = "1.10"
 crossbeam-channel = "0.5"
-dashmap = "5.5"
 rustc-hash = "2.0"
-ahash = "0.8"
 
 # File processing and ML
 flate2 = "1.0"
