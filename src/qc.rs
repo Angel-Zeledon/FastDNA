@@ -61,9 +61,19 @@ impl QcSummary {
 
         let file = File::create(path).map_err(to_err)?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, self).map_err(|e| FastDnaError::Io {
-            path: path.to_path_buf(),
-            source: std::io::Error::other(e),
+        // `serde_json::Error` conflates two distinct failure kinds: an
+        // underlying I/O error propagated up from the writer (`is_io()`
+        // true), and a genuine serialization failure (a type that cannot be
+        // represented, `is_io()` false). Only the former belongs in `Io`,
+        // which promises `source()` returns the actual `std::io::Error`;
+        // wrapping a serialization failure in a synthetic `io::Error::other`
+        // is exactly the laundering `FastDnaError::Export` exists to avoid.
+        serde_json::to_writer_pretty(&mut writer, self).map_err(|e| {
+            if e.is_io() {
+                FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
+            } else {
+                FastDnaError::Export { path: path.to_path_buf(), reason: e.to_string() }
+            }
         })?;
         writer.flush().map_err(to_err)?;
         Ok(())
