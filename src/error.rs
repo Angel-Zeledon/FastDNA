@@ -24,6 +24,8 @@ pub enum FastDnaError {
     Internal { detail: String },
     /// A configuration value supplied by the caller is not usable.
     InvalidConfig { parameter: &'static str, reason: String },
+    /// Serialization or writer failure while exporting results.
+    Export { path: PathBuf, reason: String },
 }
 
 impl fmt::Display for FastDnaError {
@@ -65,6 +67,9 @@ impl fmt::Display for FastDnaError {
             }
             FastDnaError::InvalidConfig { parameter, reason } => {
                 write!(f, "invalid configuration for {parameter}: {reason}")
+            }
+            FastDnaError::Export { path, reason } => {
+                write!(f, "export failed for {}: {reason}", path.display())
             }
         }
     }
