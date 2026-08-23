@@ -12,3 +12,6 @@ pub mod progress;
 pub mod qc;
 pub mod sketch;
 pub mod wasm;
+
+pub use error::{FastDnaError, Result};
+pub use progress::{Progress, ProgressFn};
