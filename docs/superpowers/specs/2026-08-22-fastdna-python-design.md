@@ -92,6 +92,19 @@ One core, three clients:
 - Every public function returns `Result<T, FastDnaError>`.
 - Progress is emitted through a `Fn(Progress)` callback; each client decides what
   to do with it (CLI → indicatif, Python → tqdm or nothing, WASM → ignore).
+- Long-running work accepts an optional cancellation token, `Option<&AtomicBool>`,
+  checked once per batch. When set, the call unwinds cleanly and returns
+  `FastDnaError::Cancelled`.
+
+**Why cancellation is a token and not a callback return value.** The obvious
+alternative is `Fn(Progress) -> ControlFlow<()>`, letting the progress consumer ask
+to stop. It was rejected: the callback only fires when a progress interval is
+crossed — 100,000 reads by default — so cancellation would be slow to take effect,
+and it would not work at all for a caller that passed no callback. A token is
+checked every batch (~8,000 reads), is independent of progress, and can be flipped
+from another thread. In Python, the main thread calls `PyErr_CheckSignals` and sets
+the flag, which is what turns a Ctrl-C in Jupyter into a real interruption rather
+than a four-minute wait.
 
 This separation is what prevents the current bug from recurring: the biological
 logic lives in exactly one place and all three clients share it.
@@ -601,6 +614,28 @@ deciding to emit raw counts.
 - **Progress via optional callback**; without one, total silence. `indicatif` does
   not cross the boundary — its ANSI codes are visual garbage in a Jupyter cell.
 - **Zero-copy Arrow** via the `arrow` crate's `pyarrow` feature (C Data Interface).
+- **Ctrl-C works.** The binding spawns a watcher that calls `PyErr_CheckSignals` and
+  sets the cancellation token; the core returns `Cancelled`, which the binding raises
+  as `KeyboardInterrupt`. Without this, releasing the GIL means the interpreter
+  records the signal and can do nothing with it until the call returns.
+
+### Callback contract — binding authors must read this
+
+The callback is invoked **concurrently and re-entrantly from several rayon worker
+threads at once**, which has two consequences the binding must handle:
+
+1. **`ReadsProcessed` values can arrive out of order.** The counter is atomic, but
+   delivery to the callback is not serialized: a worker can cross 200,000, be
+   preempted, and have another worker's 300,000 delivered first. `tqdm` is not
+   thread-safe and would render a bar that jumps backwards. The binding serializes
+   events itself.
+2. **Each invocation must re-acquire the GIL** with `Python::with_gil`, inside a
+   call that released it with `py.allow_threads`. Forgetting the release deadlocks
+   every worker on the GIL.
+
+A panic inside the callback — including a Python exception surfacing as one — is
+caught by the worker's `catch_unwind` and returned as `Internal`, never allowed to
+unwind across the FFI boundary.
 
 ---
 
@@ -639,6 +674,26 @@ manylinux x86_64 · manylinux aarch64 · macOS x86_64 · macOS arm64 · Windows 
 Built in GitHub Actions with `maturin-action` (which brings manylinux containers
 and ARM cross-compilation). `compile.bat` and the manual copying of the `.exe`
 into `bin/` go away.
+
+### The unwind strategy must be pinned
+
+`Cargo.toml` pins the release profile explicitly:
+
+```toml
+[profile.release]
+# Required, not cosmetic: catch_unwind is a no-op under panic = "abort".
+# The pipeline relies on catch_unwind to convert a panicking worker -- including a
+# panicking Python progress callback -- into FastDnaError::Internal instead of
+# unwinding across the FFI boundary, which is undefined behaviour. Setting abort
+# here would make a worker panic kill the host Python process with no traceback,
+# and no test would fail, because the suite does not run under this profile.
+panic = "unwind"
+```
+
+Wheel-build profiles routinely set `panic = "abort"` to shrink binaries, so this is
+a realistic accident rather than a hypothetical one, and it is the kind of change
+nobody would connect to the consequence. The cost of pinning is a few KB of unwind
+tables per wheel.
 
 ### PyO3 behind an optional feature
 
@@ -685,6 +740,10 @@ pub enum FastDnaError {
     MatrixTooLarge { estimated_bytes: u64, limit: u64 },
     VocabTooLarge { estimated_bytes: u64, limit: u64 },
     MismatchedK { left: usize, right: usize },
+    InvalidConfig { parameter: &'static str, reason: String },
+    Export { path: PathBuf, reason: String },
+    Cancelled,
+    Internal { detail: String },
 }
 ```
 
@@ -694,8 +753,19 @@ Translation per client:
 |---|---|---|
 | `Io` | `FileNotFoundError` / `OSError` | message + nonzero exit |
 | `MalformedFastq` | `ValueError` with path and record number | same |
-| `InvalidK`, `MismatchedK` | `ValueError` | same |
+| `InvalidK`, `MismatchedK`, `InvalidConfig` | `ValueError` | same |
 | `MatrixTooLarge`, `VocabTooLarge` | `MemoryError` with size and suggestion | same |
+| `Export` | `RuntimeError` (a writer/serialization failure, not I/O) | same |
+| `Cancelled` | `KeyboardInterrupt` | message + nonzero exit |
+| `Internal` | `RuntimeError` — indicates a bug in FastDNA | same |
+
+`Export` exists so Arrow and Parquet failures are not laundered into `Io`. A Parquet
+schema mismatch is not a disk problem; mapping it to `OSError` would be wrong, and
+correcting that after the Python surface ships would be a breaking change.
+
+`InvalidConfig` covers caller mistakes that are not about `k` — `num_threads == 0`
+being the one that matters, since zero worker tasks means the channel never
+disconnects and the run hangs forever.
 
 Malformed-FASTQ errors include path and record number: in a 500-file cohort,
 "parse error" with no location is useless.
