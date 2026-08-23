@@ -142,30 +142,110 @@ impl GenomeSketch {
         Ok(Self { sketch_size, k, hashes: min_set.into_iter().collect() })
     }
 
-    pub fn jaccard_similarity(&self, other: &GenomeSketch) -> f64 {
-        assert_eq!(self.k, other.k, "k-mer sizes must match");
+    /// Estimates the Jaccard similarity `|A ∩ B| / |A ∪ B|` between the two
+    /// sketches' underlying k-mer sets: symmetric, and penalized by size
+    /// differences between the genomes being compared -- a small viral
+    /// genome compared against a large metagenomic sample scores near zero
+    /// under this metric even when the virus is entirely present in the
+    /// sample. See `containment` for the question that actually answers.
+    ///
+    /// Returns `Err(FastDnaError::MismatchedK)` rather than panicking when
+    /// `self.k != other.k`: comparing sketches built with different k has
+    /// no biological meaning, so it must fail, but a `Result` failure
+    /// crosses the eventual PyO3 boundary as a `ValueError`, whereas a
+    /// panic crosses it as an unrecoverable `pyo3_runtime.PanicException`.
+    pub fn jaccard(&self, other: &GenomeSketch) -> Result<f64> {
+        if self.k != other.k {
+            return Err(FastDnaError::MismatchedK { left: self.k, right: other.k });
+        }
+
+        // Bounded by the smaller of the two sketch sizes: a bottom-k
+        // estimate over the union is only valid up to the point where
+        // *both* sketches would still contain every hash that small, so
+        // capping by `self.sketch_size` alone (the original behaviour)
+        // would overcount the union when the two sketches were built with
+        // different sizes.
+        let cap = self.sketch_size.min(other.sketch_size);
+
         let mut i = 0;
         let mut j = 0;
         let mut intersection = 0usize;
         let mut union_count = 0usize;
 
-        while i < self.hashes.len() && j < other.hashes.len() && union_count < self.sketch_size {
-            if self.hashes[i] == other.hashes[j] {
-                intersection += 1;
-                i += 1;
-                j += 1;
-            } else if self.hashes[i] < other.hashes[j] {
-                i += 1;
-            } else {
-                j += 1;
+        while i < self.hashes.len() && j < other.hashes.len() && union_count < cap {
+            match self.hashes[i].cmp(&other.hashes[j]) {
+                std::cmp::Ordering::Equal => {
+                    intersection += 1;
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
             }
             union_count += 1;
         }
 
         if union_count == 0 {
-            0.0
+            Ok(0.0)
         } else {
-            intersection as f64 / union_count as f64
+            Ok(intersection as f64 / union_count as f64)
+        }
+    }
+
+    /// Estimates containment: what fraction of `self`'s k-mers also appear
+    /// in `other`. Asymmetric by design -- `A.containment(B)` and
+    /// `B.containment(A)` answer different questions, and clinically the
+    /// one that matters is usually "is this pathogen (small, `self`)
+    /// present in this metagenomic sample (large, `other`)", which is a
+    /// containment question, not a similarity one: Jaccard would penalize
+    /// the size mismatch between the two and report near zero even when the
+    /// pathogen is entirely present.
+    ///
+    /// Only the portion of `self`'s sketch that `other`'s sketch can
+    /// actually attest to is used. If `other`'s sketch is full (holds
+    /// exactly `other.sketch_size` hashes), it has already discarded every
+    /// hash above its current maximum -- a `self` hash above that ceiling
+    /// cannot be judged present or absent in `other`, only "not observed
+    /// within the sketch", so it is excluded from both the numerator and
+    /// the denominator rather than being counted as a miss. This is the
+    /// standard bounded-MinHash containment estimator (as used by e.g. Mash
+    /// Screen), needed precisely because only `other`'s own bottom-k sketch
+    /// is available here, not its full k-mer set.
+    ///
+    /// Same `MismatchedK` behaviour as `jaccard`: comparing sketches built
+    /// with different `k` has no biological meaning, so this fails as a
+    /// `Result` instead of panicking.
+    pub fn containment(&self, other: &GenomeSketch) -> Result<f64> {
+        if self.k != other.k {
+            return Err(FastDnaError::MismatchedK { left: self.k, right: other.k });
+        }
+
+        if self.hashes.is_empty() {
+            return Ok(0.0);
+        }
+
+        let ceiling = if other.hashes.len() >= other.sketch_size {
+            other.hashes.last().copied().unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
+
+        let mut resolvable = 0usize;
+        let mut shared = 0usize;
+        for &h in &self.hashes {
+            if h > ceiling {
+                continue;
+            }
+            resolvable += 1;
+            if other.hashes.binary_search(&h).is_ok() {
+                shared += 1;
+            }
+        }
+
+        if resolvable == 0 {
+            Ok(0.0)
+        } else {
+            Ok(shared as f64 / resolvable as f64)
         }
     }
 }
@@ -198,7 +278,7 @@ mod tests {
         let a = GenomeSketch::from_kmers(&kmers, 256, 21);
         let b = GenomeSketch::from_kmers(&kmers, 256, 21);
 
-        let j = a.jaccard_similarity(&b);
+        let j = a.jaccard(&b).expect("same k must not error");
         assert_eq!(j, 1.0, "a sketch compared with itself must be exactly 1.0");
     }
 
@@ -209,7 +289,7 @@ mod tests {
         let a = GenomeSketch::from_kmers(&a_kmers, 256, 21);
         let b = GenomeSketch::from_kmers(&b_kmers, 256, 21);
 
-        let j = a.jaccard_similarity(&b);
+        let j = a.jaccard(&b).expect("same k must not error");
         assert_eq!(j, 0.0, "no shared k-mer means no shared hash, so intersection must be exactly zero");
     }
 
@@ -233,7 +313,7 @@ mod tests {
         let a = GenomeSketch::from_kmers(&a_kmers, sketch_size, 21);
         let b = GenomeSketch::from_kmers(&b_kmers, sketch_size, 21);
 
-        let estimate = a.jaccard_similarity(&b);
+        let estimate = a.jaccard(&b).expect("same k must not error");
         let true_jaccard = 50_000.0 / 150_000.0;
         let tolerance = 0.09;
 
@@ -243,16 +323,54 @@ mod tests {
         );
     }
 
+    /// Demonstrates why both `jaccard` and `containment` exist. `a` is a
+    /// small genome (50 distinct k-mers) wholly contained within `b`, a
+    /// larger sample (500 distinct k-mers, 0..500, which by construction
+    /// includes all of `a`'s 0..50). `sketch_size` is chosen larger than
+    /// either set so both sketches capture their full k-mer set with no
+    /// truncation -- this makes both `jaccard` and `containment` exact set
+    /// arithmetic here (not merely close estimates), which is the clean,
+    /// deterministic way to demonstrate the *shape* of the difference
+    /// between the two metrics rather than fighting estimator noise on top
+    /// of it.
     #[test]
-    fn finalize_hash_is_a_bijection_on_a_sample_of_inputs() {
-        // A weak/linear finalizer (the original `wrapping_mul`) can map
-        // distinct inputs to the same output when they share low bits with
-        // the multiplier; splitmix64's mixer must not, over a reasonably
-        // sized sample. This directly targets the failure mode the task
-        // calls out: "a weak hash clusters values and biases the estimate".
-        let mut seen = std::collections::HashSet::new();
-        for kmer in 0u64..10_000 {
-            assert!(seen.insert(finalize_hash(kmer)), "collision at input {kmer}");
+    fn containment_is_asymmetric_where_jaccard_is_low() {
+        let a_kmers: Vec<u64> = (0..50).collect();
+        let b_kmers: Vec<u64> = (0..500).collect();
+        let sketch_size = 1_000;
+
+        let a = GenomeSketch::from_kmers(&a_kmers, sketch_size, 21);
+        let b = GenomeSketch::from_kmers(&b_kmers, sketch_size, 21);
+
+        let a_in_b = a.containment(&b).expect("same k must not error");
+        let b_in_a = b.containment(&a).expect("same k must not error");
+        let jaccard = a.jaccard(&b).expect("same k must not error");
+
+        assert_eq!(a_in_b, 1.0, "a is wholly inside b, so containment(a, b) must be 1.0: {a_in_b}");
+        assert_eq!(b_in_a, 0.1, "only 50 of b's 500 k-mers are shared, so containment(b, a) must be 50/500: {b_in_a}");
+        assert_eq!(jaccard, 0.1, "|a ∩ b| / |a ∪ b| = 50 / 500 here, same value as b_in_a by coincidence of these numbers, but computed independently");
+        assert!(a_in_b > b_in_a, "containment must be asymmetric: a_in_b={a_in_b} must exceed b_in_a={b_in_a}");
+    }
+
+    #[test]
+    fn mismatched_k_is_an_error_not_a_panic() {
+        let a = GenomeSketch::from_kmers(&[1, 2, 3], 256, 21);
+        let b = GenomeSketch::from_kmers(&[1, 2, 3], 256, 31);
+
+        match a.jaccard(&b) {
+            Err(FastDnaError::MismatchedK { left, right }) => {
+                assert_eq!(left, 21);
+                assert_eq!(right, 31);
+            }
+            other => panic!("expected Err(MismatchedK), got {other:?}"),
+        }
+
+        match a.containment(&b) {
+            Err(FastDnaError::MismatchedK { left, right }) => {
+                assert_eq!(left, 21);
+                assert_eq!(right, 31);
+            }
+            other => panic!("expected Err(MismatchedK), got {other:?}"),
         }
     }
 
@@ -302,6 +420,19 @@ mod tests {
         match err {
             FastDnaError::MalformedFastq { record, .. } => assert_eq!(record, 2),
             other => panic!("expected MalformedFastq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_hash_is_a_bijection_on_a_sample_of_inputs() {
+        // A weak/linear finalizer (the original `wrapping_mul`) can map
+        // distinct inputs to the same output when they share low bits with
+        // the multiplier; splitmix64's mixer must not, over a reasonably
+        // sized sample. This directly targets the failure mode the task
+        // calls out: "a weak hash clusters values and biases the estimate".
+        let mut seen = std::collections::HashSet::new();
+        for kmer in 0u64..10_000 {
+            assert!(seen.insert(finalize_hash(kmer)), "collision at input {kmer}");
         }
     }
 }
