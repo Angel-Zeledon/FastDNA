@@ -74,7 +74,12 @@ impl From<FastDnaError> for PyErr {
             // but a caller-supplied bad directory is the same kind of
             // mistake as InvalidConfig, so it gets the same treatment
             // rather than being left an unclassified RuntimeError.
-            | FastDnaError::NoSamplesFound { .. } => PyValueError::new_err(err.to_string()),
+            | FastDnaError::NoSamplesFound { .. }
+            // Also not in the spec's table (predates GenomeSketch
+            // persistence). A corrupt/foreign sketch file is bad input
+            // data, the same kind of mistake as a malformed FASTQ record,
+            // not an internal failure -- ValueError, not RuntimeError.
+            | FastDnaError::Load { .. } => PyValueError::new_err(err.to_string()),
             FastDnaError::MatrixTooLarge { .. } | FastDnaError::VocabTooLarge { .. } => {
                 PyMemoryError::new_err(err.to_string())
             }

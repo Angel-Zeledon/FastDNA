@@ -26,6 +26,13 @@ pub enum FastDnaError {
     InvalidConfig { parameter: &'static str, reason: String },
     /// Serialization or writer failure while exporting results.
     Export { path: PathBuf, reason: String },
+    /// A file that was supposed to be a previously-saved artifact (e.g. a
+    /// `GenomeSketch` written by `save`) could not be read back -- corrupt
+    /// JSON, a foreign file, or data that fails the loader's own
+    /// consistency checks. Deliberately distinct from `Export`: an error
+    /// while reading must never claim to be an error while writing, which
+    /// is what reusing `Export` for both would tell a caller.
+    Load { path: PathBuf, reason: String },
     /// The caller asked to stop before the work finished.
     ///
     /// Not an error in the "something broke" sense -- it is a normal
@@ -76,6 +83,9 @@ impl fmt::Display for FastDnaError {
             }
             FastDnaError::Export { path, reason } => {
                 write!(f, "export failed for {}: {reason}", path.display())
+            }
+            FastDnaError::Load { path, reason } => {
+                write!(f, "load failed for {}: {reason}", path.display())
             }
             FastDnaError::Cancelled => write!(f, "operation cancelled by caller"),
         }

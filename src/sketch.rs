@@ -274,11 +274,11 @@ impl GenomeSketch {
         Ok(())
     }
 
-    /// Loads a sketch previously written by `save`. Uses `FastDnaError::Export`
-    /// for a corrupt/foreign file, the same variant `save` uses for a
-    /// serialization failure -- there is no dedicated "read" error taxonomy
-    /// entry, and this is the closest existing one to "the JSON layer
-    /// failed for a reason that is not a bare I/O error".
+    /// Loads a sketch previously written by `save`. Uses `FastDnaError::Load`
+    /// for a corrupt/foreign file: it used to reuse `Export`, which
+    /// `error.rs` renders as "export failed for {path}", telling a caller
+    /// that writing failed when what actually failed was reading. `Load`
+    /// names the operation honestly instead.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
@@ -289,7 +289,7 @@ impl GenomeSketch {
             if e.is_io() {
                 FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
             } else {
-                FastDnaError::Export { path: path.to_path_buf(), reason: e.to_string() }
+                FastDnaError::Load { path: path.to_path_buf(), reason: e.to_string() }
             }
         })
     }
@@ -512,6 +512,24 @@ mod tests {
         match GenomeSketch::load(&path) {
             Err(FastDnaError::Io { .. }) => {}
             other => panic!("expected Err(Io), got {other:?}"),
+        }
+    }
+
+    /// A corrupt/foreign file must surface as `FastDnaError::Load`, not
+    /// `Export` -- `error.rs` renders `Export` as "export failed for
+    /// {path}", which would tell a caller that *writing* failed while
+    /// *loading* is what actually failed.
+    #[test]
+    fn load_of_a_corrupt_file_is_a_load_error_not_an_export_error() {
+        let path = std::env::temp_dir().join("fastdna_sketch_corrupt_test.sig");
+        std::fs::write(&path, b"not valid json { at all").unwrap();
+
+        let err = GenomeSketch::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        match err {
+            Err(FastDnaError::Load { .. }) => {}
+            other => panic!("expected Err(Load), got {other:?}"),
         }
     }
 
