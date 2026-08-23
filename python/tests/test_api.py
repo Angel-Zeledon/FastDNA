@@ -32,3 +32,28 @@ def test_zero_threads_raises_valueerror_not_hang(tmp_path):
     path = write_fastq(tmp_path, ["ACGTACGTAC"] * 100)
     with pytest.raises(ValueError):
         fastdna.count(str(path), k=5, threads=0)
+
+
+def test_progress_receives_events(tmp_path):
+    path = write_fastq(tmp_path, ["ACGTACGTAC"] * 500)
+    seen = []
+    fastdna.count(str(path), k=5, progress=seen.append, progress_interval=10)
+    assert len(seen) > 1, "expected several progress events"
+
+
+def test_progress_counts_are_monotonic_for_the_consumer(tmp_path):
+    path = write_fastq(tmp_path, ["ACGTACGTAC"] * 2000)
+    seen = []
+    fastdna.count(str(path), k=5, progress=seen.append, progress_interval=10, threads=4)
+    reads = [e for e in seen if isinstance(e, int)]
+    assert reads == sorted(reads), "adapter must serialize out-of-order worker events"
+
+
+def test_a_panicking_callback_becomes_runtimeerror(tmp_path):
+    path = write_fastq(tmp_path, ["ACGTACGTAC"] * 500)
+
+    def boom(_):
+        raise ValueError("callback exploded")
+
+    with pytest.raises(RuntimeError):
+        fastdna.count(str(path), k=5, progress=boom, progress_interval=10)

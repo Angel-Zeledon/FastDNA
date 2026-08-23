@@ -8,6 +8,7 @@ the Rust/Python boundary, per the packaging design (docs/superpowers/specs/
 """
 
 from . import _core
+from ._progress import make_progress_adapter
 
 __version__ = _core.__version__
 
@@ -50,14 +51,42 @@ class KmerCounts:
         return f"KmerCounts(distinct={self.distinct_kmers}, total={self.total_kmers})"
 
 
-def count(path, *, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None):
+def count(
+    path,
+    *,
+    k=31,
+    min_count=1,
+    max_count=None,
+    min_quality=20.0,
+    threads=None,
+    progress=None,
+    progress_interval=100_000,
+):
     """Count canonical k-mers in a single FASTQ(.gz) file.
 
     `threads=None` uses the core's own default thread count. Passing
     `threads=0` explicitly raises `ValueError` rather than hanging -- the
     core guards against the zero-worker-tasks deadlock described in the
     design doc's error-handling section (§12, `InvalidConfig`).
+
+    `progress` accepts `None` (silent, the default -- a library does not
+    write to stdout unasked), `True` (drives a `tqdm` bar if `tqdm` is
+    installed), or a callable receiving each event. The callback is invoked
+    concurrently from several worker threads and its `ReadsProcessed`
+    events can arrive out of order (design doc, "Callback contract"); this
+    function always wraps whatever is passed in a serializing adapter
+    (`fastdna._progress`) before handing it to the Rust core, so neither
+    `tqdm` nor a user callback has to be thread-safe itself.
+
+    `progress_interval` controls how often (in reads) `ReadsProcessed` is
+    emitted. The default matches the core's own default; tests and small
+    inputs should lower it, since a run shorter than the interval never
+    emits a single event.
+
+    Pressing Ctrl-C during a call raises `KeyboardInterrupt` promptly
+    rather than waiting for the run to finish.
     """
+    adapter = make_progress_adapter(progress)
     raw = _core.count(
         str(path),
         k,
@@ -65,5 +94,7 @@ def count(path, *, k=31, min_count=1, max_count=None, min_quality=20.0, threads=
         max_count,
         min_quality,
         threads,
+        adapter,
+        progress_interval,
     )
     return KmerCounts(raw)

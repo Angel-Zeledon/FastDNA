@@ -21,7 +21,10 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use arrow::array::{ArrayRef, StringArray, UInt32Array, UInt64Array};
 use arrow::pyarrow::PyArrowType;
@@ -39,6 +42,7 @@ use crate::export;
 use crate::fastq::FastqReader;
 use crate::kmer;
 use crate::pipeline::{process_stream_parallel, PipelineConfig};
+use crate::progress::Progress;
 use crate::qc::QcSummary;
 
 /// The single place the spec's error-to-exception table (design doc §12) is
@@ -150,6 +154,42 @@ impl PyKmerCounts {
     }
 }
 
+/// Converts a core `Progress` event into the Python object handed to a
+/// user's callback. `ReadsProcessed` becomes a plain Python `int` (so
+/// `isinstance(event, int)` identifies it on the Python side); the other
+/// variants become a small dict tagged by `"event"`. `count()` only ever
+/// emits `ReadsProcessed` and `Finished` today -- the cohort-only variants
+/// are handled here too so this stays correct once `count_cohort` exists.
+fn progress_event_into_py(py: Python<'_>, event: Progress) -> PyObject {
+    match event {
+        Progress::ReadsProcessed(n) => n.into_py(py),
+        Progress::Finished { reads } => {
+            let dict = PyDict::new_bound(py);
+            // `PyDict::set_item` only fails on unhashable keys or a
+            // conversion failure; string keys and integer values can do
+            // neither, so discarding the `Result` here does not hide a
+            // reachable error.
+            let _ = dict.set_item("event", "finished");
+            let _ = dict.set_item("reads", reads);
+            dict.into_py(py)
+        }
+        Progress::SampleStarted { index, total } => {
+            let dict = PyDict::new_bound(py);
+            let _ = dict.set_item("event", "sample_started");
+            let _ = dict.set_item("index", index);
+            let _ = dict.set_item("total", total);
+            dict.into_py(py)
+        }
+        Progress::SampleFinished { index, total } => {
+            let dict = PyDict::new_bound(py);
+            let _ = dict.set_item("event", "sample_finished");
+            let _ = dict.set_item("index", index);
+            let _ = dict.set_item("total", total);
+            dict.into_py(py)
+        }
+    }
+}
+
 /// Opens `path` for streaming, transparently decompressing `.gz` inputs --
 /// the same rule `main.rs` applies for the CLI.
 fn open_fastq_reader(path: &PathBuf) -> Result<FastqReader<Box<dyn BufRead + Send + 'static>>, FastDnaError> {
@@ -173,8 +213,30 @@ fn open_fastq_reader(path: &PathBuf) -> Result<FastqReader<Box<dyn BufRead + Sen
 /// `InvalidConfig` -- it must never be silently folded into the `None`
 /// default, since that would let the documented "zero worker tasks hangs
 /// forever" bug back in through this exact door.
+///
+/// `progress`, if given, is a Python callable invoked concurrently and
+/// re-entrantly from several rayon worker threads at once (design doc,
+/// "Callback contract"). Each invocation re-acquires the GIL with
+/// `Python::with_gil`, inside this function's single `py.allow_threads`
+/// call -- forgetting that release would deadlock every worker on the GIL.
+/// A Python exception raised inside `progress` is turned into a Rust panic
+/// so the worker's own `catch_unwind` (in `pipeline.rs`) catches it and the
+/// call fails with `RuntimeError`, rather than the exception silently
+/// vanishing at the FFI boundary.
+///
+/// `progress_interval` defaults to the core's own default (100,000 reads)
+/// and is exposed as a keyword argument because the default makes progress
+/// untestable against small inputs: a run shorter than the interval never
+/// emits a single `ReadsProcessed` event.
+///
+/// Cancellation: a watcher thread polls `Python::check_signals` (i.e.
+/// `PyErr_CheckSignals`) roughly every 50ms while the GIL is released by
+/// `py.allow_threads`, and sets the shared cancellation flag the moment a
+/// signal (Ctrl-C) is pending. The core notices the flag at its next batch
+/// boundary and returns `FastDnaError::Cancelled`, which `impl From<..>
+/// for PyErr` above maps to `KeyboardInterrupt`.
 #[pyfunction]
-#[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None))]
+#[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=None))]
 #[allow(clippy::too_many_arguments)]
 fn count(
     py: Python<'_>,
@@ -184,25 +246,77 @@ fn count(
     max_count: Option<u32>,
     min_quality: f64,
     threads: Option<usize>,
+    progress: Option<PyObject>,
+    progress_interval: Option<u64>,
 ) -> PyResult<PyKmerCounts> {
     let path_buf = PathBuf::from(path);
     let reader = open_fastq_reader(&path_buf)?;
 
     let num_threads = threads.unwrap_or_else(|| PipelineConfig::default().num_threads);
-    let config = PipelineConfig {
-        k,
-        min_quality,
-        quality_window: 4,
-        batch_size: 10_000,
-        num_threads,
-        progress_interval: PipelineConfig::default().progress_interval,
-    };
+    let progress_interval = progress_interval.unwrap_or_else(|| PipelineConfig::default().progress_interval);
+    // Batches are the unit progress is accounted in (pipeline.rs emits at
+    // most once per batch received, on interval crossing), so a batch far
+    // larger than `progress_interval` would silently coarsen progress no
+    // matter how small the caller asks for it. Capped at the core's own
+    // default batch size so the common case (no explicit interval) is
+    // unaffected.
+    let batch_size = (progress_interval as usize).clamp(1, PipelineConfig::default().batch_size);
+    let config = PipelineConfig { k, min_quality, quality_window: 4, batch_size, num_threads, progress_interval };
+
+    // Wraps the caller's Python callable (if any) as a `ProgressFn`. Owns
+    // `cb: PyObject` by move, so this closure needs no external state beyond
+    // what PyO3's reference-counted handle already provides -- safe to call
+    // from any worker thread, any number of times, concurrently.
+    let progress_closure = progress.map(|cb| {
+        move |event: Progress| {
+            Python::with_gil(|py| {
+                let py_event = progress_event_into_py(py, event);
+                if let Err(e) = cb.call1(py, (py_event,)) {
+                    // A Python exception raised inside the callback must not
+                    // vanish here: turn it into a panic so the enclosing
+                    // worker's `catch_unwind` (pipeline.rs) converts it into
+                    // `FastDnaError::Internal` -> `RuntimeError`, per the
+                    // callback contract.
+                    panic!("progress callback raised a Python exception: {e}");
+                }
+            });
+        }
+    });
+    let progress_ref: crate::progress::ProgressFn<'_> =
+        progress_closure.as_ref().map(|f| f as &(dyn Fn(Progress) + Send + Sync));
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let watcher_stop = Arc::new(AtomicBool::new(false));
+    let watcher_cancel = cancel.clone();
+    let watcher_stop_flag = watcher_stop.clone();
+    let watcher = thread::spawn(move || {
+        // The only way Ctrl-C can interrupt a call blocked in
+        // `py.allow_threads`: the interpreter records a pending SIGINT but
+        // does nothing with it until something holding the GIL calls
+        // `check_signals`, and nothing else does for the whole duration of
+        // that call.
+        while !watcher_stop_flag.load(Ordering::Relaxed) {
+            let interrupted = Python::with_gil(|py| py.check_signals().is_err());
+            if interrupted {
+                watcher_cancel.store(true, Ordering::Relaxed);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
 
     // Released for the duration of the count: without this, a long-running
     // call freezes the calling notebook -- no progress, no Ctrl-C -- for as
     // long as the count takes.
     let outcome: Result<(KmerCounter, QcSummary, u64), FastDnaError> =
-        py.allow_threads(|| process_stream_parallel(reader, config, &path_buf, None, None));
+        py.allow_threads(|| process_stream_parallel(reader, config, &path_buf, progress_ref, Some(cancel.clone())));
+
+    watcher_stop.store(true, Ordering::Relaxed);
+    // The watcher's body cannot itself panic (its only fallible call,
+    // `check_signals`, is handled above), so a join error is unreachable;
+    // propagating it would only risk masking `outcome`'s real error.
+    let _ = watcher.join();
+
     let (mut counter, qc, _total_reads) = outcome?;
 
     // Matches what `main.rs` does: frequency filters are applied in RAM,
