@@ -126,8 +126,18 @@ fn io_read_failure_surfaces_as_io_not_malformed_fastq() {
     let result = process_stream_parallel(reader, config(4), Path::new("cohort/sample.fastq"), None, None);
 
     match result {
-        Err(FastDnaError::Io { path, .. }) => {
+        Err(FastDnaError::Io { path, source }) => {
             assert_eq!(path, Path::new("cohort/sample.fastq"), "must name the source that failed to read");
+            // The whole point of the qc.rs Io/Export split (and of this
+            // variant generally) is that Io must carry the genuine
+            // io::Error, never a synthetic stand-in laundering a different
+            // failure. `FailAfterN::fill_buf` raises `Error::other(..)`, so
+            // that is exactly the kind that must come back out here.
+            assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::Other,
+                "source must be the genuine io::Error the shim produced, got {source:?}"
+            );
         }
         other => panic!("expected Io, got {other:?}"),
     }
