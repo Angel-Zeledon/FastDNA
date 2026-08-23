@@ -26,7 +26,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -298,12 +298,19 @@ fn open_fastq_reader(path: &PathBuf) -> Result<FastqReader<Box<dyn BufRead + Sen
 /// untestable against small inputs: a run shorter than the interval never
 /// emits a single `ReadsProcessed` event.
 ///
-/// Cancellation: a watcher thread polls `Python::check_signals` (i.e.
-/// `PyErr_CheckSignals`) roughly every 50ms while the GIL is released by
-/// `py.allow_threads`, and sets the shared cancellation flag the moment a
-/// signal (Ctrl-C) is pending. The core notices the flag at its next batch
-/// boundary and returns `FastDnaError::Cancelled`, which `impl From<..>
-/// for PyErr` above maps to `KeyboardInterrupt`.
+/// Cancellation: the actual counting runs on its own worker thread; this
+/// function's thread polls that worker for a result roughly every 50ms
+/// and, while waiting, polls `Python::check_signals` (i.e.
+/// `PyErr_CheckSignals`) itself, setting the shared cancellation flag the
+/// moment a signal (Ctrl-C) is pending. That two-thread split is required,
+/// not incidental: `PyErr_CheckSignals` only has an effect when called
+/// from the OS thread the interpreter recognizes as its main thread, and a
+/// call blocked directly inside `process_stream_parallel` would occupy
+/// that thread for the whole run, leaving nothing free to poll. See the
+/// comment at the worker's `thread::spawn` call below for how this was
+/// verified. The core notices the flag at its next batch boundary and
+/// returns `FastDnaError::Cancelled`, which `impl From<..> for PyErr`
+/// above maps to `KeyboardInterrupt`.
 #[pyfunction]
 #[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=None))]
 #[allow(clippy::too_many_arguments)]
@@ -332,67 +339,106 @@ fn count(
     let batch_size = (progress_interval as usize).clamp(1, PipelineConfig::default().batch_size);
     let config = PipelineConfig { k, min_quality, num_threads, batch_size, progress_interval, ..PipelineConfig::default() };
 
-    // Wraps the caller's Python callable (if any) as a `ProgressFn`. Owns
-    // `cb: PyObject` by move, so this closure needs no external state beyond
-    // what PyO3's reference-counted handle already provides -- safe to call
-    // from any worker thread, any number of times, concurrently.
-    let progress_closure = progress.map(|cb| {
-        move |event: Progress| {
-            Python::with_gil(|py| {
-                let py_event = progress_event_into_py(py, event);
-                if let Err(e) = cb.call1(py, (py_event,)) {
-                    // A Python exception raised inside the callback must not
-                    // vanish here: turn it into a panic so the enclosing
-                    // worker's `catch_unwind` (pipeline.rs) converts it into
-                    // `FastDnaError::Internal` -> `RuntimeError`, per the
-                    // callback contract.
-                    panic!("progress callback raised a Python exception: {e}");
-                }
-            });
-        }
-    });
-    let progress_ref: crate::progress::ProgressFn<'_> =
-        progress_closure.as_ref().map(|f| f as &(dyn Fn(Progress) + Send + Sync));
-
     let cancel = Arc::new(AtomicBool::new(false));
-    let watcher_stop = Arc::new(AtomicBool::new(false));
-    let watcher_cancel = cancel.clone();
-    let watcher_stop_flag = watcher_stop.clone();
-    let watcher = thread::spawn(move || {
-        // The only way Ctrl-C can interrupt a call blocked in
-        // `py.allow_threads`: the interpreter records a pending SIGINT but
-        // does nothing with it until something holding the GIL calls
-        // `check_signals`, and nothing else does for the whole duration of
-        // that call.
-        while !watcher_stop_flag.load(Ordering::Relaxed) {
-            let interrupted = Python::with_gil(|py| py.check_signals().is_err());
-            if interrupted {
-                watcher_cancel.store(true, Ordering::Relaxed);
-                break;
+    let cancel_for_worker = cancel.clone();
+    let (result_tx, result_rx) = mpsc::channel::<Result<(KmerCounter, QcSummary, u64), FastDnaError>>();
+
+    // The actual counting runs on its own OS thread, not on the thread that
+    // entered this function. This inversion exists entirely because of a
+    // `PyErr_CheckSignals` constraint verified empirically while building
+    // this (not merely assumed from documentation): CPython only acts on a
+    // pending signal when `PyErr_CheckSignals` is called *from the OS
+    // thread the interpreter recognizes as its main thread* -- calling it
+    // from any other thread, including a dedicated "watcher" thread spawned
+    // solely to poll it, is a silent no-op. An earlier version of this
+    // function did exactly that (a separate watcher thread polling
+    // `check_signals` while this thread blocked inside `process_stream_
+    // parallel`), and Ctrl-C during a real long run was not caught until
+    // the call finished on its own -- confirmed with an instrumented
+    // build, not merely reasoned about. Moving the heavy work to a worker
+    // thread frees up *this* thread -- the one Python actually considers
+    // main, in the ordinary case of `count()` being called from a
+    // notebook's or script's main thread -- to keep polling `check_signals`
+    // itself while the worker runs.
+    //
+    // `progress_closure` is moved into the worker thread whole (rather than
+    // built and borrowed from out here, as a plain watcher-thread design
+    // would do) because `ProgressFn<'_>` is a borrow and `thread::spawn`
+    // requires `'static`; taking the reference inside the worker's own
+    // closure, after the move, satisfies both.
+    let worker_handle = thread::spawn(move || {
+        let progress_closure = progress.map(|cb| {
+            move |event: Progress| {
+                Python::with_gil(|py| {
+                    let py_event = progress_event_into_py(py, event);
+                    if let Err(e) = cb.call1(py, (py_event,)) {
+                        // A Python exception raised inside the callback must
+                        // not vanish here: turn it into a panic so the
+                        // enclosing worker's `catch_unwind` (pipeline.rs)
+                        // converts it into `FastDnaError::Internal` ->
+                        // `RuntimeError`, per the callback contract.
+                        panic!("progress callback raised a Python exception: {e}");
+                    }
+                });
             }
-            thread::sleep(Duration::from_millis(50));
+        });
+        let progress_ref: crate::progress::ProgressFn<'_> =
+            progress_closure.as_ref().map(|f| f as &(dyn Fn(Progress) + Send + Sync));
+
+        let outcome = process_stream_parallel(reader, config, &path_buf, progress_ref, Some(cancel_for_worker));
+        // The receiving end only ever stops listening after it has already
+        // gotten a result (see the loop below), so a failed send here is
+        // unreachable; there is nothing useful to do with that error even
+        // if it somehow occurred.
+        let _ = result_tx.send(outcome);
+    });
+
+    // Released for the duration of the count: without this, a long-running
+    // call freezes the calling notebook -- no progress, no Ctrl-C -- for as
+    // long as the count takes. This closure runs on the thread that called
+    // `count()`, polling for the worker's result without blocking on it
+    // indefinitely, so it can also poll `check_signals` on the one thread
+    // where doing so actually has an effect (see the comment above).
+    let outcome: Result<(KmerCounter, QcSummary, u64), FastDnaError> = py.allow_threads(move || loop {
+        match result_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(outcome) => break outcome,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if Python::with_gil(|py| py.check_signals()).is_err() {
+                    // Setting the flag does not itself produce a result:
+                    // the worker notices it at its next batch boundary and
+                    // returns `Cancelled` on its own, which the next loop
+                    // iteration's `recv_timeout` picks up like any other
+                    // outcome.
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(FastDnaError::Internal {
+                    detail: "count() worker thread ended without sending a result".to_string(),
+                });
+            }
         }
     });
 
-    // Released for the duration of the count *and* the subsequent prune:
-    // without this, a long-running call freezes the calling notebook -- no
-    // progress, no Ctrl-C -- for as long as the count takes, and `prune`
-    // (an O(distinct k-mers) `retain` over the whole table, matching what
-    // `main.rs` does: frequency filters are applied in RAM, after the
-    // pipeline and before the result is handed back) is folded into the
-    // same closure so it does not reopen that window immediately after.
-    let outcome: Result<(KmerCounter, QcSummary, u64), FastDnaError> = py.allow_threads(|| {
-        let (mut counter, qc, total_reads) =
-            process_stream_parallel(reader, config, &path_buf, progress_ref, Some(cancel.clone()))?;
-        counter.prune(min_count, max_count);
-        Ok((counter, qc, total_reads))
-    });
+    // The worker has already sent its result by the time the loop above
+    // observes it, so this returns almost immediately; joining still
+    // matters so the thread is not left detached and running past the end
+    // of this function.
+    let _ = worker_handle.join();
 
-    watcher_stop.store(true, Ordering::Relaxed);
-    // The watcher's body cannot itself panic (its only fallible call,
-    // `check_signals`, is handled above), so a join error is unreachable;
-    // propagating it would only risk masking `outcome`'s real error.
-    let _ = watcher.join();
+    // Prune stays under the same released-GIL window as the count: it is
+    // an O(distinct k-mers) `retain` over the whole table, the same order
+    // of cost as the count itself, so applying it after the GIL is
+    // reacquired would freeze the notebook a second time immediately after
+    // the first. Matches what `main.rs` does: frequency filters are
+    // applied in RAM, after the pipeline and before the result is handed
+    // back.
+    let outcome = py.allow_threads(|| {
+        outcome.map(|(mut counter, qc, total_reads)| {
+            counter.prune(min_count, max_count);
+            (counter, qc, total_reads)
+        })
+    });
 
     let (counter, qc, _total_reads) = outcome?;
 
