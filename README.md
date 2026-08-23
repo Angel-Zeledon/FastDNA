@@ -467,11 +467,21 @@ and another at the real coverage depth, with a valley between them. The
 correct `min_count` threshold sits in that valley, and **it's different for
 every sample** -- there's no universally-correct default like 5.
 `suggest_min_count()` walks the spectrum, follows the initial descent (the
-tail of the error peak) until it reverses, and returns that reversal
-point's depth -- turning "eyeball a histogram" into a function call. It
-falls back to a conservative default (`2`) when the spectrum doesn't carry
-enough signal to find a real valley (too few distinct depths, or a shape
-that never stops/starts decreasing).
+tail of the error peak) down to its lowest point, and returns that valley
+**floor**'s own depth -- since `min_count` is an inclusive lower bound,
+that keeps the floor's k-mers rather than discarding them as noise. A
+single noisy uptick partway down does not by itself end the search: the
+climb back up has to reach at least twice the candidate floor's count
+before it's accepted as the start of a genuine coverage peak, so it takes
+more than one stray depth to fool this into stopping early. Turning
+"eyeball a histogram" into a function call this way is deliberately
+conservative: it falls back to a documented default (`2`) whenever the
+spectrum's shape isn't unambiguous -- too few distinct depths, a descent
+that never finds a lower floor, or one that never climbs back up enough to
+look like a real second peak -- because a confidently wrong threshold here
+is worse than no suggestion at all. See
+[`python/fastdna/spectrum.py`](python/fastdna/spectrum.py) for the exact
+rule.
 
 ```python
 r = fastdna.count("sample.fastq.gz", k=31)

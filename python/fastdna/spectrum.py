@@ -18,44 +18,95 @@ not FFI-boundary work.
 #: this module exists to avoid.
 DEFAULT_MIN_COUNT = 2
 
+#: How far above the candidate valley floor the spectrum must climb before
+#: that climb is accepted as "the coverage peak", rather than dismissed as
+#: noise on the error peak's descending tail. A single-count uptick (one
+#: more distinct k-mer at depth d+1 than at depth d) is routine noise in any
+#: real spectrum and must not by itself end the search for the floor; a
+#: genuine coverage peak, by contrast, is typically many times taller than
+#: the valley between it and the error peak. 2x is a conservative line
+#: between those two shapes -- low enough to accept a real (if modest)
+#: coverage peak, high enough that ordinary single- or few-count noise on
+#: the descent can never be mistaken for one.
+RISE_FACTOR = 2.0
+
 
 def suggest_min_count(spectrum, default=DEFAULT_MIN_COUNT):
-    """Finds the local minimum between the error peak and the coverage peak.
+    """Finds the valley floor between the error peak and the coverage peak.
 
     `spectrum` maps depth (an int >= 1) to the number of distinct k-mers
     observed at that depth -- e.g. `KmerCounts.spectrum()`, or any dict
     shaped like it, such as `{1: 50_000, 2: 30_000, 3: 5_000, 4: 1_000,
     5: 800, 6: 4_000, 7: 9_000, ...}`.
 
-    Walks depths in ascending order and follows the initial descent (the
-    tail of the error peak) until the trend reverses -- the first point
-    where the next depth's count is no longer lower than the current one.
-    That reversal point is the valley floor, and its depth is the
-    suggested `min_count`.
+    Walks depths in ascending order, tracking the lowest count seen so far
+    (the current valley-floor candidate). A depth is only accepted as the
+    end of the valley -- i.e. the point where the *coverage* peak begins --
+    once the spectrum climbs to at least `RISE_FACTOR` times that
+    candidate's count. This means a single noisy uptick partway down the
+    error peak's tail (`{..., 40: 500, 41: 501, 42: 400, ...}`) does not end
+    the search: the walk keeps looking for a lower floor, because 501 is not
+    a *substantial* rise over 500. Only a climb that actually looks like a
+    second peak stops it. Depths between the lowest and highest key that
+    are absent from `spectrum` are treated as zero distinct k-mers (not
+    skipped), so a single sample with no k-mers at some depth cannot distort
+    the shape by making its neighbors look adjacent.
 
-    Falls back to `default` when the spectrum does not carry enough signal
-    to find a valley: fewer than 3 distinct depths, a spectrum that never
-    stops decreasing (no coverage peak visible in the sample), or one that
-    never starts decreasing (no error peak to walk past). Guessing a
-    threshold from a spectrum shaped like that would be worse than a
-    documented fallback.
+    Returns the valley **floor**'s own depth, not one above it: since
+    `min_count` is an inclusive lower bound, passing this return value
+    straight to `count(..., min_count=...)` *keeps* the k-mers at the
+    valley floor rather than discarding them as part of the error peak --
+    deliberately erring towards keeping ambiguous, boundary-depth k-mers
+    rather than discarding data that might belong to the real sample.
+
+    Falls back to `default` whenever the spectrum's shape is not
+    unambiguous: fewer than 3 distinct depths present, a walk that never
+    finds a lower floor before the data runs out (no error peak to walk
+    past), or one that never climbs back up by `RISE_FACTOR` from whatever
+    floor it does find (no coverage peak visible in the sample, even if the
+    tail is not perfectly monotonic). A wrong threshold here is worse than
+    no threshold, so every case this function is not confident about returns
+    the documented default instead of a guess.
     """
     if not spectrum:
         return default
 
-    depths = sorted(spectrum)
-    if len(depths) < 3:
+    depths_present = sorted(spectrum)
+    if len(depths_present) < 3:
         return default
 
-    counts = [spectrum[d] for d in depths]
+    # Iterate over every depth in the contiguous range, not just the ones
+    # present in `spectrum` -- a depth with zero distinct k-mers is routine
+    # in a small sample and must count as a real (zero-height) point in the
+    # shape, not be skipped so its neighbors look adjacent.
+    min_depth, max_depth = depths_present[0], depths_present[-1]
+    counts = [spectrum.get(d, 0) for d in range(min_depth, max_depth + 1)]
 
-    i = 0
-    while i + 1 < len(counts) and counts[i + 1] < counts[i]:
-        i += 1
+    floor_idx = 0
+    valley_idx = None
+    for j in range(1, len(counts)):
+        if counts[j] < counts[floor_idx]:
+            # A new, lower candidate floor -- keep walking down the error
+            # peak's tail.
+            floor_idx = j
+            continue
+        if counts[j] >= counts[floor_idx] * RISE_FACTOR:
+            # A substantial climb from the current floor: accept it as the
+            # start of the coverage peak, and the current floor as the
+            # valley.
+            valley_idx = floor_idx
+            break
+        # Otherwise: not lower, but not a substantial rise either -- this is
+        # noise (e.g. a single-count uptick), not the end of the valley.
+        # Keep walking without updating the floor.
 
-    if i == 0 or i == len(counts) - 1:
-        # The trend never reversed (or reversed immediately): no distinct
-        # valley to report.
+    if valley_idx is None:
+        # Never found a climb big enough to call a coverage peak.
+        return default
+    if valley_idx == 0:
+        # The very first depth in range was already the lowest, and the
+        # next depth alone cleared the rise threshold: there was no actual
+        # descent to walk down, i.e. no error peak to walk past.
         return default
 
-    return depths[i]
+    return min_depth + valley_idx
