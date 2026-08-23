@@ -78,7 +78,27 @@ Getting this wrong corrupts every downstream result silently, so it lands first 
 | `pat_001_R1.fastq.gz` with no `_R2` | one sample, **and a recorded orphan warning** |
 | directory with no recognizable FASTQ | `Err(NoSamplesFound)` |
 
-Recognized extensions: `.fastq`, `.fq`, `.fastq.gz`, `.fq.gz`. Pair suffixes: `_R1`/`_R2`/`_1`/`_2`, also with `.` as separator. `sample_id`s are sorted lexicographically so **matrix row order is reproducible across runs and platforms** — without that, two runs on the same data produce matrices whose rows do not correspond, and a saved model silently mispredicts.
+Recognized extensions: `.fastq`, `.fq`, `.fastq.gz`, `.fq.gz`, matched case-insensitively. Pair suffixes: `_R1`/`_R2`/`_1`/`_2`, also with `.` as separator. `sample_id`s are sorted lexicographically so **matrix row order is reproducible across runs and platforms** — without that, two runs on the same data produce matrices whose rows do not correspond, and a saved model silently mispredicts.
+
+**The Illumina form must pair, and an earlier version of this plan got it wrong.**
+`sample_S1_L001_R1_001.fastq.gz` is the most common real-world FASTQ filename
+shape, and its `_R1` is not the trailing component — `_001` is. A rule that only
+matches trailing suffixes assigns it no pair role, its `_R2_001` mate becomes a
+*separate sample with a different id*, and because neither carries a role **no
+orphan warning fires**. That turns 500 patients into 1000 half-samples silently,
+which is the exact failure this task exists to prevent.
+
+So: after stripping the extension, a stem matching `<prefix>_R[12]_<digits>`
+(an `_R1`/`_R2` followed by an underscore and a numeric-only run to the end)
+yields sample id `<prefix>` with the corresponding role. Trailing-suffix rules
+apply to everything else. `pat_R1_extra.fastq`, whose trailing part is not
+numeric, stays single-end.
+
+This plan originally required `pat_R1_001.fastq` to be treated as single-end,
+as a guard against a naive `contains("_R1")` implementation. That guard was
+right in intent and wrong in effect: it excluded the one convention that matters
+most. Keep testing that `contains` is not used — via `pat_R1_extra.fastq` —
+without breaking Illumina.
 
 An orphan is a warning, not an error, but it must be *recorded* and surfaced on the result — a silent single-end fallback is how a half-loaded cohort looks successful.
 
