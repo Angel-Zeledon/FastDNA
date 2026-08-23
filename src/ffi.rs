@@ -8,13 +8,17 @@
 //! the `pub mod ffi;` declaration, so no inner `#![cfg(...)]` is needed here
 //! -- adding one produces a `duplicated_attributes` clippy warning.
 
-// The `#[pyfunction]` macro (pyo3 0.22) generates a wrapper item around any
-// function whose body uses `?` to convert a crate error into `PyErr` while
-// itself returning `PyResult`; clippy's useless_conversion lint fires on
-// that macro-generated code, attributing the warning back to the original
-// function's source span. An `#[allow]` on the function itself does not
-// reach the separate generated item, so this is scoped to the module
-// instead -- narrow enough, since the module exists solely to hold
+// The `#[pyfunction]`/`#[pymethods]` macros (pyo3 0.22) generate a
+// trampoline item around any non-getter function/method returning
+// `PyResult<_>` that ends in an identity `.into::<PyErr>()`; clippy's
+// useless_conversion lint fires on that generated code, but *reports* the
+// warning at the original item's return-type span for readability. That
+// span-borrowing is exactly why a per-function `#[allow(clippy::
+// useless_conversion)]` does not suppress it: tried directly on `spectrum`,
+// `count`, `peek` and `build_info` (the four functions that trigger this),
+// and all four warnings remained, because the lint-triggering code lives in
+// a separate generated item the attribute never reaches. Scoped to the
+// module instead -- narrow enough, since the module exists solely to hold
 // `#[pyfunction]`/`#[pymethods]` items that all share this pattern.
 #![allow(clippy::useless_conversion)]
 
@@ -22,12 +26,12 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, StringArray, UInt32Array, UInt64Array};
-use arrow::pyarrow::PyArrowType;
+use arrow::array::{ArrayRef, StringBuilder, UInt32Builder, UInt64Builder};
+use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use flate2::read::MultiGzDecoder;
 use pyo3::exceptions::{
@@ -85,22 +89,32 @@ impl From<FastDnaError> for PyErr {
 /// using the exact schema `export.rs` writes to Parquet with (§9.2 of the
 /// design doc: the in-memory table and the Parquet files must have identical
 /// columns).
+///
+/// Builds directly into Arrow's own builders rather than collecting into
+/// intermediate `Vec<u64>`/`Vec<String>`/`Vec<u32>` first: at a realistic
+/// count of distinct k-mers, retaining a second full copy of every decoded
+/// k-mer string just to hand it to `StringArray::from_iter_values` a moment
+/// later is measurable transient memory for no benefit.
 fn build_record_batch(counter: &KmerCounter, k: usize) -> Result<RecordBatch, FastDnaError> {
     let schema = export::counts_schema();
     let n = counter.distinct_kmers();
-    let mut u64s = Vec::with_capacity(n);
-    let mut seqs = Vec::with_capacity(n);
-    let mut freqs = Vec::with_capacity(n);
+
+    let mut u64_builder = UInt64Builder::with_capacity(n);
+    // `k + 1` is a rough per-string byte estimate (the alphabet is ASCII,
+    // so bytes == characters); a data-capacity hint that undershoots costs
+    // reallocations, not correctness, so it does not need to be exact.
+    let mut seq_builder = StringBuilder::with_capacity(n, n * (k + 1));
+    let mut freq_builder = UInt32Builder::with_capacity(n);
 
     for (&kmer_bits, &count) in counter.iter() {
-        u64s.push(kmer_bits);
-        seqs.push(kmer::decode_kmer(kmer_bits, k));
-        freqs.push(count);
+        u64_builder.append_value(kmer_bits);
+        seq_builder.append_value(kmer::decode_kmer(kmer_bits, k));
+        freq_builder.append_value(count);
     }
 
-    let u64_arr: ArrayRef = Arc::new(UInt64Array::from(u64s));
-    let seq_arr: ArrayRef = Arc::new(StringArray::from_iter_values(seqs.iter().map(|s| s.as_str())));
-    let freq_arr: ArrayRef = Arc::new(UInt32Array::from(freqs));
+    let u64_arr: ArrayRef = Arc::new(u64_builder.finish());
+    let seq_arr: ArrayRef = Arc::new(seq_builder.finish());
+    let freq_arr: ArrayRef = Arc::new(freq_builder.finish());
 
     RecordBatch::try_new(schema, vec![u64_arr, seq_arr, freq_arr]).map_err(|e| FastDnaError::Export {
         path: PathBuf::from("<in-memory Arrow table>"),
@@ -109,25 +123,54 @@ fn build_record_batch(counter: &KmerCounter, k: usize) -> Result<RecordBatch, Fa
 }
 
 /// The Python-visible result of `count()`. Holds the counter and QC summary
-/// so `.table`, `.qc`, `.total_kmers` and `.distinct_kmers` can be computed
-/// lazily rather than all up front.
-#[pyclass(name = "KmerCounts")]
+/// so `.qc`, `.total_kmers` and `.distinct_kmers` can be computed lazily
+/// rather than all up front. `table_cache` holds the one Arrow batch
+/// `.table` may need to build -- see that getter for why.
+#[pyclass(name = "KmerCounts", module = "fastdna._core")]
 struct PyKmerCounts {
     counter: KmerCounter,
     qc: QcSummary,
     k: usize,
+    table_cache: OnceLock<RecordBatch>,
 }
 
 #[pymethods]
 impl PyKmerCounts {
-    /// A zero-copy `pyarrow.RecordBatch` with columns `kmer_u64`,
-    /// `kmer_sequence`, `frequency`. `python/fastdna/__init__.py` wraps this
-    /// in `pyarrow.Table.from_batches([...])`, itself a cheap wrap rather
-    /// than a copy, to present the `pyarrow.Table` the public API promises.
+    /// A `pyarrow.RecordBatch` with columns `kmer_u64`, `kmer_sequence`,
+    /// `frequency`. `python/fastdna/__init__.py` wraps this in
+    /// `pyarrow.Table.from_batches([...])`, itself a cheap wrap rather than
+    /// a copy, to present the `pyarrow.Table` the public API promises.
+    ///
+    /// The hand-off to pyarrow itself is zero-copy, via Arrow's C Data
+    /// Interface (`to_pyarrow`, which shares `batch`'s existing buffers
+    /// rather than duplicating them) -- but *building* that batch from
+    /// `self.counter` is not: decoding each k-mer back to a string is a
+    /// copy no matter how it is arranged. That build is therefore released
+    /// under `py.allow_threads` (it walks every distinct k-mer, the same
+    /// order of cost as the count itself, so holding the GIL for it would
+    /// freeze the notebook for a second time right after the first),
+    /// cached, and only cloned -- cheap, a handful of `Arc` bumps over the
+    /// underlying buffers -- on repeat access, since `r.table.num_rows`
+    /// followed by `r.table.to_pandas()` is an entirely natural thing for a
+    /// caller to write and must not rebuild the whole table twice.
     #[getter]
     fn table(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let batch = build_record_batch(&self.counter, self.k)?;
-        Ok(PyArrowType(batch).into_py(py))
+        let batch = match self.table_cache.get() {
+            Some(cached) => cached.clone(),
+            None => {
+                let built = py.allow_threads(|| build_record_batch(&self.counter, self.k))?;
+                // `OnceLock::set` can in general lose a race to a
+                // concurrent initializer. That cannot happen here -- a
+                // single Python object accessed under the GIL only ever
+                // has one caller in this method at a time -- but using
+                // `built` regardless of whether `set` won keeps this
+                // correct on its own terms rather than relying on that
+                // single-threaded assumption remaining true forever.
+                let _ = self.table_cache.set(built.clone());
+                built
+            }
+        };
+        batch.to_pyarrow(py)
     }
 
     #[getter]
@@ -152,6 +195,11 @@ impl PyKmerCounts {
     #[getter]
     fn distinct_kmers(&self) -> usize {
         self.counter.distinct_kmers()
+    }
+
+    #[getter]
+    fn k(&self) -> usize {
+        self.k
     }
 
     /// `{depth: number of distinct k-mers observed at that depth}`.
@@ -282,7 +330,7 @@ fn count(
     // default batch size so the common case (no explicit interval) is
     // unaffected.
     let batch_size = (progress_interval as usize).clamp(1, PipelineConfig::default().batch_size);
-    let config = PipelineConfig { k, min_quality, quality_window: 4, batch_size, num_threads, progress_interval };
+    let config = PipelineConfig { k, min_quality, num_threads, batch_size, progress_interval, ..PipelineConfig::default() };
 
     // Wraps the caller's Python callable (if any) as a `ProgressFn`. Owns
     // `cb: PyObject` by move, so this closure needs no external state beyond
@@ -326,11 +374,19 @@ fn count(
         }
     });
 
-    // Released for the duration of the count: without this, a long-running
-    // call freezes the calling notebook -- no progress, no Ctrl-C -- for as
-    // long as the count takes.
-    let outcome: Result<(KmerCounter, QcSummary, u64), FastDnaError> =
-        py.allow_threads(|| process_stream_parallel(reader, config, &path_buf, progress_ref, Some(cancel.clone())));
+    // Released for the duration of the count *and* the subsequent prune:
+    // without this, a long-running call freezes the calling notebook -- no
+    // progress, no Ctrl-C -- for as long as the count takes, and `prune`
+    // (an O(distinct k-mers) `retain` over the whole table, matching what
+    // `main.rs` does: frequency filters are applied in RAM, after the
+    // pipeline and before the result is handed back) is folded into the
+    // same closure so it does not reopen that window immediately after.
+    let outcome: Result<(KmerCounter, QcSummary, u64), FastDnaError> = py.allow_threads(|| {
+        let (mut counter, qc, total_reads) =
+            process_stream_parallel(reader, config, &path_buf, progress_ref, Some(cancel.clone()))?;
+        counter.prune(min_count, max_count);
+        Ok((counter, qc, total_reads))
+    });
 
     watcher_stop.store(true, Ordering::Relaxed);
     // The watcher's body cannot itself panic (its only fallible call,
@@ -338,19 +394,15 @@ fn count(
     // propagating it would only risk masking `outcome`'s real error.
     let _ = watcher.join();
 
-    let (mut counter, qc, _total_reads) = outcome?;
+    let (counter, qc, _total_reads) = outcome?;
 
-    // Matches what `main.rs` does: frequency filters are applied in RAM,
-    // after the pipeline and before the result is handed back.
-    counter.prune(min_count, max_count);
-
-    Ok(PyKmerCounts { counter, qc, k })
+    Ok(PyKmerCounts { counter, qc, k, table_cache: OnceLock::new() })
 }
 
 /// The Python-visible result of `peek()`. Wraps `preview::PreviewStats`
 /// directly -- the sampling logic itself lives in `src/preview.rs`, with no
 /// PyO3 dependency, so it stays unit-testable via `cargo test` alone.
-#[pyclass(name = "Preview")]
+#[pyclass(name = "Preview", module = "fastdna._core")]
 struct PyPreview {
     inner: preview::PreviewStats,
 }

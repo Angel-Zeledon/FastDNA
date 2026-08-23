@@ -13,6 +13,13 @@ dependencies = ["pyarrow>=14"]
 # to Python via `env!("CARGO_PKG_VERSION")` -- rather than duplicating it.
 dynamic = ["version"]
 
+# Test-only: `pytest-timeout` backs `@pytest.mark.timeout(...)` in
+# `python/tests/test_api.py`, used on the zero-threads regression test so a
+# reintroduced hang fails the test instead of blocking the suite forever.
+# Not a runtime dependency of the `fastdna` package itself.
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-timeout>=2.1"]
+
 [tool.maturin]
 features = ["python"]
 module-name = "fastdna._core"

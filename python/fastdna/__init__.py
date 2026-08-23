@@ -45,6 +45,10 @@ class KmerCounts:
     def distinct_kmers(self):
         return self._raw.distinct_kmers
 
+    @property
+    def k(self):
+        return self._raw.k
+
     def spectrum(self):
         """`{depth: number of distinct k-mers observed at that depth}`.
 
@@ -67,7 +71,7 @@ class KmerCounts:
         return self.distinct_kmers
 
     def __repr__(self):
-        return f"KmerCounts(distinct={self.distinct_kmers}, total={self.total_kmers})"
+        return f"KmerCounts(k={self.k}, distinct={self.distinct_kmers}, total={self.total_kmers})"
 
 
 def count(
@@ -107,14 +111,14 @@ def count(
     """
     adapter = make_progress_adapter(progress)
     raw = _core.count(
-        str(path),
-        k,
-        min_count,
-        max_count,
-        min_quality,
-        threads,
-        adapter,
-        progress_interval,
+        path=str(path),
+        k=k,
+        min_count=min_count,
+        max_count=max_count,
+        min_quality=min_quality,
+        threads=threads,
+        progress=adapter,
+        progress_interval=progress_interval,
     )
     return KmerCounts(raw)
 
@@ -129,7 +133,7 @@ def peek(path, *, n_reads=10_000):
     error. `peek` answers "what `k` suits *these* data?" before a long run
     commits to a wrong one.
     """
-    return _core.peek(str(path), n_reads)
+    return _core.peek(path=str(path), n_reads=n_reads)
 
 
 def build_info():
