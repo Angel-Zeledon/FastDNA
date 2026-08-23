@@ -26,7 +26,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -288,10 +288,13 @@ fn open_fastq_reader(path: &PathBuf) -> Result<FastqReader<Box<dyn BufRead + Sen
 /// "Callback contract"). Each invocation re-acquires the GIL with
 /// `Python::with_gil`, inside this function's single `py.allow_threads`
 /// call -- forgetting that release would deadlock every worker on the GIL.
-/// A Python exception raised inside `progress` is turned into a Rust panic
-/// so the worker's own `catch_unwind` (in `pipeline.rs`) catches it and the
-/// call fails with `RuntimeError`, rather than the exception silently
-/// vanishing at the FFI boundary.
+/// A Python exception raised inside `progress` is captured into
+/// `callback_error` (a side channel, not a panic -- see that variable's own
+/// comment below for why) and the run is stopped via the same cancellation
+/// flag Ctrl-C uses; once the worker thread rejoins, `callback_error` is
+/// checked first and, if set, turned into `RuntimeError`, matching the
+/// documented callback contract without letting the exception silently
+/// vanish at the FFI boundary.
 ///
 /// `progress_interval` defaults to the core's own default (100,000 reads)
 /// and is exposed as a keyword argument because the default makes progress
@@ -341,6 +344,24 @@ fn count(
 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_worker = cancel.clone();
+    let cancel_for_progress = cancel.clone();
+    // Side channel for a Python exception raised inside `progress`, instead
+    // of carrying it out via `panic!`. The panic route works (pipeline.rs's
+    // `catch_unwind` does convert it into `FastDnaError::Internal`), but it
+    // has a real cost: with no custom panic hook installed, Rust's default
+    // one writes `thread '<unnamed>' panicked at ...` to stderr *before*
+    // `catch_unwind` ever gets a chance to swallow it -- once per worker
+    // that hit the panic, unconditionally, for a library that otherwise
+    // never writes to stderr unasked. A process-global hook could suppress
+    // that, but installing one here would also silence panic output for the
+    // *host* application's own unrelated threads for as long as the hook is
+    // installed -- not this crate's stderr to give up. `Mutex`, not
+    // `OnceLock`: `OnceLock<T>: Sync` requires `T: Sync`, which `PyErr` is
+    // not guaranteed to be, so `Arc<OnceLock<PyErr>>` would not necessarily
+    // be shareable across the threads this needs to cross; `Mutex<T>: Sync`
+    // only requires `T: Send`, which `PyErr` is.
+    let callback_error: Arc<Mutex<Option<PyErr>>> = Arc::new(Mutex::new(None));
+    let callback_error_for_progress = callback_error.clone();
     let (result_tx, result_rx) = mpsc::channel::<Result<(KmerCounter, QcSummary, u64), FastDnaError>>();
 
     // The actual counting runs on its own OS thread, not on the thread that
@@ -372,12 +393,23 @@ fn count(
                 Python::with_gil(|py| {
                     let py_event = progress_event_into_py(py, event);
                     if let Err(e) = cb.call1(py, (py_event,)) {
-                        // A Python exception raised inside the callback must
-                        // not vanish here: turn it into a panic so the
-                        // enclosing worker's `catch_unwind` (pipeline.rs)
-                        // converts it into `FastDnaError::Internal` ->
-                        // `RuntimeError`, per the callback contract.
-                        panic!("progress callback raised a Python exception: {e}");
+                        // Record the first callback error (matching
+                        // pipeline.rs's own "first panic wins" priority for
+                        // worker panics) and ask the whole pipeline to stop
+                        // via the same cancellation flag Ctrl-C uses, rather
+                        // than panicking -- see `callback_error`'s
+                        // declaration above for why. `count()` checks this
+                        // channel, once the worker thread has rejoined,
+                        // ahead of anything the pipeline itself returned.
+                        let mut slot = match callback_error_for_progress.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        drop(slot);
+                        cancel_for_progress.store(true, Ordering::Relaxed);
                     }
                 });
             }
@@ -425,6 +457,22 @@ fn count(
     // matters so the thread is not left detached and running past the end
     // of this function.
     let _ = worker_handle.join();
+
+    // A raising progress callback takes priority over whatever the pipeline
+    // itself returned: cancelling via the shared flag (see `callback_error`
+    // above) can just as easily leave `outcome` looking like an ordinary
+    // `Cancelled` or even a completed `Ok` (e.g. if the exception was raised
+    // from the final `Finished` event, after all counting work was already
+    // done) -- neither of those is the error the caller's callback actually
+    // raised, so this is checked unconditionally, before `outcome` is
+    // trusted either way.
+    let callback_error = match callback_error.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    if let Some(e) = callback_error {
+        return Err(PyRuntimeError::new_err(format!("progress callback raised a Python exception: {e}")));
+    }
 
     // Prune stays under the same released-GIL window as the count: it is
     // an O(distinct k-mers) `retain` over the whole table, the same order

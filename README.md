@@ -356,19 +356,34 @@ is designed to detect.
 
 ### 7. Panics cannot cross the FFI boundary, by construction
 
+A worker's body can, in principle, panic -- corrupt internal state, a bug
+this codebase doesn't know about yet. If a panic were allowed to unwind
+through a Rayon worker and across the FFI boundary back into the Python
+interpreter, that is **undefined behaviour**, not a catchable error, per
+Rust's FFI rules -- and would very likely crash the whole Python process
+with no usable traceback. Every worker's body is wrapped in `catch_unwind`,
+converting a caught panic into `FastDnaError::Internal` (a `RuntimeError` in
+Python) instead. This is also why `[profile.release] panic = "unwind"` is
+pinned explicitly in `Cargo.toml`, with a comment: `catch_unwind` is a
+no-op under `panic = "abort"`, and wheel-build profiles routinely default
+to `abort` to shrink binaries -- exactly the kind of change nobody would
+think to connect to "a panicking worker now kills the interpreter."
+
 A Python progress callback is arbitrary user code, called from inside a
-Rayon worker thread. If it raises, PyO3 turns that into a Rust panic; if
-that panic were allowed to unwind through the worker and across the FFI
-boundary back into the Python interpreter, that is **undefined behaviour**,
-not a catchable error, per Rust's FFI rules -- and would very likely crash
-the whole Python process with no usable traceback. Every worker's body is
-wrapped in `catch_unwind`, converting a caught panic into
-`FastDnaError::Internal` (a `RuntimeError` in Python) instead. This is also
-why `[profile.release] panic = "unwind"` is pinned explicitly in
-`Cargo.toml`, with a comment: `catch_unwind` is a no-op under
-`panic = "abort"`, and wheel-build profiles routinely default to `abort` to
-shrink binaries -- exactly the kind of change nobody would think to connect
-to "a panicking Python callback now kills the interpreter."
+Rayon worker thread -- and if it raises, that is *not* carried out via this
+panic mechanism, deliberately. An earlier version of this binding did use
+`panic!` to smuggle the `PyErr` out through the same `catch_unwind` above,
+and it worked, but at a real cost: with no custom panic hook installed,
+Rust's default hook writes `thread '<unnamed>' panicked at ...` to stderr
+*before* `catch_unwind` gets a chance to swallow it -- once per worker that
+hit it, unconditionally, for a library that otherwise never writes to
+stderr unasked (see `progress` below). `src/ffi.rs` instead captures the
+`PyErr` into a side channel (a `Mutex`) and stops the run through the same
+cancellation flag Ctrl-C uses, then surfaces it as `RuntimeError` once the
+worker thread rejoins -- no panic, no unasked stderr output, same
+`RuntimeError` contract. `catch_unwind` itself is untouched and still
+guards every worker against a genuine Rust panic, callback-triggered or
+not.
 
 ### 8. Crossing into Python: the GIL and zero-copy Arrow
 
