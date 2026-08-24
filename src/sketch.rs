@@ -112,6 +112,21 @@ impl GenomeSketch {
         k: usize,
         source: &Path,
     ) -> Result<Self> {
+        // An out-of-range k makes `extract_canonical_kmers` return an empty
+        // Vec for every read, so without this check the whole file "sketches"
+        // to zero hashes and every later comparison quietly reports 0.0 --
+        // silent garbage instead of the error `count()` and
+        // `estimate_cardinality` already raise for the same mistake.
+        if k == 0 || k > 32 {
+            return Err(FastDnaError::InvalidK { k });
+        }
+        if sketch_size == 0 {
+            return Err(FastDnaError::InvalidConfig {
+                parameter: "sketch_size",
+                reason: "must be at least 1".to_string(),
+            });
+        }
+
         let mut min_set: BTreeSet<u64> = BTreeSet::new();
         let mut record_count: u64 = 0;
 
@@ -184,6 +199,27 @@ impl GenomeSketch {
                 std::cmp::Ordering::Greater => j += 1,
             }
             union_count += 1;
+        }
+
+        // One list is exhausted (or the cap was hit). If the exhausted
+        // sketch is *not full*, it holds its set's complete hash list --
+        // there is no truncation ceiling past its last element -- so every
+        // remaining hash on the other side is a genuine union-only member
+        // and must widen the denominator. Stopping here regardless (the
+        // old behaviour) shrank the union only, a systematic upward bias
+        // that reached 33x when a tiny sketch met a large one. When the
+        // exhausted sketch *is* full, stopping is correct: hashes above
+        // its ceiling cannot be judged present or absent in it.
+        let a_full = self.hashes.len() >= self.sketch_size;
+        let b_full = other.hashes.len() >= other.sketch_size;
+        if union_count < cap {
+            if i >= self.hashes.len() && !a_full {
+                let remaining = other.hashes.len() - j;
+                union_count += remaining.min(cap - union_count);
+            } else if j >= other.hashes.len() && !b_full {
+                let remaining = self.hashes.len() - i;
+                union_count += remaining.min(cap - union_count);
+            }
         }
 
         if union_count == 0 {
@@ -354,6 +390,15 @@ impl GenomeSketch {
 /// `hashes.last()` is not actually the sketch's true ceiling -- both
 /// return quiet nonsense instead of an error.
 fn validate_sketch_invariants(sketch: &GenomeSketch) -> std::result::Result<(), String> {
+    if sketch.k == 0 || sketch.k > 32 {
+        return Err(format!(
+            "k is {}, outside the 1..=32 range 2-bit packing supports",
+            sketch.k
+        ));
+    }
+    if sketch.sketch_size == 0 {
+        return Err("sketch_size is 0; a saved sketch must hold at least one slot".to_string());
+    }
     if sketch.hashes.len() > sketch.sketch_size {
         return Err(format!(
             "hashes has {} entries, more than sketch_size ({})",
@@ -511,21 +556,14 @@ mod tests {
     /// complete hash sets, so they equal the true fraction of shared
     /// k-mers with no estimation involved.
     ///
-    /// `jaccard` is not exact here, despite appearances. Its merge walk
-    /// terminates as soon as the *shorter* hash list is exhausted, so
-    /// `union_count` -- and hence the reported ratio -- depends on where
-    /// `a`'s maximum hash happens to fall in `b`'s sorted order, which is a
-    /// property of the hash finalizer, not of the true set sizes. With the
-    /// current finalizer that walk happens to end exactly at
-    /// `union_count == 500` here, giving exactly 0.1, same as `b_in_a`; a
-    /// different (still perfectly correct) finalizer measured
-    /// `union_count == 482`, giving 0.1037 instead. A future change to the
-    /// mixer constants must not be able to break this test for a reason
-    /// that has nothing to do with correctness, so `jaccard` is checked
-    /// only loosely here, as "clearly pulled down by the size mismatch,
-    /// same ballpark as containment" -- the tight, exact-value check
-    /// belongs to `known_overlap_estimates_jaccard_within_a_stated_tolerance`
-    /// above, which exists specifically for that.
+    /// `jaccard` is exact here too, since the union-side fix: with both
+    /// sketches non-full they hold their complete hash sets, and the merge
+    /// walk now counts the longer list's tail as union-only members instead
+    /// of stopping at the shorter list's end, so the ratio is genuinely
+    /// 50/500 regardless of where `a`'s maximum hash falls in `b`'s order.
+    /// The check is still kept loose deliberately: this test is about the
+    /// asymmetry story, and the exact-value contract lives in
+    /// `jaccard_counts_the_full_union_when_a_non_full_sketch_exhausts`.
     #[test]
     fn containment_is_asymmetric_where_jaccard_is_low() {
         let a_kmers: Vec<u64> = (0..50).collect();
@@ -548,6 +586,67 @@ mod tests {
              mixer's tie-breaking, not a property that must hold: jaccard={jaccard}"
         );
         assert!(a_in_b > b_in_a, "containment must be asymmetric: a_in_b={a_in_b} must exceed b_in_a={b_in_a}");
+    }
+
+    /// The union side of the Jaccard estimate must not stop at the end of
+    /// the shorter hash list when that sketch is *not full*: a non-full
+    /// sketch holds its complete k-mer set, so every remaining hash in the
+    /// other list is a genuine union-only member. The old walk stopped
+    /// anyway, shrinking the denominator only -- a systematic upward bias
+    /// that reached 33x on small-versus-large comparisons.
+    #[test]
+    fn jaccard_counts_the_full_union_when_a_non_full_sketch_exhausts() {
+        let a = GenomeSketch::from_kmers(&(0u64..3).collect::<Vec<_>>(), 1_000, 21);
+        let b = GenomeSketch::from_kmers(&(0u64..100).collect::<Vec<_>>(), 1_000, 21);
+
+        let j = a.jaccard(&b).expect("same k must not error");
+        assert!(
+            (j - 0.03).abs() < 1e-9,
+            "both sketches are exact (non-full), so Jaccard must be exactly 3/100, got {j}"
+        );
+    }
+
+    #[test]
+    fn jaccard_of_disjoint_non_full_sketches_counts_both_sides_of_the_union() {
+        let a = GenomeSketch::from_kmers(&(0u64..10).collect::<Vec<_>>(), 1_000, 21);
+        let b = GenomeSketch::from_kmers(&(1_000_000u64..1_000_030).collect::<Vec<_>>(), 1_000, 21);
+
+        let j = a.jaccard(&b).expect("same k must not error");
+        assert_eq!(j, 0.0, "disjoint sets must give exactly 0.0, got {j}");
+    }
+
+    #[test]
+    fn from_reader_rejects_an_out_of_range_k_instead_of_an_empty_sketch() {
+        for bad_k in [0usize, 33] {
+            match GenomeSketch::from_reader(reader_over(&["ACGTACGT"]), 128, bad_k, Path::new("s.fastq")) {
+                Err(FastDnaError::InvalidK { k }) => assert_eq!(k, bad_k),
+                other => panic!("k={bad_k} must be InvalidK, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_reader_rejects_a_zero_sketch_size() {
+        match GenomeSketch::from_reader(reader_over(&["ACGTACGT"]), 0, 21, Path::new("s.fastq")) {
+            Err(FastDnaError::InvalidConfig { parameter, .. }) => {
+                assert_eq!(parameter, "sketch_size");
+            }
+            other => panic!("sketch_size=0 must be InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_a_sketch_file_with_an_out_of_range_k() {
+        let dir = std::env::temp_dir().join("fastdna_sketch_bad_k_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad_k.json");
+        std::fs::write(&path, r#"{"sketch_size":128,"k":0,"hashes":[1,2,3]}"#).unwrap();
+
+        match GenomeSketch::load(&path) {
+            Err(FastDnaError::Load { .. }) => {}
+            other => panic!("k=0 in a saved sketch must be a Load error, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

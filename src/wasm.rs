@@ -16,6 +16,16 @@ use std::io::Cursor;
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 pub fn analyze_fastq_wasm(fastq_text: &str, k: usize) -> Result<JsValue, JsValue> {
+    // An out-of-range k makes `extract_canonical_kmers` return nothing for
+    // every read, so the browser would receive a successful-looking result
+    // with zero k-mers -- indistinguishable from a real file with no valid
+    // k-mers. Reject it like the CLI and Python bindings do.
+    if k == 0 || k > 32 {
+        return Err(JsValue::from_str(&format!(
+            "invalid k-mer size {k}: k must be between 1 and 32 inclusive"
+        )));
+    }
+
     let mut reader = FastqReader::new(Cursor::new(fastq_text.as_bytes()));
     let mut counter = KmerCounter::with_capacity(4096);
     let mut qc = QcSummary::default();

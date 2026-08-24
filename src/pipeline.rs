@@ -535,7 +535,11 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
                 } else {
                     CountStrategy::InMemory
                 };
-                (auto, env_max_ram.is_some())
+                // The env var only "applied" if it actually supplied the
+                // budget -- when `policy.max_ram_bytes` is set it wins at
+                // the `.or(env_max_ram)` above and the env value had no
+                // effect on the decision.
+                (auto, policy.max_ram_bytes.is_none() && env_max_ram.is_some())
             }
         },
     };
@@ -543,12 +547,31 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
     StrategyDecision { strategy, estimated_occurrences, estimated_peak_bytes, budget_bytes, env_override_applied }
 }
 
+/// How a disk-strategy worker failed. A real `FastDnaError` (a spill-file
+/// I/O failure, most commonly disk-full on the temp drive) must survive the
+/// reduce phase *typed*: stringifying it and rewrapping as
+/// `FastDnaError::Internal` -- the old behaviour -- blamed an environmental
+/// failure on "a bug in FastDNA" and stripped the path and `source()` the
+/// caller needs to diagnose it. Only a genuine panic belongs in `Internal`.
+enum DiskWorkerFailure {
+    Error(FastDnaError),
+    Panic(String),
+}
+
+impl DiskWorkerFailure {
+    fn into_error(self) -> FastDnaError {
+        match self {
+            DiskWorkerFailure::Error(err) => err,
+            DiskWorkerFailure::Panic(detail) => FastDnaError::Internal { detail },
+        }
+    }
+}
+
 /// The disk strategy's per-worker outcome: a manifest of spilled run files
 /// per bucket (see `disk_spill::SpillWriter::finish`) instead of a private
 /// `KmerCounter` -- the whole point of this strategy is that no worker
-/// builds one of those. `Err` carries a panic message or a stringified
-/// `FastDnaError` from within the worker, mirroring `WorkerOutcome` above.
-type DiskWorkerOutcome = std::result::Result<(Vec<Vec<PathBuf>>, QcSummary), String>;
+/// builds one of those.
+type DiskWorkerOutcome = std::result::Result<(Vec<Vec<PathBuf>>, QcSummary), DiskWorkerFailure>;
 
 /// The disk-partitioned counting strategy. Structurally a sibling of
 /// `process_stream_parallel`, not a variant of it: the producer thread and
@@ -692,11 +715,11 @@ fn process_stream_parallel_disk<R: BufRead + Send + 'static>(
                     // still drain so the producer never blocks on a full
                     // channel with this worker no longer consuming.
                     while receiver.recv().is_ok() {}
-                    Err(fastdna_err.to_string())
+                    Err(DiskWorkerFailure::Error(fastdna_err))
                 }
                 Err(payload) => {
                     while receiver.recv().is_ok() {}
-                    Err(panic_message(payload))
+                    Err(DiskWorkerFailure::Panic(panic_message(payload)))
                 }
             }
         })
@@ -706,7 +729,7 @@ fn process_stream_parallel_disk<R: BufRead + Send + 'static>(
         .join()
         .map_err(|_| FastDnaError::Internal { detail: "FASTQ reader thread panicked".to_string() })??;
 
-    let mut worker_panic: Option<String> = None;
+    let mut worker_failure: Option<DiskWorkerFailure> = None;
     let mut manifests: Vec<Vec<Vec<PathBuf>>> = Vec::with_capacity(results.len());
     let mut master_qc = QcSummary::default();
     for outcome in results {
@@ -715,15 +738,15 @@ fn process_stream_parallel_disk<R: BufRead + Send + 'static>(
                 manifests.push(manifest);
                 master_qc.merge(&qc);
             }
-            Err(detail) => {
-                if worker_panic.is_none() {
-                    worker_panic = Some(detail);
+            Err(failure) => {
+                if worker_failure.is_none() {
+                    worker_failure = Some(failure);
                 }
             }
         }
     }
-    if let Some(detail) = worker_panic {
-        return Err(FastDnaError::Internal { detail });
+    if let Some(failure) = worker_failure {
+        return Err(failure.into_error());
     }
 
     if cancel.as_ref().is_some_and(|tok| tok.load(Ordering::Relaxed)) {
@@ -780,4 +803,63 @@ pub fn process_stream_parallel_with_policy<R: BufRead + Send + 'static>(
     };
 
     Ok((counter, qc, total_reads, decision))
+}
+
+#[cfg(test)]
+// Same rationale as the other in-module test blocks: unwrap/expect denial
+// is about production paths, not test assertions.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A disk-strategy worker's real `FastDnaError` (e.g. disk-full while
+    /// spilling) must reach the caller typed, with its path and source
+    /// intact -- not stringified into `Internal`, which blames the
+    /// environment's failure on "a bug in FastDNA".
+    #[test]
+    fn a_worker_io_failure_stays_io_instead_of_becoming_internal() {
+        let failure = DiskWorkerFailure::Error(FastDnaError::Io {
+            path: std::path::PathBuf::from("spill_run_3.bin"),
+            source: std::io::Error::new(std::io::ErrorKind::StorageFull, "disk full"),
+        });
+        match failure.into_error() {
+            FastDnaError::Io { path, source } => {
+                assert_eq!(path, std::path::PathBuf::from("spill_run_3.bin"));
+                assert_eq!(source.kind(), std::io::ErrorKind::StorageFull);
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_worker_panic_still_becomes_internal() {
+        let failure = DiskWorkerFailure::Panic("index out of bounds".to_string());
+        match failure.into_error() {
+            FastDnaError::Internal { detail } => assert!(detail.contains("index out of bounds")),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// `env_override_applied` must be false when `--max-ram` shadowed the
+    /// env var: the decision then owes nothing to the environment.
+    #[test]
+    fn policy_max_ram_reports_no_env_override_even_if_env_var_is_set() {
+        // Set-and-remove of a process-global var: no other test in this
+        // crate reads FASTDNA_MAX_RAM_BYTES (grep-verified), so the brief
+        // window cannot race a concurrent reader.
+        std::env::set_var("FASTDNA_MAX_RAM_BYTES", "123456789");
+        let policy = MemoryPolicy {
+            strategy: None,
+            max_ram_bytes: Some(1_000_000_000),
+            estimated_input_bytes: Some(10_000_000),
+        };
+        let decision = resolve_strategy(&policy, &PipelineConfig::default());
+        std::env::remove_var("FASTDNA_MAX_RAM_BYTES");
+
+        assert_eq!(decision.budget_bytes, 1_000_000_000, "--max-ram must win the budget");
+        assert!(
+            !decision.env_override_applied,
+            "the env var did not shape this decision and must not claim credit"
+        );
+    }
 }

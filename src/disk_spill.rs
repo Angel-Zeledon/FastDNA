@@ -119,15 +119,22 @@ pub struct ScratchDir {
 static SCRATCH_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl ScratchDir {
-    /// Creates a new, empty scratch directory under the OS temp directory.
+    /// Creates a new, empty scratch directory. Location: the
+    /// `FASTDNA_SPILL_DIR` environment variable if set, else the OS temp
+    /// directory. The override exists because the OS temp dir is often a
+    /// small system drive (especially on Windows), while the disk strategy
+    /// spills exactly when the input is large -- the user needs a way to
+    /// point scratch space at the drive that actually has room.
     pub fn new() -> Result<Self> {
         let unique = SCRATCH_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let root = std::env::temp_dir()
-            .join(format!("fastdna-spill-{}-{unique}-{nanos}", std::process::id()));
+        let base = std::env::var_os("FASTDNA_SPILL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!("fastdna-spill-{}-{unique}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&root).map_err(|e| FastDnaError::Io { path: root.clone(), source: e })?;
         Ok(Self { root })
     }
@@ -303,6 +310,19 @@ impl<'a> SpillWriter<'a> {
     }
 }
 
+/// Maximum run files opened simultaneously during any one merge pass. A
+/// bucket can accumulate one run per worker per eager flush --
+/// `occurrences / SPILL_RAW_THRESHOLD` in total for real data, over a
+/// thousand for a single-digit-GB FASTQ -- so opening every run at once
+/// blows through `ulimit -n` (1024 by default on Linux) on exactly the
+/// inputs the disk strategy exists for. Merges over more runs than this
+/// cascade: groups of at most this many runs are streamed into
+/// intermediate run files, repeatedly, until one final pass fits. 64 keeps
+/// pass count low (a 4096-run bucket needs just two passes) while staying
+/// far under any real descriptor limit even with the input FASTQ, the
+/// output file, and a handful of library descriptors also open.
+pub const MAX_OPEN_RUNS: usize = 64;
+
 /// Merges one bucket's run files (across every worker that wrote to it)
 /// into `out`, in ascending k-mer order, via a streaming k-way merge over a
 /// binary min-heap -- the same algorithm as
@@ -310,6 +330,21 @@ impl<'a> SpillWriter<'a> {
 /// `RunReader`s instead of in-memory slices so no single run (let alone the
 /// whole bucket) needs to be fully resident to be merged.
 fn merge_bucket_sources(sources: &mut [RunReader], out: &mut Vec<(u64, u32)>) -> Result<()> {
+    merge_sources_into(sources, |kmer, count| {
+        out.push((kmer, count));
+        Ok(())
+    })
+}
+
+/// The streaming k-way merge itself, emitting each merged `(kmer, count)`
+/// pair to `emit` instead of materializing anywhere -- the cascade path
+/// writes pairs straight to an intermediate run file, and buffering a
+/// 64-run group in memory first would reintroduce the unbounded-memory
+/// problem this module exists to avoid.
+fn merge_sources_into(
+    sources: &mut [RunReader],
+    mut emit: impl FnMut(u64, u32) -> Result<()>,
+) -> Result<()> {
     let mut fronts: Vec<Option<(u64, u32)>> = Vec::with_capacity(sources.len());
     let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::with_capacity(sources.len());
 
@@ -349,7 +384,7 @@ fn merge_bucket_sources(sources: &mut [RunReader], out: &mut Vec<(u64, u32)>) ->
             }
         }
 
-        out.push((kmer, count));
+        emit(kmer, count)?;
     }
 
     Ok(())
@@ -373,21 +408,81 @@ pub fn merge_buckets(manifests: &[Vec<Vec<PathBuf>>], num_buckets: usize) -> Res
     let mut out = Vec::new();
 
     for bucket in 0..num_buckets {
-        let mut sources: Vec<RunReader> = Vec::new();
+        let mut paths: Vec<PathBuf> = Vec::new();
         for worker_manifest in manifests {
-            if let Some(paths) = worker_manifest.get(bucket) {
-                for path in paths {
-                    sources.push(RunReader::open(path.clone())?);
-                }
+            if let Some(worker_paths) = worker_manifest.get(bucket) {
+                paths.extend(worker_paths.iter().cloned());
             }
         }
-        if sources.is_empty() {
+        if paths.is_empty() {
             continue;
         }
-        merge_bucket_sources(&mut sources, &mut out)?;
+        merge_bucket_bounded(paths, bucket, &mut out)?;
     }
 
     Ok(out)
+}
+
+/// Merges one bucket's runs into `out` while never holding more than
+/// `MAX_OPEN_RUNS` files open at once. Oversized merges cascade: each pass
+/// streams groups of at most `MAX_OPEN_RUNS` runs into intermediate run
+/// files (written beside the originals, inside the same scratch directory,
+/// so `ScratchDir`'s drop still cleans them up on any failure), until one
+/// final pass fits. Intermediates from a finished pass are deleted eagerly
+/// -- a cascade would otherwise briefly double the bucket's disk footprint
+/// pass after pass; the original run files are left for `ScratchDir`.
+fn merge_bucket_bounded(paths: Vec<PathBuf>, bucket: usize, out: &mut Vec<(u64, u32)>) -> Result<()> {
+    let mut paths = paths;
+    let mut pass = 0usize;
+
+    while paths.len() > MAX_OPEN_RUNS {
+        let mut next_paths: Vec<PathBuf> = Vec::with_capacity(paths.len() / MAX_OPEN_RUNS + 1);
+        for (group_index, group) in paths.chunks(MAX_OPEN_RUNS).enumerate() {
+            // A one-file group needs no merging; pass it through untouched.
+            if group.len() == 1 {
+                next_paths.push(group[0].clone());
+                continue;
+            }
+            let parent = group[0].parent().unwrap_or_else(|| Path::new("."));
+            let intermediate = parent.join(format!("cascade_b{bucket}_p{pass}_g{group_index}.bin"));
+
+            let mut sources = open_sources(group)?;
+            let file = File::create(&intermediate).map_err(|e| io_err(&intermediate, e))?;
+            let mut writer = BufWriter::new(file);
+            merge_sources_into(&mut sources, |kmer, count| {
+                writer.write_all(&kmer.to_le_bytes()).map_err(|e| io_err(&intermediate, e))?;
+                writer.write_all(&count.to_le_bytes()).map_err(|e| io_err(&intermediate, e))?;
+                Ok(())
+            })?;
+            writer.flush().map_err(|e| io_err(&intermediate, e))?;
+            drop(writer);
+            drop(sources);
+
+            // Inputs that were themselves intermediates are consumed now.
+            if pass > 0 {
+                for path in group {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            next_paths.push(intermediate);
+        }
+        paths = next_paths;
+        pass += 1;
+    }
+
+    let mut sources = open_sources(&paths)?;
+    merge_bucket_sources(&mut sources, out)?;
+    drop(sources);
+    if pass > 0 {
+        for path in &paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn open_sources(paths: &[PathBuf]) -> Result<Vec<RunReader>> {
+    paths.iter().map(|path| RunReader::open(path.clone())).collect()
 }
 
 #[cfg(test)]
@@ -513,6 +608,65 @@ mod tests {
     fn merge_buckets_of_no_manifests_is_empty() {
         let merged = merge_buckets(&[], 1usize << 5).unwrap();
         assert!(merged.is_empty());
+    }
+
+    /// One bucket accumulating more run files than `MAX_OPEN_RUNS` must
+    /// still merge correctly -- via cascaded passes -- instead of opening
+    /// every run simultaneously, which blows through `ulimit -n` on the
+    /// very inputs the disk strategy exists for. 200 runs each holding
+    /// overlapping keys checks both the cascade plumbing and that counts
+    /// survive being merged twice.
+    #[test]
+    fn a_bucket_with_more_runs_than_the_open_file_bound_merges_correctly() {
+        let scratch = ScratchDir::new().unwrap();
+        let num_runs = MAX_OPEN_RUNS * 3 + 7;
+        let mut manifest: Vec<Vec<PathBuf>> = vec![Vec::new(); 1];
+
+        for run_index in 0..num_runs {
+            let path = scratch.run_path(0, 0, run_index);
+            // Every run holds kmers 0..10; run `i` also holds `1000 + i`.
+            let mut run: Vec<(u64, u32)> = (0u64..10).map(|kmer| (kmer, 2)).collect();
+            run.push((1_000 + run_index as u64, 5));
+            write_run(&path, &run).unwrap();
+            manifest[0].push(path);
+        }
+
+        let merged = merge_buckets(&[manifest], 1).unwrap();
+
+        assert_eq!(merged.len(), 10 + num_runs);
+        for &(kmer, count) in merged.iter().take(10) {
+            assert!(kmer < 10);
+            assert_eq!(count, 2 * num_runs as u32, "kmer {kmer} appears twice in every run");
+        }
+        for (offset, &(kmer, count)) in merged.iter().skip(10).enumerate() {
+            assert_eq!(kmer, 1_000 + offset as u64);
+            assert_eq!(count, 5);
+        }
+        let mut sorted = merged.clone();
+        sorted.sort_unstable_by_key(|&(k, _)| k);
+        assert_eq!(merged, sorted, "cascaded output must still be globally sorted");
+    }
+
+    /// `FASTDNA_SPILL_DIR` redirects scratch space away from the OS temp
+    /// directory -- often a small system drive on Windows -- to wherever
+    /// the user actually has room.
+    #[test]
+    fn spill_dir_env_var_overrides_the_os_temp_directory() {
+        let base = std::env::temp_dir().join("fastdna_custom_spill_test");
+        std::fs::create_dir_all(&base).unwrap();
+        // No other test in this crate reads FASTDNA_SPILL_DIR concurrently;
+        // ScratchDir::new snapshots it synchronously before this removes it.
+        std::env::set_var("FASTDNA_SPILL_DIR", &base);
+        let scratch = ScratchDir::new();
+        std::env::remove_var("FASTDNA_SPILL_DIR");
+
+        let scratch = scratch.expect("scratch dir under the override must be created");
+        assert!(
+            scratch.root.starts_with(&base),
+            "scratch root {} must live under the override {}",
+            scratch.root.display(),
+            base.display()
+        );
     }
 
     #[test]

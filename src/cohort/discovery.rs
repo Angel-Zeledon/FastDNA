@@ -201,6 +201,26 @@ pub fn discover_samples(dir: &Path) -> Result<Vec<SampleFiles>> {
             continue;
         }
         let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+            // A non-UTF8 filename cannot become a sample id. If it still
+            // looks like a FASTQ file, skipping it would drop a sample from
+            // the cohort with no trace -- the exact "silent and
+            // catastrophic" loss this module's header warns about -- so it
+            // fails loudly with the fix in the message. A non-FASTQ file
+            // with a mangled name is ignored like any other non-FASTQ file.
+            let lossy = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if strip_fastq_extension(&lossy).is_some() {
+                return Err(FastDnaError::InvalidConfig {
+                    parameter: "cohort directory",
+                    reason: format!(
+                        "{} is a FASTQ file with a non-UTF8 filename and cannot become a \
+                         sample id; rename it to include it in the cohort",
+                        path.display()
+                    ),
+                });
+            }
             continue;
         };
         let Some(stem) = strip_fastq_extension(filename) else {
@@ -295,6 +315,31 @@ mod tests {
             std::fs::write(dir.path().join(name), b"").expect("failed to write fixture file");
         }
         dir
+    }
+
+    /// A FASTQ file whose name is not valid UTF-8 cannot become a sample
+    /// id; silently skipping it would lose a sample from the cohort with no
+    /// trace, so discovery must fail loudly and tell the user to rename it.
+    #[cfg(windows)]
+    #[test]
+    fn a_fastq_file_with_a_non_utf8_name_is_an_error_not_a_silent_skip() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let d = fixture(&["ok_sample.fastq"]);
+        // 0xD800 is an unpaired UTF-16 surrogate: NTFS accepts it in a
+        // filename, but it cannot be converted to a &str.
+        let bad_name: std::ffi::OsString =
+            std::ffi::OsString::from_wide(&[0xD800, b'.' as u16, b'f' as u16, b'a' as u16,
+                b's' as u16, b't' as u16, b'q' as u16]);
+        std::fs::write(d.path().join(&bad_name), b"").expect("NTFS accepts lone surrogates");
+
+        match discover_samples(d.path()) {
+            Err(FastDnaError::InvalidConfig { parameter, reason }) => {
+                assert_eq!(parameter, "cohort directory");
+                assert!(reason.contains("rename"), "message must tell the user the fix: {reason}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
     }
 
     #[test]
