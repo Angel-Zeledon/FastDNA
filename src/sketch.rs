@@ -250,6 +250,39 @@ impl GenomeSketch {
         }
     }
 
+    /// Estimates the per-base mutation rate implied by `jaccard`, under
+    /// the same Poisson mutation model Mash itself uses (Ondov et al.,
+    /// 2016): D = -(1/k) * ln(2J / (1+J)), where J is the Jaccard
+    /// estimate. Two sketches sharing every k-mer (J=1) give D=0; sharing
+    /// none (J=0) give D=1 (this implementation's chosen convention --
+    /// the bare formula diverges to infinity there, which is not a useful
+    /// number to hand a caller).
+    ///
+    /// This exists because raw Jaccard alone is a weaker claim than what
+    /// "Mash-style" comparison implies: Jaccard says "these sketches
+    /// overlap this much", not "these genomes differ by roughly this
+    /// fraction of their bases", and the two are related but not the same
+    /// question. `k` matters here in a way it does not for `jaccard`
+    /// itself, since the model assumes each mutation destroys up to `k`
+    /// overlapping k-mers -- the same `MismatchedK` restriction applies,
+    /// for the same reason.
+    ///
+    /// What this does *not* give: Mash's own tool also reports a p-value
+    /// against a null (random-sequence) hypothesis, which needs a genome
+    /// length estimate this type does not have. This is the distance
+    /// alone, not the full statistical test.
+    pub fn mash_distance(&self, other: &GenomeSketch) -> Result<f64> {
+        let j = self.jaccard(other)?;
+        if j <= 0.0 {
+            return Ok(1.0);
+        }
+        if j >= 1.0 {
+            return Ok(0.0);
+        }
+        let d = -(1.0 / self.k as f64) * (2.0 * j / (1.0 + j)).ln();
+        Ok(d.clamp(0.0, 1.0))
+    }
+
     /// Persists the sketch as JSON. This is what makes N-sample comparison
     /// stop being O(N^2) FASTQ reads: compute each sample's sketch once,
     /// save it, and every later comparison loads two small files instead of
@@ -364,6 +397,60 @@ mod tests {
 
         let j = a.jaccard(&b).expect("same k must not error");
         assert_eq!(j, 1.0, "a sketch compared with itself must be exactly 1.0");
+    }
+
+    #[test]
+    fn mash_distance_of_identical_sketches_is_zero() {
+        let kmers: Vec<u64> = (0..2_000).collect();
+        let a = GenomeSketch::from_kmers(&kmers, 256, 21);
+        let b = GenomeSketch::from_kmers(&kmers, 256, 21);
+
+        let d = a.mash_distance(&b).expect("same k must not error");
+        assert_eq!(d, 0.0);
+    }
+
+    #[test]
+    fn mash_distance_of_disjoint_sketches_is_one() {
+        let a = GenomeSketch::from_kmers(&(0u64..2_000).collect::<Vec<_>>(), 256, 21);
+        let b = GenomeSketch::from_kmers(&(1_000_000u64..1_002_000).collect::<Vec<_>>(), 256, 21);
+
+        let d = a.mash_distance(&b).expect("same k must not error");
+        assert_eq!(d, 1.0);
+    }
+
+    #[test]
+    fn mash_distance_decreases_as_jaccard_increases() {
+        // Two pairs of sketches at different overlap levels: the pair with
+        // higher Jaccard must report a lower (or equal) Mash distance --
+        // the formula is monotonically decreasing in J.
+        let base: Vec<u64> = (0..1_000).collect();
+        let mostly_shared: Vec<u64> = (0..900).chain(2_000_000..2_000_100).collect();
+        let barely_shared: Vec<u64> = (0..50).chain(3_000_000..3_000_950).collect();
+
+        let a = GenomeSketch::from_kmers(&base, 500, 21);
+        let b = GenomeSketch::from_kmers(&mostly_shared, 500, 21);
+        let c = GenomeSketch::from_kmers(&barely_shared, 500, 21);
+
+        let d_close = a.mash_distance(&b).expect("same k must not error");
+        let d_far = a.mash_distance(&c).expect("same k must not error");
+
+        assert!(
+            d_close < d_far,
+            "higher overlap must give a smaller distance: d_close={d_close}, d_far={d_far}"
+        );
+    }
+
+    #[test]
+    fn mash_distance_rejects_mismatched_k_like_jaccard() {
+        let a = GenomeSketch::from_kmers(&[1, 2, 3], 10, 21);
+        let b = GenomeSketch::from_kmers(&[1, 2, 3], 10, 25);
+
+        match a.mash_distance(&b) {
+            Err(FastDnaError::MismatchedK { left, right }) => {
+                assert_eq!((left, right), (21, 25));
+            }
+            other => panic!("expected MismatchedK, got {other:?}"),
+        }
     }
 
     #[test]

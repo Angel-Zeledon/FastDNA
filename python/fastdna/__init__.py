@@ -292,6 +292,22 @@ class Sketch:
         """
         return self._raw.containment(other._raw)
 
+    def mash_distance(self, other):
+        """Estimates the per-base mutation rate implied by `.jaccard()`,
+        under the Poisson mutation model Mash itself uses (Ondov et al.,
+        2016) -- the same k-mer overlap turned into an evolutionary-
+        distance estimate. Two identical sketches give `0.0`; two sketches
+        sharing no k-mers give `1.0`.
+
+        `.jaccard()` alone is a weaker claim than what "Mash-style"
+        comparison implies: it says "these sketches overlap this much",
+        not "these genomes differ by roughly this fraction of their
+        bases". This method is the latter question; note it does not
+        include Mash's own p-value against a null hypothesis, which needs
+        a genome-length estimate this method does not have.
+        """
+        return self._raw.mash_distance(other._raw)
+
     def save(self, path):
         """Persists this sketch as JSON, for :func:`load_sketch` later."""
         self._raw.save(str(path))
@@ -327,3 +343,42 @@ def compare(path_a, path_b, *, k=21, sketch_size=1000):
     more than once.
     """
     return sketch(path_a, k=k, sketch_size=sketch_size).jaccard(sketch(path_b, k=k, sketch_size=sketch_size))
+
+
+def compare_all(paths, *, k=21, sketch_size=1000, metric="jaccard"):
+    """Builds a sketch for each of `paths` once, then compares every pair,
+    returning a `pyarrow.Table` in long format (`sample_a`, `sample_b`,
+    the metric column) -- one row per unordered pair (`n*(n-1)/2` rows for
+    `n` paths), since both metrics are symmetric (asking for both
+    orderings of a pair would be redundant).
+
+    Building N sketches once and comparing them pairwise is O(N) FASTQ
+    reads plus O(N^2) sketch comparisons -- cheap, since each comparison
+    is O(sketch_size), not O(genome size). Comparing full k-mer sets
+    directly, pair by pair, would be O(N^2) FASTQ reads: the exact cost
+    sketching exists to avoid.
+
+    `metric` is `"jaccard"` (symmetric similarity, the default) or
+    `"mash_distance"` (Poisson-model evolutionary distance -- see
+    `Sketch.mash_distance`).
+
+    The result is a plain `pyarrow.Table`, not a `KmerCounts`: it already
+    composes with `.sort_by()`/DuckDB/Polars on its own, and inventing a
+    second chainable wrapper type for one function would not add anything
+    those tools do not already give it.
+    """
+    if metric not in ("jaccard", "mash_distance"):
+        raise ValueError(f"metric must be 'jaccard' or 'mash_distance', got {metric!r}")
+
+    str_paths = [str(p) for p in paths]
+    sketches = [sketch(p, k=k, sketch_size=sketch_size) for p in str_paths]
+
+    sample_a, sample_b, values = [], [], []
+    for i in range(len(str_paths)):
+        for j in range(i + 1, len(str_paths)):
+            value = getattr(sketches[i], metric)(sketches[j])
+            sample_a.append(str_paths[i])
+            sample_b.append(str_paths[j])
+            values.append(value)
+
+    return pa.table({"sample_a": sample_a, "sample_b": sample_b, metric: values})

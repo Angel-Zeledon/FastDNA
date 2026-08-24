@@ -644,6 +644,18 @@ impl PySketch {
         Ok(self.inner.containment(&other.inner)?)
     }
 
+    /// Estimates the per-base mutation rate implied by `.jaccard()`, under
+    /// the Poisson mutation model Mash itself uses. `.jaccard()` alone is
+    /// a similarity score; this is the same overlap turned into an
+    /// evolutionary-distance estimate, which is what "Mash-style"
+    /// comparison actually promises. See `GenomeSketch::mash_distance`'s
+    /// own doc comment for the formula and what this does not give (a
+    /// p-value against a null hypothesis, which needs a genome-length
+    /// estimate this type does not have).
+    fn mash_distance(&self, other: &PySketch) -> PyResult<f64> {
+        Ok(self.inner.mash_distance(&other.inner)?)
+    }
+
     /// Persists the sketch as JSON. Computing a sketch is the expensive
     /// part (a full pass over the FASTQ file); comparing saved sketches
     /// afterwards is what keeps an N-sample comparison from re-reading N
