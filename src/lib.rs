@@ -1,5 +1,6 @@
 // src/lib.rs
 
+pub mod atomic;
 pub mod cli;
 pub mod cms;
 pub mod cohort;

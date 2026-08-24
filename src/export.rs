@@ -12,6 +12,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rustc_hash::FxHashMap;
 
+use crate::atomic::AtomicFile;
 use crate::counter::KmerCounter;
 use crate::error::{FastDnaError, Result};
 use crate::kmer;
@@ -55,10 +56,7 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
     min_count: u32,
 ) -> Result<usize> {
     let path = output_path.as_ref();
-    let file = File::create(path).map_err(|e| FastDnaError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    let (file, pending) = AtomicFile::create(path)?;
     let schema = counts_schema();
 
     let props = WriterProperties::builder()
@@ -95,7 +93,10 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
         write_chunk(&mut writer, &schema, &u64_chunk, &seq_chunk, &freq_chunk, path)?;
     }
 
+    // `close` consumes the writer and with it the last handle on the temp
+    // file; only then can the rename-over-destination succeed on Windows.
     writer.close().map_err(|e| export_err(path, e))?;
+    pending.commit()?;
     Ok(total_written)
 }
 
@@ -133,10 +134,7 @@ pub fn export_counts_csv<P: AsRef<Path>>(
     min_count: u32,
 ) -> Result<usize> {
     let path = output_path.as_ref();
-    let file = File::create(path).map_err(|e| FastDnaError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    let (file, pending) = AtomicFile::create(path)?;
     let mut writer = BufWriter::with_capacity(512 * 1024, file);
     writeln!(writer, "kmer_u64,kmer_sequence,frequency").map_err(|e| io_err(path, e))?;
 
@@ -149,6 +147,8 @@ pub fn export_counts_csv<P: AsRef<Path>>(
         }
     }
     writer.flush().map_err(|e| io_err(path, e))?;
+    drop(writer);
+    pending.commit()?;
     Ok(written)
 }
 
@@ -166,10 +166,7 @@ pub fn export_histogram_csv<P: AsRef<Path>>(
     output_path: P,
 ) -> Result<()> {
     let path = output_path.as_ref();
-    let file = File::create(path).map_err(|e| FastDnaError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    let (file, pending) = AtomicFile::create(path)?;
     let mut writer = BufWriter::with_capacity(64 * 1024, file);
     writeln!(writer, "coverage_depth,kmer_distinct_count").map_err(|e| io_err(path, e))?;
 
@@ -185,6 +182,8 @@ pub fn export_histogram_csv<P: AsRef<Path>>(
         writeln!(writer, "{},{}", coverage, count).map_err(|e| io_err(path, e))?;
     }
     writer.flush().map_err(|e| io_err(path, e))?;
+    drop(writer);
+    pending.commit()?;
     Ok(())
 }
 

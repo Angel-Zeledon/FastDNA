@@ -41,10 +41,31 @@ fn parse_byte_size(raw: &str) -> Result<u64, String> {
     };
 
     let value: f64 = digits.trim().parse().map_err(|_| format!("'{raw}' is not a valid size (examples: 4096, 512M, 4G)"))?;
+    // f64::from_str accepts "nan" and "inf"; NaN would cast to a silent
+    // budget of 0 bytes, flipping the auto strategy to disk for no reason.
+    if !value.is_finite() {
+        return Err(format!("'{raw}' is not a valid size (examples: 4096, 512M, 4G)"));
+    }
     if value < 0.0 {
         return Err(format!("'{raw}' must not be negative"));
     }
     Ok((value * multiplier as f64) as u64)
+}
+
+/// Parses `--min-quality`: a finite Phred score within the Phred+33
+/// printable range (0..=93). Anything above the ceiling would trim every
+/// base of every read and produce a plausible-looking but empty output.
+fn parse_min_quality(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{raw}' is not a valid Phred quality score"))?;
+    if !value.is_finite() || !(0.0..=93.0).contains(&value) {
+        return Err(format!(
+            "'{raw}' is outside the Phred+33 range 0-93 (typical Illumina data uses 0-40)"
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Parser, Debug)]
@@ -62,12 +83,12 @@ pub struct Cli {
     #[arg(short, long, default_value_t = 31)]
     pub kmer_size: usize,
 
-    /// Minimum Phred quality score cutoff (0-40)
-    #[arg(short = 'q', long, default_value_t = 20.0)]
+    /// Minimum Phred quality score cutoff (0-93; typical data uses 0-40)
+    #[arg(short = 'q', long, default_value_t = 20.0, value_parser = parse_min_quality)]
     pub min_quality: f64,
 
-    /// Filter out k-mers with frequency below this cutoff
-    #[arg(short = 'm', long, default_value_t = 1)]
+    /// Filter out k-mers with frequency below this cutoff (>= 1)
+    #[arg(short = 'm', long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     pub min_count: u32,
 
     /// Filter out k-mers with frequency above this cutoff (repetitive regions)
@@ -101,4 +122,21 @@ pub struct Cli {
     /// strategy outright, for benchmarking and debugging.
     #[arg(long, value_enum, default_value = "auto")]
     pub strategy: CliStrategy,
+}
+
+impl Cli {
+    /// Cross-flag validation clap cannot express declaratively. Called by
+    /// `main` right after parsing; a distinct method so the argument-parsing
+    /// tests can exercise it without spawning the binary.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(max) = self.max_count {
+            if max < self.min_count {
+                return Err(format!(
+                    "--max-count {max} is below --min-count {}: this band keeps no k-mer at all",
+                    self.min_count
+                ));
+            }
+        }
+        Ok(())
+    }
 }

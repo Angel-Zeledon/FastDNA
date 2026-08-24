@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 
 /// Represents a single FASTQ sequencing record.
 pub struct FastqRecord {
@@ -20,11 +20,16 @@ impl FastqRecord {
     }
 
     pub fn quality_trim_end(&mut self, min_qual: f64, window_size: usize) {
-        if self.seq.len() < window_size {
+        // The reader guarantees seq and qual are the same length, but this
+        // is a public method on a struct with public fields: a structurally
+        // invalid record must clamp to the shared prefix, not index past
+        // the shorter buffer and panic.
+        let mut end_pos = self.seq.len().min(self.qual.len());
+        if end_pos < window_size {
+            self.seq.truncate(end_pos);
+            self.qual.truncate(end_pos);
             return;
         }
-
-        let mut end_pos = self.seq.len();
         let qual_slice = &self.qual;
 
         while end_pos >= window_size {
@@ -136,10 +141,19 @@ impl FastqReader<Box<dyn BufRead + Send>> {
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path_ref = path.as_ref();
         let file = File::open(path_ref)?;
-        let is_gzipped = path_ref.extension().and_then(|s| s.to_str()) == Some("gz");
+        let is_gzipped = path_ref
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("gz"));
 
+        // MultiGzDecoder, not GzDecoder: real SRA/ENA downloads are
+        // multi-member gzip, and a single-member decoder silently stops at
+        // the first member boundary -- the counting pipeline (`main.rs`,
+        // `ffi.rs`) already decodes all members, and `preview`/`sketch`/
+        // `hll` reading a truncated prefix of the same file must not
+        // disagree with it.
         let reader: Box<dyn BufRead + Send> = if is_gzipped {
-            Box::new(BufReader::with_capacity(128 * 1024, GzDecoder::new(file)))
+            Box::new(BufReader::with_capacity(128 * 1024, MultiGzDecoder::new(file)))
         } else {
             Box::new(BufReader::with_capacity(128 * 1024, file))
         };

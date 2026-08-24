@@ -1,9 +1,9 @@
 // src/qc.rs
 
 use serde::{Deserialize, Serialize};
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use crate::atomic::AtomicFile;
 use crate::error::{FastDnaError, Result};
 use crate::fastq::FastqRecord;
 
@@ -59,7 +59,7 @@ impl QcSummary {
         let path = path.as_ref();
         let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
 
-        let file = File::create(path).map_err(to_err)?;
+        let (file, pending) = AtomicFile::create(path)?;
         let mut writer = BufWriter::new(file);
         // `serde_json::Error` conflates two distinct failure kinds: an
         // underlying I/O error propagated up from the writer (`is_io()`
@@ -76,6 +76,8 @@ impl QcSummary {
             }
         })?;
         writer.flush().map_err(to_err)?;
+        drop(writer);
+        pending.commit()?;
         Ok(())
     }
 }

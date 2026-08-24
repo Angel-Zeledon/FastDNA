@@ -71,7 +71,51 @@ fn spinner(message: &str) -> ProgressBar {
     pb
 }
 
+/// Rejects the run before any work happens when an output path would
+/// overwrite the input: export runs after the input is fully read, so
+/// without this guard `-o` pointed at the input silently replaces the
+/// user's FASTQ with a counts table -- irreversible data loss.
+fn guard_against_input_overwrite(args: &Cli) -> Result<()> {
+    let outputs: [(&str, Option<&std::path::PathBuf>); 3] = [
+        ("--output", Some(&args.output)),
+        ("--qc", Some(&args.qc)),
+        ("--histogram", args.histogram.as_ref()),
+    ];
+    for (flag, path) in outputs.into_iter() {
+        if let Some(path) = path {
+            if fastdna_core::atomic::same_file(&args.input, path) {
+                return Err(FastDnaError::InvalidConfig {
+                    parameter: "output paths",
+                    reason: format!(
+                        "{flag} points at the input file {} and would overwrite it",
+                        args.input.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Probes every output path for writability before the counting run, so a
+/// typo'd output directory fails in milliseconds instead of after hours.
+fn preflight_outputs(args: &Cli) -> Result<()> {
+    fastdna_core::atomic::preflight_writable(&args.output)?;
+    fastdna_core::atomic::preflight_writable(&args.qc)?;
+    if let Some(histogram) = &args.histogram {
+        fastdna_core::atomic::preflight_writable(histogram)?;
+    }
+    Ok(())
+}
+
 fn run(args: Cli) -> Result<()> {
+    args.validate().map_err(|reason| FastDnaError::InvalidConfig {
+        parameter: "count filters",
+        reason,
+    })?;
+    guard_against_input_overwrite(&args)?;
+    preflight_outputs(&args)?;
+
     println!("==================================================");
     println!(" FastDNA: High-Performance Genomic Kernel (Rust)  ");
     println!("==================================================");
@@ -95,7 +139,10 @@ fn run(args: Cli) -> Result<()> {
         progress_interval: default_config.progress_interval,
     };
 
-    let is_gz = args.input.extension().is_some_and(|ext| ext == "gz");
+    let is_gz = args
+        .input
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"));
     let file = File::open(&args.input).map_err(|e| FastDnaError::Io { path: args.input.clone(), source: e })?;
 
     // Best-effort: a size we cannot read (an unusual filesystem, a stream
@@ -181,8 +228,14 @@ fn run(args: Cli) -> Result<()> {
     let pb_export = spinner("Compressing and writing to disk (Parquet/CSV)...");
     let export_start = Instant::now();
 
-    let output_str = args.output.to_string_lossy();
-    let records_written = if output_str.ends_with(".parquet") {
+    // Case-insensitive: on Windows filesystems `OUT.PARQUET` is the same
+    // file as `out.parquet`, and writing CSV bytes into it hands the
+    // downstream Parquet reader a corrupt file.
+    let wants_parquet = args
+        .output
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"));
+    let records_written = if wants_parquet {
         export::export_parquet(&counter, &args.output, args.kmer_size, args.min_count)
             .inspect_err(|_| pb_export.abandon())?
     } else {
