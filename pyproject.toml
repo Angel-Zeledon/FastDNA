@@ -23,8 +23,30 @@ dynamic = ["version"]
 # itself. Neither is a runtime dependency of the `fastdna` package itself;
 # that test module uses `pytest.importorskip` so their absence skips rather
 # than fails.
+# `numpy`, `scipy`, `scikit-learn` and `shap` back
+# `python/tests/test_interpret.py` only -- none is a dependency of
+# `fastdna.interpret` itself, which imports nothing but `pyarrow` at module
+# level. Its two core functions (`top_features`,
+# `export_top_features_fasta`) are pure Python over plain array-likes; only
+# `explain_with_shap` needs `shap`/`numpy`, and it imports both lazily
+# inside the function body, raising a clear "pip install shap" ImportError
+# rather than a raw one when `shap` is absent. `shap` in particular drags
+# in the full scientific stack (numba/llvmlite), which is exactly why it
+# stays a test-only extra and never a runtime dependency of the wheel.
+# In the test module, `pytest.importorskip("shap", ...)` is called inside
+# the one test that needs it -- not at module level -- so a missing `shap`
+# skips only that test rather than the whole file.
 [project.optional-dependencies]
-test = ["pytest>=7", "pytest-timeout>=2.1", "polars>=1.0", "duckdb>=1.0"]
+test = [
+    "pytest>=7",
+    "pytest-timeout>=2.1",
+    "polars>=1.0",
+    "duckdb>=1.0",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "shap",
+]
 
 [tool.maturin]
 features = ["python"]
