@@ -13,12 +13,27 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use flate2::read::MultiGzDecoder;
 
-use fastdna_core::cli::Cli;
+use fastdna_core::cli::{Cli, CliStrategy};
 use fastdna_core::error::{FastDnaError, Result};
 use fastdna_core::export;
 use fastdna_core::fastq::FastqReader;
-use fastdna_core::pipeline::{process_stream_parallel, PipelineConfig};
+use fastdna_core::pipeline::{
+    process_stream_parallel_with_policy, CountStrategy, MemoryPolicy, PipelineConfig,
+};
 use fastdna_core::progress::Progress;
+
+/// A `.gz` input's on-disk size is compressed, not the decompressed size
+/// the counting pipeline actually sees -- feeding the compressed size
+/// straight into `mem_estimate`'s occurrence estimate would badly
+/// under-predict peak memory for gzip input. This is a fixed, documented
+/// approximation rather than a live measurement (e.g. decompressing a
+/// prefix to measure the real ratio): FASTQ text compresses reasonably
+/// consistently with gzip (repetitive quality strings, a small DNA
+/// alphabet), and a fixed multiplier costs nothing on every run, unlike a
+/// live sample. If this proves too far off in practice, a live-sampled
+/// ratio is the natural next step -- this is a starting point, not a
+/// value proven optimal by a sweep across real `.gz` inputs.
+const GZIP_FASTQ_EXPANSION_FACTOR: f64 = 3.5;
 
 fn main() -> ExitCode {
     let args = Cli::parse();
@@ -29,6 +44,19 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Formats a byte count for the strategy banner (binary units, one decimal
+/// place) -- `format_bytes(8_600_000_000)` -> `"8.01GB"`.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit_idx = 0;
+    while value >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_idx += 1;
+    }
+    format!("{value:.2}{}", UNITS[unit_idx])
 }
 
 fn spinner(message: &str) -> ProgressBar {
@@ -57,7 +85,6 @@ fn run(args: Cli) -> Result<()> {
     let default_config = PipelineConfig::default();
     let threads = args.threads.unwrap_or(default_config.num_threads);
     println!("Worker Threads: {threads}");
-    println!("--------------------------------------------------");
 
     let config = PipelineConfig {
         k: args.kmer_size,
@@ -68,16 +95,50 @@ fn run(args: Cli) -> Result<()> {
         progress_interval: default_config.progress_interval,
     };
 
+    let is_gz = args.input.extension().is_some_and(|ext| ext == "gz");
+    let file = File::open(&args.input).map_err(|e| FastDnaError::Io { path: args.input.clone(), source: e })?;
+
+    // Best-effort: a size we cannot read (an unusual filesystem, a stream
+    // that lies about its length) just disables size-based estimation --
+    // see `MemoryPolicy::estimated_input_bytes`'s doc comment for why that
+    // defaults to the conservative in-memory choice rather than failing
+    // the whole run over a memory *prediction* that could not be made.
+    let on_disk_bytes = file.metadata().ok().map(|m| m.len());
+    let estimated_input_bytes = on_disk_bytes.map(|bytes| {
+        if is_gz {
+            (bytes as f64 * GZIP_FASTQ_EXPANSION_FACTOR) as u64
+        } else {
+            bytes
+        }
+    });
+
+    let policy = MemoryPolicy {
+        strategy: match args.strategy {
+            CliStrategy::Auto => None,
+            CliStrategy::Memory => Some(CountStrategy::InMemory),
+            CliStrategy::Disk => Some(CountStrategy::Disk),
+        },
+        max_ram_bytes: args.max_ram,
+        estimated_input_bytes,
+    };
+
+    // Printed from the *same* pure decision `process_stream_parallel_with_
+    // policy` itself will act on below (not a separate ad hoc guess), so
+    // this line and the run it precedes can never disagree with each
+    // other -- "record which one was used so it is visible rather than
+    // mysterious" means this has to be the actual decision, not a
+    // approximation of it.
+    let preview_decision = fastdna_core::pipeline::resolve_strategy(&policy, &config);
+    println!(
+        "Strategy:       {} (estimated peak {}, budget {})",
+        preview_decision.strategy.as_str(),
+        format_bytes(preview_decision.estimated_peak_bytes),
+        format_bytes(preview_decision.budget_bytes),
+    );
+    println!("--------------------------------------------------");
+
     let start_time = Instant::now();
     let pb = spinner("Analyzing genomic reads in streaming...");
-
-    let is_gz = args.input.extension().is_some_and(|ext| ext == "gz");
-    let file = File::open(&args.input)
-        .map_err(|e| FastDnaError::Io {
-            path: args.input.clone(),
-            source: e,
-        })
-        .inspect_err(|_| pb.abandon())?;
 
     let buf_reader: Box<dyn BufRead + Send + 'static> = if is_gz {
         Box::new(BufReader::new(MultiGzDecoder::new(file)))
@@ -95,12 +156,13 @@ fn run(args: Cli) -> Result<()> {
         }
     };
 
-    let (mut counter, qc, total_reads) = process_stream_parallel(
+    let (mut counter, qc, total_reads, decision) = process_stream_parallel_with_policy(
         fastq_reader,
         config,
         &args.input,
         Some(&on_progress),
         None, // the CLI has no way to cancel a running call yet
+        policy,
     )
     .inspect_err(|_| pb.abandon())?;
 
@@ -141,6 +203,7 @@ fn run(args: Cli) -> Result<()> {
     }
 
     println!("--------------------------------------------------");
+    println!("Strategy Used: {}", decision.strategy.as_str());
     println!("Total Reads: {total_reads}");
     println!(
         "Total k-mers Indexed: {} | Distinct k-mers: {}",
