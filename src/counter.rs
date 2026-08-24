@@ -1,6 +1,6 @@
 // src/counter.rs
 
-use std::cell::{Ref, RefCell};
+use std::sync::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
 /// Outcome of a `prune` call, for reporting what a filter removed.
@@ -12,7 +12,7 @@ pub struct PruneStats {
 }
 
 /// The mutable state behind `KmerCounter`, split out so it can live inside
-/// a single `RefCell` (see `KmerCounter`'s doc comment for why).
+/// a single `Mutex` (see `KmerCounter`'s doc comment for why).
 #[derive(Debug, Default)]
 struct Inner {
     /// Every canonical k-mer instance seen since the last time `finalized`
@@ -141,13 +141,25 @@ fn merge_sorted_counts(a: &[(u64, u32)], b: &[(u64, u32)]) -> Vec<(u64, u32)> {
 /// hot loop. Every read method (`iter`, `get_count`, `distinct_kmers`,
 /// `generate_histogram`, `top_kmers`) stays `&self`, matching the API
 /// this type has always had, and lazily triggers a one-time
-/// sort-and-compact pass (`finalize_inner`) via `RefCell` interior
-/// mutability if the buffer has grown since the last one: call
-/// `insert`/`insert_batch` freely during counting, the sort only happens
-/// once, on first read, however many inserts came before it.
+/// sort-and-compact pass (`finalize_inner`) if the buffer has grown since
+/// the last one: call `insert`/`insert_batch` freely during counting, the
+/// sort only happens once, on first read, however many inserts came
+/// before it.
+///
+/// The state lives behind a `Mutex<Inner>`, not a `RefCell<Inner>`: a
+/// `RefCell` makes this type `!Sync`, which is invisible to `cargo test`
+/// and `cargo clippy --all-targets` (both default-feature, and the FFI
+/// layer that needs `Sync` is gated behind `feature = "python"`) but
+/// breaks `cargo build --features python` outright, because pyo3's
+/// `Python::allow_threads` requires the closure -- and everything it
+/// captures, including `&KmerCounter` -- to be `Send`, which in turn
+/// requires `KmerCounter: Sync`. A `Mutex` costs an uncontended lock/
+/// unlock per read-method call, which is immaterial next to the O(n log n)
+/// sort it may guard; see `kmer_counter_is_sync` below for the regression
+/// test.
 #[derive(Debug, Default)]
 pub struct KmerCounter {
-    inner: RefCell<Inner>,
+    inner: Mutex<Inner>,
     total_kmers: u64,
 }
 
@@ -161,21 +173,47 @@ impl KmerCounter {
     /// sample's instance count climbs into the hundreds of millions.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            inner: RefCell::new(Inner { raw: Vec::with_capacity(capacity), ..Inner::default() }),
+            inner: Mutex::new(Inner { raw: Vec::with_capacity(capacity), ..Inner::default() }),
             total_kmers: 0,
         }
     }
 
+    /// Access to `inner` from a `&mut self` method: no locking is actually
+    /// needed (exclusive access is already guaranteed at compile time by
+    /// `&mut self`), but `Mutex::get_mut` still returns a `LockResult`
+    /// because a *previous* holder of the lock could have panicked while
+    /// holding it (`pipeline.rs`'s worker `catch_unwind` makes that
+    /// possible: a panic mid-`finalize_inner`, say). Recovering the
+    /// guard rather than propagating the poison is deliberate: a poisoned
+    /// counter's producing worker has already had its whole result
+    /// discarded by `process_stream_parallel`'s `worker_panic` check, so
+    /// there is no result depending on this one being pristine, and
+    /// refusing to even inspect it would just turn one panic into a
+    /// second, unrelated one here.
+    fn inner_mut(&mut self) -> &mut Inner {
+        self.inner.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Locks `inner` from a `&self` method, finalizing it first if it is
+    /// not already valid, and hands back the guard so the caller can read
+    /// `finalized` directly. See `inner_mut` for why a poisoned lock is
+    /// recovered rather than propagated.
+    fn ensure_finalized(&self) -> MutexGuard<'_, Inner> {
+        let mut guard = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        finalize_inner(&mut guard);
+        guard
+    }
+
     #[inline(always)]
     pub fn insert(&mut self, kmer: u64) {
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         inner.raw.push(kmer);
         inner.valid = false;
         self.total_kmers += 1;
     }
 
     pub fn insert_batch(&mut self, kmers: &[u64]) {
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         inner.raw.extend_from_slice(kmers);
         inner.valid = false;
         self.total_kmers += kmers.len() as u64;
@@ -190,8 +228,9 @@ impl KmerCounter {
     pub fn merge(&mut self, other: KmerCounter) {
         self.total_kmers += other.total_kmers;
 
-        let mut other_inner = other.inner.into_inner();
-        let self_inner = self.inner.get_mut();
+        let mut other_inner =
+            other.inner.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let self_inner = self.inner_mut();
         finalize_inner(self_inner);
         finalize_inner(&mut other_inner);
 
@@ -208,7 +247,7 @@ impl KmerCounter {
     /// kept. `total_kmers` is deliberately left unchanged — it is the
     /// normalization basis and must reflect the sample's true depth.
     pub fn prune(&mut self, min: u32, max: Option<u32>) -> PruneStats {
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         finalize_inner(inner);
 
         let mut stats = PruneStats::default();
@@ -228,17 +267,9 @@ impl KmerCounter {
         stats
     }
 
-    fn ensure_finalized(&self) -> Ref<'_, Vec<(u64, u32)>> {
-        {
-            let mut inner = self.inner.borrow_mut();
-            finalize_inner(&mut inner);
-        }
-        Ref::map(self.inner.borrow(), |inner| &inner.finalized)
-    }
-
     #[inline(always)]
     pub fn distinct_kmers(&self) -> usize {
-        self.ensure_finalized().len()
+        self.ensure_finalized().finalized.len()
     }
 
     #[inline(always)]
@@ -247,33 +278,36 @@ impl KmerCounter {
     }
 
     pub fn get_count(&self, kmer: u64) -> u32 {
-        let finalized = self.ensure_finalized();
-        finalized.binary_search_by_key(&kmer, |&(k, _)| k).map(|idx| finalized[idx].1).unwrap_or(0)
+        let guard = self.ensure_finalized();
+        guard
+            .finalized
+            .binary_search_by_key(&kmer, |&(k, _)| k)
+            .map(|idx| guard.finalized[idx].1)
+            .unwrap_or(0)
     }
 
     /// Every `(kmer, count)` pair, ascending by k-mer. Owned tuples, not
-    /// borrowed: the sorted table lives behind a `RefCell` (see
-    /// `KmerCounter`'s doc comment), and `u64`/`u32` are cheap enough to
-    /// copy that cloning the finalized table once per call -- typically
-    /// once per `KmerCounter` lifetime in practice, since callers iterate
-    /// it exactly once to build an export or an Arrow batch -- costs far
-    /// less than the sort it follows.
+    /// borrowed: `u64`/`u32` are cheap enough to copy that cloning the
+    /// finalized table once per call -- typically once per `KmerCounter`
+    /// lifetime in practice, since callers iterate it exactly once to
+    /// build an export or an Arrow batch -- costs far less than the sort
+    /// it follows.
     pub fn iter(&self) -> std::vec::IntoIter<(u64, u32)> {
-        self.ensure_finalized().clone().into_iter()
+        self.ensure_finalized().finalized.clone().into_iter()
     }
 
     pub fn generate_histogram(&self) -> FxHashMap<u32, u64> {
-        let finalized = self.ensure_finalized();
+        let guard = self.ensure_finalized();
         let mut histogram: FxHashMap<u32, u64> = FxHashMap::default();
-        for &(_, count) in finalized.iter() {
+        for &(_, count) in guard.finalized.iter() {
             *histogram.entry(count).or_insert(0) += 1;
         }
         histogram
     }
 
     pub fn top_kmers(&self, n: usize) -> Vec<(u64, u32)> {
-        let finalized = self.ensure_finalized();
-        let mut entries: Vec<(u64, u32)> = finalized.clone();
+        let guard = self.ensure_finalized();
+        let mut entries: Vec<(u64, u32)> = guard.finalized.clone();
         entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         entries.truncate(n);
         entries
@@ -293,6 +327,21 @@ mod tests {
             }
         }
         c
+    }
+
+    /// `cargo build --features python` requires `&PyKmerCounts: Send`,
+    /// which requires `KmerCounter: Sync` (see `PyKmerCounts::table` in
+    /// `ffi.rs`, which calls `py.allow_threads` over a closure borrowing
+    /// `self.counter`). That feature is not built by `cargo test` or
+    /// `cargo clippy --all-targets` (both default-feature), so a change
+    /// that silently reintroduces `!Sync` -- e.g. swapping `Mutex` back
+    /// for `RefCell` -- would pass this crate's ordinary CI checks and
+    /// only fail the wheel build. This test makes that failure local and
+    /// immediate instead.
+    #[test]
+    fn kmer_counter_is_sync() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<KmerCounter>();
     }
 
     #[test]
