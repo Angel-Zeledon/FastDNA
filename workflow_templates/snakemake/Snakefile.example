@@ -1,0 +1,86 @@
+# Snakefile.example -- minimal FastDNA integration for Snakemake
+#
+# A "one rule per sample" pattern: given a directory of per-sample FASTQ(.gz)
+# files, count canonical k-mers for each one and write a Parquet file plus a
+# QC report, using FastDNA's CLI (`fastdna --input ... --output ... -k ...`).
+# CLI flags below match the current README's "Command-line interface"
+# section exactly:
+#
+#   fastdna --input sample.fastq.gz --output counts.parquet -k 31
+#   -i/--input, -o/--output, -k/--kmer-size, -q/--min-quality,
+#   -m/--min-count, -M/--max-count, -t/--threads, --qc, --histogram
+#
+# Copy this file to your pipeline as `Snakefile` (or `include:` it from one)
+# and adjust SAMPLES / the `data/{sample}.fastq.gz` glob to your own layout
+# -- nothing else here should need to change to run.
+#
+# Verification note: written by hand against Snakemake's current rule/
+# wildcard syntax; `snakemake -n` (dry run) was not available to actually
+# execute against this file in the environment this was written in -- see
+# this repo's contribution notes for what was and wasn't run.
+
+SAMPLES = glob_wildcards("data/{sample}.fastq.gz").sample
+
+
+rule all:
+    input:
+        expand("results/{sample}.counts.parquet", sample=SAMPLES),
+        expand("results/{sample}.qc.json", sample=SAMPLES),
+
+
+# --- Option A: shell out to the fastdna CLI (most pipelines will use this) ---
+rule fastdna_count:
+    input:
+        fastq="data/{sample}.fastq.gz",
+    output:
+        counts="results/{sample}.counts.parquet",
+        qc="results/{sample}.qc.json",
+    params:
+        k=31,
+        min_quality=20.0,
+        min_count=1,
+        threads=4,
+    threads: 4
+    shell:
+        "fastdna "
+        "--input {input.fastq} "
+        "--output {output.counts} "
+        "--kmer-size {params.k} "
+        "--min-quality {params.min_quality} "
+        "--min-count {params.min_count} "
+        "--threads {threads} "
+        "--qc {output.qc}"
+
+
+# --- Option B: the equivalent via the Python API in a `run:` block ---------
+# Both are legitimate; use this one if you want the result (a KmerCounts,
+# with its zero-copy pyarrow.Table) in Python for further processing in the
+# same rule, rather than immediately writing Parquet/JSON to disk via the
+# CLI above and reading them back in a later rule.
+#
+# rule fastdna_count_python:
+#     input:
+#         fastq="data/{sample}.fastq.gz",
+#     output:
+#         counts="results/{sample}.counts.parquet",
+#         qc="results/{sample}.qc.json",
+#     params:
+#         k=31,
+#         min_quality=20.0,
+#         min_count=1,
+#     threads: 4
+#     run:
+#         import json
+#         import pyarrow.parquet as pq
+#         import fastdna
+#
+#         result = fastdna.count(
+#             input.fastq,
+#             k=params.k,
+#             min_quality=params.min_quality,
+#             min_count=params.min_count,
+#             threads=threads,
+#         )
+#         pq.write_table(result.table, output.counts)
+#         with open(output.qc, "w") as f:
+#             json.dump(result.qc, f, indent=2)
