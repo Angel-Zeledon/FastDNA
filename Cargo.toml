@@ -2,6 +2,12 @@
 name = "fastdna"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Fast canonical k-mer counting from FASTQ, with a zero-copy Arrow bridge to Python"
+repository = "https://github.com/anzeledon/fastdna"
+readme = "README.md"
+keywords = ["bioinformatics", "genomics", "kmer", "fastq", "arrow"]
+categories = ["science", "command-line-utilities"]
 
 [lib]
 name = "fastdna_core"
