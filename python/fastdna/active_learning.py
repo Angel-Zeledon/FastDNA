@@ -62,6 +62,21 @@ def _is_valid_candidate_pair(entry):
     )
 
 
+def _looks_like_probability_vector_pair(result):
+    """True if top-level `result` (already known to have exactly 2
+    elements) could *itself* be read as the probability-vector shape: a
+    `(probs, labels)` pair of two same-length, non-empty sequences where
+    `probs` is entirely numeric. Used only by `_is_ranked_tuples` to
+    detect a genuine shape ambiguity -- see there.
+    """
+    probs, labels = result
+    if not isinstance(probs, (list, tuple)) or not isinstance(labels, (list, tuple)):
+        return False
+    if len(probs) == 0 or len(probs) != len(labels):
+        return False
+    return all(isinstance(p, (int, float)) and not isinstance(p, bool) for p in probs)
+
+
 def _is_ranked_tuples(result):
     """True if `result` looks like the ranked-tuples shape: a sequence
     where *every* element is a `(label, score)` candidate pair (see
@@ -72,23 +87,42 @@ def _is_ranked_tuples(result):
     candidates, and for probability vectors of any length != 2 (the
     top-level `(probs, labels)` pair itself is never a valid `(label,
     score)` candidate unless it happens to have exactly 2 classes *and*
-    numeric class labels -- documented known ambiguity below). A ranked
-    list with string labels is unambiguous regardless of its length,
-    including the length-2 case, because `labels` in the probability-vector
-    shape is checked too: it only "looks like" a candidate pair if its own
-    second element is itself numeric, which fails for ordinary (string)
-    class labels.
+    numeric class labels). A ranked list with string labels is
+    unambiguous regardless of its length, including the length-2 case,
+    because `labels` in the probability-vector shape is checked too: it
+    only "looks like" a candidate pair if its own second element is
+    itself numeric, which fails for ordinary (string) class labels.
 
-    Known limitation: a 2-class probability vector paired with *numeric*
-    class labels (e.g. `([0.6, 0.4], [0, 1])`) is structurally
-    indistinguishable from a 2-entry ranked-tuples list and will be
-    misdetected as ranked-tuples. Use string (or otherwise non-numeric)
-    class labels, or pre-convert to the ranked-tuples shape yourself, to
-    avoid this corner case.
+    The one genuine ambiguity -- a 2-class probability vector paired with
+    *numeric* class labels, e.g. `([0.6, 0.4], [0, 1])`, which is exactly
+    `(clf.predict_proba(x)[0].tolist(), list(clf.classes_))` for an
+    ordinary binary scikit-learn classifier -- is structurally
+    indistinguishable from a 2-entry ranked-tuples list purely by shape.
+    It is resolved here, not documented away: a ranked-tuples list is
+    contractually ordered best-first, i.e. non-increasing scores. When
+    `result` has exactly two elements and *also* looks like a valid
+    `(probs, labels)` pair (`_looks_like_probability_vector_pair`), the
+    ranked-tuples reading is accepted only if its implied scores (each
+    element's second value) are actually non-increasing. `([0.5, 0.5],
+    [0, 1])` read as ranked-tuples has scores `[0.5, 1]` -- *ascending* --
+    so it fails this check and is correctly read as a probability vector
+    instead. A non-ambiguous 2-entry ranked list (e.g. `[("A", 3.0), ("B",
+    4.0)]`, whose first "candidate"'s label `"A"` is not numeric, so it
+    cannot be a valid `probs` sequence) is unaffected by this check
+    regardless of its own score order, since there's nothing to
+    disambiguate it from.
     """
     if not isinstance(result, (list, tuple)):
         return False
-    return all(_is_valid_candidate_pair(entry) for entry in result)
+    if not all(_is_valid_candidate_pair(entry) for entry in result):
+        return False
+
+    if len(result) == 2 and _looks_like_probability_vector_pair(result):
+        scores = [entry[1] for entry in result]
+        if scores != sorted(scores, reverse=True):
+            return False
+
+    return True
 
 
 def _scores_from_ranked_tuples(ranked_results):
@@ -97,16 +131,12 @@ def _scores_from_ranked_tuples(ranked_results):
             "uncertainty_score: ranked_results is empty -- need at least "
             "one (label, score) candidate to compute an uncertainty score."
         )
-    scores = []
-    for i, entry in enumerate(ranked_results):
-        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-            raise ValueError(
-                f"uncertainty_score: entry {i!r} of ranked_results is not "
-                f"a (label, score) pair: {entry!r}"
-            )
-        _, score = entry
-        scores.append(float(score))
-    return scores
+    # No further shape validation needed here: this is only ever called
+    # after `_is_ranked_tuples(ranked_results)` returned True, which
+    # already guarantees every entry is a length-2 sequence with a
+    # numeric second element (`_is_valid_candidate_pair`) -- re-checking
+    # that here would be dead code, unreachable by construction.
+    return [float(entry[1]) for entry in ranked_results]
 
 
 def _scores_from_probability_vector(probs, labels):

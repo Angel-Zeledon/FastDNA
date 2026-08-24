@@ -166,7 +166,21 @@ def test_uncertainty_score_rejects_unknown_method():
 
 
 def test_uncertainty_score_rejects_malformed_entries():
-    with pytest.raises(ValueError):
+    """A malformed "ranked" entry never reaches a dedicated ranked-tuples
+    validation branch -- there isn't one, by construction:
+    `_scores_from_ranked_tuples` only runs once `_is_ranked_tuples` has
+    already confirmed every entry looks like a `(label, score)` pair, so a
+    genuinely malformed entry like the bare string `"not-a-pair"` below
+    always fails *that* check first and falls through to the
+    probability-vector branch instead, which reports it as a probs/labels
+    length mismatch (`"not-a-pair"` counted as 10 one-character labels).
+    Asserting the actual message here (not just `pytest.raises(ValueError)`)
+    is what makes this test really exercise that path, rather than merely
+    happening to pass through it -- see
+    `test_active_learning_audit.py::test_malformed_ranked_entries_report_a_misleading_probability_vector_error`
+    for the fuller characterisation.
+    """
+    with pytest.raises(ValueError, match=r"probs has 2 entries but labels has 10"):
         uncertainty_score([("A", 0.9), "not-a-pair"], method="margin")
 
 
