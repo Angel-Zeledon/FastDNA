@@ -106,6 +106,15 @@ def kmer_feature_table(sample_paths, *, k=31, min_count=1, top_features=None, id
     Column order: `sample_id` first, then k-mer columns sorted by k-mer
     sequence, for a deterministic, reproducible table across runs.
     """
+    # Mirrors `KmerVectorizer.fit()`'s own validation: a negative value
+    # would silently slice from the *end* of the ranking (dropping the top
+    # k-mers instead of keeping them), and 0 would silently produce a
+    # feature-less table.
+    if top_features is not None and (
+        not isinstance(top_features, int) or isinstance(top_features, bool) or top_features <= 0
+    ):
+        raise ValueError(f"top_features must be a positive int or None, got {top_features!r}")
+
     if isinstance(sample_paths, dict):
         id_to_path = dict(sample_paths)
     else:

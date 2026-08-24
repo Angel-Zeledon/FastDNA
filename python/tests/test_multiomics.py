@@ -140,6 +140,20 @@ def test_kmer_feature_table_top_features_restricts_columns(tmp_path):
     assert set(limited_kmer_columns).issubset(set(full_kmer_columns))
 
 
+def test_kmer_feature_table_rejects_zero_top_features(tmp_path):
+    a = write_fastq(tmp_path, "s1.fastq", ["ACGTACGTACGT"] * 3)
+    with pytest.raises(ValueError, match="top_features"):
+        kmer_feature_table([str(a)], k=5, top_features=0)
+
+
+def test_kmer_feature_table_rejects_negative_top_features(tmp_path):
+    # A negative value would silently slice from the *end* of the ranking
+    # (dropping the top k-mers instead of keeping them) -- it must raise.
+    a = write_fastq(tmp_path, "s1.fastq", ["ACGTACGTACGT"] * 3)
+    with pytest.raises(ValueError, match="top_features"):
+        kmer_feature_table([str(a)], k=5, top_features=-3)
+
+
 def test_kmer_feature_table_dict_input_uses_explicit_ids(tmp_path):
     a = write_fastq(tmp_path, "raw_file_1.fastq", ["ACGTACGTACGT"] * 3)
     b = write_fastq(tmp_path, "raw_file_2.fastq", ["TTTTGGGGCCCC"] * 3)

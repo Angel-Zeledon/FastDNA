@@ -39,12 +39,29 @@ label).
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from scipy import sparse
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
 import fastdna
+
+
+def _validate_paths(X, method_name):
+    """Turns `X` into a list of path strings, rejecting the classic footgun
+    of passing a single path instead of a list of them: a bare string (or
+    `os.PathLike`) *is* iterable, so it would otherwise be iterated
+    character by character and surface as a baffling per-character
+    `FileNotFoundError` deep inside the counting loop.
+    """
+    if isinstance(X, (str, os.PathLike)):
+        raise TypeError(
+            f"KmerVectorizer.{method_name}() expects a list of paths, got a single "
+            f"path {str(X)!r} -- wrap it in a list: [{str(X)!r}]"
+        )
+    return [str(p) for p in X]
 
 
 class KmerVectorizer(BaseEstimator, TransformerMixin):
@@ -144,9 +161,18 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         self, per the scikit-learn convention that `fit()` always returns
         the (now-fitted) estimator, so calls chain: `vectorizer.fit(X).transform(X)`.
         """
-        paths = [str(p) for p in X]
+        paths = _validate_paths(X, "fit")
         if not paths:
             raise ValueError("KmerVectorizer.fit() requires at least one sample path, got an empty X")
+        seen: set[str] = set()
+        for path in paths:
+            if path in seen:
+                raise ValueError(
+                    f"X contains a duplicate path: {path!r}. Each training sample may "
+                    "appear only once -- a duplicated path would double-count its "
+                    "k-mers' prevalence, the vocabulary ranking's primary criterion."
+                )
+            seen.add(path)
         if self.top_features is not None and (
             not isinstance(self.top_features, (int, np.integer)) or isinstance(self.top_features, bool) or self.top_features <= 0
         ):
@@ -237,7 +263,7 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         an explicit densify step.
         """
         check_is_fitted(self, "vocabulary_")
-        paths = [str(p) for p in X]
+        paths = _validate_paths(X, "transform")
         n_features = len(self.vocabulary_)
 
         rows: list[int] = []

@@ -75,38 +75,56 @@ def suggest_min_count(spectrum, default=DEFAULT_MIN_COUNT):
     if len(depths_present) < 3:
         return default
 
-    # Iterate over every depth in the contiguous range, not just the ones
-    # present in `spectrum` -- a depth with zero distinct k-mers is routine
-    # in a small sample and must count as a real (zero-height) point in the
-    # shape, not be skipped so its neighbors look adjacent.
-    min_depth, max_depth = depths_present[0], depths_present[-1]
-    counts = [spectrum.get(d, 0) for d in range(min_depth, max_depth + 1)]
+    # Walk the *observed* depths only, never the contiguous range -- a
+    # single adapter-dimer k-mer at depth 10^7+ would otherwise force a
+    # multi-gigabyte materialized list. A depth with zero distinct k-mers is
+    # still routine in a small sample and must count as a real (zero-height)
+    # point in the shape, not be skipped so its neighbors look adjacent --
+    # so a gap between consecutive observed depths is handled explicitly
+    # below, exactly as the contiguous walk would have: the gap's first
+    # missing depth (count 0) becomes a new floor (it is lower than any
+    # positive floor), and the very next point -- present or missing --
+    # trivially clears `0 * RISE_FACTOR`, ending the walk there.
+    min_depth = depths_present[0]
 
-    floor_idx = 0
-    valley_idx = None
-    for j in range(1, len(counts)):
-        if counts[j] < counts[floor_idx]:
+    floor_depth = min_depth
+    floor_count = spectrum[min_depth]
+    valley_depth = None
+    prev_depth = min_depth
+    for d in depths_present[1:]:
+        if d > prev_depth + 1:
+            # A gap: depth `prev_depth + 1` exists in the shape with zero
+            # distinct k-mers. If the current floor is already 0 (an
+            # explicit zero entry earlier), the gap's zero is not lower and
+            # itself clears the (zero) rise threshold, ending the walk at
+            # that existing floor; otherwise the gap's first missing depth
+            # is the new, lowest-possible floor, and the next point ends
+            # the walk there.
+            valley_depth = floor_depth if floor_count == 0 else prev_depth + 1
+            break
+        count = spectrum[d]
+        if count < floor_count:
             # A new, lower candidate floor -- keep walking down the error
             # peak's tail.
-            floor_idx = j
-            continue
-        if counts[j] >= counts[floor_idx] * RISE_FACTOR:
+            floor_depth, floor_count = d, count
+        elif count >= floor_count * RISE_FACTOR:
             # A substantial climb from the current floor: accept it as the
             # start of the coverage peak, and the current floor as the
             # valley.
-            valley_idx = floor_idx
+            valley_depth = floor_depth
             break
         # Otherwise: not lower, but not a substantial rise either -- this is
         # noise (e.g. a single-count uptick), not the end of the valley.
         # Keep walking without updating the floor.
+        prev_depth = d
 
-    if valley_idx is None:
+    if valley_depth is None:
         # Never found a climb big enough to call a coverage peak.
         return default
-    if valley_idx == 0:
+    if valley_depth == min_depth:
         # The very first depth in range was already the lowest, and the
         # next depth alone cleared the rise threshold: there was no actual
         # descent to walk down, i.e. no error peak to walk past.
         return default
 
-    return min_depth + valley_idx
+    return valley_depth

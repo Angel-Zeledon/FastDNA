@@ -196,6 +196,20 @@ def embed_cohort(
 
     str_paths = [str(p) for p in paths]
 
+    # A duplicated path would make `_distance_matrix`'s path->index dict map
+    # both occurrences to the last index, silently leaving the earlier
+    # duplicate's row all zeros -- corrupt output, not a degenerate-but-valid
+    # embedding. Refuse it explicitly, before any sketching work is done.
+    seen = set()
+    for p in str_paths:
+        if p in seen:
+            raise ValueError(
+                f"paths contains a duplicate entry: {p!r}. Each sample may "
+                "appear only once; a duplicated path would silently corrupt "
+                "its distance-matrix row."
+            )
+        seen.add(p)
+
     table = fastdna.compare_all(str_paths, k=k, sketch_size=sketch_size, metric=metric)
     distance_matrix = _distance_matrix(table, str_paths, metric)
 

@@ -210,6 +210,17 @@ def test_export_top_features_fasta_handles_negative_importance_in_header(tmp_pat
     assert lines[0] == ">rank1_importance-0.417"
 
 
+def test_export_top_features_fasta_writes_lf_line_endings_only(tmp_path):
+    # FASTA is conventionally an LF format; on Windows, platform text-mode
+    # translation would silently write CRLF and break byte-identical
+    # cross-platform output (and some downstream tools). No CR bytes ever.
+    out = tmp_path / "lf.fasta"
+
+    export_top_features_fasta([0.9, -0.5], ["ACGTA", "TTTTG"], str(out), n=2)
+
+    assert b"\r" not in out.read_bytes()
+
+
 def test_export_top_features_fasta_returns_the_same_table_it_wrote(tmp_path):
     out = tmp_path / "ret.fasta"
     importances = [0.9, -0.5, 0.1]

@@ -281,6 +281,21 @@ class TestValidation:
         with pytest.raises(ValueError):
             embed_cohort(paths, method="pcoa", n_components=1)
 
+    def test_duplicated_path_raises_valueerror_naming_the_path(self, cohort_paths):
+        # A duplicated path would make the path->index dict map both
+        # occurrences to the last index, silently leaving the earlier
+        # duplicate's distance-matrix row all zeros -- this must be an
+        # explicit error naming the offending path, not corrupt output.
+        paths = list(cohort_paths.values())
+        duplicated = paths + [paths[0]]
+
+        with pytest.raises(ValueError) as exc_info:
+            embed_cohort(duplicated, method="pcoa", n_components=2)
+
+        # The message names the offending path (repr'd, so Windows
+        # backslashes appear escaped).
+        assert repr(paths[0]) in str(exc_info.value)
+
 
 class TestTsne:
     def test_tsne_runs_over_a_precomputed_distance_matrix(self, cohort_paths):

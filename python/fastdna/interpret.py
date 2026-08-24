@@ -155,7 +155,9 @@ def export_top_features_fasta(importances, feature_names, path, *, n=20):
     kmers = table.column("kmer").to_pylist()
     values = table.column("importance").to_pylist()
 
-    with open(path, "w") as f:
+    # newline="\n" pins LF line endings (FASTA, like FASTQ, is conventionally
+    # an LF format) instead of letting Windows text mode translate to CRLF.
+    with open(path, "w", newline="\n") as f:
         for rank, kmer, importance in zip(ranks, kmers, values):
             f.write(f">rank{rank}_importance{importance:.3f}\n{kmer}\n")
 

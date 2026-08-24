@@ -85,6 +85,43 @@ def test_suggest_min_count_falls_back_when_no_real_peak_follows_a_blip():
     assert suggest_min_count(spectrum) == 2
 
 
+def test_suggest_min_count_handles_a_huge_outlier_depth_without_materializing_the_range():
+    # A single adapter-dimer k-mer at depth 50,000,000 must not make the
+    # scan materialize a 50-million-entry contiguous list (which stalls or
+    # OOMs on real inputs); the scan must work over the observed depths
+    # instead. Structural (not timing) assertion: count every dict lookup
+    # the function performs -- the old contiguous-range walk does one per
+    # depth in [1, 50_000_000], the fixed one only a handful.
+    class CountingSpectrum(dict):
+        lookups = 0
+
+        def get(self, key, default=None):
+            CountingSpectrum.lookups += 1
+            return super().get(key, default)
+
+        def __getitem__(self, key):
+            CountingSpectrum.lookups += 1
+            return super().__getitem__(key)
+
+    spectrum = CountingSpectrum(
+        {
+            1: 10_000,
+            2: 6_000,
+            3: 1_000,
+            4: 500,
+            5: 800,
+            6: 2_000,
+            7: 5_000,
+            50_000_000: 1,
+        }
+    )
+
+    # The far-away outlier must not change the valley found among the
+    # observed depths either.
+    assert suggest_min_count(spectrum) == 4
+    assert CountingSpectrum.lookups < 1_000
+
+
 def test_suggest_min_count_treats_a_missing_depth_as_zero():
     # Depth 4 is entirely absent (zero distinct k-mers there -- routine in
     # a small sample), while depths 3 and 5 are both present. Treating 3

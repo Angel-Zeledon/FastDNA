@@ -124,6 +124,23 @@ def test_count_from_duck_typed_seqrecord_with_real_quality_uses_it(tmp_path):
     assert result.total_kmers == 0
 
 
+def test_seqrecord_with_mismatched_quality_length_warns_and_substitutes_q40():
+    # A SeqRecord whose phred_quality list does not match its sequence
+    # length cannot round-trip its quality; the uniform-Q40 substitution is
+    # kept, but it must be announced with a UserWarning naming the record,
+    # not applied silently.
+    seq = "ACGTACGTAC"
+    record = _FakeSeqRecord(seq, "truncated_quality")
+    record.letter_annotations = {"phred_quality": [2] * (len(seq) - 3)}
+
+    with pytest.warns(UserWarning, match="truncated_quality"):
+        result = count_from_sequences([record], k=5, min_quality=20.0)
+
+    # The substitution itself is unchanged: uniform Q40 means the low real
+    # scores are ignored and nothing gets quality-trimmed.
+    assert result.total_kmers > 0
+
+
 def test_biopython_seqrecords_real_objects(tmp_path):
     Bio_SeqIO = pytest.importorskip("Bio.SeqIO")
     from Bio.Seq import Seq

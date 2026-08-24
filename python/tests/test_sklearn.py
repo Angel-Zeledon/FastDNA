@@ -109,6 +109,37 @@ def test_fit_on_empty_x_raises_valueerror():
         KmerVectorizer(k=5).fit([])
 
 
+def test_fit_on_a_bare_string_raises_typeerror_not_per_character_errors(tmp_path):
+    # A single path passed as a bare string would iterate character by
+    # character, producing a baffling per-character FileNotFoundError deep
+    # inside the counting loop -- it must be a clear TypeError up front.
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTAC"] * 3)
+
+    with pytest.raises(TypeError, match="list of paths"):
+        KmerVectorizer(k=5).fit(str(path))
+
+
+def test_transform_on_a_bare_string_raises_typeerror(tmp_path):
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTAC"] * 3)
+    vec = KmerVectorizer(k=5, top_features=None).fit([str(path)])
+
+    with pytest.raises(TypeError, match="list of paths"):
+        vec.transform(str(path))
+
+
+def test_fit_on_duplicate_paths_raises_valueerror_naming_the_path(tmp_path):
+    # The same file listed twice would double-count its k-mers' prevalence
+    # (the vocabulary ranking's primary criterion) -- refuse it loudly.
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTAC"] * 3)
+
+    with pytest.raises(ValueError) as exc_info:
+        KmerVectorizer(k=5).fit([str(path), str(path)])
+
+    # The message names the offending path (repr'd, so Windows backslashes
+    # appear escaped).
+    assert repr(str(path)) in str(exc_info.value)
+
+
 def test_fit_transform_matches_separate_fit_then_transform(tmp_path):
     a = write_fastq(tmp_path, "a.fastq", ["ACGTACGTAC"] * 3)
     b = write_fastq(tmp_path, "b.fastq", ["AAACCCGGGT"] * 4)

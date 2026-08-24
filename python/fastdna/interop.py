@@ -37,6 +37,7 @@ and clean the file up afterward.
 
 import os
 import tempfile
+import warnings
 
 from . import count as _count
 from . import sketch as _sketch
@@ -77,6 +78,18 @@ def _sequence_and_id_for(item, index):
             phred_scores = letter_annotations["phred_quality"]
             if len(phred_scores) == len(sequence):
                 quality = "".join(chr(int(q) + 33) for q in phred_scores)
+            else:
+                # A mismatched quality cannot be trusted base-for-base, so
+                # the uniform default is substituted -- but never silently:
+                # the caller's real scores are being discarded here.
+                warnings.warn(
+                    f"record {record_id!r}: phred_quality has {len(phred_scores)} "
+                    f"scores but the sequence has {len(sequence)} bases; "
+                    "discarding the mismatched scores and substituting uniform "
+                    "Q40 quality",
+                    UserWarning,
+                    stacklevel=4,
+                )
         return record_id, sequence, quality
 
     if isinstance(item, (tuple, list)) and len(item) == 2:
