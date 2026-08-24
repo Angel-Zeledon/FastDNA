@@ -449,6 +449,7 @@ def evaluate_assembly(
     *,
     k: int = 21,
     min_count: int | None = None,
+    min_quality: float = 0.0,
 ) -> AssemblyQC:
     """Merqury-style reference-free assembly quality assessment (Rhie et
     al. 2020 -- see this module's own docstring for the full citation and
@@ -487,11 +488,30 @@ def evaluate_assembly(
     design position (see `fastdna.spectrum.suggest_min_count`'s docstring)
     that there is no single correct universal `min_count`.
 
+    `min_quality`: the minimum per-base Phred quality `reads_path` is
+    counted at, passed straight through to `fastdna.count`. Defaults to
+    `0.0` here -- **not** `fastdna.count`'s own default of `20.0` -- which
+    is a deliberate divergence, not an oversight: `fastdna.count(...,
+    min_quality=20.0)` 3'-end-trims every read before counting, so any
+    read k-mer that existed only in a trimmed tail silently vanishes from
+    the ground truth this function grades the assembly against, and every
+    assembly k-mer that depended on it is then scored as a *consensus
+    error* that was never really there. Merqury itself builds its read
+    k-mer database from the reads exactly as given (`meryl count` on the
+    raw FASTQ, no quality trimming) -- this default matches that, and
+    keeps an assembly's QV a property of the assembly, not of how sharply
+    the caller's sequencer's quality happened to decay toward the read's
+    3' end (ordinary, harmless decay on an otherwise-correct read
+    dropped this module's own worked example's QV from `inf` to `25.00`
+    with zero real assembly errors). Pass `min_quality=20.0` (or any other
+    value) explicitly to opt back into `fastdna.count`'s own trimming
+    behavior if that is genuinely wanted.
+
     Returns an `AssemblyQC` (see its own docstring for every field's exact
     meaning and units): `qv` (float, Phred-like, higher is better),
     `completeness` (float in `[0, 1]`, higher is better), and `spectra` (a
     `pyarrow.Table` a caller can plot).
     """
-    reads_counts = fastdna.count(reads_path, k=k)
+    reads_counts = fastdna.count(reads_path, k=k, min_quality=min_quality)
     assembly_kmers = _assembly_kmer_counts(assembly_path, k)
     return evaluate_kmers(assembly_kmers, reads_counts, k=k, min_count=min_count)
