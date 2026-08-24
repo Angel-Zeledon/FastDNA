@@ -1,5 +1,7 @@
 // src/counter.rs
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::sync::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
@@ -22,13 +24,22 @@ struct Inner {
     /// lookup: see `KmerCounter`'s doc comment for why that distinction
     /// is the entire point of this type.
     raw: Vec<u64>,
+    /// Sorted, deduplicated `(kmer, count)` runs produced by `compact_raw`
+    /// but not yet folded into `finalized` -- each one internally correct
+    /// (no duplicate keys within a single run), but keys may repeat
+    /// *across* runs (the same k-mer compacted separately in two different
+    /// eager passes). See `consolidate` for why these accumulate instead
+    /// of being merged in immediately, and `MAX_PENDING_RUNS` for why that
+    /// accumulation is bounded rather than unbounded.
+    pending: Vec<Vec<(u64, u32)>>,
     /// Sorted (ascending by k-mer), deduplicated `(kmer, count)` pairs.
-    /// Only trustworthy when `valid` is `true`; rebuilt from `raw` by
-    /// `finalize_inner` otherwise.
+    /// Only trustworthy when `valid` is `true`; rebuilt by `finalize_inner`
+    /// otherwise (which folds `pending` -- and any leftover `raw` -- into
+    /// it via `consolidate`).
     finalized: Vec<(u64, u32)>,
-    /// Whether `finalized` currently reflects every instance in `raw`
-    /// (which is drained empty once it does). `false` after any
-    /// insertion; set back to `true` by `finalize_inner`.
+    /// Whether `finalized` currently reflects every instance in `raw` and
+    /// every run in `pending` (both drained empty once it does). `false`
+    /// after any insertion; set back to `true` by `finalize_inner`.
     valid: bool,
 }
 
@@ -69,9 +80,54 @@ struct Inner {
 /// not a value proven optimal by a sweep across input shapes.
 const RAW_FINALIZE_THRESHOLD: usize = 2_000_000;
 
-/// Sorts `inner.raw` and compacts it into `inner.finalized` as sorted,
-/// deduplicated `(kmer, count)` pairs -- a no-op if `inner.valid` already
-/// holds.
+/// Above this many *unconsolidated* runs in `inner.pending`, an eager
+/// `compact_raw` (see `RAW_FINALIZE_THRESHOLD`) triggers a `consolidate`
+/// pass rather than leaving the run count to grow for the rest of the run.
+///
+/// This is the fix for a real, measured quadratic blowup in the design
+/// `MAX_PENDING_RUNS` replaces: that design folded every newly-compacted
+/// run straight into a single ever-growing `finalized` table via
+/// `merge_sorted_counts`, so the Nth eager compaction touched the *entire*
+/// table accumulated so far -- O(compactions x table size) over a whole
+/// run. On a large, diverse 2.14 GB input (53.8M distinct k-mers, 840M
+/// occurrences, 8 workers), each worker crosses `RAW_FINALIZE_THRESHOLD`
+/// roughly 52 times, and its running table grows for the entire run rather
+/// than staying small and stable -- exactly the case where that repeated
+/// full-table remerge dominates.
+///
+/// Deferring *every* compaction to a single k-way merge at the very end
+/// (`sources.len()` unbounded) would fix the time cost but reopen a worse
+/// problem: k-mers that recur across many different eager-compaction
+/// windows (normal for real coverage, since reads touching the same locus
+/// are scattered throughout a FASTQ file, not clustered by input order)
+/// would sit duplicated across many still-separate `pending` runs instead
+/// of being deduplicated as they arrive -- the exact "buffer holds every
+/// occurrence, not just every distinct one" bug `RAW_FINALIZE_THRESHOLD`
+/// itself exists to prevent, just moved one level up. Capping the number
+/// of pending runs before folding them together (via the same O(n log
+/// runs) k-way merge either way) bounds that duplication to at most
+/// `MAX_PENDING_RUNS` runs' worth, while cutting the number of full,
+/// O(table size) consolidation passes over a run from ~52 to ~52 /
+/// `MAX_PENDING_RUNS` -- the actual lever on the quadratic cost, since it
+/// is the *count* of full-table passes that made the old design quadratic,
+/// not the cost of any single pass.
+///
+/// 8 is a starting point sized the same way `RAW_FINALIZE_THRESHOLD` was:
+/// large enough to meaningfully cut the number of full consolidations
+/// (~6.5x fewer on the 52-compaction case above), small enough that the
+/// transient over-counting from unmerged duplicate keys across at most 8
+/// runs stays a bounded multiple of one compaction window's worth of
+/// entries, not an unbounded one. Not proven optimal by a sweep across
+/// input shapes.
+const MAX_PENDING_RUNS: usize = 8;
+
+/// Sorts `inner.raw` and compacts it into a new sorted, deduplicated
+/// `(kmer, count)` run, appended to `inner.pending` -- a no-op if `raw` is
+/// empty. Does not touch `inner.finalized` or `inner.valid`: folding
+/// `pending` runs together is `consolidate`'s job, kept separate so an
+/// eager mid-run compaction (see `RAW_FINALIZE_THRESHOLD`) can stay cheap
+/// -- O(this run's size), not O(everything accumulated so far) -- letting
+/// `pending` runs build up until `consolidate` is actually needed.
 ///
 /// This, not a hash table, is the counting step: `raw.sort_unstable()` is
 /// a handful of cache-friendly sequential passes over contiguous memory,
@@ -81,29 +137,37 @@ const RAW_FINALIZE_THRESHOLD: usize = 2_000_000;
 /// placement, which is an L3 cache miss once the table exceeds cache size
 /// (tens of MB -- a few hundred thousand entries) -- true of any real
 /// FASTQ file, not just large ones.
-fn finalize_inner(inner: &mut Inner) {
-    if inner.valid {
-        return;
-    }
-
+///
+/// **Tried and reverted: LSD radix sort in place of `sort_unstable` here.**
+/// A 4-pass (16-bit digit) counting-radix-sort implementation, measured in
+/// isolation against `sort_unstable` on the same `u64` inputs at this
+/// function's actual call size (~2,000,000 keys, `RAW_FINALIZE_THRESHOLD`),
+/// 20 runs each, scratch buffers reused across calls (not reallocated per
+/// call, which was tried first and was far worse): `sort_unstable` mean
+/// 0.0555 s; radix (16-bit/4-pass) mean 0.1910 s -- 3.4x *slower*; radix
+/// (8-bit/8-pass, tried to reduce the scatter-write working set) mean
+/// 0.1167 s -- still 2.1x slower. Rust's `sort_unstable` (pattern-defeating
+/// quicksort) on primitive `u64` keys is not the naive O(n log n)
+/// comparison sort the "radix should win on dense integer keys" reasoning
+/// assumes: it is branchless-comparison, cache-friendly, and reads/writes
+/// the data in place, while this radix implementation's counting-sort
+/// scatter step writes to a data-dependent, effectively-random offset
+/// within a multi-megabyte buffer once per pass -- worse cache behavior,
+/// not better, at this bucket count, and more total passes over the data
+/// than a single in-place sort regardless of bucket count. A more heavily
+/// engineered radix sort (SIMD histogramming, software-prefetched
+/// scatter, cache-blocking) might still win; this straightforward one does
+/// not, on this data size and this hardware, and shipping it anyway on the
+/// strength of the general "radix is O(n)" argument -- without the
+/// measurement -- would have been a real regression.
+fn compact_raw(inner: &mut Inner) {
     if inner.raw.is_empty() {
-        // Nothing new since the last finalize (or ever): `finalized`, if
-        // non-empty, already reflects everything -- e.g. a read followed
-        // by no further inserts before another read.
-        inner.valid = true;
         return;
     }
 
     inner.raw.sort_unstable();
 
-    // Compact the newly-sorted instances into (kmer, count) pairs. This
-    // is *only* the new arrivals since the last finalize, not the whole
-    // table -- `inner.finalized` may already hold entries from an earlier
-    // finalize (a read followed by more inserts is a normal sequence, not
-    // a one-way transition, and so is the eager finalize
-    // `RAW_FINALIZE_THRESHOLD` triggers mid-run, well before any read),
-    // so it must be merged into, never discarded.
-    let mut new_entries: Vec<(u64, u32)> = Vec::with_capacity(inner.raw.len());
+    let mut new_run: Vec<(u64, u32)> = Vec::with_capacity(inner.raw.len());
     let mut iter = inner.raw.drain(..).peekable();
     while let Some(kmer) = iter.next() {
         let mut count: u32 = 1;
@@ -114,17 +178,104 @@ fn finalize_inner(inner: &mut Inner) {
             // though that is not expected to occur in practice.
             count = count.saturating_add(1);
         }
-        new_entries.push((kmer, count));
+        new_run.push((kmer, count));
     }
 
-    if inner.finalized.is_empty() {
-        inner.finalized = new_entries;
-    } else {
-        let previous = std::mem::take(&mut inner.finalized);
-        inner.finalized = merge_sorted_counts(&previous, &new_entries);
+    inner.pending.push(new_run);
+}
+
+/// Folds every run in `inner.pending` (plus `inner.finalized`, if
+/// non-empty) into a single new `inner.finalized`, via one k-way merge --
+/// a no-op if `pending` is empty. See `MAX_PENDING_RUNS` for why this is
+/// called periodically during eager compaction rather than only once at
+/// the very end.
+fn consolidate(inner: &mut Inner) {
+    if inner.pending.is_empty() {
+        return;
     }
+
+    let mut sources = std::mem::take(&mut inner.pending);
+    if !inner.finalized.is_empty() {
+        sources.push(std::mem::take(&mut inner.finalized));
+    }
+    inner.finalized = k_way_merge_sorted_counts(sources);
+}
+
+/// Brings `inner.finalized` fully up to date with everything inserted so
+/// far -- draining `raw` into a new run via `compact_raw`, then folding
+/// every pending run into `finalized` via `consolidate` -- a no-op if
+/// `inner.valid` already holds.
+fn finalize_inner(inner: &mut Inner) {
+    if inner.valid {
+        return;
+    }
+
+    compact_raw(inner);
+    consolidate(inner);
 
     inner.valid = true;
+}
+
+/// Merges any number of sorted, deduplicated `(kmer, count)` sources into
+/// one, via a binary min-heap over each source's current head -- O(total
+/// entries x log(sources)) with every source read and written exactly
+/// once, rather than the O(sources x total) of repeatedly folding one new
+/// source into a single growing accumulator (see `MAX_PENDING_RUNS`).
+/// Consumes `sources` rather than borrowing, so `consolidate` does not
+/// need to clone runs it is about to discard.
+fn k_way_merge_sorted_counts(mut sources: Vec<Vec<(u64, u32)>>) -> Vec<(u64, u32)> {
+    match sources.len() {
+        0 => return Vec::new(),
+        // A single source is already exactly what a merge of one source
+        // produces; skip the heap machinery entirely.
+        1 => return sources.remove(0),
+        _ => {}
+    }
+
+    let total_len: usize = sources.iter().map(Vec::len).sum();
+    let mut merged: Vec<(u64, u32)> = Vec::with_capacity(total_len);
+
+    // Each heap entry is `Reverse((kmer, source index, index within that
+    // source))` -- `Reverse` turns `BinaryHeap`'s natural max-heap into the
+    // min-heap a merge needs, and the two indices are enough to advance
+    // exactly the source a popped entry came from.
+    let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> = BinaryHeap::with_capacity(sources.len());
+    for (src_idx, src) in sources.iter().enumerate() {
+        if let Some(&(kmer, _)) = src.first() {
+            heap.push(Reverse((kmer, src_idx, 0)));
+        }
+    }
+
+    while let Some(Reverse((kmer, src_idx, elem_idx))) = heap.pop() {
+        let mut count = sources[src_idx][elem_idx].1;
+
+        let next_idx = elem_idx + 1;
+        if let Some(&(next_kmer, _)) = sources[src_idx].get(next_idx) {
+            heap.push(Reverse((next_kmer, src_idx, next_idx)));
+        }
+
+        // Fold in every other source currently sitting at the same key --
+        // possible because sources may share keys (that is exactly what
+        // makes this a merge rather than a concatenation), but never
+        // *within* one source (each is already deduplicated on its own).
+        loop {
+            let same_key = matches!(heap.peek(), Some(&Reverse((peek_kmer, _, _))) if peek_kmer == kmer);
+            if !same_key {
+                break;
+            }
+            if let Some(Reverse((_, other_src, other_idx))) = heap.pop() {
+                count = count.saturating_add(sources[other_src][other_idx].1);
+                let next = other_idx + 1;
+                if let Some(&(next_kmer, _)) = sources[other_src].get(next) {
+                    heap.push(Reverse((next_kmer, other_src, next)));
+                }
+            }
+        }
+
+        merged.push((kmer, count));
+    }
+
+    merged
 }
 
 /// Merges two sorted, deduplicated `(kmer, count)` sequences into one, in
@@ -204,8 +355,10 @@ fn merge_sorted_counts(a: &[(u64, u32)], b: &[(u64, u32)]) -> Vec<(u64, u32)> {
 /// A caveat for callers, not a bug: alternating inserts with reads (e.g.
 /// `insert`, `distinct_kmers()`, `insert`, `distinct_kmers()`, ...) is
 /// correct, but each read after new inserts re-runs `finalize_inner`,
-/// which re-merges the *whole* `finalized` table against whatever is new
-/// in `raw`. That is fine for the "insert many, read a few times" shape
+/// which folds whatever is pending (any unflushed `raw`, plus up to
+/// `MAX_PENDING_RUNS` compacted runs not yet consolidated) into
+/// `finalized` via a k-way merge -- still, unavoidably, a full pass over
+/// the table. That is fine for the "insert many, read a few times" shape
 /// this type is built for; a loop that reads after every single insert
 /// pays a full-table merge every time, not just a cheap lookup.
 #[derive(Debug, Default)]
@@ -262,9 +415,15 @@ impl KmerCounter {
             inner.raw.push(kmer);
             inner.valid = false;
             // See `RAW_FINALIZE_THRESHOLD` for why this cannot be left to
-            // grow until the first read: nothing else bounds `raw`.
+            // grow until the first read: nothing else bounds `raw`. Only
+            // `compact_raw`, not the full `finalize_inner`: see
+            // `MAX_PENDING_RUNS` for why folding every eager compaction's
+            // run straight into `finalized` here would be quadratic.
             if inner.raw.len() >= RAW_FINALIZE_THRESHOLD {
-                finalize_inner(inner);
+                compact_raw(inner);
+                if inner.pending.len() >= MAX_PENDING_RUNS {
+                    consolidate(inner);
+                }
             }
         }
         self.total_kmers += 1;
@@ -276,7 +435,10 @@ impl KmerCounter {
             inner.raw.extend_from_slice(kmers);
             inner.valid = false;
             if inner.raw.len() >= RAW_FINALIZE_THRESHOLD {
-                finalize_inner(inner);
+                compact_raw(inner);
+                if inner.pending.len() >= MAX_PENDING_RUNS {
+                    consolidate(inner);
+                }
             }
         }
         self.total_kmers += kmers.len() as u64;
@@ -529,6 +691,40 @@ mod tests {
     }
 
     #[test]
+    fn k_way_merge_of_zero_sources_is_empty() {
+        assert_eq!(k_way_merge_sorted_counts(Vec::new()), Vec::new());
+    }
+
+    #[test]
+    fn k_way_merge_of_one_source_returns_it_unchanged() {
+        let only = vec![(1u64, 3u32), (5, 1), (9, 7)];
+        assert_eq!(k_way_merge_sorted_counts(vec![only.clone()]), only);
+    }
+
+    /// More than two sources, with keys overlapping across three of them
+    /// (not just pairwise) and one source fully disjoint -- the case a
+    /// naive pairwise-only merge implementation could get subtly wrong
+    /// (e.g. only combining the first pair it finds at a given key,
+    /// leaving a third source's count for that same key un-added).
+    #[test]
+    fn k_way_merge_combines_counts_shared_across_more_than_two_sources() {
+        let sources = vec![
+            vec![(1u64, 1u32), (2, 1), (10, 1)],
+            vec![(1, 10), (3, 1)],
+            vec![(1, 100), (2, 10)],
+            vec![(4, 1)],
+        ];
+
+        let merged = k_way_merge_sorted_counts(sources);
+
+        assert_eq!(
+            merged,
+            vec![(1, 111), (2, 11), (3, 1), (4, 1), (10, 1)],
+            "kmer 1 must sum contributions from all three sources that carry it"
+        );
+    }
+
+    #[test]
     fn merge_combines_counts_for_shared_kmers_and_keeps_disjoint_ones() {
         let mut a = KmerCounter::new();
         a.insert(1);
@@ -700,6 +896,36 @@ mod tests {
         for kmer in 0u64..4 {
             let expected = (total_inserts / 4) as u32;
             assert_eq!(c.get_count(kmer), expected, "kmer {kmer} count across finalize boundaries");
+        }
+    }
+
+    /// Exercises `MAX_PENDING_RUNS`'s own eager-consolidation trigger, not
+    /// just the final read-triggered one every other test here relies on.
+    /// Crosses `RAW_FINALIZE_THRESHOLD` enough times (`MAX_PENDING_RUNS * 2
+    /// + 1`) to push `pending` over `MAX_PENDING_RUNS` twice during
+    /// insertion alone, so at least two full `consolidate` passes happen
+    /// mid-run -- exactly the seam where a bug in folding several pending
+    /// runs (each internally deduplicated, but sharing keys with each
+    /// other and with whatever `finalized` already held) would surface.
+    #[test]
+    fn counts_are_correct_across_multiple_eager_mid_run_consolidations() {
+        let mut c = KmerCounter::new();
+
+        let total_inserts = RAW_FINALIZE_THRESHOLD * (MAX_PENDING_RUNS * 2 + 1);
+        for i in 0..total_inserts {
+            // Same small alphabet trick as the tests above: every eager
+            // compaction sees a mix of brand-new-to-this-run and
+            // already-seen-elsewhere values, so consolidation actually has
+            // overlapping keys to merge, not disjoint ones.
+            let kmer = (i % 4) as u64;
+            c.insert(kmer);
+        }
+
+        assert_eq!(c.total_kmers(), total_inserts as u64);
+        assert_eq!(c.distinct_kmers(), 4);
+        for kmer in 0u64..4 {
+            let expected = (total_inserts / 4) as u32;
+            assert_eq!(c.get_count(kmer), expected, "kmer {kmer} count across consolidation boundaries");
         }
     }
 }
