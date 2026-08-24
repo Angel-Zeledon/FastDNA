@@ -351,11 +351,16 @@ string-allocating version costs. Canonicalization is then just
 
 `KmerCounter` (`src/counter.rs`) does not use a hash table. Each worker
 appends every canonical k-mer it sees to a plain `Vec<u64>` -- O(1)
-amortized, sequential memory writes. The first time anything reads the
-counter (after counting for that worker is done), it sorts that buffer
-once (`sort_unstable`) and does a single linear pass turning runs of equal
-values into `(kmer, count)` pairs; the result is cached, so repeat reads
-don't re-sort.
+amortized, sequential memory writes. That buffer is bounded, not left to
+grow for a worker's entire share of the run: once it crosses 2,000,000
+buffered instances, or the first time anything reads the counter,
+whichever comes first, it is sorted (`sort_unstable`) and compacted in a
+single linear pass into `(kmer, count)` pairs, merged into whatever was
+already compacted from an earlier pass. The eager threshold exists so a
+worker's buffer is capped at that fixed size instead of every occurrence
+it ever sees over the whole run; see [Limitations](#limitations) for what
+that does and does not fix about peak memory in practice, with measured
+numbers on both a case it helps a lot and a case it does not help at all.
 
 This is a deliberate choice, not an incidental detail, and it replaced an
 earlier `HashMap<u64, u32>` version of this same type for a specific,
@@ -502,22 +507,77 @@ no minimizer-based partitioning and no spill to disk. `src/cms.rs` contains a
 Count-Min Sketch that would support a bounded-memory mode, but it is not
 wired to anything today.
 
-Two practical consequences follow directly from that:
+Each worker also buffers newly-seen k-mer instances in a plain `Vec<u64>`
+before they are sorted and compacted into that worker's running table, and
+that buffer is bounded (2,000,000 instances, 16 MB) rather than left to grow
+for a worker's entire share of the run. An earlier version of this
+sort-based design had a real bug here: nothing triggered compaction during
+counting itself, only the first read afterward, so a worker's buffer held
+every occurrence it had ever seen -- not just every distinct one -- before
+that first read. The practical effect and the fix are both stated with
+measured numbers below, because the fix is not a flat win across every input
+shape, and a claim that it is would be exactly the kind of thing this
+section exists to catch.
 
-- **Peak memory scales with the number of *distinct* k-mers**, not with file
-  size. A high-diversity sample -- a metagenome, or any data with a heavy
-  sequencing-error tail -- can exhaust RAM on an input that a partitioned
-  counter would handle comfortably. On the 2.14 GB / 53.7M-distinct-k-mer
-  benchmark file, peak RSS was 2.00 GB (measured, not estimated); the
-  practical ceiling on a given machine scales from there and is exactly
-  what [`scripts/bench/memory_ceiling.py`](scripts/bench/memory_ceiling.py)
-  exists to find on yours.
+Three practical consequences follow, and the first is more conditional than
+a flat "peak memory scales with distinct k-mers" claim would be:
+
+- **Below roughly 2,000,000 occurrences per worker thread, peak memory still
+  scales with occurrences, not distinct k-mers** -- the same behavior the
+  unbounded buffer had, because the eager compaction never triggers in that
+  regime. Measured on three FASTQ files built by literally repeating one
+  file's content 1x / 4x / 16x (so the distinct-k-mer set -- 1,175,574 -- is
+  identical across all three by construction, and only occurrence count
+  changes), at the default 8 worker threads on this machine:
+
+  | Occurrences | Peak RSS, unbounded buffer | Peak RSS, current (bounded) |
+  |---:|---:|---:|
+  | 7,999,788 | 122.7 MB | 111.8 MB |
+  | 31,999,152 | 250.6 MB | 272.7 MB |
+  | 127,996,608 | 1.02 GB | 353.4 MB |
+
+  The first two rows still show real occurrence-driven growth in the current
+  code (each worker's ~1.0M / ~4.0M-occurrence share brackets the
+  2,000,000 threshold, so the buffer behaves exactly as it always did in
+  that range); only the third row, where each worker's ~16M-occurrence share
+  is well past the threshold, shows the flattening the bound exists to
+  produce -- 4x the occurrences for 30% more RAM, not roughly 4x more RAM.
+  This is the regime the fix targets: high-coverage resequencing of a small,
+  low-diversity template, where the same small set of k-mers recurs millions
+  of times.
+- **On a large, genuinely diverse sample -- new distinct k-mers still
+  arriving steadily throughout the run, not a small set repeating -- the
+  fix showed no measurable benefit on this machine, and plausibly costs
+  some wall-clock time.** Measured on the 2.14 GB / 53,774,150-distinct- /
+  839,987,618-occurrence benchmark file (same file as
+  [Large-scale comparison](#large-scale-comparison-fastdna-vs-kmc3-vs-fastk)
+  above), two runs each, isolated (nothing else competing for the machine):
+  unbounded buffer 6.49 GB / 109.9 s and 8.81 GB / 87.6 s; current (bounded)
+  7.10 GB / 173.1 s and 7.66 GB / 125.3 s. The peak-RSS ranges overlap --
+  this machine's run-to-run variance at this scale is wide enough that no
+  clean before/after memory delta can be claimed either way -- but every
+  bounded-buffer run was slower than every unbounded one. The reason is
+  structural, not noise: at ~105M occurrences per worker, the bounded buffer
+  triggers roughly 52 eager compactions per worker instead of one, and each
+  one re-merges the *entire* running table built so far, not just the newly
+  arrived slice -- an O(running table size) copy, repeated every time,
+  because the table itself keeps growing across the whole run when the
+  input is this diverse. The fix trades well when a worker's finalized
+  table stays small and stable (case above); it trades poorly when that
+  table keeps growing for the whole run, which is exactly what a
+  high-diversity sample does. This is a real, measured trade-off, not a
+  free win, and the threshold (`RAW_FINALIZE_THRESHOLD` in
+  `src/counter.rs`) is a starting point rather than a value tuned across
+  input shapes.
 - **There is no out-of-core path.** When the table does not fit in RAM, the
   run fails or swaps; it does not degrade to disk the way KMC3's
   disk-resident bins or FASTK's disk-resident sorted partitions do. This is
   why KMC3 can process a 729-gigabase human genome dataset in under 100
   minutes using 33-34 GB of RAM (Kokot et al., *Bioinformatics*, 2017) --
-  a dataset size FastDNA is not built to attempt.
+  a dataset size FastDNA is not built to attempt. The practical ceiling on a
+  given machine is exactly what
+  [`scripts/bench/memory_ceiling.py`](scripts/bench/memory_ceiling.py)
+  exists to find on yours.
 
 `max_k` is 32, imposed by the 2-bit-per-base `u64` packing. Analyses that need
 longer k-mers are out of scope.
