@@ -10,9 +10,11 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::prelude::*;
 
 use crate::counter::KmerCounter;
+use crate::disk_spill::{self, ScratchDir, SpillWriter};
 use crate::error::{FastDnaError, Result};
 use crate::fastq::{FastqReadError, FastqReader, FastqRecord};
 use crate::kmer;
+use crate::mem_estimate;
 use crate::progress::{Progress, ProgressFn, PROGRESS_INTERVAL};
 use crate::qc::QcSummary;
 
@@ -71,13 +73,16 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// able to see it too: if only the worker pool checked it, cancelling would
 /// leave the producer blocked forever on a full channel with no one left to
 /// drain it, the same deadlock item A guards against for `num_threads == 0`.
-pub fn process_stream_parallel<R: BufRead + Send + 'static>(
-    reader: FastqReader<R>,
-    config: PipelineConfig,
-    source: &Path,
-    progress: ProgressFn<'_>,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<(KmerCounter, QcSummary, u64)> {
+/// Validates the subset of `PipelineConfig` that both counting strategies
+/// share, before either commits to any work. Extracted so
+/// `process_stream_parallel` (the in-memory strategy) and
+/// `process_stream_parallel_disk` (the disk strategy, see `disk_spill.rs`)
+/// reject the same bad config the same way instead of maintaining two
+/// copies of these checks that could drift apart. This is a pure
+/// extraction of what used to be inline at the top of
+/// `process_stream_parallel` -- same checks, same order, same error
+/// values -- not a behavior change.
+fn validate_config(config: &PipelineConfig) -> Result<()> {
     if config.k == 0 || config.k > 32 {
         return Err(FastDnaError::InvalidK { k: config.k });
     }
@@ -156,6 +161,18 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
             reason: "must be a finite number (not NaN or infinite)".to_string(),
         });
     }
+
+    Ok(())
+}
+
+pub fn process_stream_parallel<R: BufRead + Send + 'static>(
+    reader: FastqReader<R>,
+    config: PipelineConfig,
+    source: &Path,
+    progress: ProgressFn<'_>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(KmerCounter, QcSummary, u64)> {
+    validate_config(&config)?;
 
     let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(64);
 
@@ -401,4 +418,366 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
     }
 
     Ok((master_counter, master_qc, total_reads))
+}
+
+/// Which of FastDNA's two counting strategies produced a result.
+///
+/// `InMemory` (`process_stream_parallel`) sorts and compacts entirely in
+/// RAM and is the faster of the two whenever the input fits; `Disk` (see
+/// `disk_spill.rs`) partitions k-mers into buckets, spills each to scratch
+/// files, and merges bucket by bucket so only one bucket is resident at
+/// once, trading speed for a peak memory footprint that does not scale
+/// with `threads * distinct_kmers` the way the in-memory strategy's does
+/// (see `mem_estimate.rs` for the measured reason that scaling exists).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountStrategy {
+    InMemory,
+    Disk,
+}
+
+impl CountStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CountStrategy::InMemory => "in-memory",
+            CountStrategy::Disk => "disk",
+        }
+    }
+}
+
+/// Caller-supplied knobs for `process_stream_parallel_with_policy`'s
+/// automatic strategy choice. Every field defaults to "figure it out" --
+/// `MemoryPolicy::default()` reproduces today's in-memory-only behavior for
+/// any caller that does not know or care about the disk strategy.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryPolicy {
+    /// Forces a specific strategy, bypassing the estimate entirely. `None`
+    /// lets `resolve_strategy` decide.
+    pub strategy: Option<CountStrategy>,
+    /// The memory budget the automatic chooser compares its estimate
+    /// against. `None` uses `mem_estimate::default_max_ram_bytes()` (half
+    /// of currently available system memory, or a fixed fallback -- see
+    /// that function's doc comment).
+    pub max_ram_bytes: Option<u64>,
+    /// Best-effort decompressed input size in bytes, used to derive an
+    /// occurrence estimate (see
+    /// `mem_estimate::estimate_occurrences_from_bytes`). `None` disables
+    /// size-based estimation: the chooser then has no basis to predict a
+    /// nonzero peak, so it defaults to `InMemory` rather than guessing.
+    /// Callers that know their input size (a real file on disk) should
+    /// always supply it; callers that do not (an in-memory buffer, as most
+    /// of this crate's own tests use) get today's behavior unchanged.
+    pub estimated_input_bytes: Option<u64>,
+}
+
+/// What the automatic chooser decided and why, returned alongside the
+/// counting result so a caller can report it -- "record which one was
+/// used so it is visible rather than mysterious" is a stated requirement,
+/// not an afterthought.
+#[derive(Debug, Clone, Copy)]
+pub struct StrategyDecision {
+    pub strategy: CountStrategy,
+    pub estimated_occurrences: u64,
+    pub estimated_peak_bytes: u64,
+    pub budget_bytes: u64,
+    /// True when a `FASTDNA_STRATEGY`/`FASTDNA_MAX_RAM_BYTES` environment
+    /// variable (see `resolve_strategy`) contributed to this decision,
+    /// rather than `policy` and the estimate alone -- surfaced so a report
+    /// built from this struct can say so, instead of silently attributing
+    /// an environment-driven choice to the estimator.
+    pub env_override_applied: bool,
+}
+
+/// Decides which counting strategy a run should use, without running
+/// anything. Pure and side-effect-free except for reading two environment
+/// variables (see below), so a caller can call this once to report the
+/// decision (e.g. the CLI, before it prints its banner) and
+/// `process_stream_parallel_with_policy` can call it again internally to
+/// act on it, with no risk of the two disagreeing.
+///
+/// Resolution order: an explicit `policy.strategy` wins outright. Failing
+/// that, `FASTDNA_STRATEGY` (`disk`, or `memory`/`in-memory`) is checked --
+/// an escape hatch for forcing a strategy through callers that have no
+/// dedicated API surface for it yet, most notably the Python bindings
+/// (`ffi.rs`'s `count()` takes no strategy argument, and adding one is out
+/// of scope here; see the CLI's `--strategy` flag for the intended primary
+/// interface). Failing that, the estimate decides:
+/// `mem_estimate::estimate_peak_bytes` against a budget that is
+/// `policy.max_ram_bytes`, then `FASTDNA_MAX_RAM_BYTES` (parsed as a plain
+/// byte count) if set, then `mem_estimate::default_max_ram_bytes()`. With
+/// no `estimated_input_bytes` at all, the estimate has nothing to work
+/// from and this always resolves to `InMemory` -- the conservative choice
+/// for library callers who have not told this function enough to justify
+/// spilling to disk.
+pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> StrategyDecision {
+    let env_max_ram = std::env::var("FASTDNA_MAX_RAM_BYTES").ok().and_then(|s| s.trim().parse::<u64>().ok());
+    let budget_bytes = policy
+        .max_ram_bytes
+        .or(env_max_ram)
+        .unwrap_or_else(mem_estimate::default_max_ram_bytes);
+
+    let estimated_occurrences =
+        policy.estimated_input_bytes.map(mem_estimate::estimate_occurrences_from_bytes).unwrap_or(0);
+    let estimated_peak_bytes = mem_estimate::estimate_peak_bytes(estimated_occurrences, config.num_threads);
+
+    let env_strategy = std::env::var("FASTDNA_STRATEGY").ok().and_then(|s| match s.trim() {
+        "disk" => Some(CountStrategy::Disk),
+        "memory" | "in-memory" => Some(CountStrategy::InMemory),
+        _ => None,
+    });
+
+    let (strategy, env_override_applied) = match policy.strategy {
+        Some(s) => (s, false),
+        None => match env_strategy {
+            Some(s) => (s, true),
+            None => {
+                let auto = if policy.estimated_input_bytes.is_some() && estimated_peak_bytes > budget_bytes {
+                    CountStrategy::Disk
+                } else {
+                    CountStrategy::InMemory
+                };
+                (auto, env_max_ram.is_some())
+            }
+        },
+    };
+
+    StrategyDecision { strategy, estimated_occurrences, estimated_peak_bytes, budget_bytes, env_override_applied }
+}
+
+/// The disk strategy's per-worker outcome: a manifest of spilled run files
+/// per bucket (see `disk_spill::SpillWriter::finish`) instead of a private
+/// `KmerCounter` -- the whole point of this strategy is that no worker
+/// builds one of those. `Err` carries a panic message or a stringified
+/// `FastDnaError` from within the worker, mirroring `WorkerOutcome` above.
+type DiskWorkerOutcome = std::result::Result<(Vec<Vec<PathBuf>>, QcSummary), String>;
+
+/// The disk-partitioned counting strategy. Structurally a sibling of
+/// `process_stream_parallel`, not a variant of it: the producer thread and
+/// channel setup below are intentionally re-implemented rather than
+/// factored out from that function, so this strategy's own bugs cannot
+/// reach back into the in-memory path's already-tested behavior, and vice
+/// versa. `config` must already be valid
+/// (`process_stream_parallel_with_policy` validates it before choosing a
+/// strategy).
+fn process_stream_parallel_disk<R: BufRead + Send + 'static>(
+    reader: FastqReader<R>,
+    config: PipelineConfig,
+    source: &Path,
+    progress: ProgressFn<'_>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(KmerCounter, QcSummary, u64)> {
+    let scratch = ScratchDir::new()?;
+    let bucket_bits = disk_spill::DEFAULT_BUCKET_BITS;
+
+    let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(64);
+
+    let batch_size = config.batch_size;
+    let k = config.k;
+    let min_qual = config.min_quality;
+    let qual_win = config.quality_window;
+    let progress_interval = config.progress_interval;
+    let source_owned: PathBuf = source.to_path_buf();
+    let cancel_for_reader = cancel.clone();
+
+    // 1. Producer thread -- same shape and same reasoning as
+    // `process_stream_parallel`'s (see that function's inline comments for
+    // why each piece is there); duplicated rather than shared, see this
+    // function's own doc comment for why.
+    let reader_handle = thread::spawn(move || -> Result<u64> {
+        let mut reader = reader;
+        let mut current_batch = Vec::with_capacity(batch_size);
+        let mut total_reads: u64 = 0;
+        let mut cancelled = false;
+
+        loop {
+            match reader.next_record() {
+                Ok(Some(record)) => {
+                    current_batch.push(record);
+                    total_reads += 1;
+
+                    if current_batch.len() >= batch_size {
+                        if let Some(tok) = &cancel_for_reader {
+                            if tok.load(Ordering::Relaxed) {
+                                cancelled = true;
+                                break;
+                            }
+                        }
+
+                        let batch_to_send =
+                            std::mem::replace(&mut current_batch, Vec::with_capacity(batch_size));
+                        if sender.send(batch_to_send).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(FastqReadError::Io(source_err)) => {
+                    return Err(FastDnaError::Io { path: source_owned, source: source_err });
+                }
+                Err(FastqReadError::Malformed(reason)) => {
+                    return Err(FastDnaError::MalformedFastq {
+                        path: source_owned,
+                        record: total_reads + 1,
+                        reason,
+                    });
+                }
+            }
+        }
+
+        if !cancelled && !current_batch.is_empty() {
+            let _ = sender.send(current_batch);
+        }
+
+        Ok(total_reads)
+    });
+
+    let reads_seen = AtomicU64::new(0);
+    // Tracks total k-mer occurrences the same way `KmerCounter::insert_batch`
+    // does internally (an exact running count of every instance handed to
+    // it, independent of any later per-key saturation) -- required for the
+    // disk strategy's result to be bit-identical to the in-memory
+    // strategy's, including `total_kmers()`, not merely its distinct-kmer
+    // table.
+    let total_occurrences = AtomicU64::new(0);
+
+    // 2. Parallel consumer pool. Each worker spills bucketed, sorted runs
+    // to its own scratch files instead of building a private KmerCounter --
+    // see `disk_spill.rs` for why that is what keeps this strategy's peak
+    // memory from scaling with `threads * distinct_kmers`.
+    let results: Vec<DiskWorkerOutcome> = (0..config.num_threads)
+        .into_par_iter()
+        .map(|worker_idx| {
+            let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(Vec<Vec<PathBuf>>, QcSummary)> {
+                let mut spill = SpillWriter::new(&scratch, worker_idx, k, bucket_bits);
+                let mut local_qc = QcSummary::default();
+
+                while let Ok(mut batch) = receiver.recv() {
+                    if let Some(tok) = &cancel {
+                        if tok.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+
+                    let n = batch.len() as u64;
+
+                    for record in &mut batch {
+                        local_qc.observe_record(record);
+                        record.quality_trim_end(min_qual, qual_win);
+
+                        let canon_kmers = kmer::extract_canonical_kmers(&record.seq, k);
+                        total_occurrences.fetch_add(canon_kmers.len() as u64, Ordering::Relaxed);
+                        spill.insert_batch(&canon_kmers)?;
+                    }
+
+                    if let Some(emit) = progress {
+                        let prev = reads_seen.fetch_add(n, Ordering::Relaxed);
+                        if prev / progress_interval != (prev + n) / progress_interval {
+                            emit(Progress::ReadsProcessed(prev + n));
+                        }
+                    }
+                }
+
+                let manifest = spill.finish()?;
+                Ok((manifest, local_qc))
+            }));
+
+            match outcome {
+                Ok(Ok(v)) => {
+                    if cancel.as_ref().is_some_and(|tok| tok.load(Ordering::Relaxed)) {
+                        while receiver.recv().is_ok() {}
+                    }
+                    Ok(v)
+                }
+                Ok(Err(fastdna_err)) => {
+                    // A spill I/O failure is a real error, not a panic --
+                    // still drain so the producer never blocks on a full
+                    // channel with this worker no longer consuming.
+                    while receiver.recv().is_ok() {}
+                    Err(fastdna_err.to_string())
+                }
+                Err(payload) => {
+                    while receiver.recv().is_ok() {}
+                    Err(panic_message(payload))
+                }
+            }
+        })
+        .collect();
+
+    let total_reads = reader_handle
+        .join()
+        .map_err(|_| FastDnaError::Internal { detail: "FASTQ reader thread panicked".to_string() })??;
+
+    let mut worker_panic: Option<String> = None;
+    let mut manifests: Vec<Vec<Vec<PathBuf>>> = Vec::with_capacity(results.len());
+    let mut master_qc = QcSummary::default();
+    for outcome in results {
+        match outcome {
+            Ok((manifest, qc)) => {
+                manifests.push(manifest);
+                master_qc.merge(&qc);
+            }
+            Err(detail) => {
+                if worker_panic.is_none() {
+                    worker_panic = Some(detail);
+                }
+            }
+        }
+    }
+    if let Some(detail) = worker_panic {
+        return Err(FastDnaError::Internal { detail });
+    }
+
+    if cancel.as_ref().is_some_and(|tok| tok.load(Ordering::Relaxed)) {
+        return Err(FastDnaError::Cancelled);
+    }
+
+    master_qc.finalize();
+
+    // 3. Merge phase: bucket by bucket, so only one bucket's worth of
+    // spilled data is resident at a time (see `disk_spill::merge_buckets`).
+    let num_buckets = 1usize << bucket_bits;
+    let merged = disk_spill::merge_buckets(&manifests, num_buckets)?;
+    let counter = KmerCounter::from_sorted_entries(merged, total_occurrences.load(Ordering::Relaxed));
+
+    if let Some(emit) = progress {
+        if catch_unwind(AssertUnwindSafe(|| emit(Progress::Finished { reads: total_reads }))).is_err() {
+            return Err(FastDnaError::Internal { detail: "progress callback panicked".to_string() });
+        }
+    }
+
+    // `scratch` drops here, recursively removing every spill file this run
+    // created -- including on the early returns above (a worker panic, a
+    // cancellation, an I/O failure): `Drop` runs during unwinding as well
+    // as ordinary scope exit, per this crate's `panic = "unwind"` profile
+    // setting (see `Cargo.toml`).
+    Ok((counter, master_qc, total_reads))
+}
+
+/// Streams a FASTQ source and returns its canonical k-mer counts, choosing
+/// between FastDNA's two counting strategies automatically (or as forced
+/// by `policy`) and reporting which one ran.
+///
+/// This is `process_stream_parallel` plus strategy selection, not a
+/// replacement for it: `process_stream_parallel` itself is untouched and
+/// keeps behaving exactly as it always has for any caller that does not
+/// need the disk strategy (every one of this crate's existing tests calls
+/// it directly, unmodified, for exactly that reason). Pass
+/// `MemoryPolicy::default()` here to reproduce that same in-memory-only
+/// behavior while additionally getting a `CountStrategy` back.
+pub fn process_stream_parallel_with_policy<R: BufRead + Send + 'static>(
+    reader: FastqReader<R>,
+    config: PipelineConfig,
+    source: &Path,
+    progress: ProgressFn<'_>,
+    cancel: Option<Arc<AtomicBool>>,
+    policy: MemoryPolicy,
+) -> Result<(KmerCounter, QcSummary, u64, StrategyDecision)> {
+    validate_config(&config)?;
+    let decision = resolve_strategy(&policy, &config);
+
+    let (counter, qc, total_reads) = match decision.strategy {
+        CountStrategy::InMemory => process_stream_parallel(reader, config, source, progress, cancel)?,
+        CountStrategy::Disk => process_stream_parallel_disk(reader, config, source, progress, cancel)?,
+    };
+
+    Ok((counter, qc, total_reads, decision))
 }

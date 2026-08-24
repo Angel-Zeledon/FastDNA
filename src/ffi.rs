@@ -45,7 +45,7 @@ use crate::error::FastDnaError;
 use crate::export;
 use crate::fastq::FastqReader;
 use crate::kmer;
-use crate::pipeline::{process_stream_parallel, PipelineConfig};
+use crate::pipeline::{process_stream_parallel_with_policy, MemoryPolicy, PipelineConfig};
 use crate::preview;
 use crate::progress::Progress;
 use crate::qc::QcSummary;
@@ -429,7 +429,27 @@ fn count(
         let progress_ref: crate::progress::ProgressFn<'_> =
             progress_closure.as_ref().map(|f| f as &(dyn Fn(Progress) + Send + Sync));
 
-        let outcome = process_stream_parallel(reader, config, &path_buf, progress_ref, Some(cancel_for_worker));
+        // `MemoryPolicy::default()` reproduces this function's previous
+        // in-memory-only behavior exactly (no `estimated_input_bytes`, so
+        // `resolve_strategy` has no basis to choose the disk strategy on
+        // its own) unless a caller explicitly opts in via the
+        // `FASTDNA_STRATEGY` / `FASTDNA_MAX_RAM_BYTES` environment
+        // variables `resolve_strategy` reads as a fallback -- see that
+        // function's doc comment. Those exist specifically because this
+        // binding has no dedicated `strategy=`/`max_ram=` keyword argument
+        // of its own yet (adding one is out of scope here); they let
+        // `scripts/bench/crosscheck.py` and similar tooling exercise both
+        // counting strategies through the same public `fastdna.count()`
+        // Python API without needing one.
+        let outcome = process_stream_parallel_with_policy(
+            reader,
+            config,
+            &path_buf,
+            progress_ref,
+            Some(cancel_for_worker),
+            MemoryPolicy::default(),
+        )
+        .map(|(counter, qc, reads, _decision)| (counter, qc, reads));
         // The receiving end only ever stops listening after it has already
         // gotten a result (see the loop below), so a failed send here is
         // unreachable; there is nothing useful to do with that error even
