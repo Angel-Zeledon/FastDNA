@@ -463,26 +463,40 @@ fn count(
     // `count()`, polling for the worker's result without blocking on it
     // indefinitely, so it can also poll `check_signals` on the one thread
     // where doing so actually has an effect (see the comment above).
-    let outcome: Result<(KmerCounter, QcSummary, u64), FastDnaError> = py.allow_threads(move || loop {
-        match result_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(outcome) => break outcome,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if Python::with_gil(|py| py.check_signals()).is_err() {
-                    // Setting the flag does not itself produce a result:
-                    // the worker notices it at its next batch boundary and
-                    // returns `Cancelled` on its own, which the next loop
-                    // iteration's `recv_timeout` picks up like any other
-                    // outcome.
-                    cancel.store(true, Ordering::Relaxed);
+    let (outcome, signal_error): (Result<(KmerCounter, QcSummary, u64), FastDnaError>, Option<PyErr>) =
+        py.allow_threads(move || {
+            // `check_signals` returning `Err` means CPython consumed the
+            // pending signal (its flag is cleared) and handed us the
+            // exception to raise. It must be kept: if the worker finishes
+            // successfully inside the same 50ms window, discarding it
+            // would swallow the user's Ctrl-C entirely -- a completed
+            // result would come back as if nothing had been pressed.
+            let mut signal_error: Option<PyErr> = None;
+            let outcome = loop {
+                match result_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(outcome) => break outcome,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Err(err) = Python::with_gil(|py| py.check_signals()) {
+                            signal_error = Some(err);
+                            // Setting the flag does not itself produce a
+                            // result: the worker notices it at its next
+                            // batch boundary and returns `Cancelled` on its
+                            // own, which the next loop iteration's
+                            // `recv_timeout` picks up like any other
+                            // outcome.
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(FastDnaError::Internal {
+                            detail: "count() worker thread ended without sending a result"
+                                .to_string(),
+                        });
+                    }
                 }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break Err(FastDnaError::Internal {
-                    detail: "count() worker thread ended without sending a result".to_string(),
-                });
-            }
-        }
-    });
+            };
+            (outcome, signal_error)
+        });
 
     // The worker has already sent its result by the time the loop above
     // observes it, so this returns almost immediately; joining still
@@ -504,6 +518,16 @@ fn count(
     };
     if let Some(e) = callback_error {
         return Err(PyRuntimeError::new_err(format!("progress callback raised a Python exception: {e}")));
+    }
+
+    // Second priority: a consumed interrupt. The exception CPython handed
+    // over (typically KeyboardInterrupt) outranks whatever the worker
+    // returned -- including a successful count that slipped in during the
+    // signal race window -- because the user's Ctrl-C was already eaten
+    // from the interpreter's pending-signal state and this is the only
+    // place left that can honour it.
+    if let Some(err) = signal_error {
+        return Err(err);
     }
 
     // Prune stays under the same released-GIL window as the count: it is
