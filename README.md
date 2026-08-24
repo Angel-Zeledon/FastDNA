@@ -4,11 +4,9 @@ FastDNA is a Rust genomic k-mer counter: it reads FASTQ (optionally gzipped)
 files and counts canonical k-mers with quality filtering, in parallel, on the
 CPUs you already have. It hands the result to Python as a zero-copy Arrow
 table, so it lands in your notebook or pipeline without a serialization step.
-
-This README covers, in order: installation and a quick start, **real,
-reproducible benchmarks against three Python implementations**, **how the
-Rust core actually works** (the encoding, the math, the parallel pipeline),
-and the **full Python API reference**.
+When a run is predicted not to fit in RAM, the CLI can switch to a
+disk-partitioned counting strategy instead of failing -- see
+[Memory use and limitations](#memory-use-and-limitations).
 
 ## Installation
 
@@ -18,7 +16,14 @@ pip install fastdna
 
 No Rust toolchain, no compiler, no build step. `fastdna` ships as a prebuilt
 wheel using [PyO3's `abi3` stable ABI](https://pyo3.rs), so one wheel per
-platform covers Python 3.8 through 3.13+.
+platform covers CPython 3.8 through 3.13+. CI
+([`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)) builds and
+tests wheels for five platforms: manylinux x86_64, manylinux aarch64
+(cross-compiled, built but not test-executed in CI), macOS x86_64, macOS
+arm64, and Windows x86_64. The wheels are tagged `cp38-abi3`
+(`requires-python = ">=3.8"`), though the CI test matrix currently runs on
+Python 3.9+, so 3.8 support is declared but not exercised by CI. A Bioconda
+recipe is drafted but not yet submitted -- see [Roadmap](#roadmap).
 
 ## Quick start
 
@@ -37,252 +42,70 @@ print(result.qc)
 # {'total_reads': 200000, 'total_bases': 30000000, 'q20_pct': 99.6, ...}
 ```
 
+The Arrow table drops straight into pandas -- no copy, no export step:
+
+```python
+df = result.table.to_pandas()        # pyarrow.Table -> pandas.DataFrame
+print(df.nlargest(5, "frequency"))   # the five most frequent k-mers
+```
+
+(`result.to_pandas()` is a shortcut for the same thing, and
+`result.to_polars()` does the equivalent for Polars.)
+
+## Table of contents
+
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Benchmarks](#benchmarks)
+- [How the Rust core actually works](#how-the-rust-core-actually-works)
+- [Command-line interface](#command-line-interface)
+- [Memory use and limitations](#memory-use-and-limitations)
+- [Python API reference](#python-api-reference)
+- [Building from source](#building-from-source)
+- [Roadmap](#roadmap)
+
 ---
 
 ## Benchmarks
 
-**Everything in this section was measured on this machine, in this
-repository, with the scripts committed under [`scripts/bench/`](scripts/bench/).**
-No numbers here are copied from a paper or a vendor claim. Every command
-below is exactly what was run to produce the table; run it yourself and you
-should land within noise of the same figures.
+**Summary.** All numbers below were measured on a 4-core/8-thread laptop
+(i7-1165G7, 16 GB RAM, Windows 11) with the scripts committed under
+[`scripts/bench/`](scripts/bench/), using FastDNA's in-memory counting
+strategy. Full methodology -- machine details, dataset generation, exact
+commands, per-run times, the four-way correctness cross-check, and the
+measurement history (including corrections) -- lives in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-### Test machine and dataset
+**Against three Python implementations** (200,000 reads / 30,000,000 bases,
+k=31; all four count canonical k-mers and agree within 0.001%):
 
-| | |
-|---|---|
-| CPU | Intel Core i7-1165G7 @ 2.80GHz (11th Gen), 4 physical cores / 8 logical threads |
-| RAM | 16 GB |
-| OS | Windows 11 Pro |
-| Rust | rustc/cargo 1.91.0, `cargo build --release` |
-| Python | 3.12.10, NumPy 2.5.2, Biopython 1.88 |
+| Implementation | Time | Notes |
+|---|---:|---|
+| Pure Python (`Counter`) | 88.13 s / 113.41 s (two runs) | stdlib only, no quality trimming |
+| Biopython (`Bio.SeqIO`) | 121.17 s / 125.57 s (two runs) | real FASTQ parser, no quality trimming |
+| NumPy (vectorized) | 123.51 s / 107.11 s (two runs) | 2-bit packing + array ops, no quality trimming |
+| **FastDNA, 1 thread** | **4.94 s** (median of 5) | full pipeline incl. quality trimming |
+| **FastDNA, 8 threads (default)** | **1.99 s** (median of 5) | |
 
-The dataset is **synthetic but realistic, not uniformly-random noise**:
-[`scripts/bench/generate_reads.py`](scripts/bench/generate_reads.py) builds a
-1 Mbp random reference genome, then samples 150 bp reads across it to 30x
-coverage (both strands), applying an Illumina-like quality curve (~Q38
-decaying to ~Q25 towards the read's 3' end, with occasional dips) and
-injecting substitution errors at the rate that quality score implies
-(`p_error = 10^(-Q/10)`, the same relationship `fastq.rs`'s own quality
-trimming assumes). This gives the file a genuine two-peak k-mer frequency
-spectrum -- a large peak of once/twice-seen erroneous k-mers, and a real
-coverage peak around depth 30 -- instead of the flat, uninformative spectrum
-uniformly-random bases would produce.
+That is roughly 18-25x faster than the fastest Python baseline on a single
+thread, and 44-63x faster on 8 threads.
 
-```bash
-python scripts/bench/generate_reads.py 1000000 30 150 bench_small.fastq 1337
-# wrote 200000 reads, 30000000 bases, genome=1000000bp, cov=30.0x
-# -> a 65.8 MB FASTQ file
-```
+**Against the field's dedicated k-mer counters** (same 2.14 GB synthetic
+FASTQ, k=31, singletons included on all three):
 
-**Correctness cross-check**, `k=31`, canonical k-mers: this is not a
-remembered observation -- it's asserted by a script,
-[`scripts/bench/crosscheck.py`](scripts/bench/crosscheck.py), specifically
-so "fast because it does less work" has something checking for it every
-time this claim gets re-published, not just the one time someone eyeballed
-a table.
+| Tool | Time | Peak RAM | Distinct k-mers |
+|---|---:|---:|---:|
+| FASTK (2023) | 119.3 s | 2.99 GB | 53,776,394 |
+| **FastDNA** (in-memory strategy) | **~101 s** (median of 3) | **8.02 GB** | 53,774,150 |
+| KMC3 | 293.4 s | 9.77 GB | 53,776,394 |
 
-```bash
-python scripts/bench/crosscheck.py
-```
-
-This regenerates the same dataset the benchmark table below was measured
-against (same generator, same seed) and runs all four implementations --
-FastDNA plus the three Python baselines -- against it, printing each one's
-distinct/total counts and asserting the spread between them stays within a
-stated tolerance (0.05% by default), exiting non-zero if it doesn't. Its
-actual output, from this machine:
-
-```
-  fastdna       distinct=   1423950  total=    23999892
-  naive_python  distinct=   1423964  total=    24000000
-  biopython     distinct=   1423964  total=    24000000
-  numpy         distinct=   1423964  total=    24000000
-
-distinct spread: 0.0010%  |  total spread: 0.0004%  (tolerance: 0.05%)
-
-OK: all four implementations agree within tolerance.
-```
-
-The 14-k-mer, 0.001% difference between FastDNA and the three Python
-baselines (which do not apply quality trimming -- see their docstrings) is
-exactly what FastDNA's quality trimming removing a handful of low-quality
-read tails would produce, not a counting discrepancy -- four
-independently-written implementations landing within 0.001% of each other
-is itself a correctness check worth having, and now one that runs on
-demand rather than one that was merely true once. The full run above takes
-on the order of minutes (the two slower Python baselines are O(reads x k)
-pure-Python loops over the full 200,000-read file); pass `--quick` for a
-small generated file and a sanity check in seconds instead -- see the
-script's own `--help` for that and its other options
-(`--file`/`--k`/`--tolerance-pct`).
-
-### Counting speed: FastDNA vs. three ways to write this in Python
-
-The comparison is against **three real, runnable, correctness-checked
-implementations**, not a strawman:
-
-- **`naive_python.py`** -- pure standard library, `collections.Counter`,
-  string slicing. What most people write first.
-- **`biopython_baseline.py`** -- same algorithm, but parses the FASTQ with
-  `Bio.SeqIO` instead of hand-rolled parsing, because that's what most
-  bioinformaticians reach for next.
-- **`numpy_baseline.py`** -- a genuinely vectorized attempt: bases are
-  2-bit-packed and k-mers built with array shifts rather than a Python loop
-  per k-mer, and the reverse complement is computed with the *same*
-  bit-trick FastDNA's Rust core uses (see below), ported to NumPy.
-
-All three count **canonical** k-mers (`min(kmer, reverse_complement(kmer))`),
-same as FastDNA. None of them write an output file -- this table is the
-counting step alone, isolated from I/O, on both sides: for FastDNA, the
-`fastdna.count()` Python binding, not the CLI.
-
-```bash
-python scripts/bench/naive_python.py bench_small.fastq 31
-python scripts/bench/biopython_baseline.py bench_small.fastq 31
-python scripts/bench/numpy_baseline.py bench_small.fastq 31
-python scripts/bench/fastdna_bench.py bench_small.fastq 31 <threads> <repeats>
-```
-
-200,000 reads / 30,000,000 bases, k=31, two independent runs of each Python
-baseline and five of each FastDNA thread count (median reported; full
-per-run times are in the script output, reproduced in the PR/commit this
-README shipped with):
-
-| Implementation | Run 1 | Run 2 | Notes |
-|---|---:|---:|---|
-| Pure Python (`Counter`) | 88.13 s | 113.41 s | stdlib only, no quality trimming |
-| Biopython (`Bio.SeqIO`) | 121.17 s | 125.57 s | real FASTQ parser, no quality trimming |
-| NumPy (vectorized) | 123.51 s | 107.11 s | 2-bit packing + array ops, no quality trimming |
-| **FastDNA, 1 thread** | **4.94 s** (median of 5) | | full pipeline incl. quality trimming |
-| **FastDNA, 2 threads** | **4.70 s** (median of 5) | | |
-| **FastDNA, 4 threads** | **2.54 s** (median of 5) | | |
-| **FastDNA, 8 threads (default)** | **1.99 s** (median of 5) | | |
-
-Against the **fastest** Python baseline in this table (`Counter`, 88.13 s --
-comparing against the slowest baseline would flatter the result), that puts
-FastDNA at roughly **18-25x faster on a single thread** (88.13 / 4.94 s =
-17.8x, up to 125.57 / 4.94 s = 25.4x against the slowest run recorded, the
-Biopython run at 125.57 s), and **44-63x faster using the 8 threads this
-laptop has** (88.13 / 1.99 s = 44.3x, up to 125.57 / 1.99 s = 63.1x) --
-against a NumPy implementation that is itself already vectorized, not
-naive. The honest reason the NumPy baseline doesn't win is
-worth stating plainly: it still runs a Python-level loop once per *read*
-(200,000 iterations), and inside each iteration a k=31-deep chain of small
-array operations to build that read's k-mer windows. NumPy's per-call
-overhead (tens of microseconds) dominates when the arrays involved are only
-~150 elements long; it never amortizes the way it would over one huge array.
-This is itself a genuine, useful data point: "vectorize it in NumPy" is not
-automatically a free win at this granularity, and a hand-rolled Python
-attempt at this problem is easy to get slower than expected, not just slower
-than Rust.
-
-**Scaling is sub-linear** (1.99 s at 8 threads vs. 4.94 s at 1 thread is
-~2.5x from 8x the threads, not 8x) because this machine has 4 physical cores
-(8 is hyperthreaded) and, at this dataset size, opening and reading the same
-65 MB file from disk on every run is a fixed cost the thread count doesn't
-reduce -- see "The parallel pipeline" below for why the architecture still
-scales further on larger files, where that fixed cost amortizes away.
-
-**Run-to-run variance**: this machine is a laptop under normal desktop load
-(IDE, language servers, browser), not a dedicated benchmark rig, and the
-numbers above show it -- e.g. the two `Counter` runs differ by 29% (88.13 s
-vs. 113.41 s). That
-variance is disclosed rather than hidden: re-run the scripts and expect
-figures in the same range, not bit-identical ones.
-
-### End-to-end CLI (counting + Parquet export + QC report)
-
-```bash
-fastdna --input bench_small.fastq --output counts.parquet -k 31
-```
-
-Six runs, default 8 threads: 3.07, 3.14, 4.24, 5.00, 6.01, 9.50 s
-(min 3.07 s, median 4.62 s) -- this is the number that matters if you only
-care about "how long until `counts.parquet` exists on disk," and it includes
-writing all 1,423,950 rows through Snappy-compressed Parquet plus the QC
-JSON report, not just the in-memory count. This is a small file; the
-comparison that actually matters -- against the field's own dedicated
-k-mer counters, at a scale where the difference between an in-memory hash
-table and a sequential-access strategy is visible -- is next.
-
-### Large-scale comparison: FastDNA vs. KMC3 vs. FASTK
-
-This is the comparison that matters, not the Python one above: KMC3 and
-FASTK are the field's own dedicated tools, not something people write
-themselves. Measured in WSL2 (Ubuntu 26.04) for KMC3 and FASTK, and the
-native Windows release binary for FastDNA, all three against the *same*
-2.14 GB synthetic FASTQ file (35 Mbp genome, 30x coverage, 150 bp reads,
-same generator and quality/error model as above, scaled up --
-[`scripts/bench/generate_reads_large.py`](scripts/bench/generate_reads_large.py),
-seed 9001; exact install and run commands in
-[`scripts/bench/kmc3_fastk_comparison.sh`](scripts/bench/kmc3_fastk_comparison.sh)),
-`k=31`, singleton k-mers included on all three (`kmc -ci1`, `FastK -t1`,
-FastDNA's own `min_count=1` default):
-
-| Tool | Time | Peak RAM | Disk (output) | Distinct k-mers |
-|---|---:|---:|---:|---:|
-| FASTK (2023) | 119.3 s | 2.99 GB | 412 MB | 53,776,394 |
-| **FastDNA** | **~101 s** (median of 3: 97 / 101 / 131 s) | **8.02 GB** | 431 MB (Parquet) | 53,774,150 |
-| KMC3 | 293.4 s | 9.77 GB | 412 MB | 53,776,394 |
-
-**FastDNA is the fastest of the three on this file, and the most
-memory-hungry.** It beats FASTK on wall-clock by roughly 15% and KMC3 by
-almost 3x, while using 2.7x more RAM than FASTK. That trade is the whole
-story of the design: FastDNA sorts in memory, where FASTK partitions to
-disk. If you have the RAM, FastDNA finishes first; if you do not, FASTK
-finishes and FastDNA does not (see [Limitations](#limitations) -- the
-process dies somewhere between 2.14 GB and 3.98 GB of input on a 16 GB
-machine).
-
-An earlier version of this table reported 194.5 s and 2.00 GB. Both figures
-were wrong: re-measured on an otherwise-idle machine the time is roughly
-half that and the peak memory four times it. The originals were taken while
-other heavy work shared the CPU, and the memory figure never matched any
-subsequent measurement. They are corrected here rather than quietly
-replaced, because a published memory figure four times under the real one
-is how someone plans a 16 GB run that dies twenty minutes in. The 2,244-k-mer (0.004%) difference between FastDNA's count and
-KMC3/FASTK's is the same quality-trimming effect documented above (KMC3
-and FASTK do not trim; FastDNA does by default), not a counting bug --
-consistent with the ~0.001% gap already measured against the pure-Python
-implementations on the small dataset.
-
-**This table did not always look like this.** The first version of this
-comparison had FastDNA at 920.7 s and 6.96 GB peak RAM on the same file --
-about 3x slower than KMC3 and 7.7x slower than FASTK. `KmerCounter` was, at
-that point, an in-memory `HashMap<u64, u32>`: every insertion is
-effectively-random bucket placement, an L3 cache miss once the table
-outgrows a few tens of MB, which happens well before a real sample
-finishes counting -- exactly the failure mode the field moved away from
-after Jellyfish (2011), which is why KMC3 partitions k-mers into
-disk-resident bins by minimizer signature before sorting each one, and why
-FASTK does not hash at all, sorting 2-bit-packed k-mers into disk
-partitions instead. Both are sequential-memory-access strategies.
-`KmerCounter` now uses the same strategy, in memory rather than on disk:
-insertion appends to a plain `Vec<u64>` (sequential, cache-friendly), and
-counting happens as a one-time sort-and-compact pass on first read (see
-["Exact counting"](#4-exact-counting-with-a-fast-non-cryptographic-hash)
-above and `src/counter.rs`'s own doc comments for the detail). That change
-alone -- not new hardware, not a smaller test file -- is the entire
-difference between the two numbers in this paragraph.
-
-**What this does not fix**: FastDNA still holds the whole counting table in
-RAM. KMC3 and FASTK bound peak memory by spilling to disk; FastDNA does
-not, so there remains a dataset size past which FastDNA fails where they
-would not. See [Limitations](#limitations) for what that means in
-practice and where the actual ceiling is on this machine.
-
-### What FastDNA's own QC report looks like on this dataset
-
-```json
-{
-  "total_reads": 200000,
-  "total_bases": 30000000,
-  "q20_pct": 99.63,
-  "q30_pct": 81.98,
-  "gc_content_pct": 50.11
-}
-```
+FastDNA's in-memory strategy is the fastest of the three on this file and
+the most memory-hungry -- that trade, and what the disk strategy changes
+about it, is covered in
+[Memory use and limitations](#memory-use-and-limitations). The tiny count
+differences are FastDNA's quality trimming (the others don't trim), not a
+counting discrepancy; [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) has the
+cross-check that asserts this on demand.
 
 ---
 
@@ -316,7 +139,7 @@ decision is why almost everything downstream is cheap:
 
 The naive way to get every k-mer from a sequence of length n is to slice out
 each of the `n - k + 1` windows -- which is `O(k)` work per window, `O(n·k)`
-total, and it's exactly what `naive_python.py` above does.
+total, and it's exactly what the pure-Python baseline does.
 `extract_canonical_kmers` instead keeps a **rolling window**:
 
 ```rust
@@ -336,8 +159,7 @@ Counting *canonical* k-mers -- `min(kmer, reverse_complement(kmer))`, so
 that a read and its reverse-complement strand contribute to the same count
 -- is the single most expensive-looking part of this problem if you write
 it the obvious way: reverse the string, complement each character, allocate
-a new string. `numpy_baseline.py` and `naive_python.py` both do this, and it
-shows in their numbers.
+a new string.
 
 `reverse_complement_u64` never touches a string. It exploits a property of
 the encoding above that isn't an accident: **A and T are bitwise
@@ -365,41 +187,63 @@ string-allocating version costs. Canonicalization is then just
 
 `KmerCounter` (`src/counter.rs`) does not use a hash table. Each worker
 appends every canonical k-mer it sees to a plain `Vec<u64>` -- O(1)
-amortized, sequential memory writes. That buffer is bounded, not left to
-grow for a worker's entire share of the run: once it crosses 2,000,000
-buffered instances, or the first time anything reads the counter,
-whichever comes first, it is sorted (`sort_unstable`) and compacted in a
-single linear pass into `(kmer, count)` pairs, merged into whatever was
-already compacted from an earlier pass. The eager threshold exists so a
-worker's buffer is capped at that fixed size instead of every occurrence
-it ever sees over the whole run; see [Limitations](#limitations) for what
-that does and does not fix about peak memory in practice, with measured
-numbers on both a case it helps a lot and a case it does not help at all.
+amortized, sequential memory writes. That buffer is bounded: once it
+crosses 2,000,000 buffered instances, or the first time anything reads the
+counter, whichever comes first, it is sorted (`sort_unstable`) and
+compacted in a single linear pass into `(kmer, count)` pairs, merged into
+whatever was already compacted from an earlier pass. The bound caps a
+worker's buffer at a fixed size instead of every occurrence it ever sees;
+its measured effect -- a large win on one input shape, a wash-to-loss on
+another -- is documented with numbers in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md#worker-buffer-bound-measured-effect-by-input-shape).
 
-This is a deliberate choice, not an incidental detail, and it replaced an
-earlier `HashMap<u64, u32>` version of this same type for a specific,
-measured reason: a hash table's bucket placement is effectively random, so
-once the table outgrows the CPU's L3 cache (a few tens of megabytes --
-well under a million entries), nearly every insertion is a cache miss.
-That is true regardless of how good the hash function is -- no faster hash
-fixes an access pattern that hits main memory on every operation. Sorting
-instead touches memory in a handful of sequential passes, which is exactly
-why KMC3 (radix-sorting disk-resident bins) and FASTK (sorting 2-bit-packed
-k-mers into disk partitions with no hash table at all) are built the way
-they are, and exactly why switching to the same strategy -- in memory
-rather than on disk -- made FastDNA 4.7x faster and cut its peak memory by
-3.5x on the same 2.14 GB benchmark file; see
-[Large-scale comparison](#large-scale-comparison-fastdna-vs-kmc3-vs-fastk).
+This replaced an earlier `HashMap<u64, u32>` version of the same type for a
+specific, measured reason: a hash table's bucket placement is effectively
+random, so once the table outgrows the CPU's L3 cache (a few tens of
+megabytes -- well under a million entries), nearly every insertion is a
+cache miss, regardless of how good the hash function is. Sorting instead
+touches memory in a handful of sequential passes, which is exactly why KMC3
+(radix-sorting disk-resident bins) and FASTK (sorting 2-bit-packed k-mers
+into disk partitions with no hash table at all) are built the way they are.
+Switching to the same strategy made FastDNA 9x faster on the 2.14 GB
+benchmark file; the before/after numbers are in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md#measurement-history-and-corrections).
 
-Counting is still **exact**, the same guarantee the hash table gave: the
-key really is the k-mer, not a hash of it, so there is no probability of
-two different k-mers colliding into the same count -- unlike Bloom-filter
-or Count-Min-Sketch-based counters some tools use to bound memory on very
-large datasets (the codebase has an unused `CountMinSketch` in
-`src/cms.rs` for a possible future bounded-memory mode, but it isn't wired
-into the counting pipeline today).
+Counting is **exact** in both strategies: the key really is the k-mer, not
+a hash of it, so there is no probability of two different k-mers colliding
+into the same count -- unlike Bloom-filter or Count-Min-Sketch-based
+counters some tools use (the codebase has an unused `CountMinSketch` in
+`src/cms.rs`, but it isn't wired into the counting pipeline).
 
-### 5. The parallel pipeline: producer/consumer with backpressure, not a lock
+### 5. Two counting strategies, and an estimator that chooses between them
+
+The sort-and-compact counter above is the **in-memory strategy**: fastest,
+but it holds every worker's table in RAM. FastDNA also has a
+**disk-partitioned strategy** (`src/disk_spill.rs`): k-mers are bucketed by
+their high bits, each worker spills sorted, deduplicated runs to per-bucket
+scratch files, and a final pass merges bucket by bucket -- so only one
+bucket's worth of data is resident in memory at a time. Because canonical
+k-mers are compared as plain integers and buckets are high-bit ranges,
+concatenating the buckets' merge output in bucket order *is* the final
+globally sorted table, with no extra sort. (This is deliberately simpler
+than KMC3's minimizer-signature partitioning, which balances bucket sizes
+better; the header comment in `src/disk_spill.rs` explains the trade.) The
+result is identical to the in-memory strategy's -- same exact counts --
+with bounded peak memory, at the cost of touching disk and some raw speed.
+
+Which strategy runs is decided *before* the run starts, by
+`pipeline::resolve_strategy`, using a calibrated peak-memory estimator
+(`src/mem_estimate.rs`): input size predicts total k-mer occurrences, and
+occurrences times thread count predicts peak RSS (the model and its
+calibration runs are in that module's doc comments, and pinned by its own
+tests). If the predicted peak exceeds the memory budget (`--max-ram`, or
+half of currently available RAM by default), the disk strategy is chosen;
+otherwise in-memory. The CLI prints the decision, the estimate, and the
+budget in its startup banner, and `--strategy memory|disk` overrides the
+chooser outright -- see
+[Command-line interface](#command-line-interface).
+
+### 6. The parallel pipeline: producer/consumer with backpressure, not a lock
 
 `src/pipeline.rs`'s `process_stream_parallel` is the whole reason more
 threads help at all:
@@ -424,9 +268,11 @@ disconnects, so the producer blocks on a full channel forever with nobody
 left to drain it. That's now rejected explicitly as `InvalidConfig`
 (`ValueError` in Python) before the channel is even created, and
 `python/tests/test_api.py::test_zero_threads_raises_valueerror_not_hang` is
-the regression test for it.
+the regression test for it. The disk strategy runs the same
+producer/channel/worker shape, with spill writers in place of private
+counters.
 
-### 6. Quality trimming, and the math behind Phred scores
+### 7. Quality trimming, and the math behind Phred scores
 
 FASTQ quality bytes are Phred+33 encoded: `phred_score = byte - 33`. A
 Phred score is `-10 * log10(P_error)`, i.e. **`P_error = 10^(-Q/10)`** -- Q20
@@ -436,12 +282,11 @@ in from the read's 3' end, computing that window's mean Phred score;
 trimming stops the moment the window's average reaches the `min_quality`
 threshold (Q20 by default). If it never recovers, the whole read collapses
 to length zero and contributes no k-mers. The benchmark dataset's own
-generator (`generate_reads.py`) uses this exact `P_error = 10^(-Q/10)`
-relationship to decide when to inject a substitution error, so the
-synthetic data's error/quality relationship matches what this trimming step
-is designed to detect.
+generator uses this exact `P_error = 10^(-Q/10)` relationship to decide
+when to inject a substitution error, so the synthetic data's error/quality
+relationship matches what this trimming step is designed to detect.
 
-### 7. Panics cannot cross the FFI boundary, by construction
+### 8. Panics cannot cross the FFI boundary, by construction
 
 A worker's body can, in principle, panic -- corrupt internal state, a bug
 this codebase doesn't know about yet. If a panic were allowed to unwind
@@ -472,7 +317,7 @@ worker thread rejoins -- no panic, no unasked stderr output, same
 guards every worker against a genuine Rust panic, callback-triggered or
 not.
 
-### 8. Crossing into Python: the GIL and zero-copy Arrow
+### 9. Crossing into Python: the GIL and zero-copy Arrow
 
 Two things make the Python binding (`src/ffi.rs`) usable from a notebook
 rather than just correct:
@@ -504,120 +349,148 @@ already done.
 
 ---
 
-## Limitations
-
-**FastDNA is still not KMC3 or FASTK at true production scale, and the
-benchmarks above should not be read as claiming otherwise.** It closed the
-*speed* and *memory-efficiency* gap on a 2.14 GB file (see
-[Large-scale comparison](#large-scale-comparison-fastdna-vs-kmc3-vs-fastk)
-above) by adopting the same sequential-memory-access strategy those tools
-use, but it did not close the *scale* gap: KMC3 and FASTK bound peak memory
-by spilling to disk, and FastDNA does not.
-
-`KmerCounter` (`src/counter.rs`) holds every distinct k-mer's count in RAM
-simultaneously -- a sorted `Vec<(u64, u32)>`, not the `HashMap<u64, u32>` an
-earlier version of this README described, but still entirely in-memory, with
-no minimizer-based partitioning and no spill to disk. `src/cms.rs` contains a
-Count-Min Sketch that would support a bounded-memory mode, but it is not
-wired to anything today.
-
-Each worker also buffers newly-seen k-mer instances in a plain `Vec<u64>`
-before they are sorted and compacted into that worker's running table, and
-that buffer is bounded (2,000,000 instances, 16 MB) rather than left to grow
-for a worker's entire share of the run. An earlier version of this
-sort-based design had a real bug here: nothing triggered compaction during
-counting itself, only the first read afterward, so a worker's buffer held
-every occurrence it had ever seen -- not just every distinct one -- before
-that first read. The practical effect and the fix are both stated with
-measured numbers below, because the fix is not a flat win across every input
-shape, and a claim that it is would be exactly the kind of thing this
-section exists to catch.
-
-Three practical consequences follow, and the first is more conditional than
-a flat "peak memory scales with distinct k-mers" claim would be:
-
-- **Below roughly 2,000,000 occurrences per worker thread, peak memory still
-  scales with occurrences, not distinct k-mers** -- the same behavior the
-  unbounded buffer had, because the eager compaction never triggers in that
-  regime. Measured on three FASTQ files built by literally repeating one
-  file's content 1x / 4x / 16x (so the distinct-k-mer set -- 1,175,574 -- is
-  identical across all three by construction, and only occurrence count
-  changes), at the default 8 worker threads on this machine:
-
-  | Occurrences | Peak RSS, unbounded buffer | Peak RSS, current (bounded) |
-  |---:|---:|---:|
-  | 7,999,788 | 122.7 MB | 111.8 MB |
-  | 31,999,152 | 250.6 MB | 272.7 MB |
-  | 127,996,608 | 1.02 GB | 353.4 MB |
-
-  The first two rows still show real occurrence-driven growth in the current
-  code (each worker's ~1.0M / ~4.0M-occurrence share brackets the
-  2,000,000 threshold, so the buffer behaves exactly as it always did in
-  that range); only the third row, where each worker's ~16M-occurrence share
-  is well past the threshold, shows the flattening the bound exists to
-  produce -- 4x the occurrences for 30% more RAM, not roughly 4x more RAM.
-  This is the regime the fix targets: high-coverage resequencing of a small,
-  low-diversity template, where the same small set of k-mers recurs millions
-  of times.
-- **On a large, genuinely diverse sample -- new distinct k-mers still
-  arriving steadily throughout the run, not a small set repeating -- the
-  fix showed no measurable benefit on this machine, and plausibly costs
-  some wall-clock time.** Measured on the 2.14 GB / 53,774,150-distinct- /
-  839,987,618-occurrence benchmark file (same file as
-  [Large-scale comparison](#large-scale-comparison-fastdna-vs-kmc3-vs-fastk)
-  above), two runs each, isolated (nothing else competing for the machine):
-  unbounded buffer 6.49 GB / 109.9 s and 8.81 GB / 87.6 s; current (bounded)
-  7.10 GB / 173.1 s and 7.66 GB / 125.3 s. The peak-RSS ranges overlap --
-  this machine's run-to-run variance at this scale is wide enough that no
-  clean before/after memory delta can be claimed either way -- but every
-  bounded-buffer run was slower than every unbounded one. The reason is
-  structural, not noise: at ~105M occurrences per worker, the bounded buffer
-  triggers roughly 52 eager compactions per worker instead of one, and each
-  one re-merges the *entire* running table built so far, not just the newly
-  arrived slice -- an O(running table size) copy, repeated every time,
-  because the table itself keeps growing across the whole run when the
-  input is this diverse. The fix trades well when a worker's finalized
-  table stays small and stable (case above); it trades poorly when that
-  table keeps growing for the whole run, which is exactly what a
-  high-diversity sample does. This is a real, measured trade-off, not a
-  free win, and the threshold (`RAW_FINALIZE_THRESHOLD` in
-  `src/counter.rs`) is a starting point rather than a value tuned across
-  input shapes.
-- **There is no out-of-core path.** When the table does not fit in RAM, the
-  run fails or swaps; it does not degrade to disk the way KMC3's
-  disk-resident bins or FASTK's disk-resident sorted partitions do. This is
-  why KMC3 can process a 729-gigabase human genome dataset in under 100
-  minutes using 33-34 GB of RAM (Kokot et al., *Bioinformatics*, 2017) --
-  a dataset size FastDNA is not built to attempt. The practical ceiling on a
-  given machine is exactly what
-  [`scripts/bench/memory_ceiling.py`](scripts/bench/memory_ceiling.py)
-  exists to find on yours.
-
-`max_k` is 32, imposed by the 2-bit-per-base `u64` packing. Analyses that need
-longer k-mers are out of scope.
-
-**What FastDNA is for**: getting k-mer counts out of FASTQ files and into
-Python -- as Arrow, in-process, without a serialization step or a
-subprocess -- for sample sizes that fit in memory, at speed and memory
-efficiency that no longer assumes a small-file regime as an excuse. If your
-data does not fit in RAM at all -- a human genome at full coverage, a large
-metagenome -- use KMC3 or FASTK; they are excellent, and going out-of-core
-is a materially different, larger undertaking than the one this project
-took on.
-
 ## Command-line interface
 
-FastDNA also ships a standalone CLI (installed separately from the crate --
-see [Building from source](#building-from-source)):
+The `fastdna` CLI is installed separately from the Python package -- see
+[Building from source](#building-from-source). It counts k-mers in one
+FASTQ(.gz) file and writes the frequency table plus a QC report:
 
 ```bash
 fastdna --input sample.fastq.gz --output counts.parquet -k 31
 ```
 
-Writes k-mer counts to `counts.parquet` (or `.csv`, based on the output
-extension), plus a QC report. Run `fastdna --help` for the full set of flags
-(`--min-quality`, `--min-count`, `--max-count`, `--threads`, `--qc`,
-`--histogram`).
+`.gz` input is detected by file extension and decoded with a multi-member
+gzip decoder (as required for real SRA/ENA downloads). The output format is
+chosen by extension: `.parquet` writes Arrow/Snappy Parquet, anything else
+writes CSV. Every exporter writes the same three columns: `kmer_u64`
+(`uint64`), `kmer_sequence` (string), `frequency` (`uint32`).
+
+### Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `-i, --input <FILE>` | (required) | Input FASTQ file (`.fastq` or `.fastq.gz`) |
+| `-o, --output <FILE>` | `kmer_counts.parquet` | Output path for k-mer frequencies (`.csv` or `.parquet`) |
+| `-k, --kmer-size <N>` | `31` | Length of k-mers (`1 <= k <= 32`) |
+| `-q, --min-quality <Q>` | `20` | Minimum Phred quality score cutoff (0-40) for 3'-end trimming |
+| `-m, --min-count <COUNT>` | `1` | Filter out k-mers with frequency below this cutoff |
+| `-M, --max-count <COUNT>` | unset | Filter out k-mers with frequency above this cutoff (repetitive regions) |
+| `-t, --threads <N>` | all logical CPUs | Number of worker threads |
+| `--qc <FILE>` | `qc_report.json` | Path to export the quality-control summary JSON |
+| `--histogram <FILE>` | unset | Optional path to export the frequency spectrum (histogram CSV) |
+| `--strategy <auto\|memory\|disk>` | `auto` | Counting strategy: `auto` picks based on the estimated peak memory versus `--max-ram`; `memory` and `disk` force one strategy outright |
+| `--max-ram <SIZE>` | half of available RAM; 4 GB if undetectable | Memory budget the automatic chooser targets before switching to the disk strategy. Plain byte count or `K`/`M`/`G`/`T` suffix (binary, 1024-based units; `4G`, `4GB`, `4gb` are equivalent) |
+
+At startup the CLI prints the strategy decision it will act on, alongside
+the estimated peak memory and the budget it was compared against:
+
+```
+Strategy:       in-memory (estimated peak 2.28GB, budget 3.35GB)
+```
+
+### Environment variables
+
+Two environment variables reach the same strategy chooser, mainly as an
+escape hatch for callers with no flag surface of their own (notably the
+Python binding, whose `count()` takes no strategy argument yet):
+
+| Variable | Effect |
+|---|---|
+| `FASTDNA_STRATEGY` | `disk`, or `memory`/`in-memory`: forces that strategy (unless `--strategy` was given explicitly, which wins) |
+| `FASTDNA_MAX_RAM_BYTES` | Memory budget as a plain byte count (no suffixes); `--max-ram` wins over it |
+
+Precedence, highest first: `--strategy memory|disk`, then
+`FASTDNA_STRATEGY`, then the automatic estimate compared against the budget
+(`--max-ram`, then `FASTDNA_MAX_RAM_BYTES`, then the half-of-available-RAM
+default).
+
+---
+
+## Memory use and limitations
+
+**The in-memory strategy is the fastest way FastDNA can count, and its peak
+memory scales with the input.** Every worker's private counter converges
+toward holding the entire distinct-k-mer table (batches are distributed
+across workers essentially at random, and the same k-mers recur throughout
+a real FASTQ file), so peak memory scales with `threads x distinct_kmers`,
+not `distinct_kmers` alone.
+
+### Rule of thumb
+
+The calibrated model in `src/mem_estimate.rs` (fit against five real
+release-build runs; the calibration data and residuals are in that module's
+doc comments and pinned by its tests) predicts peak RSS as:
+
+```
+peak ~= 777 MB (fixed) + 48 MB x threads + 1.168 bytes x threads x total_kmer_occurrences
+```
+
+where `1.168` is `CALIBRATED_BYTES_PER_OCCURRENCE_PER_THREAD` -- an
+empirical constant folding "distinct k-mers as a fraction of occurrences,
+for FASTQ-shaped coverage data" and "bytes per distinct entry" into one
+per-occurrence-per-thread rate. Occurrences are in turn estimated from
+input size at ~0.366 per uncompressed FASTQ byte. In practical terms:
+
+- **~3.4 GB of peak RAM per GB of uncompressed FASTQ at 8 threads** (plus
+  the ~0.8 GB fixed base). Halve the threads, roughly halve it.
+- In distinct-k-mer terms, the measured anchor point (8.02 GB peak for
+  53.8M distinct k-mers at 8 threads) works out to **roughly 1 GB per ~7
+  million distinct k-mers at 8 threads**.
+- Gzipped input is assumed to expand ~3.5x for estimation purposes
+  (`GZIP_FASTQ_EXPANSION_FACTOR` in `src/main.rs`).
+
+The model is calibrated on Illumina-like, moderate-coverage data; unusually
+low-coverage input (mostly-new k-mers) under-predicts, very high coverage
+of a small genome over-predicts. It lands within ~2-8% of measured peaks at
+realistic scale on the calibration machine.
+
+### When the estimate exceeds the budget: the disk strategy
+
+The CLI no longer simply fails when a run will not fit. With the default
+`--strategy auto`, the run is predicted up front against the `--max-ram`
+budget (half of currently available RAM by default), and if it does not
+fit, FastDNA switches to the **disk-partitioned strategy**
+(`src/disk_spill.rs`): exact counts, identical output, peak memory bounded
+by one bucket plus the final table instead of the whole per-worker tables
+-- at the cost of scratch-disk I/O and some speed. `--strategy disk`
+forces it regardless of the estimate; `--strategy memory` forces the
+in-memory path (and reintroduces the old failure mode if the input really
+doesn't fit -- on the 16 GB benchmark machine, forced-in-memory runs died
+somewhere between 2.14 GB and 3.98 GB of input;
+[`scripts/bench/memory_ceiling.py`](scripts/bench/memory_ceiling.py) finds
+the ceiling on yours).
+
+Two honest caveats:
+
+- The disk strategy's memory bound is only as tight as its largest bucket:
+  buckets are fixed high-bit ranges, not KMC3-style minimizer partitions,
+  so heavily skewed base composition can leave some buckets much larger
+  than others (`src/disk_spill.rs` documents the trade).
+- The **Python binding does not engage the automatic chooser**: `count()`
+  supplies no input-size estimate, so it always counts in memory unless
+  you set `FASTDNA_STRATEGY=disk` in the environment (see
+  [Command-line interface](#command-line-interface)). A `strategy=`
+  parameter on `count()` is future work.
+
+For truly production-scale out-of-core counting -- a 729-gigabase human
+dataset in 33-34 GB of RAM (Kokot et al., *Bioinformatics*, 2017) -- KMC3
+and FASTK remain the mature tools; FastDNA's disk strategy is newer, less
+tuned, and not yet benchmarked against them at that scale.
+
+### Other limits
+
+- `max_k` is 32, imposed by the 2-bit-per-base `u64` packing. Analyses that
+  need longer k-mers are out of scope.
+- Each worker's raw buffer is bounded at 2,000,000 buffered instances
+  before an eager compaction; the measured effect of that bound -- helpful
+  on low-diversity input, a wash-to-loss on high-diversity input -- is
+  documented with numbers in
+  [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md#worker-buffer-bound-measured-effect-by-input-shape).
+
+**What FastDNA is for**: getting k-mer counts out of FASTQ files and into
+Python -- as Arrow, in-process, without a serialization step or a
+subprocess -- fastest when the sample fits in memory, and degrading to an
+exact disk-partitioned mode rather than failing when it does not.
 
 ---
 
@@ -660,6 +533,9 @@ Counts canonical k-mers in a single FASTQ or FASTQ.gz file.
   interpreter's main thread; `PyErr_CheckSignals` is a no-op on any other
   thread, so calling `count()` from a `threading.Thread` makes Ctrl-C do
   nothing until the run completes on its own.
+- `count()` always uses the in-memory counting strategy unless the
+  `FASTDNA_STRATEGY=disk` environment variable is set -- see
+  [Memory use and limitations](#memory-use-and-limitations).
 
 `KmerCounts` (the return value):
 
@@ -763,9 +639,9 @@ it. Without this, "it's slow on my Mac" is undiagnosable remotely. (See
 
 Builds a MinHash fingerprint of a FASTQ(.gz) file by streaming it --
 memory stays bounded by `sketch_size` regardless of file size, unlike
-`count()`, which must hold every distinct k-mer at once. `k=21` (not
-`count()`'s `k=31`) matches the shorter k typical of sketching/comparison
-work in the literature (Mash's own default).
+`count()`'s in-memory strategy, which holds every distinct k-mer at once.
+`k=21` (not `count()`'s `k=31`) matches the shorter k typical of
+sketching/comparison work in the literature (Mash's own default).
 
 ```python
 s1 = fastdna.sketch("virus1.fastq", k=21)
@@ -810,9 +686,9 @@ complementary question from `peek().sample_distinct_kmers`, which is
 exact but covers only a sampled prefix. This covers the whole file, at
 the cost of a full streaming pass (the same I/O `count()` itself pays),
 trading exactness for a small, known error bound (~0.8% standard error at
-the default `precision=14`) instead. Useful for deciding whether a file
-is worth attempting to `count()` exactly at all, before committing to a
-run that might not fit in memory -- see [Limitations](#limitations).
+the default `precision=14`) instead. Useful for deciding whether a file's
+exact count will fit in memory before committing to a run -- see
+[Memory use and limitations](#memory-use-and-limitations).
 
 ```python
 >>> fastdna.estimate_cardinality("huge_sample.fastq.gz", k=31)
@@ -839,20 +715,35 @@ pip install maturin
 maturin develop --release --features python   # NOTE: --release matters --
 pytest python/tests -v                        # a debug build of the extension
                                                 # measured 4-5x slower in this
-                                                # README's own benchmarking
+                                                # project's own benchmarking
 ```
+
+`maturin build --release --features python` produces a wheel for the host
+platform; the CI workflow builds the same way for the five platforms listed
+under [Installation](#installation).
 
 ---
 
 ## Roadmap
 
-MinHash/Jaccard sketching (`fastdna.sketch`/`compare`/`compare_all`) and
-HyperLogLog cardinality estimation (`fastdna.estimate_cardinality`) are
-implemented and covered above -- not roadmap items. Still **not yet
-implemented**: cohort-level processing across many samples, a
-scikit-learn-compatible `KmerVectorizer`, and a bounded-memory approximate
-*counting* mode (`src/cms.rs` contains a Count-Min Sketch that could
-support one, but it needs hardening -- tests, `Result`-based error
-handling instead of an assertion-based `merge` -- before it is wired to
-anything). This README describes only what `pip install fastdna` gives
-you today.
+Implemented and documented above: counting with automatic memory/disk
+strategy selection (CLI), MinHash sketching
+(`fastdna.sketch`/`compare`/`compare_all`), and HyperLogLog cardinality
+estimation (`fastdna.estimate_cardinality`). The Python package also ships
+newer modules not yet covered by this README's API reference -- among them
+a scikit-learn-compatible `KmerVectorizer` (`fastdna.sklearn`) and cohort
+embedding (`fastdna.embed.embed_cohort`); see their module docstrings until
+this README catches up.
+
+Still ahead:
+
+- A `strategy=`/`max_ram=` parameter on `fastdna.count()`, so the Python
+  binding can use the disk strategy and automatic chooser without the
+  `FASTDNA_STRATEGY` environment variable.
+- **Bioconda packaging.** A recipe skeleton exists at
+  [`recipe/meta.yaml`](recipe/meta.yaml), but it is unverified: it has not
+  been built with `conda build` or submitted to bioconda-recipes, and its
+  source URL and sha256 are placeholders. The recipe's own header comments
+  document the submission steps.
+- Benchmarking the disk strategy against KMC3/FASTK at out-of-RAM scale.
+- Explicit SIMD in the counting hot path (see "What isn't SIMD yet").
