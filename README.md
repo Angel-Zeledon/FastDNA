@@ -223,11 +223,25 @@ FastDNA's own `min_count=1` default):
 | Tool | Time | Peak RAM | Disk (output) | Distinct k-mers |
 |---|---:|---:|---:|---:|
 | FASTK (2023) | 119.3 s | 2.99 GB | 412 MB | 53,776,394 |
-| **FastDNA** | **194.5 s** | **2.00 GB** | 431 MB (Parquet) | 53,774,150 |
+| **FastDNA** | **~101 s** (median of 3: 97 / 101 / 131 s) | **8.02 GB** | 431 MB (Parquet) | 53,774,150 |
 | KMC3 | 293.4 s | 9.77 GB | 412 MB | 53,776,394 |
 
-FastDNA beats KMC3 here and trails FASTK by 1.6x -- on this file, on this
-machine. The 2,244-k-mer (0.004%) difference between FastDNA's count and
+**FastDNA is the fastest of the three on this file, and the most
+memory-hungry.** It beats FASTK on wall-clock by roughly 15% and KMC3 by
+almost 3x, while using 2.7x more RAM than FASTK. That trade is the whole
+story of the design: FastDNA sorts in memory, where FASTK partitions to
+disk. If you have the RAM, FastDNA finishes first; if you do not, FASTK
+finishes and FastDNA does not (see [Limitations](#limitations) -- the
+process dies somewhere between 2.14 GB and 3.98 GB of input on a 16 GB
+machine).
+
+An earlier version of this table reported 194.5 s and 2.00 GB. Both figures
+were wrong: re-measured on an otherwise-idle machine the time is roughly
+half that and the peak memory four times it. The originals were taken while
+other heavy work shared the CPU, and the memory figure never matched any
+subsequent measurement. They are corrected here rather than quietly
+replaced, because a published memory figure four times under the real one
+is how someone plans a 16 GB run that dies twenty minutes in. The 2,244-k-mer (0.004%) difference between FastDNA's count and
 KMC3/FASTK's is the same quality-trimming effect documented above (KMC3
 and FASTK do not trim; FastDNA does by default), not a counting bug --
 consistent with the ~0.001% gap already measured against the pure-Python
