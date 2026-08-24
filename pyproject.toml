@@ -23,23 +23,19 @@ dynamic = ["version"]
 # itself. Neither is a runtime dependency of the `fastdna` package itself;
 # that test module uses `pytest.importorskip` so their absence skips rather
 # than fails.
-# Test-only extras. None of these is a runtime dependency of the `fastdna`
-# package: every module that needs one is opt-in (imported as
-# `from fastdna.sklearn import KmerVectorizer`, never via plain
-# `import fastdna`) or imports it lazily inside the one function that uses
-# it. `shap` matters most here -- it drags in numba and llvmlite, which many
-# users cannot install, so `fastdna.interpret` imports nothing but `pyarrow`
-# at module level and only `explain_with_shap` reaches for it, raising a
-# clear "pip install shap" ImportError when absent.
+# Test-only extras. None is a runtime dependency of the `fastdna` package:
+# every module needing one is opt-in, or imports it lazily inside the single
+# function that uses it. `shap` matters most -- it pulls in numba and
+# llvmlite, which many users cannot install.
 [project.optional-dependencies]
 test = [
+    "duckdb>=1.0",
+    "numpy",
+    "polars>=1.0",
     "pytest>=7",
     "pytest-timeout>=2.1",
-    "polars>=1.0",
-    "duckdb>=1.0",
     "scikit-learn>=1.3",
     "scipy>=1.10",
-    "numpy",
     "shap",
 ]
 
