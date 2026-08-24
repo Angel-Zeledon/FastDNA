@@ -382,6 +382,32 @@ impl KmerCounter {
         }
     }
 
+    /// Builds a `KmerCounter` directly from an already-sorted,
+    /// already-deduplicated `(kmer, count)` table and a known total
+    /// occurrence count, bypassing `insert`/`insert_batch` entirely.
+    ///
+    /// This exists for `disk_spill.rs`'s counting strategy: it produces its
+    /// final table via `merge_buckets` (a k-way merge of on-disk runs)
+    /// rather than through this type's own raw-buffer-and-sort path, but
+    /// every caller downstream of counting (`prune`, `iter`, `export.rs`,
+    /// the FFI layer) expects a `KmerCounter`, not a bare `Vec`. `entries`
+    /// is trusted, not re-validated: it is the caller's responsibility that
+    /// it is genuinely sorted ascending by k-mer with no duplicate keys --
+    /// exactly the invariant `finalized` already carries elsewhere in this
+    /// type, and re-sorting here would silently paper over a caller bug
+    /// instead of surfacing it (`debug_assert!` catches it in debug builds
+    /// without paying for a re-sort in release).
+    pub(crate) fn from_sorted_entries(entries: Vec<(u64, u32)>, total_kmers: u64) -> Self {
+        debug_assert!(
+            entries.windows(2).all(|w| w[0].0 < w[1].0),
+            "from_sorted_entries requires a strictly ascending, deduplicated table"
+        );
+        Self {
+            inner: Mutex::new(Inner { finalized: entries, valid: true, ..Inner::default() }),
+            total_kmers,
+        }
+    }
+
     /// Access to `inner` from a `&mut self` method: no locking is actually
     /// needed (exclusive access is already guaranteed at compile time by
     /// `&mut self`), but `Mutex::get_mut` still returns a `LockResult`
@@ -771,6 +797,24 @@ mod tests {
         assert_eq!(a.total_kmers(), 2);
         assert_eq!(a.distinct_kmers(), 1);
         assert_eq!(a.get_count(7), 2);
+    }
+
+    #[test]
+    fn from_sorted_entries_builds_a_fully_usable_counter() {
+        let c = KmerCounter::from_sorted_entries(vec![(1, 2), (5, 7), (9, 1)], 10);
+
+        assert_eq!(c.total_kmers(), 10);
+        assert_eq!(c.distinct_kmers(), 3);
+        assert_eq!(c.get_count(5), 7);
+        assert_eq!(c.get_count(2), 0, "absent kmer stays zero");
+        assert_eq!(c.iter().collect::<Vec<_>>(), vec![(1, 2), (5, 7), (9, 1)]);
+    }
+
+    #[test]
+    fn from_sorted_entries_of_empty_input_is_a_valid_empty_counter() {
+        let c = KmerCounter::from_sorted_entries(Vec::new(), 0);
+        assert_eq!(c.total_kmers(), 0);
+        assert_eq!(c.distinct_kmers(), 0);
     }
 
     #[test]

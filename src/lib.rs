@@ -4,6 +4,7 @@ pub mod cli;
 pub mod cms;
 pub mod cohort;
 pub mod counter;
+pub mod disk_spill;
 pub mod error;
 pub mod export;
 pub mod fastq;
