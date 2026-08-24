@@ -17,6 +17,23 @@ from .spectrum import suggest_min_count as _suggest_min_count
 __version__ = _core.__version__
 
 
+def _fallback_table_html(table):
+    """A minimal hand-built HTML `<table>` over a small `pyarrow.Table`,
+    used by `_repr_html_` methods when `pandas` (their preferred renderer)
+    is not installed. No styling beyond what a Jupyter cell already
+    applies to a bare `<table>` -- this exists so rich display degrades
+    gracefully rather than not at all, not to look identical to pandas'
+    own `to_html()` output.
+    """
+    columns = table.column_names
+    header = "".join(f"<th>{col}</th>" for col in columns)
+    rows_html = []
+    for row in table.to_pylist():
+        cells = "".join(f"<td>{row[col]}</td>" for col in columns)
+        rows_html.append(f"<tr>{cells}</tr>")
+    return f"<table><thead><tr>{header}</tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
+
+
 class KmerCounts:
     """The result of :func:`count`, and of chaining any of its own
     filtering/ordering methods.
@@ -161,6 +178,37 @@ class KmerCounts:
 
     def __repr__(self):
         return f"KmerCounts(k={self.k}, distinct={self.distinct_kmers}, total={self.total_kmers})"
+
+    def _repr_html_(self):
+        """Rich display for Jupyter/IPython: a compact HTML summary (k,
+        distinct/total k-mer counts) plus a preview of the first few rows
+        of `.table`.
+
+        `pandas` is a soft dependency used only for its `to_html()`
+        convenience (the same soft-dependency pattern `to_pandas()` above
+        already relies on); when it isn't installed, this falls back to a
+        small hand-built HTML table over `.table` directly rather than
+        raising -- a notebook should never see a traceback just because it
+        displayed a result.
+        """
+        preview_rows = min(10, self.distinct_kmers)
+        head = self.table.slice(0, preview_rows)
+
+        try:
+            import pandas  # noqa: F401
+
+            table_html = head.to_pandas().to_html(index=False)
+        except ImportError:
+            table_html = _fallback_table_html(head)
+
+        return (
+            "<div>"
+            f"<p><b>KmerCounts</b> &mdash; k={self.k}, "
+            f"distinct_kmers={self.distinct_kmers:,}, "
+            f"total_kmers={self.total_kmers:,}</p>"
+            f"{table_html}"
+            "</div>"
+        )
 
 
 def count(
@@ -314,6 +362,30 @@ class Sketch:
 
     def __repr__(self):
         return f"Sketch(k={self.k}, sketch_size={self.sketch_size})"
+
+    def _repr_html_(self):
+        """Rich display for Jupyter/IPython: k, sketch_size, and a
+        one-line explanation of what a sketch is -- a newcomer looking at
+        a bare `Sketch` in a notebook cell will not have read the README
+        first, so this spells out the "MinHash fingerprint, not a full
+        k-mer set" distinction inline rather than assuming it.
+
+        No optional dependency involved (unlike `KmerCounts._repr_html_`):
+        a sketch has no table to preview, just a handful of scalars.
+        """
+        return (
+            "<div>"
+            f"<p><b>Sketch</b> &mdash; k={self.k}, sketch_size={self.sketch_size:,}</p>"
+            "<p style='color: #666; font-size: 0.9em;'>"
+            "A MinHash fingerprint of a FASTQ file's canonical k-mer set: "
+            f"only the {self.sketch_size:,} smallest hash values seen are kept, "
+            "so comparing two sketches (<code>.jaccard()</code>, "
+            "<code>.containment()</code>, <code>.mash_distance()</code>) "
+            "estimates similarity between the full k-mer sets behind them "
+            "without materializing either one."
+            "</p>"
+            "</div>"
+        )
 
 
 def sketch(path, *, k=21, sketch_size=1000):
