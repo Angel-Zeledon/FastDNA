@@ -625,6 +625,20 @@ mod tests {
         assert_sync::<KmerCounter>();
     }
 
+    /// `mem_estimate.rs` keeps its own copy of this threshold (it predicts
+    /// peak memory *before* any `KmerCounter` exists, so it deliberately
+    /// does not import this module's types) -- see that copy's own doc
+    /// comment. This test is what keeps the two from silently drifting
+    /// apart if one is tuned without the other.
+    #[test]
+    fn raw_finalize_threshold_matches_mem_estimate_copy() {
+        assert_eq!(
+            RAW_FINALIZE_THRESHOLD as u64,
+            crate::mem_estimate::RAW_FINALIZE_THRESHOLD,
+            "counter.rs's RAW_FINALIZE_THRESHOLD and mem_estimate.rs's copy of it must match"
+        );
+    }
+
     #[test]
     fn prune_drops_counts_below_min_and_keeps_the_boundary() {
         let mut c = counter_with_graded_counts();

@@ -11,6 +11,7 @@ pub mod hll;
 #[cfg(feature = "python")]
 pub mod ffi;
 pub mod kmer;
+pub mod mem_estimate;
 pub mod pipeline;
 pub mod preview;
 pub mod progress;
