@@ -327,7 +327,10 @@ impl GenomeSketch {
         let path = path.as_ref();
         let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
 
-        let file = File::create(path).map_err(to_err)?;
+        // Write-to-temp + rename like every other writer (see `atomic.rs`):
+        // a failed save must not leave a corrupt half-written sketch where a
+        // good one used to be.
+        let (file, pending) = crate::atomic::AtomicFile::create(path)?;
         let mut writer = BufWriter::new(file);
         // Mirrors `QcSummary::export_json`: `serde_json::Error` conflates a
         // propagated I/O failure (`is_io()` true) with a genuine
@@ -340,6 +343,8 @@ impl GenomeSketch {
             }
         })?;
         writer.flush().map_err(to_err)?;
+        drop(writer);
+        pending.commit()?;
         Ok(())
     }
 
