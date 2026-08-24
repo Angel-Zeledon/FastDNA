@@ -49,6 +49,7 @@ use crate::pipeline::{process_stream_parallel, PipelineConfig};
 use crate::preview;
 use crate::progress::Progress;
 use crate::qc::QcSummary;
+use crate::sketch::GenomeSketch;
 
 /// The single place the spec's error-to-exception table (design doc §12) is
 /// implemented. No call site maps a `FastDnaError` to a `PyErr` directly, so
@@ -599,13 +600,96 @@ fn avx2_is_live() -> bool {
     }
 }
 
+/// The Python-visible result of `sketch()` and `load_sketch()`. Wraps
+/// `sketch::GenomeSketch` (MinHash bottom-k sketching, design doc §9.4) --
+/// a fingerprint that estimates similarity between two samples without
+/// ever materializing their full k-mer sets side by side.
+#[pyclass(name = "Sketch", module = "fastdna._core")]
+struct PySketch {
+    inner: GenomeSketch,
+}
+
+#[pymethods]
+impl PySketch {
+    #[getter]
+    fn k(&self) -> usize {
+        self.inner.k
+    }
+
+    #[getter]
+    fn sketch_size(&self) -> usize {
+        self.inner.sketch_size
+    }
+
+    /// Symmetric similarity: the fraction of the union of both sketches'
+    /// k-mer sets that is shared, estimated from the bottom-k overlap.
+    /// Penalizes genome-size differences -- two sketches from genomes of
+    /// very different sizes report a low Jaccard even if the smaller one
+    /// is entirely contained in the larger. Raises `ValueError` if the two
+    /// sketches were built with different `k` (comparing them has no
+    /// biological meaning).
+    fn jaccard(&self, other: &PySketch) -> PyResult<f64> {
+        Ok(self.inner.jaccard(&other.inner)?)
+    }
+
+    /// Asymmetric containment: what fraction of *this* sketch's k-mers
+    /// also appear in `other`. Unlike `jaccard`, does not penalize a size
+    /// mismatch -- the question this answers is "is this (small) pathogen
+    /// present in this (large) metagenomic sample", not "how similar are
+    /// these two genomes overall". `self.containment(other)` and
+    /// `other.containment(self)` are different questions with different
+    /// answers. Same `ValueError` behaviour as `jaccard` for mismatched
+    /// `k`.
+    fn containment(&self, other: &PySketch) -> PyResult<f64> {
+        Ok(self.inner.containment(&other.inner)?)
+    }
+
+    /// Persists the sketch as JSON. Computing a sketch is the expensive
+    /// part (a full pass over the FASTQ file); comparing saved sketches
+    /// afterwards is what keeps an N-sample comparison from re-reading N
+    /// large files on every later query.
+    fn save(&self, path: String) -> PyResult<()> {
+        self.inner.save(path)?;
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Sketch(k={}, sketch_size={}, hashes={})", self.inner.k, self.inner.sketch_size, self.inner.hashes.len())
+    }
+}
+
+/// Builds a MinHash sketch of a single FASTQ(.gz) file by streaming it --
+/// memory stays bounded by `sketch_size` regardless of file size, unlike
+/// `count()`, which must hold every distinct k-mer.
+///
+/// Released under `py.allow_threads` like `count()`'s and `peek()`'s own
+/// I/O-bound work, for the same reason: a large file could otherwise run
+/// for a while holding the GIL, freezing the calling interpreter with no
+/// way to interrupt it.
+#[pyfunction]
+#[pyo3(signature = (path, k=21, sketch_size=1000))]
+fn sketch(py: Python<'_>, path: String, k: usize, sketch_size: usize) -> PyResult<PySketch> {
+    let inner = py.allow_threads(|| GenomeSketch::from_path(path, sketch_size, k))?;
+    Ok(PySketch { inner })
+}
+
+/// Loads a sketch previously written by `Sketch.save`.
+#[pyfunction]
+fn load_sketch(path: String) -> PyResult<PySketch> {
+    let inner = GenomeSketch::load(path)?;
+    Ok(PySketch { inner })
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PyKmerCounts>()?;
     m.add_class::<PyPreview>()?;
+    m.add_class::<PySketch>()?;
     m.add_function(wrap_pyfunction!(count, m)?)?;
     m.add_function(wrap_pyfunction!(peek, m)?)?;
     m.add_function(wrap_pyfunction!(build_info, m)?)?;
+    m.add_function(wrap_pyfunction!(sketch, m)?)?;
+    m.add_function(wrap_pyfunction!(load_sketch, m)?)?;
     Ok(())
 }
