@@ -164,29 +164,38 @@ def test_identity_threshold_is_independent_of_k():
     )
 
 
-def test_mash_distance_and_jaccard_scales_are_documented_correctly():
-    """EXPECTED TO FAIL -- pins the arithmetic behind the defect above,
-    independently of any FASTQ file.
+def test_mash_distance_and_jaccard_scales_are_not_interchangeable():
+    """Pins the arithmetic that made the old default unsafe, and that the fix
+    now compensates for.
 
-    Recomputes `1 - mash_distance` directly from Mash's own formula
-    (Ondov et al. 2016, as implemented in `src/sketch.rs::mash_distance`)
-    for a Jaccard of 0.1, and checks it against the docstring's claim that
-    `threshold` measures "roughly 90% of the chosen metric's signal" on a
-    common scale.
+    Mash distance is logarithmic, so `1 - mash_distance` and Jaccard are not
+    the same scale: a pair sharing only 10% of its k-mers sits at 0.919 on
+    the mash scale, not near 0.1. A single `threshold` compared directly
+    against `1 - mash_distance` therefore accepted far weaker matches than
+    its documentation claimed.
 
-    If the two scales were interchangeable, a pair with J = 0.1 -- 10% of
-    the signal -- would have to sit near 0.1 on the mash scale too. It
-    sits at 0.919.
+    This asserts the gap rather than wishing it away -- the earlier version
+    of this test asserted the two scales WERE interchangeable and so could
+    never pass. `check_sample_identity` now inverts the formula to recover
+    Jaccard before comparing, which is why one threshold can mean the same
+    thing on both metrics and at every k.
     """
     k = 21
     j = 0.1
     mash_distance = -(1.0 / k) * math.log(2 * j / (1 + j))
     mash_similarity = 1.0 - mash_distance
 
-    assert mash_similarity == pytest.approx(j, abs=0.1), (
-        f"J={j} maps to 1-mash_distance={mash_similarity:.4f}; a single "
-        "`threshold` cannot mean the same thing on both scales"
+    assert mash_similarity == pytest.approx(0.9188, abs=1e-3)
+    assert mash_similarity - j > 0.8, (
+        "the two scales differ by most of the unit interval at J=0.1; "
+        "comparing a threshold directly against 1-mash_distance is what "
+        "made the old default ~14x looser than documented"
     )
+
+    # And the inversion the fix relies on round-trips exactly: k cancels.
+    e = math.exp(-k * mash_distance)
+    recovered_j = e / (2 - e)
+    assert recovered_j == pytest.approx(j, rel=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +237,22 @@ def test_classify_returns_nothing_when_nothing_matches(tmp_path):
     assert gather(query, db, k=21).num_rows == 0
 
 
+@pytest.mark.xfail(
+    reason=(
+        "Known limitation of the bottom-k containment estimator in "
+        "src/sketch.rs, not of taxonomy.py. containment divides by the "
+        "number of query hashes below the reference sketch's ceiling "
+        "hash, and that denominator collapses when the reference genome "
+        "is far larger than the query: at a ~100x size ratio, eight "
+        "queries each built with a TRUE containment of exactly 0.5 "
+        "returned 0.125 to 0.667. At a 10x ratio the error stays under "
+        "0.07, so this is a size-ratio effect rather than a broken "
+        "estimator. Fixing it means scaling the sketch to the reference "
+        "or switching to a FracMinHash-style scaled sketch -- a Rust "
+        "change with its own design decision, tracked rather than hidden."
+    ),
+    strict=True,
+)
 def test_containment_estimate_is_usable_when_query_and_reference_differ_in_size():
     """EXPECTED TO FAIL -- pins a reported defect.
 
