@@ -50,6 +50,7 @@ use crate::preview;
 use crate::progress::Progress;
 use crate::qc::QcSummary;
 use crate::sketch::GenomeSketch;
+use crate::hll;
 
 /// The single place the spec's error-to-exception table (design doc §12) is
 /// implemented. No call site maps a `FastDnaError` to a `PyErr` directly, so
@@ -692,6 +693,23 @@ fn load_sketch(path: String) -> PyResult<PySketch> {
     Ok(PySketch { inner })
 }
 
+/// Estimates the number of distinct canonical k-mers across an *entire*
+/// FASTQ(.gz) file using HyperLogLog, in a fixed, small amount of memory
+/// (`2^precision` bytes) regardless of file size -- unlike `peek()`'s
+/// `sample_distinct_kmers`, which is exact but only over a sampled
+/// prefix, this covers the whole file at the cost of a full streaming
+/// pass (the same I/O `count()` itself pays) rather than a sample's worth.
+///
+/// Released under `py.allow_threads` like `count()`/`peek()`/`sketch()`'s
+/// own I/O-bound work, for the same reason: a large file would otherwise
+/// hold the GIL for the whole pass with no way to interrupt it.
+#[pyfunction]
+#[pyo3(signature = (path, k=31, precision=hll::DEFAULT_PRECISION))]
+fn estimate_cardinality(py: Python<'_>, path: String, k: usize, precision: u32) -> PyResult<f64> {
+    Ok(py.allow_threads(|| hll::estimate_cardinality(path, k, precision))?)
+}
+
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -703,5 +721,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_info, m)?)?;
     m.add_function(wrap_pyfunction!(sketch, m)?)?;
     m.add_function(wrap_pyfunction!(load_sketch, m)?)?;
+    m.add_function(wrap_pyfunction!(estimate_cardinality, m)?)?;
     Ok(())
 }

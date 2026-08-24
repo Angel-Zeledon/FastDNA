@@ -382,3 +382,20 @@ def compare_all(paths, *, k=21, sketch_size=1000, metric="jaccard"):
             values.append(value)
 
     return pa.table({"sample_a": sample_a, "sample_b": sample_b, metric: values})
+
+
+def estimate_cardinality(path, *, k=31, precision=14):
+    """Estimates the number of *distinct* canonical k-mers across an
+    entire FASTQ(.gz) file using HyperLogLog, in a fixed, small amount of
+    memory (`2**precision` bytes, 16 KB at the default) regardless of
+    file size.
+
+    This is a different question from `peek().sample_distinct_kmers`,
+    which is exact but only covers a sampled prefix: this covers the
+    whole file (at the cost of a full streaming pass, the same I/O
+    `count()` itself pays), with a small, known error instead of exact
+    precision -- `precision=14`'s standard error is ~0.8%. Useful for a
+    file too large to `count()` exactly in available memory, when
+    "roughly how many distinct k-mers" is enough to plan around.
+    """
+    return _core.estimate_cardinality(str(path), k, precision)

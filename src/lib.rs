@@ -7,6 +7,7 @@ pub mod counter;
 pub mod error;
 pub mod export;
 pub mod fastq;
+pub mod hll;
 #[cfg(feature = "python")]
 pub mod ffi;
 pub mod kmer;

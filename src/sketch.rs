@@ -36,7 +36,7 @@ pub struct GenomeSketch {
 /// per k-mer on the hot path -- two multiplies and three xorshifts, no
 /// branches, no allocation.
 #[inline(always)]
-fn finalize_hash(kmer: u64) -> u64 {
+pub(crate) fn finalize_hash(kmer: u64) -> u64 {
     let mut z = kmer;
     z ^= z >> 30;
     z = z.wrapping_mul(0xbf58_476d_1ce4_e5b9);
