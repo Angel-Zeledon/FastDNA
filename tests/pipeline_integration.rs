@@ -70,7 +70,7 @@ fn pipeline_merges_forward_and_reverse_complement_strands() {
         "reverse-complement reads must share one canonical k-mer"
     );
 
-    let (&kmer_bits, &count) = counter.iter().next().expect("one entry");
+    let (kmer_bits, count) = counter.iter().next().expect("one entry");
     assert_eq!(kmer::decode_kmer(kmer_bits, 4), "AACG");
     assert_eq!(count, 2);
 }

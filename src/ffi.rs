@@ -111,7 +111,7 @@ fn build_record_batch(counter: &KmerCounter, k: usize) -> Result<RecordBatch, Fa
     let mut seq_builder = StringBuilder::with_capacity(n, n * (k + 1));
     let mut freq_builder = UInt32Builder::with_capacity(n);
 
-    for (&kmer_bits, &count) in counter.iter() {
+    for (kmer_bits, count) in counter.iter() {
         u64_builder.append_value(kmer_bits);
         seq_builder.append_value(kmer::decode_kmer(kmer_bits, k));
         freq_builder.append_value(count);

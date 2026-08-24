@@ -74,7 +74,7 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
     let mut seq_chunk = Vec::with_capacity(chunk_size);
     let mut freq_chunk = Vec::with_capacity(chunk_size);
 
-    for (&kmer_bits, &count) in counter.iter() {
+    for (kmer_bits, count) in counter.iter() {
         if count >= min_count {
             u64_chunk.push(kmer_bits);
             seq_chunk.push(kmer::decode_kmer(kmer_bits, k));
@@ -141,7 +141,7 @@ pub fn export_counts_csv<P: AsRef<Path>>(
     writeln!(writer, "kmer_u64,kmer_sequence,frequency").map_err(|e| io_err(path, e))?;
 
     let mut written = 0;
-    for (&kmer_bits, &count) in counter.iter() {
+    for (kmer_bits, count) in counter.iter() {
         if count >= min_count {
             writeln!(writer, "{},{},{}", kmer_bits, kmer::decode_kmer(kmer_bits, k), count)
                 .map_err(|e| io_err(path, e))?;
@@ -174,7 +174,7 @@ pub fn export_histogram_csv<P: AsRef<Path>>(
     writeln!(writer, "coverage_depth,kmer_distinct_count").map_err(|e| io_err(path, e))?;
 
     let mut hist_map: FxHashMap<u32, u64> = FxHashMap::default();
-    for &count in counter.iter().map(|(_, c)| c) {
+    for count in counter.iter().map(|(_, c)| c) {
         *hist_map.entry(count).or_insert(0) += 1;
     }
 
