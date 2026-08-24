@@ -201,13 +201,62 @@ Six runs, default 8 threads: 3.07, 3.14, 4.24, 5.00, 6.01, 9.50 s
 (min 3.07 s, median 4.62 s) -- this is the number that matters if you only
 care about "how long until `counts.parquet` exists on disk," and it includes
 writing all 1,423,950 rows through Snappy-compressed Parquet plus the QC
-JSON report, not just the in-memory count. **We did not benchmark against
-established C/C++ k-mer counters** (KMC3, Jellyfish, DSK): they require a
-Linux/conda environment this sandboxed Windows session didn't have, and we
-would rather say that plainly than paste in numbers from their papers and
-imply they were measured here. If you have access to one, the same
-`bench_small.fastq` file (or your own run of `generate_reads.py`) is a fair
-input to point it at.
+JSON report, not just the in-memory count. This is a small file; the
+comparison that actually matters -- against the field's own dedicated
+k-mer counters, at a scale where the difference between an in-memory hash
+table and a sequential-access strategy is visible -- is next.
+
+### Large-scale comparison: FastDNA vs. KMC3 vs. FASTK
+
+This is the comparison that matters, not the Python one above: KMC3 and
+FASTK are the field's own dedicated tools, not something people write
+themselves. Measured in WSL2 (Ubuntu 26.04) for KMC3 and FASTK, and the
+native Windows release binary for FastDNA, all three against the *same*
+2.14 GB synthetic FASTQ file (35 Mbp genome, 30x coverage, 150 bp reads,
+same generator and quality/error model as above, scaled up --
+[`scripts/bench/generate_reads_large.py`](scripts/bench/generate_reads_large.py),
+seed 9001; exact install and run commands in
+[`scripts/bench/kmc3_fastk_comparison.sh`](scripts/bench/kmc3_fastk_comparison.sh)),
+`k=31`, singleton k-mers included on all three (`kmc -ci1`, `FastK -t1`,
+FastDNA's own `min_count=1` default):
+
+| Tool | Time | Peak RAM | Disk (output) | Distinct k-mers |
+|---|---:|---:|---:|---:|
+| FASTK (2023) | 119.3 s | 2.99 GB | 412 MB | 53,776,394 |
+| **FastDNA** | **194.5 s** | **2.00 GB** | 431 MB (Parquet) | 53,774,150 |
+| KMC3 | 293.4 s | 9.77 GB | 412 MB | 53,776,394 |
+
+FastDNA beats KMC3 here and trails FASTK by 1.6x -- on this file, on this
+machine. The 2,244-k-mer (0.004%) difference between FastDNA's count and
+KMC3/FASTK's is the same quality-trimming effect documented above (KMC3
+and FASTK do not trim; FastDNA does by default), not a counting bug --
+consistent with the ~0.001% gap already measured against the pure-Python
+implementations on the small dataset.
+
+**This table did not always look like this.** The first version of this
+comparison had FastDNA at 920.7 s and 6.96 GB peak RAM on the same file --
+about 3x slower than KMC3 and 7.7x slower than FASTK. `KmerCounter` was, at
+that point, an in-memory `HashMap<u64, u32>`: every insertion is
+effectively-random bucket placement, an L3 cache miss once the table
+outgrows a few tens of MB, which happens well before a real sample
+finishes counting -- exactly the failure mode the field moved away from
+after Jellyfish (2011), which is why KMC3 partitions k-mers into
+disk-resident bins by minimizer signature before sorting each one, and why
+FASTK does not hash at all, sorting 2-bit-packed k-mers into disk
+partitions instead. Both are sequential-memory-access strategies.
+`KmerCounter` now uses the same strategy, in memory rather than on disk:
+insertion appends to a plain `Vec<u64>` (sequential, cache-friendly), and
+counting happens as a one-time sort-and-compact pass on first read (see
+["Exact counting"](#4-exact-counting-with-a-fast-non-cryptographic-hash)
+above and `src/counter.rs`'s own doc comments for the detail). That change
+alone -- not new hardware, not a smaller test file -- is the entire
+difference between the two numbers in this paragraph.
+
+**What this does not fix**: FastDNA still holds the whole counting table in
+RAM. KMC3 and FASTK bound peak memory by spilling to disk; FastDNA does
+not, so there remains a dataset size past which FastDNA fails where they
+would not. See [Limitations](#limitations) for what that means in
+practice and where the actual ceiling is on this machine.
 
 ### What FastDNA's own QC report looks like on this dataset
 
@@ -242,10 +291,12 @@ decision is why almost everything downstream is cheap:
 
 - No heap allocation per k-mer. A Python string, or a Rust `String`, is a
   pointer to a heap buffer; a `u64` lives in a CPU register.
-- Comparing, hashing, and storing a k-mer is comparing, hashing, and storing
-  one machine word.
-- The entire count table is `HashMap<u64, u32>` -- a flat array of 12-byte
-  entries, not a forest of heap-allocated string buckets.
+- Comparing, sorting, and storing a k-mer is comparing, sorting, and storing
+  one machine word -- and machine-word comparisons are what the counting
+  strategy in ["Exact counting"](#4-exact-counting-via-sort-and-compact-not-a-hash-table)
+  below is built entirely out of.
+- The entire count table is a flat `Vec<(u64, u32)>` -- 12-byte entries in
+  one contiguous allocation, not a forest of heap-allocated string buckets.
 
 ### 2. Extracting every k-mer from a read is O(n), not O(n x k)
 
@@ -296,21 +347,38 @@ a dozen machine instructions -- nanoseconds, not the microseconds a
 string-allocating version costs. Canonicalization is then just
 `kmer.min(reverse_complement)`: one integer comparison.
 
-### 4. Exact counting with a fast, non-cryptographic hash
+### 4. Exact counting via sort-and-compact, not a hash table
 
-Because the key *is* the k-mer (not a hash of it), counting is **exact** --
-there is no probability of two different k-mers colliding into the same
-count, unlike Bloom-filter or Count-Min-Sketch-based counters some tools use
-to bound memory on very large datasets (the codebase has an unused
-`CountMinSketch` in `src/cms.rs` for a possible future bounded-memory mode,
-but it isn't wired into the counting pipeline today -- worth being explicit
-about, since it would be easy to imply otherwise). The hash map itself uses
-`rustc-hash`'s `FxHashMap` instead of Rust's default `SipHash`: `SipHash` is
-cryptographically strong (resistant to hash-flooding attacks, which matters
-for a public web server's hash maps) at the cost of more CPU cycles per
-hash; `FxHash` is a simple multiply-rotate hash that is 3-10x cheaper and
-unsuitable for adversarial input. FASTQ files aren't adversarial input --
-the caller already chose to trust them -- so this is the right trade.
+`KmerCounter` (`src/counter.rs`) does not use a hash table. Each worker
+appends every canonical k-mer it sees to a plain `Vec<u64>` -- O(1)
+amortized, sequential memory writes. The first time anything reads the
+counter (after counting for that worker is done), it sorts that buffer
+once (`sort_unstable`) and does a single linear pass turning runs of equal
+values into `(kmer, count)` pairs; the result is cached, so repeat reads
+don't re-sort.
+
+This is a deliberate choice, not an incidental detail, and it replaced an
+earlier `HashMap<u64, u32>` version of this same type for a specific,
+measured reason: a hash table's bucket placement is effectively random, so
+once the table outgrows the CPU's L3 cache (a few tens of megabytes --
+well under a million entries), nearly every insertion is a cache miss.
+That is true regardless of how good the hash function is -- no faster hash
+fixes an access pattern that hits main memory on every operation. Sorting
+instead touches memory in a handful of sequential passes, which is exactly
+why KMC3 (radix-sorting disk-resident bins) and FASTK (sorting 2-bit-packed
+k-mers into disk partitions with no hash table at all) are built the way
+they are, and exactly why switching to the same strategy -- in memory
+rather than on disk -- made FastDNA 4.7x faster and cut its peak memory by
+3.5x on the same 2.14 GB benchmark file; see
+[Large-scale comparison](#large-scale-comparison-fastdna-vs-kmc3-vs-fastk).
+
+Counting is still **exact**, the same guarantee the hash table gave: the
+key really is the k-mer, not a hash of it, so there is no probability of
+two different k-mers colliding into the same count -- unlike Bloom-filter
+or Count-Min-Sketch-based counters some tools use to bound memory on very
+large datasets (the codebase has an unused `CountMinSketch` in
+`src/cms.rs` for a possible future bounded-memory mode, but it isn't wired
+into the counting pipeline today).
 
 ### 5. The parallel pipeline: producer/consumer with backpressure, not a lock
 
@@ -419,52 +487,49 @@ already done.
 
 ## Limitations
 
-**FastDNA is not competitive with dedicated k-mer counters at production
-scale, and the benchmarks above should not be read as suggesting otherwise.**
-They measure a 65 MB file against Python baselines. That is the regime FastDNA
-is built for; it is not the regime KMC3, FASTK or Gerbil are built for.
+**FastDNA is still not KMC3 or FASTK at true production scale, and the
+benchmarks above should not be read as claiming otherwise.** It closed the
+*speed* and *memory-efficiency* gap on a 2.14 GB file (see
+[Large-scale comparison](#large-scale-comparison-fastdna-vs-kmc3-vs-fastk)
+above) by adopting the same sequential-memory-access strategy those tools
+use, but it did not close the *scale* gap: KMC3 and FASTK bound peak memory
+by spilling to disk, and FastDNA does not.
 
-The reason is architectural and visible in the source. `KmerCounter`
-(`src/counter.rs`) is an in-memory `FxHashMap<u64, u32>`: every distinct k-mer
-in the sample lives in RAM simultaneously, and there is no minimizer-based
-partitioning and no spill to disk. That is essentially the design Jellyfish
-used in 2011. `src/cms.rs` contains a Count-Min Sketch that would support a
-bounded-memory mode, but it is not wired to anything today.
+`KmerCounter` (`src/counter.rs`) holds every distinct k-mer's count in RAM
+simultaneously -- a sorted `Vec<(u64, u32)>`, not the `HashMap<u64, u32>` an
+earlier version of this README described, but still entirely in-memory, with
+no minimizer-based partitioning and no spill to disk. `src/cms.rs` contains a
+Count-Min Sketch that would support a bounded-memory mode, but it is not
+wired to anything today.
 
-**The deeper reason is memory access, not hashing.** KMC2 onward (2013) bins
-k-mers into hundreds of disk-backed buckets by minimizer signature, so only one
-bucket is ever resident; KMC3 then radix-sorts each bucket. FASTK does not use a
-hash table at all — each thread sorts its share of 2-bit-packed k-mers into
-disk partitions and merges them. Both designs are *sequential* in their memory
-access. A large hash table is not: once it outgrows L3 cache, essentially every
-lookup is a cache miss, and no choice of hash function fixes that. FastDNA's
-counter is fast while the table stays cache-resident and degrades sharply once
-it does not — which is why the gap grows with input size rather than staying
-constant.
-
-Three practical consequences:
+Two practical consequences follow directly from that:
 
 - **Peak memory scales with the number of *distinct* k-mers**, not with file
-  size. A high-diversity sample — a metagenome, or any data with a heavy
-  sequencing-error tail — can exhaust RAM on an input that a partitioned
-  counter would handle comfortably.
-- **There is no out-of-core path.** When the table does not fit, the run fails
-  or swaps; it does not degrade to disk.
-- **A preliminary multi-gigabyte comparison had FastDNA several times slower
-  than FASTK and KMC3** on the same input. Those figures were measured under
-  possible CPU contention and are deliberately not published here as a table
-  until they can be reproduced in isolation — but the direction is not in
-  doubt, and it follows from the architecture above.
+  size. A high-diversity sample -- a metagenome, or any data with a heavy
+  sequencing-error tail -- can exhaust RAM on an input that a partitioned
+  counter would handle comfortably. On the 2.14 GB / 53.7M-distinct-k-mer
+  benchmark file, peak RSS was 2.00 GB (measured, not estimated); the
+  practical ceiling on a given machine scales from there and is exactly
+  what [`scripts/bench/memory_ceiling.py`](scripts/bench/memory_ceiling.py)
+  exists to find on yours.
+- **There is no out-of-core path.** When the table does not fit in RAM, the
+  run fails or swaps; it does not degrade to disk the way KMC3's
+  disk-resident bins or FASTK's disk-resident sorted partitions do. This is
+  why KMC3 can process a 729-gigabase human genome dataset in under 100
+  minutes using 33-34 GB of RAM (Kokot et al., *Bioinformatics*, 2017) --
+  a dataset size FastDNA is not built to attempt.
 
 `max_k` is 32, imposed by the 2-bit-per-base `u64` packing. Analyses that need
 longer k-mers are out of scope.
 
-**What FastDNA is for**, and where the comparison that matters is the one in
-[Benchmarks](#benchmarks): getting k-mer counts out of FASTQ files and into
-Python — as Arrow, in-process, without a serialization step or a subprocess —
-for sample sizes that fit in memory. If you need to count a human genome at
-production scale, use KMC3 or FASTK; they are excellent and this is not trying
-to replace them.
+**What FastDNA is for**: getting k-mer counts out of FASTQ files and into
+Python -- as Arrow, in-process, without a serialization step or a
+subprocess -- for sample sizes that fit in memory, at speed and memory
+efficiency that no longer assumes a small-file regime as an excuse. If your
+data does not fit in RAM at all -- a human genome at full coverage, a large
+metagenome -- use KMC3 or FASTK; they are excellent, and going out-of-core
+is a materially different, larger undertaking than the one this project
+took on.
 
 ## Command-line interface
 
