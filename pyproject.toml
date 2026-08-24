@@ -23,8 +23,16 @@ dynamic = ["version"]
 # itself. Neither is a runtime dependency of the `fastdna` package itself;
 # that test module uses `pytest.importorskip` so their absence skips rather
 # than fails.
+# `pandas` backs `python/tests/test_multiomics.py`: `fastdna.multiomics`
+# deliberately returns `pandas.DataFrame` from `join_omics_layers` (most
+# other-omics/clinical data already lives in pandas in practice), so its
+# tests need pandas to construct sample "other layer" DataFrames and to
+# assert on the joined result. Not a runtime dependency of the `fastdna`
+# package itself -- `fastdna.multiomics` imports pandas lazily, inside the
+# functions that need it, exactly like `polars` is imported lazily in
+# `KmerCounts.to_polars()` above.
 [project.optional-dependencies]
-test = ["pytest>=7", "pytest-timeout>=2.1", "polars>=1.0", "duckdb>=1.0"]
+test = ["pytest>=7", "pytest-timeout>=2.1", "polars>=1.0", "duckdb>=1.0", "pandas>=2.0"]
 
 [tool.maturin]
 features = ["python"]

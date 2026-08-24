@@ -1,0 +1,468 @@
+"""fastdna.multiomics -- joining k-mer features with other omics/clinical
+data by sample ID.
+
+Real studies are rarely genomics-only: clinical metadata, other omics
+layers (transcriptomics, proteomics, metabolomics), and k-mer-derived
+genomic features all need to line up correctly by sample before a model can
+use them together. The hard part is not the join mechanics -- pandas/polars
+already do joins -- it's getting *sample ID matching and mismatch handling*
+right and explicit: what happens when a sample exists in one layer but not
+another, when IDs need light normalization to match across layers, and when
+a caller needs to know exactly which samples got dropped and why.
+
+This module is deliberately independent of `fastdna.sklearn.KmerVectorizer`
+(built by a parallel agent, not merged when this module was written): the
+join utilities here work over *any* per-sample tabular feature
+representation -- a `{sample_id: pyarrow.Table}` dict of single-sample
+`fastdna.count()` results (what `kmer_feature_table` below builds from),
+or a single wide table already keyed by sample ID (what a
+`KmerVectorizer`-style matrix, or any other omics layer, looks like) -- so
+they work today, and keep working once `KmerVectorizer` lands.
+
+Three pieces:
+
+- `kmer_feature_table`: a simple, self-contained wide-table builder that
+  turns a set of FASTQ files into one k-mer feature table keyed by
+  `sample_id`. Not a general-purpose ML vectorizer (that's
+  `KmerVectorizer`'s job) -- it exists so this module has a concrete, real,
+  testable genomic feature table to join against other omics data.
+- `join_omics_layers`: joins several such tables (or arbitrary other omics
+  tables) on a shared sample ID column, returning both the combined table
+  and an explicit report of what happened to every sample ID.
+- `normalize_sample_ids`: a small, conservative, rule-based string
+  normalizer for the common "sample_001" vs "Sample-1" vs "sample1"
+  cosmetic-mismatch problem -- not a fuzzy matcher, and not meant to be one.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pyarrow as pa
+
+from . import count as _count
+
+__all__ = ["kmer_feature_table", "join_omics_layers", "normalize_sample_ids", "JoinReport"]
+
+
+def _sample_id_from_filename(path):
+    """The "filename" convention for `id_from`: the file's stem, e.g.
+    `Path("data/sample_001.fastq.gz").stem` -- `pathlib.Path.stem` only
+    strips the *last* suffix, so a `.fastq.gz` file's stem is
+    `sample_001.fastq`, not `sample_001`. FASTQ files very commonly carry a
+    double extension, and a stray `.fastq` left in every sample_id would
+    silently break joins against a clinical sheet that used the bare name --
+    exactly the kind of cosmetic mismatch this module exists to avoid
+    creating in the first place. Any other trailing `.gz`/`.fastq`/`.fq`
+    suffixes are stripped the same way.
+    """
+    p = Path(path)
+    name = p.name
+    for suffix in (".gz", ".fastq", ".fq"):
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+    return name
+
+
+_ID_FROM_STRATEGIES = {
+    "filename": _sample_id_from_filename,
+}
+
+
+def kmer_feature_table(sample_paths, *, k=31, min_count=1, top_features=None, id_from="filename"):
+    """Runs `fastdna.count()` once per sample and assembles the results
+    into a single wide `pyarrow.Table`: one row per `sample_id`, one column
+    per k-mer, plus a `sample_id` column.
+
+    `sample_paths` is either a `dict` mapping `{sample_id: fastq_path}`
+    (explicit IDs, used as-is), or a list/iterable of FASTQ paths, in which
+    case each path's `sample_id` is derived per `id_from`. Only
+    `id_from="filename"` (the default, and currently the only supported
+    value) is implemented: the file's name with a trailing `.fastq`/`.fq`/
+    `.gz` suffix stripped (see `_sample_id_from_filename`), e.g.
+    `"data/sample_001.fastq.gz"` -> `"sample_001"`. Passing any other
+    `id_from` value raises `ValueError` rather than silently falling back,
+    since a caller relying on a convention this module does not actually
+    implement is a real bug, not a preference to be silently ignored.
+
+    The k-mer vocabulary (the set of columns emitted, beyond `sample_id`)
+    is the union of every k-mer seen across all samples, unless
+    `top_features` is set, in which case only the `top_features` k-mers
+    with the highest *total* count summed across all samples are kept
+    (ties broken by the k-mer's own sequence, for a deterministic column
+    order). This is a much simpler selection rule than `KmerVectorizer`'s
+    own vocabulary selection (see the design note at the top of this
+    module) -- appropriate for this module's own scope of "produce one
+    concrete, joinable feature table", not for general-purpose ML feature
+    selection.
+
+    A k-mer absent from a given sample's own counts becomes `0` in that
+    sample's row -- ordinary sparse-count semantics, not a missing value:
+    the k-mer simply was not observed in that sample, which is different
+    from (and much more common than) "we don't know its count".
+
+    Column order: `sample_id` first, then k-mer columns sorted by k-mer
+    sequence, for a deterministic, reproducible table across runs.
+    """
+    if isinstance(sample_paths, dict):
+        id_to_path = dict(sample_paths)
+    else:
+        if id_from not in _ID_FROM_STRATEGIES:
+            raise ValueError(
+                f"id_from={id_from!r} is not supported; only {sorted(_ID_FROM_STRATEGIES)} "
+                "are implemented -- pass an explicit {sample_id: path} dict instead if you "
+                "need a different convention."
+            )
+        derive = _ID_FROM_STRATEGIES[id_from]
+        id_to_path = {}
+        for path in sample_paths:
+            sample_id = derive(path)
+            if sample_id in id_to_path:
+                raise ValueError(
+                    f"two input paths both derive sample_id {sample_id!r} under "
+                    f"id_from={id_from!r} ({id_to_path[sample_id]!r} and {path!r}); "
+                    "pass an explicit {sample_id: path} dict to disambiguate."
+                )
+            id_to_path[sample_id] = path
+
+    # Per-sample {kmer_sequence: frequency} dicts, computed once each.
+    per_sample_counts = {}
+    for sample_id, path in id_to_path.items():
+        result = _count(path, k=k, min_count=min_count)
+        table = result.table
+        sequences = table.column("kmer_sequence").to_pylist()
+        frequencies = table.column("frequency").to_pylist()
+        per_sample_counts[sample_id] = dict(zip(sequences, frequencies))
+
+    # Total count per k-mer, summed across all samples -- used both to pick
+    # `top_features` (when set) and, either way, to fix a deterministic
+    # column order.
+    totals = {}
+    for counts in per_sample_counts.values():
+        for kmer, freq in counts.items():
+            totals[kmer] = totals.get(kmer, 0) + freq
+
+    if top_features is not None:
+        ranked = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
+        vocabulary = sorted(kmer for kmer, _ in ranked[:top_features])
+    else:
+        vocabulary = sorted(totals)
+
+    sample_ids = list(id_to_path)
+    columns = {"sample_id": sample_ids}
+    for kmer in vocabulary:
+        columns[kmer] = [per_sample_counts[sid].get(kmer, 0) for sid in sample_ids]
+
+    return pa.table(columns)
+
+
+def normalize_sample_ids(ids, *, strategy="lower_strip_punct"):
+    """Normalizes a list/Series of sample-ID strings so that IDs differing
+    only cosmetically (case, punctuation, whitespace) can be made to match
+    across layers before a join.
+
+    Exactly one strategy is implemented, `"lower_strip_punct"` (the
+    default): for each ID, lowercase it, strip leading/trailing whitespace,
+    then replace every run of one or more characters that is not an ASCII
+    letter or digit with a single `_`, and finally strip any leading or
+    trailing `_` left over from that replacement. Note that `"Sample-1"`
+    and `"sample_001"` do NOT normalize to the same string under this rule
+    (`"Sample-1"` -> `"sample_1"`, `"sample_001"` -> `"sample_001"`): this
+    function fixes *punctuation/case/whitespace* mismatches, not numeric
+    zero-padding differences, and does not try to. Concretely:
+
+        "Sample-1"    -> "sample_1"
+        " sample_1 "  -> "sample_1"
+        "SAMPLE 1"    -> "sample_1"
+        "sample--1"   -> "sample_1"
+        "sample.1"    -> "sample_1"
+
+    What this deliberately does NOT do (by design, not by omission): it
+    does not strip or add zero-padding (`"sample_1"` and `"sample_001"`
+    stay distinct), it does not reorder tokens, it does not guess at
+    abbreviations or synonyms, and it never merges two IDs that were
+    genuinely different before normalization into a false match beyond
+    the simple case/punctuation/whitespace rule above. This is a
+    conservative, rule-based transform, not fuzzy matching: a wrong
+    automatic match silently joining the wrong two samples' data together
+    is a much worse failure mode than a join that drops an unmatched
+    sample and reports it (see `join_omics_layers`'s `JoinReport`) -- so
+    when normalization is not enough to make two IDs match, this function
+    leaves them unmatched rather than guessing further.
+
+    Edge case, stated rather than hidden: an ID consisting entirely of
+    whitespace and/or punctuation (`"  "`, `"---"`) normalizes to the empty
+    string, and several such IDs therefore all collide on `""`. That is the
+    documented rule applied consistently, not a special case -- but it does
+    mean a column of blank IDs will appear to "match" each other, so check
+    for empty results before joining on them if blank IDs are possible in
+    your data.
+
+    Raises `ValueError` for any `strategy` other than
+    `"lower_strip_punct"`.
+
+    Accepts a `list`, a `pandas.Series`, or a `polars.Series` (or anything
+    else iterable of strings); always returns a plain `list[str]` in the
+    same order as the input, regardless of input type, since a normalized
+    ID list is typically about to be assigned back onto some table's
+    column rather than used as a Series in its own right.
+    """
+    if strategy != "lower_strip_punct":
+        raise ValueError(
+            f"strategy={strategy!r} is not supported; only 'lower_strip_punct' is implemented."
+        )
+
+    result = []
+    for raw in ids:
+        s = str(raw).strip().lower()
+        s = re.sub(r"[^a-z0-9]+", "_", s)
+        s = s.strip("_")
+        result.append(s)
+    return result
+
+
+@dataclass
+class JoinReport:
+    """The explicit account of what `join_omics_layers` did, so a caller
+    never has to guess why they ended up with fewer rows than expected.
+
+    - `layer_sample_ids`: `{layer_name: set of sample_id values present in
+      that layer's input table}`, exactly as they appeared in the `on`
+      column before joining (no normalization is applied by
+      `join_omics_layers` itself -- see its docstring).
+    - `kept_sample_ids`: the sample IDs present in the final combined
+      table, in row order.
+    - `dropped_sample_ids`: `{sample_id: sorted list of layer names that
+      sample_id was MISSING from}` -- only samples actually dropped from
+      the final result appear here. Under `how="inner"`, this is every
+      sample_id not present in every layer; under `how="outer"`, this is
+      always empty (nothing is dropped). A per-layer `how` dict (see
+      `join_omics_layers`) produces the drop set implied by that
+      configuration.
+    - `row_count`: `len(kept_sample_ids)`, i.e. the final table's row
+      count -- redundant with `len(kept_sample_ids)` but kept as a field
+      in its own right so a caller reading only `report.row_count` does
+      not have to know that equivalence holds.
+    """
+
+    layer_sample_ids: dict = field(default_factory=dict)
+    kept_sample_ids: list = field(default_factory=list)
+    dropped_sample_ids: dict = field(default_factory=dict)
+    row_count: int = 0
+
+
+def _as_pandas(table):
+    """Coerces a pandas.DataFrame, polars.DataFrame, or pyarrow.Table into
+    a pandas.DataFrame (a copy, so later mutation -- e.g. normalizing the
+    `on` column -- never touches the caller's own object).
+    """
+    import pandas as pd
+
+    if isinstance(table, pd.DataFrame):
+        return table.copy()
+    if isinstance(table, pa.Table):
+        return table.to_pandas()
+    # polars.DataFrame, without a hard import dependency on polars.
+    if hasattr(table, "to_pandas"):
+        return table.to_pandas()
+    raise TypeError(
+        f"unsupported table type {type(table)!r}; expected pandas.DataFrame, "
+        "polars.DataFrame, or pyarrow.Table"
+    )
+
+
+def _fill_missing(df, on):
+    """Fills values pandas' `outer` merge left as NaN for rows a given
+    layer did not contribute, "appropriately per column dtype":
+
+    - numeric columns (any pandas dtype `is_numeric_dtype` accepts, i.e.
+      every int/float/bool dtype) are filled with `0` -- matching this
+      module's own sparse-count convention for k-mer columns (`0` means
+      "not observed in this sample", not "unknown"), and a reasonable
+      default for other numeric omics measurements in the same spirit
+      (absence reads as "no signal" rather than a guessed average).
+    - non-numeric columns (strings, categoricals, objects) are filled with
+      the literal string `"missing"`, so a missing clinical/categorical
+      value is visibly flagged rather than silently rendered as an empty
+      string or coerced into some other category's value.
+
+    The `on` column itself is never touched (every row has a real sample_id
+    by construction of the outer join).
+
+    One pandas artifact worth knowing about rather than being surprised by:
+    an integer column that acquired any missing cell during the outer merge
+    is promoted to float64 by pandas *before* this fill runs, so its filled
+    value reads as `0.0` rather than `0`. The value is right either way; the
+    dtype is pandas' own doing, not a choice made here, and is left alone
+    rather than cast back -- a blind cast to int would corrupt any genuinely
+    float-valued omics column that happened to be missing a cell.
+    """
+    import pandas as pd
+
+    for column in df.columns:
+        if column == on:
+            continue
+        if pd.api.types.is_numeric_dtype(df[column]):
+            df[column] = df[column].fillna(0)
+        else:
+            df[column] = df[column].fillna("missing")
+    return df
+
+
+def join_omics_layers(layers, *, on="sample_id", how="inner"):
+    """Joins several omics layers into a single `pandas.DataFrame`, on the
+    `on` column (default `"sample_id"`) that each layer's table must carry
+    alongside its own feature columns.
+
+    `layers` is a `dict` `{layer_name: table}`, where each `table` is a
+    `pandas.DataFrame`, `polars.DataFrame`, or `pyarrow.Table` (e.g.
+    `{"kmers": kmer_feature_table(...), "clinical": my_clinical_df,
+    "transcriptomics": my_expression_df}`). Every table is coerced to
+    pandas internally (see the return-type note below) before joining.
+
+    A feature column name appearing in more than one layer (anything other
+    than `on`) is renamed to `<column>_<layer_name>` in *every* layer that
+    carries it, so no layer's values can silently overwrite another's and
+    every such column says which layer it came from. Columns unique to a
+    single layer keep their original names untouched. Three layers each
+    with a `value` column therefore yield `value_a`, `value_b`, `value_c`
+    -- not pandas' own `value_a`, `value_b`, `value`, which leaves the
+    last one ambiguous.
+
+    No ID normalization is performed here -- if two layers' `on` columns
+    use cosmetically different conventions for the same samples, call
+    `normalize_sample_ids` on each layer's `on` column yourself first (see
+    this module's end-to-end usage). Silently normalizing inside a generic
+    join function would risk merging two IDs that were not actually meant
+    to match; that decision belongs to the caller, made explicitly, not
+    guessed at here.
+
+    `how`:
+    - `"inner"` (default): keep only sample IDs present in *every* layer --
+      the safe default for training a model that needs every modality
+      present for every sample.
+    - `"outer"`: keep every sample ID present in *any* layer. Cells a given
+      layer did not supply a value for are filled per `_fill_missing`'s
+      documented, dtype-appropriate rule (`0` for numeric columns, the
+      string `"missing"` for everything else) rather than left as pandas'
+      own default `NaN`, since a `NaN` k-mer count would misrepresent
+      "not observed" (which is `0`) as "unknown" (which `NaN` actually
+      means).
+    - a `dict` `{layer_name: "inner" | "outer"}`: per-layer control -- a
+      layer marked `"inner"` must contribute every sample_id in the final
+      result (any sample_id missing from it is dropped from the result
+      entirely, same as a plain `how="inner"` layer would be), while a
+      layer marked `"outer"` may be missing some sample_ids (filled per
+      the rule above) without affecting which rows survive. Every layer in
+      `layers` must have an entry in this dict, or `ValueError` is raised
+      -- silently defaulting an unlisted layer's behavior would be exactly
+      the kind of unexplained row-count surprise this function's report
+      exists to prevent.
+
+    Returns `(combined_df, join_report)`:
+    - `combined_df`: a `pandas.DataFrame` (chosen deliberately for this
+      function's return type -- most other-omics data already lives in
+      pandas in practice, and downstream ML code overwhelmingly expects a
+      DataFrame here, even though `kmer_feature_table` above returns a
+      `pyarrow.Table` and individual layers may be pandas, polars, or
+      pyarrow on the way in).
+    - `join_report`: a `JoinReport` (see its own docstring) recording,
+      per layer, exactly which sample IDs were present, which final
+      sample IDs were kept, which were dropped and from which layer(s)
+      they were missing, and the final row count -- so a caller never has
+      to guess why they ended up with fewer rows than expected.
+    """
+    if not layers:
+        raise ValueError("join_omics_layers requires at least one layer")
+
+    if isinstance(how, dict):
+        missing = set(layers) - set(how)
+        if missing:
+            raise ValueError(
+                f"how dict is missing an entry for layer(s) {sorted(missing)}; every layer in "
+                "`layers` must have an explicit 'inner' or 'outer' entry in a per-layer `how`."
+            )
+        extra = set(how) - set(layers)
+        if extra:
+            raise ValueError(f"how dict names layer(s) not present in `layers`: {sorted(extra)}")
+        per_layer_how = dict(how)
+    elif how in ("inner", "outer"):
+        per_layer_how = {name: how for name in layers}
+    else:
+        raise ValueError(f"how must be 'inner', 'outer', or a per-layer dict, got {how!r}")
+
+    frames = {}
+    layer_sample_ids = {}
+    for name, table in layers.items():
+        df = _as_pandas(table)
+        if on not in df.columns:
+            raise ValueError(f"layer {name!r} has no {on!r} column (columns: {list(df.columns)})")
+        frames[name] = df
+        layer_sample_ids[name] = set(df[on].tolist())
+
+    names = list(layers)
+
+    # Determine the final surviving sample_id set from the per-layer how:
+    # start from the union of every layer's ids, then intersect down with
+    # each layer marked "inner".
+    all_ids = set()
+    for ids in layer_sample_ids.values():
+        all_ids |= ids
+    kept_ids = set(all_ids)
+    for name in names:
+        if per_layer_how[name] == "inner":
+            kept_ids &= layer_sample_ids[name]
+
+    # Disambiguate feature columns that appear in more than one layer
+    # BEFORE merging, rather than leaning on pandas' `suffixes=`. Relying
+    # on pandas here is subtly wrong for more than two layers: `suffixes`
+    # applies per pairwise merge, so in a sequential fold the third and
+    # later layers' colliding columns come out unsuffixed (`value_a`,
+    # `value_b`, `value`) and the caller cannot tell which layer the bare
+    # one came from. Renaming upfront makes every collided column carry
+    # its own layer's name, consistently, no matter how many layers there
+    # are -- which is the whole point of a join utility that reports what
+    # it did. Columns unique to one layer keep their original names.
+    seen = {}
+    for name in names:
+        for column in frames[name].columns:
+            if column != on:
+                seen[column] = seen.get(column, 0) + 1
+    collided = {column for column, n in seen.items() if n > 1}
+    if collided:
+        for name in names:
+            renames = {c: f"{c}_{name}" for c in frames[name].columns if c in collided}
+            if renames:
+                frames[name] = frames[name].rename(columns=renames)
+
+    # Sequentially outer-merge every layer, then restrict to the surviving
+    # sample_id set and fill per dtype.
+    combined = frames[names[0]]
+    for name in names[1:]:
+        combined = combined.merge(frames[name], on=on, how="outer")
+
+    combined = combined[combined[on].isin(kept_ids)].reset_index(drop=True)
+
+    any_outer = any(per_layer_how[name] == "outer" for name in names)
+    if any_outer:
+        combined = _fill_missing(combined, on)
+
+    # Preserve a stable, deterministic row order: sorted by the join key.
+    combined = combined.sort_values(on, kind="stable").reset_index(drop=True)
+
+    kept_sample_ids = combined[on].tolist()
+    dropped = {}
+    for sample_id in sorted(all_ids - set(kept_sample_ids)):
+        missing_from = sorted(name for name in names if sample_id not in layer_sample_ids[name])
+        dropped[sample_id] = missing_from
+
+    report = JoinReport(
+        layer_sample_ids=layer_sample_ids,
+        kept_sample_ids=kept_sample_ids,
+        dropped_sample_ids=dropped,
+        row_count=len(kept_sample_ids),
+    )
+
+    return combined, report
