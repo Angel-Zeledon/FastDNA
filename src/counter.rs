@@ -342,14 +342,22 @@ impl KmerCounter {
             .unwrap_or(0)
     }
 
-    /// Every `(kmer, count)` pair, ascending by k-mer. Owned tuples, not
-    /// borrowed: `u64`/`u32` are cheap enough to copy that cloning the
-    /// finalized table once per call -- typically once per `KmerCounter`
-    /// lifetime in practice, since callers iterate it exactly once to
-    /// build an export or an Arrow batch -- costs far less than the sort
-    /// it follows.
-    pub fn iter(&self) -> std::vec::IntoIter<(u64, u32)> {
-        self.ensure_finalized().finalized.clone().into_iter()
+    /// Every `(kmer, count)` pair, ascending by k-mer, as a borrowed
+    /// iterator over the table in place -- not a clone. At benchmark
+    /// scale, cloning the whole `finalized` table (the previous
+    /// behaviour) was on the order of 860MB per call, and every one of
+    /// `export.rs`'s three export functions plus `ffi.rs`'s Arrow-batch
+    /// builder called it once each; it also defeated
+    /// `export_counts_parquet`'s 131,072-row chunking, which exists
+    /// precisely to avoid materializing the whole table before writing
+    /// the first chunk. `Iter` holds the counter's lock for its whole
+    /// lifetime instead of cloning out from under it: every call site
+    /// iterates the counter exactly once to build an export or an Arrow
+    /// batch, so this only serializes two callers doing that concurrently
+    /// against the same counter, rather than letting either corrupt the
+    /// other's read the way sharing a `Vec` without a lock would.
+    pub fn iter(&self) -> Iter<'_> {
+        Iter { guard: self.ensure_finalized(), idx: 0 }
     }
 
     pub fn generate_histogram(&self) -> FxHashMap<u32, u64> {
@@ -367,6 +375,31 @@ impl KmerCounter {
         entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         entries.truncate(n);
         entries
+    }
+}
+
+/// Borrowed iterator over a `KmerCounter`'s finalized `(kmer, count)`
+/// table, ascending by k-mer. Returned by `KmerCounter::iter`; holds the
+/// counter's lock for as long as it is alive.
+pub struct Iter<'a> {
+    guard: MutexGuard<'a, Inner>,
+    idx: usize,
+}
+
+impl Iterator for Iter<'_> {
+    type Item = (u64, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.guard.finalized.get(self.idx).copied();
+        if item.is_some() {
+            self.idx += 1;
+        }
+        item
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.guard.finalized.len().saturating_sub(self.idx);
+        (remaining, Some(remaining))
     }
 }
 
