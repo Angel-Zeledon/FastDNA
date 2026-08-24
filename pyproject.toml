@@ -23,8 +23,13 @@ dynamic = ["version"]
 # itself. Neither is a runtime dependency of the `fastdna` package itself;
 # that test module uses `pytest.importorskip` so their absence skips rather
 # than fails.
+# `scikit-learn` and `scipy` back `python/tests/test_sklearn.py`, which
+# exercises `fastdna.sklearn.KmerVectorizer` -- a pure-Python, opt-in
+# module (imported as `from fastdna.sklearn import KmerVectorizer`, never
+# via plain `import fastdna`) so neither is a runtime dependency of the
+# `fastdna` package itself.
 [project.optional-dependencies]
-test = ["pytest>=7", "pytest-timeout>=2.1", "polars>=1.0", "duckdb>=1.0"]
+test = ["pytest>=7", "pytest-timeout>=2.1", "polars>=1.0", "duckdb>=1.0", "scikit-learn>=1.3", "scipy>=1.10"]
 
 [tool.maturin]
 features = ["python"]
