@@ -27,8 +27,15 @@ dynamic = ["version"]
 # every module needing one is opt-in, or imports it lazily inside the single
 # function that uses it. `shap` matters most -- it pulls in numba and
 # llvmlite, which many users cannot install.
+# `biopython` backs `python/tests/test_interop.py`'s claim that
+# `fastdna.interop` accepts real Biopython `SeqRecord` objects, not just the
+# hand-written fake used when biopython is absent. Without it in this extra,
+# that headline claim is only ever verified because biopython happened to
+# already be installed on whichever machine ran the tests -- never in a
+# clean CI environment.
 [project.optional-dependencies]
 test = [
+    "biopython",
     "duckdb>=1.0",
     "numpy",
     "pandas>=2.0",

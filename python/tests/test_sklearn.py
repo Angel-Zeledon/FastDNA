@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import pathlib
 
-import numpy as np
 import pytest
 
 pytest.importorskip("sklearn")
 pytest.importorskip("scipy")
+
+np = pytest.importorskip("numpy")
 
 import scipy.sparse
 from sklearn.exceptions import NotFittedError
@@ -393,3 +394,204 @@ def test_get_params_round_trips():
     cloned = clone(vec)
     assert cloned.get_params() == params
     assert not hasattr(cloned, "vocabulary_"), "clone() must yield an unfitted estimator"
+
+
+# ---------------------------------------------------------------------------
+# Audit additions (2026-08-24) -- coverage the original suite was missing.
+#
+# Everything below this line was added during a post-merge review. None of
+# it changes `KmerVectorizer`; it pins behaviour the original tests either
+# asserted too weakly to fail, or did not assert at all.
+# ---------------------------------------------------------------------------
+
+
+def test_transform_columns_line_up_positionally_with_get_feature_names_out(tmp_path):
+    """`get_feature_names_out()[j]` must name column `j` of
+    `transform()`'s output. Every downstream consumer of this class relies
+    on that -- `fastdna.interpret.top_features(model.coef_[0],
+    vec.get_feature_names_out())` maps importance `j` onto name `j` and
+    would report confidently wrong biology if the two orders diverged.
+
+    The original suite only asserted `set(names) == {...}` (see
+    `test_get_feature_names_out_returns_decoded_sequences`), which is
+    insensitive to any permutation of the columns. This asserts the
+    correspondence *positionally*, against counts computed independently
+    via `fastdna.count()` rather than via the vectorizer itself.
+    """
+    k = 6
+    reads = ["ACGTACGCATGCATGCACGTAGCTAGCTGACT"] * 3
+    a = write_fastq(tmp_path, "a.fastq", reads)
+    b = write_fastq(tmp_path, "b.fastq", ["TTTTGGGGCCCCAAAATTTTGGGGCCCCAAAA"] * 2)
+
+    vec = KmerVectorizer(k=k, top_features=None).fit([str(a), str(b)])
+    names = list(vec.get_feature_names_out())
+    dense = vec.transform([str(a), str(b)]).toarray()
+
+    assert len(names) == dense.shape[1] == len(vec.vocabulary_)
+
+    for sample_index, path in enumerate([a, b]):
+        table = fastdna.count(str(path), k=k).table
+        truth = dict(
+            zip(table.column("kmer_sequence").to_pylist(), table.column("frequency").to_pylist())
+        )
+        for column_index, name in enumerate(names):
+            assert dense[sample_index, column_index] == truth.get(name, 0), (
+                f"column {column_index} of transform() does not hold the count of "
+                f"get_feature_names_out()[{column_index}] == {name!r} for {path.name}"
+            )
+
+
+def test_transform_with_zero_vocabulary_overlap_returns_a_true_all_zero_row(tmp_path):
+    """A sample sharing no k-mer at all with the fitted vocabulary must
+    produce a full-width all-zero row -- not an error, not a narrower
+    matrix, and not a matrix with explicitly-stored zeros that would make
+    `nnz` lie to a downstream sparse consumer.
+    """
+    train = write_fastq(tmp_path, "train.fastq", ["ACGTACGTAC"] * 3)
+    disjoint = write_fastq(tmp_path, "disjoint.fastq", ["GGGGGGGGGG"] * 3)
+    _assert_pairwise_disjoint(5, {"train": train, "disjoint": disjoint})
+
+    vec = KmerVectorizer(k=5, top_features=None).fit([str(train)])
+    matrix = vec.transform([str(disjoint)])
+
+    assert isinstance(matrix, scipy.sparse.csr_matrix)
+    assert matrix.shape == (1, len(vec.vocabulary_))
+    assert matrix.dtype == np.float64
+    assert matrix.nnz == 0, "an all-zero row must contain no stored entries"
+    assert matrix.toarray().tolist() == [[0.0] * len(vec.vocabulary_)]
+
+
+def test_leakage_guarantee_check_actually_catches_a_leaky_transform(tmp_path):
+    """Independent mutation test of the leakage guarantee.
+
+    `test_unseen_sample_never_influences_vocabulary` asserts that
+    `transform()` leaves `vocabulary_` untouched. That assertion is only
+    worth anything if it would *fail* on an implementation that broke the
+    guarantee. Here a deliberately-leaky subclass extends the vocabulary
+    inside `transform()` -- precisely the bug the guarantee exists to
+    forbid -- and this test asserts the same check the real test performs
+    rejects it.
+
+    Without this, "the leakage test passes" is unfalsifiable: it would
+    also pass against a `transform()` that did nothing at all.
+    """
+
+    class LeakyVectorizer(KmerVectorizer):
+        def transform(self, X):
+            # The bug: let the transformed (possibly held-out) samples add
+            # their own k-mers to the vocabulary.
+            for path in [str(p) for p in X]:
+                table = fastdna.count(
+                    path, k=self.k, min_count=self.min_count, threads=self.threads
+                ).table
+                for kmer, seq in zip(
+                    table.column("kmer_u64").to_pylist(),
+                    table.column("kmer_sequence").to_pylist(),
+                ):
+                    if kmer not in self._vocab_index_:
+                        self._vocab_index_[kmer] = len(self._vocab_index_)
+                        self._feature_sequences_.append(seq)
+                        self.vocabulary_ = np.append(self.vocabulary_, np.uint64(kmer))
+            return super().transform(X)
+
+    k = 6
+    a = write_fastq(tmp_path, "a.fastq", ["AAAAAAAAAAAAAAAAAAAA"] * 5)
+    b = write_fastq(tmp_path, "b.fastq", ["CCCCCCCCCCCCCCCCCCCC"] * 5)
+    c = write_fastq(tmp_path, "c.fastq", ["ACACACACACACACACACAC"] * 5)
+    _assert_pairwise_disjoint(k, {"a": a, "b": b, "c": c})
+
+    # Control: the real class passes the guarantee check.
+    honest = KmerVectorizer(k=k, top_features=None).fit([str(a), str(b)])
+    before = set(int(x) for x in honest.vocabulary_.tolist())
+    honest.transform([str(c)])
+    assert set(int(x) for x in honest.vocabulary_.tolist()) == before
+
+    # Mutant: the same check must reject it.
+    leaky = LeakyVectorizer(k=k, top_features=None).fit([str(a), str(b)])
+    before_leaky = set(int(x) for x in leaky.vocabulary_.tolist())
+    assert before_leaky == before, "the mutant must start from the same fitted vocabulary"
+    leaky.transform([str(c)])
+    after_leaky = set(int(x) for x in leaky.vocabulary_.tolist())
+
+    assert after_leaky != before_leaky, (
+        "the mutation-test subclass did not actually leak -- this test proves "
+        "nothing unless the leaky transform() genuinely widens vocabulary_"
+    )
+    assert after_leaky - before_leaky, "expected c's k-mers to have leaked in"
+
+
+def test_cross_validation_vocabulary_excludes_kmers_unique_to_the_test_fold(tmp_path):
+    """The assertion `test_pipeline_cross_val_score_never_leaks_across_folds`
+    is named for but does not make.
+
+    That test asserts only `len(scores) == 5` and `0.0 <= s <= 1.0` -- both
+    trivially true of *any* accuracy array, including one produced by a
+    vectorizer that pooled every fold's k-mers before splitting. It would
+    not fail if leakage were reintroduced.
+
+    This test walks the same `KFold` splits scikit-learn would, fits a
+    fresh vectorizer on each training fold, and asserts directly that no
+    k-mer contributed *only* by that split's held-out samples ever appears
+    in the fitted vocabulary. Each sample carries a private marker motif so
+    "unique to the test fold" is a real, non-empty set at every split --
+    asserted, not assumed.
+    """
+    from sklearn.model_selection import KFold
+
+    k = 6
+    # A shared backbone every sample has, plus a per-sample marker motif no
+    # other sample carries, so each fold's held-out samples own k-mers the
+    # training fold provably never sees.
+    # Chosen so that, at k=6 and after canonical (reverse-complement)
+    # collapsing, each marker contributes 15 k-mers no other marker and no
+    # backbone read supplies. Simple patterns like ACACAC.../GTGTGT... are
+    # NOT usable here: they are reverse complements of one another and
+    # collapse onto the same canonical k-mers, which would make the
+    # "unique to the test fold" set empty and the test vacuous.
+    markers = [
+        "GCTAAAGACAATTACATAAC",
+        "ATACACGTCAGCACGAAACT",
+        "TGTTGGCCCAGTGTGAATCG",
+        "CTTAAGGGTTAAGTAAGTGT",
+        "CTGTGTCCACCCCATCGGAC",
+        "TTGACAGGTCACGCAGAGGC",
+    ]
+    paths = []
+    for i, marker in enumerate(markers):
+        p = write_fastq(tmp_path, f"s{i}.fastq", ["ACGTACGTACGTACGTACGT"] * 3 + [marker] * 3)
+        paths.append(str(p))
+
+    def kmers_of(path):
+        return set(fastdna.count(path, k=k).table.column("kmer_u64").to_pylist())
+
+    per_sample = {p: kmers_of(p) for p in paths}
+
+    checked_splits = 0
+    for train_index, test_index in KFold(n_splits=3, shuffle=True, random_state=0).split(paths):
+        train_paths = [paths[i] for i in train_index]
+        test_paths = [paths[i] for i in test_index]
+
+        train_kmers = set().union(*(per_sample[p] for p in train_paths))
+        test_only = set().union(*(per_sample[p] for p in test_paths)) - train_kmers
+        assert test_only, (
+            "this split's held-out samples contribute no k-mer the training fold "
+            "lacks -- the leakage assertion below would be vacuous"
+        )
+
+        vec = KmerVectorizer(k=k, top_features=None).fit(train_paths)
+        fitted_vocab = set(int(x) for x in vec.vocabulary_.tolist())
+
+        assert fitted_vocab & test_only == set(), (
+            "vocabulary fitted on the training fold contains k-mers only the "
+            "held-out fold could have supplied -- feature selection leaked"
+        )
+        # And the vocabulary must be exactly the training fold's k-mers,
+        # not merely a subset avoiding the marked ones.
+        assert fitted_vocab == train_kmers
+
+        # transform() on the held-out fold must not change that.
+        vec.transform(test_paths)
+        assert set(int(x) for x in vec.vocabulary_.tolist()) == fitted_vocab
+        checked_splits += 1
+
+    assert checked_splits == 3

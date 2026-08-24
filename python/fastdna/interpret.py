@@ -199,11 +199,16 @@ def explain_with_shap(model, X_transformed, feature_names, *, n=20):
     shap_values = explainer(X_transformed)
 
     values = shap_values.values
-    # Multi-class output: shap gives (n_samples, n_features, n_classes) --
-    # collapse the class axis too, so every case reduces to one importance
-    # per feature. Binary/regression output is (n_samples, n_features).
+    # Multi-class output: shap gives (n_samples, n_features, n_classes).
+    # Per-class SHAP values for a given (sample, feature) sum to zero across
+    # classes (predicted probabilities and base values both sum to 1), so
+    # averaging over the class axis BEFORE taking the absolute value cancels
+    # real per-class contributions down to floating-point noise. Absolute
+    # value must come first; only then can the class axis be averaged away
+    # along with the sample axis. Binary/regression output is already
+    # (n_samples, n_features), so a plain mean(axis=0) is correct for it.
     if values.ndim == 3:
-        values = values.mean(axis=2)
-
-    mean_abs = np.abs(values).mean(axis=0)
+        mean_abs = np.abs(values).mean(axis=(0, 2))
+    else:
+        mean_abs = np.abs(values).mean(axis=0)
     return top_features(mean_abs.tolist(), feature_names, n=n)

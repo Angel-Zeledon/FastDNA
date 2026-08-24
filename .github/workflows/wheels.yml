@@ -147,7 +147,18 @@ jobs:
           # so this is the same artifact a `pip install fastdna` user gets.
           # pyarrow comes along automatically as a wheel-declared dependency
           # (pyproject.toml `project.dependencies`).
-          "$venv_py" -m pip install dist/*.whl pytest
+          #
+          # The `[test]` extra (pyproject.toml `project.optional-dependencies`)
+          # is installed here deliberately: five test modules import an
+          # optional package (numpy/pandas/scipy) at module scope, so without
+          # it pytest fails during *collection* -- before running a single
+          # test -- rather than skipping the tests that need it. `pip install
+          # "<wheel>[test]"` resolves that extra straight off the built wheel
+          # file, exactly the way a real `pip install "fastdna[test]"` user
+          # would get it; it also brings in pytest itself, so a separate
+          # `pytest` install is no longer needed.
+          whl="$(ls dist/*.whl | head -n1)"
+          "$venv_py" -m pip install "${whl}[test]"
           "$venv_py" -m pytest python/tests -v
 
       - name: Note untested cross-compiled wheel

@@ -7,9 +7,10 @@ from __future__ import annotations
 import gzip
 import pathlib
 
-import pandas as pd
 import pyarrow as pa
 import pytest
+
+pd = pytest.importorskip("pandas")
 
 import fastdna
 from fastdna.multiomics import join_omics_layers, kmer_feature_table, normalize_sample_ids
@@ -334,3 +335,174 @@ def test_end_to_end_kmer_table_joined_with_clinical_data(tmp_path):
     assert "condition" in combined.columns
     kmer_columns = [c for c in kmers_df.columns if c != "sample_id"]
     assert any(c in combined.columns for c in kmer_columns)
+
+
+# ===========================================================================
+# Audit additions (2026-08-24).
+#
+# The per-layer `how` dict -- a fully documented branch of
+# `join_omics_layers`, including two of its three ValueError paths -- had
+# no test at all before this section.
+#
+# The last two tests are EXPECTED TO FAIL against the module as merged.
+# Each pins a defect reported to the maintainer; nothing here changes
+# `multiomics.py`.
+# ===========================================================================
+
+
+def test_per_layer_how_dict_mixes_inner_and_outer():
+    """`how={"a": "inner", "b": "outer"}`: a sample must be present in
+    every "inner" layer to survive, but may be absent from an "outer" one
+    (whose columns are then filled per `_fill_missing`). Documented in
+    `join_omics_layers`'s docstring, previously untested -- every existing
+    test passes a plain `"inner"` or `"outer"` string.
+    """
+    a = pd.DataFrame({"sample_id": ["1", "2", "3"], "x": [1, 2, 3]})
+    b = pd.DataFrame({"sample_id": ["2", "3", "4"], "y": [20, 30, 40]})
+
+    combined, report = join_omics_layers({"a": a, "b": b}, how={"a": "inner", "b": "outer"})
+
+    # "4" is absent from the inner layer -> dropped. "1" is absent only
+    # from the outer layer -> kept, with y filled.
+    assert report.kept_sample_ids == ["1", "2", "3"]
+    assert report.row_count == 3
+    assert report.dropped_sample_ids == {"4": ["a"]}
+
+    row1 = combined[combined["sample_id"] == "1"].iloc[0]
+    assert row1["x"] == 1
+    assert row1["y"] == 0, "an outer layer's missing numeric cell fills with 0, not NaN"
+
+    row2 = combined[combined["sample_id"] == "2"].iloc[0]
+    assert row2["x"] == 2 and row2["y"] == 20
+
+
+def test_per_layer_how_dict_reversed_roles_drops_the_other_side():
+    """The mirror image of the test above -- proving the per-layer
+    behaviour actually follows the dict rather than a fixed order.
+    """
+    a = pd.DataFrame({"sample_id": ["1", "2", "3"], "x": [1, 2, 3]})
+    b = pd.DataFrame({"sample_id": ["2", "3", "4"], "y": [20, 30, 40]})
+
+    combined, report = join_omics_layers({"a": a, "b": b}, how={"a": "outer", "b": "inner"})
+
+    assert report.kept_sample_ids == ["2", "3", "4"]
+    assert report.dropped_sample_ids == {"1": ["b"]}
+    row4 = combined[combined["sample_id"] == "4"].iloc[0]
+    assert row4["x"] == 0 and row4["y"] == 40
+
+
+def test_per_layer_how_dict_rejects_a_layer_it_does_not_name():
+    """Documented: "Every layer in `layers` must have an entry in this
+    dict, or ValueError is raised -- silently defaulting an unlisted
+    layer's behavior would be exactly the kind of unexplained row-count
+    surprise this function's report exists to prevent."
+    """
+    a = pd.DataFrame({"sample_id": ["1"], "x": [1]})
+    b = pd.DataFrame({"sample_id": ["1"], "y": [2]})
+
+    with pytest.raises(ValueError, match="missing an entry"):
+        join_omics_layers({"a": a, "b": b}, how={"a": "inner"})
+
+
+def test_per_layer_how_dict_rejects_a_layer_name_that_does_not_exist():
+    a = pd.DataFrame({"sample_id": ["1"], "x": [1]})
+
+    with pytest.raises(ValueError, match="not present in"):
+        join_omics_layers({"a": a}, how={"a": "inner", "typo": "outer"})
+
+
+def test_invalid_how_string_raises():
+    a = pd.DataFrame({"sample_id": ["1"], "x": [1]})
+
+    with pytest.raises(ValueError, match="how must be"):
+        join_omics_layers({"a": a}, how="left")
+
+
+def test_report_names_every_layer_a_dropped_sample_was_missing_from():
+    """`JoinReport.dropped_sample_ids` maps a dropped sample to the sorted
+    list of layers it was missing from. The existing tests only ever
+    exercise samples missing from exactly one layer; this checks the
+    multi-layer case, which is the one where "which layer did this sample
+    vanish from" is actually a question.
+    """
+    a = pd.DataFrame({"sample_id": ["1", "2"], "x": [1, 2]})
+    b = pd.DataFrame({"sample_id": ["2"], "y": [20]})
+    c = pd.DataFrame({"sample_id": ["2", "9"], "z": [200, 900]})
+
+    _, report = join_omics_layers({"a": a, "b": b, "c": c}, how="inner")
+
+    assert report.kept_sample_ids == ["2"]
+    assert report.dropped_sample_ids == {"1": ["b", "c"], "9": ["a", "b"]}
+
+
+def test_outer_join_does_not_overwrite_a_genuinely_unknown_input_value():
+    """EXPECTED TO FAIL -- pins a reported defect.
+
+    `_fill_missing` is documented as filling "values pandas' `outer` merge
+    left as NaN for rows a given layer did not contribute". It cannot
+    distinguish those from NaN that was already in the caller's input, and
+    does not try: it runs `fillna` over every non-`on` column of the merged
+    frame.
+
+    So under `how="outer"` a genuinely unknown clinical measurement -- a
+    viral load nobody recorded -- is silently rewritten to `0`, a real and
+    wrong value, and an unknown categorical becomes the string
+    `"missing"`. The same input under `how="inner"` keeps its NaN, so the
+    two modes disagree about what the caller's own data means.
+
+    Only merge-introduced NaN should be filled (e.g. by filling per layer
+    before the merge, or by tracking which rows each layer contributed).
+    """
+    measurements = pd.DataFrame({"sample_id": ["1", "2"], "viral_load": [float("nan"), 5.0]})
+    clinical = pd.DataFrame({"sample_id": ["1", "2"], "status": ["sick", None]})
+
+    combined, _ = join_omics_layers(
+        {"measurements": measurements, "clinical": clinical}, how="outer"
+    )
+
+    # Both samples are present in both layers -- the merge introduced no
+    # NaN whatsoever. Every NaN here is the caller's own "unknown".
+    row1 = combined[combined["sample_id"] == "1"].iloc[0]
+    row2 = combined[combined["sample_id"] == "2"].iloc[0]
+
+    assert pd.isna(row1["viral_load"]), (
+        f"an unrecorded viral load became {row1['viral_load']!r} -- a genuinely "
+        "unknown measurement was silently rewritten as a real measured zero"
+    )
+    assert pd.isna(row2["status"]), (
+        f"an unrecorded status became {row2['status']!r} -- a genuinely unknown "
+        "categorical was silently rewritten as the literal string 'missing'"
+    )
+
+
+def test_duplicate_sample_ids_are_rejected_or_reported():
+    """EXPECTED TO FAIL -- pins a reported defect.
+
+    `join_omics_layers` builds `report.layer_sample_ids` with
+    `set(df[on].tolist())`, which collapses duplicates, but merges with
+    plain `DataFrame.merge`, which fans them out. A layer carrying the same
+    `sample_id` twice therefore multiplies that sample's rows in the
+    combined table -- duplicates on both sides give a full cartesian
+    product -- and the report says nothing about it.
+
+    `JoinReport` exists so "a caller never has to guess why they ended up
+    with fewer rows than expected". It handles *fewer* and is silent about
+    *more*, which in a cohort join is how one sample ends up weighted
+    several times in a study.
+
+    Either outcome would be acceptable: raise on duplicate IDs, or keep
+    them and surface the fan-out in the report. Doing neither is not.
+    """
+    a = pd.DataFrame({"sample_id": ["1", "1", "2"], "x": [1, 99, 2]})
+    b = pd.DataFrame({"sample_id": ["1", "2"], "y": [10, 20]})
+
+    try:
+        combined, report = join_omics_layers({"a": a, "b": b}, how="inner")
+    except ValueError:
+        return  # rejecting duplicates outright is a valid answer
+
+    assert combined.shape[0] == 2, (
+        f"two distinct sample_ids produced {combined.shape[0]} rows "
+        f"({report.kept_sample_ids}) -- a duplicate sample_id silently fanned the "
+        "join out, and nothing in the JoinReport records that it happened"
+    )

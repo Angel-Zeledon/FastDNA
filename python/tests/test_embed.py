@@ -7,9 +7,10 @@ import pathlib
 import random
 import sys
 
-import numpy as np
 import pyarrow as pa
 import pytest
+
+np = pytest.importorskip("numpy")
 
 import fastdna
 from fastdna.embed import _distance_matrix, embed_cohort
@@ -354,3 +355,79 @@ class TestUmap:
         # must sit closer to each other on average than to samples from
         # the unrelated group.
         assert within < between
+
+
+# ===========================================================================
+# Audit additions (2026-08-24). All expected to PASS -- these strengthen the
+# similarity-vs-distance coverage from "one pair is ordered correctly" to
+# "every pair is, over real sketches". Nothing here changes `embed.py`.
+# ===========================================================================
+
+
+class TestDistanceMatrixOverRealSketches:
+    def test_jaccard_and_mash_distance_matrices_agree_on_every_pair_ordering(self, cohort_paths):
+        """`TestSimilarityVsDistanceHandling` checks the conversion against
+        a hand-built three-row table, and checks a single pair (`ab` vs
+        `ac`) end to end. This runs both metrics over the *same real
+        sketches* and asserts the two distance matrices rank all six
+        unordered pairs identically.
+
+        A missing or inverted `1 - jaccard` would reverse the jaccard
+        ordering completely, so this is the assertion that fails loudest if
+        the conversion is ever dropped -- and unlike a plot, it cannot look
+        plausible while being inside out.
+        """
+        names = ["near_a", "near_b", "diff_c", "diff_d"]
+        paths = [cohort_paths[n] for n in names]
+
+        jaccard_table = fastdna.compare_all(paths, k=15, sketch_size=200, metric="jaccard")
+        mash_table = fastdna.compare_all(paths, k=15, sketch_size=200, metric="mash_distance")
+
+        jaccard_dist = _distance_matrix(jaccard_table, paths, "jaccard")
+        mash_dist = _distance_matrix(mash_table, paths, "mash_distance")
+
+        n = len(paths)
+        pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        assert len(pairs) == 6
+
+        jaccard_order = sorted(pairs, key=lambda p: jaccard_dist[p])
+        mash_order = sorted(pairs, key=lambda p: mash_dist[p])
+        assert jaccard_order == mash_order, (
+            f"jaccard-derived distances rank pairs {jaccard_order} but mash "
+            f"distances rank them {mash_order}; if these disagree the "
+            "1 - jaccard conversion is missing or inverted"
+        )
+
+        # And the closest pair really is the near-identical one, under both.
+        assert jaccard_order[0] == (0, 1)
+        assert mash_order[0] == (0, 1)
+
+    def test_both_metrics_produce_a_valid_distance_matrix(self, cohort_paths):
+        """Every property `_reduce`'s `metric="precomputed"` /
+        `dissimilarity="precomputed"` estimators require of their input:
+        exact zero diagonal, symmetry, and no negative entries. A raw
+        jaccard similarity matrix would violate the diagonal (1.0, not 0.0)
+        -- which is the specific way "the embedding is inside out" shows up
+        before any estimator runs.
+        """
+        names = ["near_a", "near_b", "diff_c", "diff_d"]
+        paths = [cohort_paths[n] for n in names]
+
+        for metric in ("jaccard", "mash_distance"):
+            table = fastdna.compare_all(paths, k=15, sketch_size=200, metric=metric)
+            dist = _distance_matrix(table, paths, metric)
+
+            assert dist.shape == (len(paths), len(paths))
+            assert np.array_equal(np.diag(dist), np.zeros(len(paths))), (
+                f"metric={metric!r}: diagonal is not exactly 0 -- a sample is not "
+                "identical to itself"
+            )
+            assert np.array_equal(dist, dist.T), f"metric={metric!r}: matrix is not symmetric"
+            assert (dist >= 0).all(), f"metric={metric!r}: negative distance"
+            # Off-diagonal entries must be strictly positive for distinct
+            # samples, otherwise "larger = more dissimilar" carries no
+            # information here.
+            off_diagonal = dist[~np.eye(len(paths), dtype=bool)]
+            assert (off_diagonal > 0).all(), (
+                f"metric={metric!r}: two distinct samples are at distance 0"
+            )

@@ -33,10 +33,11 @@ is merged, a real integration test should be added that fits an actual
 """
 from __future__ import annotations
 
-import numpy as np
 import pyarrow as pa
 import pytest
-import scipy.sparse as sp
+
+np = pytest.importorskip("numpy")
+sp = pytest.importorskip("scipy.sparse")
 
 from fastdna.interpret import export_top_features_fasta, top_features
 
@@ -259,3 +260,152 @@ def test_explain_with_shap_on_a_real_fitted_logistic_regression():
     assert set(table.column_names) == {"rank", "kmer", "importance"}
     # SHAP importances here are mean absolute values -- non-negative.
     assert all(v >= 0 for v in table.column("importance").to_pylist())
+
+
+# ===========================================================================
+# Audit additions (2026-08-24).
+#
+# The integration coverage this module's own docstring says is missing
+# ("Once fastdna.sklearn.KmerVectorizer is merged, a real integration test
+# should be added ... nothing in this file proves that"), plus a multiclass
+# SHAP test.
+#
+# `test_explain_with_shap_collapses_multiclass_importances_to_noise` is
+# EXPECTED TO FAIL against the module as merged: it pins a defect reported
+# to the maintainer. Nothing here changes `interpret.py`.
+# ===========================================================================
+
+
+def test_top_features_and_fasta_round_trip_against_the_real_kmer_vectorizer(tmp_path):
+    """Fits a real `fastdna.sklearn.KmerVectorizer` on real FASTQ files,
+    trains a real `LogisticRegression` on its `transform()` output, and
+    runs `top_features` / `export_top_features_fasta` on the result.
+
+    Two things the stub-only suite cannot check:
+
+    1. The exported FASTA holds **valid DNA**. Every existing FASTA test
+       passes placeholder names like `"k1"`, `"a"`, `"b"` as the "k-mer",
+       so they pin the record *format* while proving nothing about the
+       sequences ever being biological. Here every sequence must be
+       exactly `k` characters drawn from ACGT and must be a k-mer the
+       vectorizer genuinely selected.
+    2. The importance attached to each exported k-mer is the coefficient
+       for that k-mer's own column, checked back through the real class's
+       `get_feature_names_out()` ordering.
+    """
+    pytest.importorskip("sklearn")
+    from sklearn.linear_model import LogisticRegression
+
+    import fastdna
+    from fastdna.sklearn import KmerVectorizer
+
+    k = 6
+
+    def write(name, reads):
+        p = tmp_path / name
+        p.write_text("".join(f"@r{i}\n{s}\n+\n{'I' * len(s)}\n" for i, s in enumerate(reads)))
+        return str(p)
+
+    class0 = ["AAATTTAAATTTAAATTTAA", "AAATTTAAATTTAAATTTAC", "AAATTTAAATTTAAATTTAG"] * 4
+    class1 = ["GGGCCCGGGCCCGGGCCCGG", "GGGCCCGGGCCCGGGCCCGC", "GGGCCCGGGCCCGGGCCCGA"] * 4
+
+    paths, labels = [], []
+    for i in range(4):
+        paths.append(write(f"c0_{i}.fastq", class0))
+        labels.append(0)
+    for i in range(4):
+        paths.append(write(f"c1_{i}.fastq", class1))
+        labels.append(1)
+
+    vec = KmerVectorizer(k=k, top_features=None)
+    X = vec.fit_transform(paths)
+    names = list(vec.get_feature_names_out())
+    assert X.shape[1] == len(names)
+
+    model = LogisticRegression(max_iter=1000).fit(X, labels)
+    coefficients = model.coef_[0]
+
+    n = min(5, len(names))
+    table = top_features(coefficients, names, n=n)
+    assert table.num_rows == n
+
+    # Each reported importance must be the coefficient of the column that
+    # `get_feature_names_out()` gives that same name.
+    by_name = dict(zip(names, coefficients))
+    for kmer, importance in zip(
+        table.column("kmer").to_pylist(), table.column("importance").to_pylist()
+    ):
+        assert importance == pytest.approx(by_name[kmer])
+
+    # And the ranking really is by magnitude over the real coefficients.
+    magnitudes = table.column("importance").to_pylist()
+    assert [abs(v) for v in magnitudes] == sorted((abs(v) for v in magnitudes), reverse=True)
+
+    out = tmp_path / "top.fasta"
+    export_top_features_fasta(coefficients, names, str(out), n=n)
+    records = parse_fasta(str(out))
+
+    assert len(records) == n
+    selected = set(names)
+    counted_kmers = set(
+        fastdna.count(paths[0], k=k).table.column("kmer_sequence").to_pylist()
+    ) | set(fastdna.count(paths[-1], k=k).table.column("kmer_sequence").to_pylist())
+
+    for header, sequence in records:
+        assert header.startswith("rank")
+        assert len(sequence) == k, f"exported sequence {sequence!r} is not a {k}-mer"
+        assert set(sequence) <= set("ACGT"), f"exported sequence {sequence!r} is not DNA"
+        assert sequence in selected, "exported a sequence the vectorizer never selected"
+        assert sequence in counted_kmers, (
+            "exported a sequence that fastdna.count() never observed in the input FASTQs"
+        )
+
+
+def test_explain_with_shap_collapses_multiclass_importances_to_noise():
+    """EXPECTED TO FAIL -- pins a reported defect.
+
+    `explain_with_shap` handles shap's 3-D multiclass output with::
+
+        if values.ndim == 3:
+            values = values.mean(axis=2)
+        mean_abs = np.abs(values).mean(axis=0)
+
+    The mean is taken over the class axis *before* the absolute value. For
+    a probability-output model the per-class SHAP values for a given
+    (sample, feature) sum to zero across classes -- the predicted
+    probabilities sum to 1 and so do the base values -- so `mean(axis=2)`
+    cancels them to floating-point noise (~1e-13) for every feature.
+
+    The function still returns a well-formed, plausible-looking top-N
+    table; its ordering is just noise. The correct reduction is
+    `np.abs(values).mean(axis=(0, 2))` -- absolute value first.
+
+    This test builds a 3-class problem where features 0 and 1 alone drive
+    the label, and asserts they come out on top.
+    """
+    pytest.importorskip("shap", reason="shap is an optional dependency of explain_with_shap")
+    from sklearn.linear_model import LogisticRegression
+
+    from fastdna.interpret import explain_with_shap
+
+    rng = np.random.default_rng(0)
+    n_samples, n_features = 90, 6
+    X = rng.integers(0, 6, size=(n_samples, n_features)).astype(float)
+    y = np.select([X[:, 0] > 4, X[:, 1] > 4], [1, 2], default=0)
+    assert len(np.unique(y)) == 3, "fixture must be genuinely multiclass"
+
+    model = LogisticRegression(max_iter=2000).fit(X, y)
+    names = [f"kmer_{i}" for i in range(n_features)]
+
+    table = explain_with_shap(model, X, names, n=2)
+    reported = set(table.column("kmer").to_pylist())
+    importances = table.column("importance").to_pylist()
+
+    assert max(importances) > 1e-6, (
+        f"every multiclass SHAP importance collapsed to ~0 ({importances}) -- "
+        "values.mean(axis=2) cancels the per-class SHAP values before abs() is "
+        "taken, so the returned ranking is floating-point noise"
+    )
+    assert reported == {"kmer_0", "kmer_1"}, (
+        f"expected the two label-driving features, got {sorted(reported)}"
+    )

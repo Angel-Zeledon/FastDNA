@@ -253,12 +253,34 @@ class JoinReport:
     row_count: int = 0
 
 
+def _missing_pandas():
+    """`join_omics_layers` returns a `pandas.DataFrame` by design (see its
+    own docstring's return-type note): most other-omics data already lives
+    in pandas in practice, and downstream ML code overwhelmingly expects a
+    DataFrame here. That makes pandas a de-facto requirement of this one
+    join path even though it is not a runtime dependency of the `fastdna`
+    package as a whole (`pyproject.toml`'s `project.dependencies` stays
+    `["pyarrow>=14"]`). A bare `import pandas` deep inside this module would
+    surface as a raw `ModuleNotFoundError` from somewhere the caller never
+    typed; this names the package and the install command instead, matching
+    `fastdna.embed`'s `_missing_dependency` convention.
+    """
+    return ImportError(
+        "fastdna.multiomics.join_omics_layers() requires the optional "
+        "'pandas' package, which is not installed. Install it with: "
+        "pip install pandas"
+    )
+
+
 def _as_pandas(table):
     """Coerces a pandas.DataFrame, polars.DataFrame, or pyarrow.Table into
     a pandas.DataFrame (a copy, so later mutation -- e.g. normalizing the
     `on` column -- never touches the caller's own object).
     """
-    import pandas as pd
+    try:
+        import pandas as pd
+    except ImportError as e:
+        raise _missing_pandas() from e
 
     if isinstance(table, pd.DataFrame):
         return table.copy()
@@ -273,9 +295,10 @@ def _as_pandas(table):
     )
 
 
-def _fill_missing(df, on):
-    """Fills values pandas' `outer` merge left as NaN for rows a given
-    layer did not contribute, "appropriately per column dtype":
+def _fill_missing(df, on, column_owner_ids):
+    """Fills values the `outer` merge left as NaN for rows a given layer
+    did not contribute -- and *only* those -- "appropriately per column
+    dtype":
 
     - numeric columns (any pandas dtype `is_numeric_dtype` accepts, i.e.
       every int/float/bool dtype) are filled with `0` -- matching this
@@ -287,6 +310,19 @@ def _fill_missing(df, on):
       the literal string `"missing"`, so a missing clinical/categorical
       value is visibly flagged rather than silently rendered as an empty
       string or coerced into some other category's value.
+
+    `column_owner_ids` is `{column_name: set of sample_id values the one
+    layer that column came from actually carried}` (built by the caller
+    from the pre-merge, pre-rename-collision-safe per-layer frames -- see
+    `join_omics_layers`). A cell is only a candidate for filling when its
+    row's `on` value is NOT in that column's owning layer -- i.e. the row
+    genuinely did not come from that layer, so pandas' outer merge is what
+    produced the NaN there. A NaN in a row that *is* one of the owning
+    layer's own sample IDs is the caller's own data (a viral load nobody
+    recorded, a status nobody filled in) and is left untouched: this
+    function cannot tell caller-supplied NaN from merge-introduced NaN by
+    looking at the value alone, so it uses row membership instead, computed
+    before the merge ever ran.
 
     The `on` column itself is never touched (every row has a real sample_id
     by construction of the outer join).
@@ -304,10 +340,20 @@ def _fill_missing(df, on):
     for column in df.columns:
         if column == on:
             continue
+        owner_ids = column_owner_ids.get(column)
+        if owner_ids is None:
+            continue
+        # Only rows whose sample_id is absent from the owning layer are
+        # candidates: a NaN there was introduced by the merge, not carried
+        # in from the caller's own data.
+        merge_introduced = ~df[on].isin(owner_ids)
+        if not merge_introduced.any():
+            continue
         if pd.api.types.is_numeric_dtype(df[column]):
-            df[column] = df[column].fillna(0)
+            fill_value = 0
         else:
-            df[column] = df[column].fillna("missing")
+            fill_value = "missing"
+        df.loc[merge_introduced, column] = df.loc[merge_introduced, column].fillna(fill_value)
     return df
 
 
@@ -321,6 +367,16 @@ def join_omics_layers(layers, *, on="sample_id", how="inner"):
     `{"kmers": kmer_feature_table(...), "clinical": my_clinical_df,
     "transcriptomics": my_expression_df}`). Every table is coerced to
     pandas internally (see the return-type note below) before joining.
+
+    **This function requires pandas**, unlike the rest of `fastdna`, which
+    stays importable with only `pyarrow` installed: its return type is a
+    `pandas.DataFrame` (see the return-type note below), and every input
+    -- including a plain `pyarrow.Table` -- is coerced through pandas on
+    the way in. If `pandas` is not installed, calling this function raises
+    a clear `ImportError` naming the package and `pip install pandas`,
+    rather than a raw `ModuleNotFoundError` from deep inside this module;
+    `import fastdna.multiomics` itself, and `kmer_feature_table` /
+    `normalize_sample_ids`, do not require pandas at all.
 
     A feature column name appearing in more than one layer (anything other
     than `on`) is renamed to `<column>_<layer_name>` in *every* layer that
@@ -339,17 +395,34 @@ def join_omics_layers(layers, *, on="sample_id", how="inner"):
     to match; that decision belongs to the caller, made explicitly, not
     guessed at here.
 
+    Every layer's `on` column must be free of duplicate values: a layer
+    carrying the same sample_id twice would silently fan out into multiple
+    rows once `DataFrame.merge` runs (a cartesian product if both sides of
+    a merge have the same ID duplicated), quietly giving one sample extra
+    weight with nothing in `JoinReport` to explain why the row count grew.
+    `ValueError` is raised naming the layer and the duplicated ID(s)
+    instead; resolve duplicates (rename, aggregate, or drop) before
+    calling.
+
     `how`:
     - `"inner"` (default): keep only sample IDs present in *every* layer --
       the safe default for training a model that needs every modality
       present for every sample.
-    - `"outer"`: keep every sample ID present in *any* layer. Cells a given
-      layer did not supply a value for are filled per `_fill_missing`'s
-      documented, dtype-appropriate rule (`0` for numeric columns, the
-      string `"missing"` for everything else) rather than left as pandas'
-      own default `NaN`, since a `NaN` k-mer count would misrepresent
-      "not observed" (which is `0`) as "unknown" (which `NaN` actually
-      means).
+    - `"outer"`: keep every sample ID present in *any* layer. A cell whose
+      row's sample_id is genuinely absent from the layer that column came
+      from -- i.e. the row this `outer` merge added -- is filled per
+      `_fill_missing`'s documented, dtype-appropriate rule (`0` for numeric
+      columns, the string `"missing"` for everything else) rather than
+      left as pandas' own `NaN`, since a `NaN` k-mer count would
+      misrepresent "not observed" (which is `0`) as "unknown" (which `NaN`
+      actually means). This fill is scoped to merge-introduced cells only:
+      a `NaN` the caller's own input already had for a sample the owning
+      layer *did* contribute (an unrecorded lab measurement, a blank
+      clinical field) is left as `NaN` -- `_fill_missing` cannot tell
+      caller-supplied "unknown" from merge-introduced "absent" by value
+      alone, so it decides by row membership, computed before the merge
+      runs, not by blanket-filling every NaN the merged frame happens to
+      contain.
     - a `dict` `{layer_name: "inner" | "outer"}`: per-layer control -- a
       layer marked `"inner"` must contribute every sample_id in the final
       result (any sample_id missing from it is dropped from the result
@@ -399,6 +472,26 @@ def join_omics_layers(layers, *, on="sample_id", how="inner"):
         df = _as_pandas(table)
         if on not in df.columns:
             raise ValueError(f"layer {name!r} has no {on!r} column (columns: {list(df.columns)})")
+        # `layer_sample_ids` (below) is built with `set(...)`, which
+        # silently collapses duplicates, while the sequential
+        # `DataFrame.merge` a few lines down fans them out -- two sample
+        # IDs with one duplicated becomes 3+ rows, and duplicates on both
+        # sides of a merge give a full cartesian product. `JoinReport`
+        # exists so a caller never has to guess why a join changed their
+        # row count; it already handles *fewer* rows (via
+        # `dropped_sample_ids`) but had nothing to say about *more*. Rather
+        # than silently multiply a sample's weight in a cohort study, this
+        # is refused outright -- a caller with genuinely duplicated
+        # sample_ids (e.g. technical replicates) must resolve that
+        # explicitly (rename, aggregate, or pick one) before joining.
+        duplicate_ids = sorted(df.loc[df[on].duplicated(keep=False), on].unique().tolist())
+        if duplicate_ids:
+            raise ValueError(
+                f"layer {name!r} has duplicate {on!r} value(s) {duplicate_ids}; "
+                "join_omics_layers requires unique sample IDs per layer, since a "
+                "duplicate silently fans out into multiple rows during the merge. "
+                "Resolve duplicates (rename, aggregate, or drop) before joining."
+            )
         frames[name] = df
         layer_sample_ids[name] = set(df[on].tolist())
 
@@ -437,6 +530,21 @@ def join_omics_layers(layers, *, on="sample_id", how="inner"):
             if renames:
                 frames[name] = frames[name].rename(columns=renames)
 
+    # Every column (other than `on`) now belongs to exactly one layer's
+    # frame -- collided names were just renamed to make that true. Record
+    # which sample IDs that owning layer actually carried, so
+    # `_fill_missing` can tell "this NaN is here because the merge
+    # introduced it" (row's sample_id not in the owner's set) from "this
+    # NaN was already in the caller's own data for a row the owning layer
+    # genuinely contributed" (row's sample_id IS in the owner's set) --
+    # only the former should ever be filled. See `_fill_missing`'s
+    # docstring and this function's `how="outer"` bullet above.
+    column_owner_ids = {}
+    for name in names:
+        for column in frames[name].columns:
+            if column != on:
+                column_owner_ids[column] = layer_sample_ids[name]
+
     # Sequentially outer-merge every layer, then restrict to the surviving
     # sample_id set and fill per dtype.
     combined = frames[names[0]]
@@ -445,9 +553,7 @@ def join_omics_layers(layers, *, on="sample_id", how="inner"):
 
     combined = combined[combined[on].isin(kept_ids)].reset_index(drop=True)
 
-    any_outer = any(per_layer_how[name] == "outer" for name in names)
-    if any_outer:
-        combined = _fill_missing(combined, on)
+    combined = _fill_missing(combined, on, column_owner_ids)
 
     # Preserve a stable, deterministic row order: sorted by the join key.
     combined = combined.sort_values(on, kind="stable").reset_index(drop=True)
