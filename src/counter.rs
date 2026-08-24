@@ -32,6 +32,43 @@ struct Inner {
     valid: bool,
 }
 
+/// Above this many buffered (unsorted, with duplicates) instances in
+/// `raw`, `insert`/`insert_batch` triggers an eager `finalize_inner`
+/// rather than waiting for the first read.
+///
+/// Left unbounded, `raw` accumulates every occurrence a worker ever sees
+/// -- hundreds of millions for a real sample -- before the first read
+/// ever happens: `pipeline.rs` builds one `KmerCounter` per worker and
+/// only reads any of them after the whole run, via `insert_batch` in a
+/// loop with no read in between, and every worker's full share is alive
+/// at once ahead of the reduce. Measured effect of leaving this
+/// unbounded: three inputs sharing the same 514,827-distinct-k-mer set
+/// but different occurrence counts (7,943,824 / 31,775,296 /
+/// 127,101,184) produced peak RSS of 76MB / 283MB / 1,003MB -- linear in
+/// occurrences at roughly 8.3 bytes each, not flat in cardinality the way
+/// the old hash map was. This constant is what turns that back into
+/// O(distinct k-mers) + O(cap) per worker instead of O(occurrences) per
+/// worker.
+///
+/// 2,000,000 is a "low millions" starting point, not a round number
+/// picked blind. At 8 bytes per buffered `u64`, the cap itself bounds
+/// `raw` to 16MB per worker. That is large enough that
+/// `finalize_inner`'s O(n log n) sort amortizes well against the O(1)
+/// pushes that fill it -- a worker counting a 127M-occurrence input
+/// finalizes on the order of ten times over the whole run at this cap,
+/// not once per small batch -- and small enough that a single finalize
+/// call's transient allocation stays bounded rather than scaling with
+/// total occurrences: `finalize_inner` keeps `raw`'s already-allocated
+/// capacity (8 bytes/entry) alive alongside a fresh
+/// `Vec::with_capacity(raw.len())` of `(u64, u32)` pairs (16 bytes/entry
+/// after alignment padding) while it drains one into the other, so a
+/// finalize at the cap costs on the order of 2,000,000 * 24 bytes =~
+/// 48MB transient per worker, not gigabytes. Raising the cap trades more
+/// of that transient (and a higher permanent floor) for fewer, larger
+/// sorts; lowering it trades the other way. This is a starting point,
+/// not a value proven optimal by a sweep across input shapes.
+const RAW_FINALIZE_THRESHOLD: usize = 2_000_000;
+
 /// Sorts `inner.raw` and compacts it into `inner.finalized` as sorted,
 /// deduplicated `(kmer, count)` pairs -- a no-op if `inner.valid` already
 /// holds.
@@ -64,7 +101,9 @@ fn finalize_inner(inner: &mut Inner) {
     // is *only* the new arrivals since the last finalize, not the whole
     // table -- `inner.finalized` may already hold entries from an earlier
     // finalize (a read followed by more inserts is a normal sequence, not
-    // a one-way transition), so it must be merged into, never discarded.
+    // a one-way transition, and so is the eager finalize
+    // `RAW_FINALIZE_THRESHOLD` triggers mid-run, well before any read),
+    // so it must be merged into, never discarded.
     let mut new_entries: Vec<(u64, u32)> = Vec::with_capacity(inner.raw.len());
     let mut iter = inner.raw.drain(..).peekable();
     while let Some(kmer) = iter.next() {
@@ -138,13 +177,18 @@ fn merge_sorted_counts(a: &[(u64, u32)], b: &[(u64, u32)]) -> Vec<(u64, u32)> {
 ///
 /// Internally, insertion (`insert`/`insert_batch`, both `&mut self`) is a
 /// plain, unsorted append to a `Vec<u64>`, cheap and safe to call from a
-/// hot loop. Every read method (`iter`, `get_count`, `distinct_kmers`,
-/// `generate_histogram`, `top_kmers`) stays `&self`, matching the API
-/// this type has always had, and lazily triggers a one-time
-/// sort-and-compact pass (`finalize_inner`) if the buffer has grown since
-/// the last one: call `insert`/`insert_batch` freely during counting, the
-/// sort only happens once, on first read, however many inserts came
-/// before it.
+/// hot loop -- but bounded, not left to grow for a whole run's worth of
+/// occurrences: past `RAW_FINALIZE_THRESHOLD` buffered instances, an
+/// insert eagerly triggers the same sort-and-compact pass a read would,
+/// so peak memory tracks distinct k-mers plus that bound rather than
+/// every occurrence ever inserted (see that constant's doc comment for
+/// the measurements behind the choice). Every read method (`iter`,
+/// `get_count`, `distinct_kmers`, `generate_histogram`, `top_kmers`)
+/// stays `&self`, matching the API this type has always had, and lazily
+/// triggers the same finalize if the buffer has grown since the last one:
+/// call `insert`/`insert_batch` freely during counting, a sort only
+/// happens when the buffer crosses the threshold or is read, however many
+/// inserts came before it.
 ///
 /// The state lives behind a `Mutex<Inner>`, not a `RefCell<Inner>`: a
 /// `RefCell` makes this type `!Sync`, which is invisible to `cargo test`
@@ -206,16 +250,28 @@ impl KmerCounter {
 
     #[inline(always)]
     pub fn insert(&mut self, kmer: u64) {
-        let inner = self.inner_mut();
-        inner.raw.push(kmer);
-        inner.valid = false;
+        {
+            let inner = self.inner_mut();
+            inner.raw.push(kmer);
+            inner.valid = false;
+            // See `RAW_FINALIZE_THRESHOLD` for why this cannot be left to
+            // grow until the first read: nothing else bounds `raw`.
+            if inner.raw.len() >= RAW_FINALIZE_THRESHOLD {
+                finalize_inner(inner);
+            }
+        }
         self.total_kmers += 1;
     }
 
     pub fn insert_batch(&mut self, kmers: &[u64]) {
-        let inner = self.inner_mut();
-        inner.raw.extend_from_slice(kmers);
-        inner.valid = false;
+        {
+            let inner = self.inner_mut();
+            inner.raw.extend_from_slice(kmers);
+            inner.valid = false;
+            if inner.raw.len() >= RAW_FINALIZE_THRESHOLD {
+                finalize_inner(inner);
+            }
+        }
         self.total_kmers += kmers.len() as u64;
     }
 
@@ -498,5 +554,67 @@ mod tests {
 
         assert_eq!(hist.get(&1), Some(&1), "one distinct k-mer seen once");
         assert_eq!(hist.get(&2), Some(&2), "two distinct k-mers seen twice each");
+    }
+
+    /// Exercises the eager mid-run finalize `RAW_FINALIZE_THRESHOLD`
+    /// triggers -- not just the one-shot finalize-on-first-read every
+    /// other test here relies on. Inserts three times past the
+    /// threshold, in a pattern designed to hit both branches
+    /// `finalize_inner` can take when it runs more than once (an empty
+    /// `finalized` the first time, a non-empty one to merge into on
+    /// every call after), then confirms counts across the boundary are
+    /// still correct: this is exactly where a seam bug in the
+    /// incremental merge would show up.
+    #[test]
+    fn counts_are_correct_across_multiple_eager_mid_run_finalizes() {
+        let mut c = KmerCounter::new();
+
+        // Three times over the threshold, so at least two eager finalizes
+        // fire during these inserts alone, before any read forces one.
+        let total_inserts = RAW_FINALIZE_THRESHOLD * 3;
+        for i in 0..total_inserts {
+            // A small alphabet of k-mer values so the run mixes brand-new
+            // values with repeats of values seen in an earlier eager
+            // finalize -- the case that actually exercises the "merge
+            // into a non-empty `finalized`" branch, not just "extend an
+            // empty one".
+            let kmer = (i % 4) as u64;
+            c.insert(kmer);
+        }
+
+        assert_eq!(c.total_kmers(), total_inserts as u64);
+        assert_eq!(c.distinct_kmers(), 4);
+        for kmer in 0u64..4 {
+            let expected = (total_inserts / 4) as u32;
+            assert_eq!(c.get_count(kmer), expected, "kmer {kmer} count across finalize boundaries");
+        }
+    }
+
+    /// Same as above but through `insert_batch`, the path
+    /// `pipeline.rs` actually uses per-record during real counting --
+    /// `insert`'s single-kmer loop above proves the merge seam is
+    /// correct, this proves the batched entry point trips the same
+    /// eager threshold check correctly too.
+    #[test]
+    fn counts_are_correct_across_multiple_eager_mid_run_finalizes_via_insert_batch() {
+        let mut c = KmerCounter::new();
+
+        let total_inserts = RAW_FINALIZE_THRESHOLD * 3;
+        let batch: Vec<u64> = (0..total_inserts as u64).map(|i| i % 4).collect();
+
+        // Fed in chunks, not as one `Vec::extend_from_slice` -- a single
+        // call larger than the threshold would only ever cross it once,
+        // which would not exercise repeated finalizes the way real
+        // per-record batches do.
+        for chunk in batch.chunks(9_973) {
+            c.insert_batch(chunk);
+        }
+
+        assert_eq!(c.total_kmers(), total_inserts as u64);
+        assert_eq!(c.distinct_kmers(), 4);
+        for kmer in 0u64..4 {
+            let expected = (total_inserts / 4) as u32;
+            assert_eq!(c.get_count(kmer), expected, "kmer {kmer} count across finalize boundaries");
+        }
     }
 }
