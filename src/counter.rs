@@ -80,8 +80,7 @@ const RAW_FINALIZE_THRESHOLD: usize = 2_000_000;
 /// spends essentially every insertion on effectively-random bucket
 /// placement, which is an L3 cache miss once the table exceeds cache size
 /// (tens of MB -- a few hundred thousand entries) -- true of any real
-/// FASTQ file, not just large ones. Measured effect on a 2.14 GB / 53.7M
-/// distinct k-mer benchmark file is documented in the README.
+/// FASTQ file, not just large ones.
 fn finalize_inner(inner: &mut Inner) {
     if inner.valid {
         return;
@@ -201,6 +200,14 @@ fn merge_sorted_counts(a: &[(u64, u32)], b: &[(u64, u32)]) -> Vec<(u64, u32)> {
 /// unlock per read-method call, which is immaterial next to the O(n log n)
 /// sort it may guard; see `kmer_counter_is_sync` below for the regression
 /// test.
+///
+/// A caveat for callers, not a bug: alternating inserts with reads (e.g.
+/// `insert`, `distinct_kmers()`, `insert`, `distinct_kmers()`, ...) is
+/// correct, but each read after new inserts re-runs `finalize_inner`,
+/// which re-merges the *whole* `finalized` table against whatever is new
+/// in `raw`. That is fine for the "insert many, read a few times" shape
+/// this type is built for; a loop that reads after every single insert
+/// pays a full-table merge every time, not just a cheap lookup.
 #[derive(Debug, Default)]
 pub struct KmerCounter {
     inner: Mutex<Inner>,
@@ -292,7 +299,9 @@ impl KmerCounter {
 
         let merged = merge_sorted_counts(&self_inner.finalized, &other_inner.finalized);
 
-        self_inner.raw.clear();
+        // No `self_inner.raw.clear()` needed here: the `finalize_inner`
+        // call just above already drained it -- that is what "finalized"
+        // means.
         self_inner.finalized = merged;
         self_inner.valid = true;
     }
@@ -323,7 +332,12 @@ impl KmerCounter {
         stats
     }
 
-    #[inline(always)]
+    // Not `#[inline(always)]`: unlike `total_kmers` below (a plain field
+    // read), this can trigger `ensure_finalized`'s O(n log n)
+    // sort-and-compact pass. Forcing that to inline at every call site
+    // would be misleading -- it is not the cheap accessor the annotation
+    // implies -- and the compiler is free to inline it anyway if it
+    // decides that is actually worthwhile.
     pub fn distinct_kmers(&self) -> usize {
         self.ensure_finalized().finalized.len()
     }
@@ -369,11 +383,27 @@ impl KmerCounter {
         histogram
     }
 
+    /// The `n` k-mers with the highest counts, descending.
+    ///
+    /// Partitions with `select_nth_unstable_by` (average O(entries)) to
+    /// put the top `n` in the front, then sorts only that front slice --
+    /// O(n log n) in the requested `n`, not in the table size -- rather
+    /// than fully sorting the whole cloned table just to keep its first
+    /// `n` elements, which was the entire table's worth of comparisons
+    /// for however small a caller-requested `n` actually was.
     pub fn top_kmers(&self, n: usize) -> Vec<(u64, u32)> {
         let guard = self.ensure_finalized();
         let mut entries: Vec<(u64, u32)> = guard.finalized.clone();
+        drop(guard);
+
+        let take = n.min(entries.len());
+        if take == 0 {
+            return Vec::new();
+        }
+
+        entries.select_nth_unstable_by(take - 1, |a, b| b.1.cmp(&a.1));
+        entries.truncate(take);
         entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        entries.truncate(n);
         entries
     }
 }
@@ -572,6 +602,28 @@ mod tests {
         let top = c.top_kmers(2);
 
         assert_eq!(top, vec![(5, 5), (4, 4)]);
+    }
+
+    /// `select_nth_unstable_by(take - 1, ..)` would panic if `take` were
+    /// naively left at `n == 0` (index `0usize - 1` underflows); this
+    /// pins the early return that avoids it.
+    #[test]
+    fn top_kmers_of_zero_is_empty() {
+        let c = counter_with_graded_counts();
+
+        assert_eq!(c.top_kmers(0), Vec::new());
+    }
+
+    /// `select_nth_unstable_by` would panic if `take` were left at the
+    /// requested `n` when `n` exceeds the table size (out-of-bounds
+    /// index); this pins the `n.min(entries.len())` clamp.
+    #[test]
+    fn top_kmers_asking_for_more_than_exist_returns_everything() {
+        let c = counter_with_graded_counts();
+
+        let top = c.top_kmers(100);
+
+        assert_eq!(top, vec![(5, 5), (4, 4), (3, 3), (2, 2), (1, 1)]);
     }
 
     #[test]
