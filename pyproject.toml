@@ -23,8 +23,14 @@ dynamic = ["version"]
 # itself. Neither is a runtime dependency of the `fastdna` package itself;
 # that test module uses `pytest.importorskip` so their absence skips rather
 # than fails.
+# `scikit-learn` (which pulls in `numpy`) backs `fastdna.anomaly` and its
+# tests (`python/tests/test_anomaly.py`) -- an unsupervised outlier
+# detector (`IsolationForest`/`OneClassSVM`) over FastDNA-derived features.
+# Not a runtime dependency of the core `fastdna` package: `fastdna.anomaly`
+# is an explicitly-imported, optional module (`from fastdna.anomaly import
+# GenomicAnomalyDetector`), same convention as `fastdna.sklearn` et al.
 [project.optional-dependencies]
-test = ["pytest>=7", "pytest-timeout>=2.1", "polars>=1.0", "duckdb>=1.0"]
+test = ["pytest>=7", "pytest-timeout>=2.1", "polars>=1.0", "duckdb>=1.0", "scikit-learn>=1.3"]
 
 [tool.maturin]
 features = ["python"]
