@@ -659,6 +659,21 @@ Counts canonical k-mers in a single FASTQ or FASTQ.gz file.
 | `.spectrum()` | `dict` | `{depth: number of distinct k-mers observed at that depth}` -- the frequency histogram |
 | `.suggest_min_count()` | `int` | the `min_count` detected from *this sample's own* frequency spectrum (see below) |
 
+`.filter()`, `.sort_by()` and `.top()` are chainable -- each returns a new
+`KmerCounts` holding a derived view (`pyarrow.compute` under the hood, no
+Rust involved), the same immutable-chaining convention pandas/polars use:
+
+```python
+fastdna.count("sample.fastq.gz", k=31)     .filter(min_count=5)     .sort_by("frequency")     .top(20)     .to_pandas()   # or .to_polars()
+```
+
+`.total_kmers` and `.spectrum()`/`.suggest_min_count()` always read the
+*original* counts regardless of how many `.filter()`/`.top()` calls
+preceded them -- the normalization basis, and the spectrum
+`suggest_min_count()` needs the error peak in, must not silently change
+because a view was filtered or truncated. `.distinct_kmers`/`len()` do
+track the current view: `len(result.top(20)) == 20`.
+
 **Why `suggest_min_count()` exists**: a sequenced sample's frequency
 spectrum has two peaks -- a large one at frequency 1-2 (sequencing errors)
 and another at the real coverage depth, with a valley between them. The
@@ -730,6 +745,66 @@ answer would be wrong on any machine that differs from the one that built
 it. Without this, "it's slow on my Mac" is undiagnosable remotely. (See
 "What isn't SIMD yet" above for what this field does and doesn't imply.)
 
+### `fastdna.sketch(path, *, k=21, sketch_size=1000) -> Sketch`
+
+Builds a MinHash fingerprint of a FASTQ(.gz) file by streaming it --
+memory stays bounded by `sketch_size` regardless of file size, unlike
+`count()`, which must hold every distinct k-mer at once. `k=21` (not
+`count()`'s `k=31`) matches the shorter k typical of sketching/comparison
+work in the literature (Mash's own default).
+
+```python
+s1 = fastdna.sketch("virus1.fastq", k=21)
+s2 = fastdna.sketch("virus2.fastq", k=21)
+
+s1.jaccard(s2)         # symmetric similarity, penalizes genome-size mismatch
+s1.containment(s2)     # asymmetric: what fraction of s1 is inside s2
+s1.mash_distance(s2)   # Poisson-model evolutionary distance (Ondov et al., 2016);
+                        # D = -(1/k)*ln(2J/(1+J)) -- 0 for identical, 1 for disjoint
+
+s1.save("virus1.sketch.json")
+fastdna.load_sketch("virus1.sketch.json")
+
+fastdna.compare("a.fastq", "b.fastq", k=21)              # sugar for sketch()+jaccard()
+fastdna.compare_all(["a.fastq", "b.fastq", "c.fastq"])   # N-choose-2 pairwise table
+```
+
+`.jaccard()` penalizes genome-size differences -- two sketches from very
+differently-sized genomes report low Jaccard even if the smaller is
+entirely contained in the larger; `.containment()` is the question that
+does not ("is this small pathogen present in this large metagenomic
+sample" is a containment question). `.mash_distance()` turns the same
+overlap into an evolutionary-distance estimate instead of a raw
+similarity score -- what "Mash-style" comparison actually promises, not
+just a Jaccard number. It does not include Mash's own p-value against a
+null hypothesis, which needs a genome-length estimate this method does
+not have; that gap is stated, not silently papered over.
+
+`fastdna.compare_all(paths, *, metric="jaccard"|"mash_distance")` builds
+each sketch once (`O(N)` FASTQ reads), then compares every pair (`O(N^2)`
+cheap sketch comparisons, not `O(N^2)` FASTQ reads -- the exact cost
+sketching exists to avoid), returning a plain `pyarrow.Table` in long
+format (`sample_a`, `sample_b`, the metric column) that composes directly
+with `.sort_by()`/DuckDB/Polars.
+
+### `fastdna.estimate_cardinality(path, *, k=31, precision=14) -> float`
+
+Estimates the number of *distinct* canonical k-mers across an **entire**
+file using HyperLogLog (Flajolet et al., 2007), in `2**precision` bytes
+(16 KB at the default) regardless of file size -- a different,
+complementary question from `peek().sample_distinct_kmers`, which is
+exact but covers only a sampled prefix. This covers the whole file, at
+the cost of a full streaming pass (the same I/O `count()` itself pays),
+trading exactness for a small, known error bound (~0.8% standard error at
+the default `precision=14`) instead. Useful for deciding whether a file
+is worth attempting to `count()` exactly at all, before committing to a
+run that might not fit in memory -- see [Limitations](#limitations).
+
+```python
+>>> fastdna.estimate_cardinality("huge_sample.fastq.gz", k=31)
+53812004.2
+```
+
 ---
 
 ## Building from source
@@ -757,8 +832,13 @@ pytest python/tests -v                        # a debug build of the extension
 
 ## Roadmap
 
-Cohort-level processing across many samples, a scikit-learn-compatible
-`KmerVectorizer`, and MinHash/Jaccard sketching (`src/sketch.rs` exists but
-isn't wired into any public API yet) are designed but **not yet
-implemented** -- they are not part of the current `fastdna` package. This
-README describes only what `pip install fastdna` gives you today.
+MinHash/Jaccard sketching (`fastdna.sketch`/`compare`/`compare_all`) and
+HyperLogLog cardinality estimation (`fastdna.estimate_cardinality`) are
+implemented and covered above -- not roadmap items. Still **not yet
+implemented**: cohort-level processing across many samples, a
+scikit-learn-compatible `KmerVectorizer`, and a bounded-memory approximate
+*counting* mode (`src/cms.rs` contains a Count-Min Sketch that could
+support one, but it needs hardening -- tests, `Result`-based error
+handling instead of an assertion-based `merge` -- before it is wired to
+anything). This README describes only what `pip install fastdna` gives
+you today.
