@@ -24,6 +24,7 @@ necessarily heuristic given what a MinHash sketch can and cannot expose.
 """
 from __future__ import annotations
 
+import math
 import pathlib
 from typing import NamedTuple
 
@@ -102,7 +103,16 @@ def _empty_score_table(name_column="name", score_column="score"):
     return pa.table({name_column: pa.array([], type=pa.string()), score_column: pa.array([], type=pa.float64())})
 
 
-def classify(query_path_or_sketch, reference_db, *, k=21, sketch_size=1000, top_n=5, metric="containment"):
+def classify(
+    query_path_or_sketch,
+    reference_db,
+    *,
+    k=21,
+    sketch_size=1000,
+    top_n=5,
+    metric="containment",
+    min_score=0.0,
+):
     """Ranks the references in `reference_db` (a `{name: Sketch}` mapping,
     as returned by `build_reference_database`, or any raw dict of the same
     shape) by how well each one explains the query. Returns the `top_n`
@@ -131,6 +141,23 @@ def classify(query_path_or_sketch, reference_db, *, k=21, sketch_size=1000, top_
     so classifying one query sketch against several different
     `reference_db`s, or reusing a sketch already built for another
     purpose, costs one sketch build total rather than one per call.
+
+    `min_score`: references scoring at or below this value are dropped
+    from the result entirely, the same "there is a floor below which a
+    ranked position is not a finding" idea `gather`'s `min_containment`
+    already applies. Without it, a query sharing literally zero k-mers
+    with *every* reference in `reference_db` still produced a full,
+    confidently-sorted `top_n` table -- `result.column("name")[0]` handed
+    back a named reference backed by no evidence at all, which is exactly
+    the kind of silent-wrong-answer this package's docstrings elsewhere
+    (`gather`, `check_sample_identity`) go out of their way to avoid. The
+    default `min_score=0.0` is deliberately the weakest possible floor --
+    both `containment` and `jaccard` are bounded below by 0, so this only
+    ever drops a reference with *zero* real overlap with the query, never
+    a low-but-real one; a caller who wants a stronger bar (analogous to
+    `gather`'s `min_containment=0.1`, chosen there for a different,
+    iterative algorithm and not reused here as a default) can pass a
+    higher `min_score` explicitly.
     """
     if metric not in _CLASSIFY_METRICS:
         raise ValueError(f"metric must be one of {_CLASSIFY_METRICS!r}, got {metric!r}")
@@ -143,8 +170,14 @@ def classify(query_path_or_sketch, reference_db, *, k=21, sketch_size=1000, top_
     names, scores = [], []
     for name, reference in reference_db.items():
         score_fn = getattr(query, metric)
+        score = score_fn(reference)
+        if score <= min_score:
+            continue
         names.append(name)
-        scores.append(score_fn(reference))
+        scores.append(score)
+
+    if not names:
+        return _empty_score_table()
 
     table = pa.table({"name": names, "score": scores})
     table = table.sort_by([("score", "descending")])
@@ -164,6 +197,43 @@ class SampleIdentityResult(NamedTuple):
     score: float
     metric: str
     threshold: float
+
+
+def _implied_jaccard_from_mash_distance(mash_distance: float, k: int) -> float:
+    """Recovers the Jaccard similarity a `mash_distance` score was itself
+    computed from, by inverting `src/sketch.rs::mash_distance`'s own
+    formula exactly.
+
+    That Rust method computes `d = -(1/k) * ln(2J / (1+J))` from `J =
+    self.jaccard(other)` -- literally the same sketch-vs-sketch Jaccard
+    estimate `check_sample_identity(..., metric="jaccard")` would report
+    for the identical pair of files (see `sketch.rs`'s `mash_distance`,
+    which calls its own `jaccard` first and only then applies the log
+    transform). Solving that formula for `J` given `d`:
+
+        exp(-k*d) = 2J / (1+J)
+        =>  J = e / (2 - e),   where e = exp(-k*d)
+
+    is therefore not an approximation but an exact algebraic round trip:
+    it recovers the same `J` Rust started from, up to floating-point
+    precision, for any `d` produced by the general-case branch of that
+    formula. The two clamped edge cases (`J <= 0 -> d = 1.0` and
+    `J >= 1 -> d = 0.0`, both special-cased in `mash_distance` itself
+    rather than going through the log) are inverted the same way here.
+
+    Why this matters: `k` appears on *both* legs of this round trip --
+    once when Rust folded it into `d`, once again here un-folding it --
+    so it cancels exactly. That cancellation is what makes comparing this
+    recovered `J` against `threshold`, instead of comparing `1 - d`
+    directly, independent of `k` (see `check_sample_identity`'s
+    docstring).
+    """
+    if mash_distance >= 1.0:
+        return 0.0
+    if mash_distance <= 0.0:
+        return 1.0
+    e = math.exp(-k * mash_distance)
+    return e / (2.0 - e)
 
 
 def check_sample_identity(path_a, path_b, *, k=21, sketch_size=1000, threshold=0.9, metric="mash_distance"):
@@ -188,20 +258,45 @@ def check_sample_identity(path_a, path_b, *, k=21, sketch_size=1000, threshold=0
     `fastdna/__init__.py`). `metric="jaccard"` remains available for
     callers who specifically want that raw overlap signal instead.
 
-    Both metrics are compared against `threshold` on the same "closer to
-    1 is closer to identical" scale, so one threshold parameter works for
-    either: for `metric="jaccard"` that scale is the score itself; for
-    `metric="mash_distance"` (a *distance*, where 0 means identical) it
-    is `1 - mash_distance`. `threshold=0.9` is a deliberately generous
-    default on that scale: it absorbs the MinHash sampling noise a finite
-    `sketch_size` introduces and the coverage differences ordinary between
-    two runs of one library, while still requiring the two files to agree
-    on roughly 90% of the chosen metric's signal -- comfortably above
-    where an actual sample swap (a different specimen, let alone a
-    different species) would typically land. Tighten it (e.g.
-    `threshold=0.98`) for a stricter same-run check when coverage is known
-    to be comparable; loosen it if the two runs are known to differ a lot
-    in depth or library prep and some slack is expected.
+    On the threshold, and a defect this docstring used to describe
+    incorrectly: an earlier version of this function compared `1 -
+    mash_distance` directly against `threshold`, on the claim that this
+    put both metrics on the same "closer to 1 is closer to identical"
+    scale. That claim was false. `mash_distance` is `D = -(1/k) *
+    ln(2J/(1+J))` -- a *logarithm* of the Jaccard `J` it was computed
+    from, not a linear rescaling of it -- so `1 - D` compresses the whole
+    low-`J` range into the top of `[0, 1]`: at `k=21`, `1 - D >= 0.9` was
+    satisfied by any pair sharing as little as `J >= 0.066` of its
+    k-mers, roughly 14x looser than what `metric="jaccard"` demands at
+    the identical `threshold=0.9`. Worse, that `1/k` factor meant the
+    same `threshold=0.9` silently demanded a different amount of real
+    overlap at every `k` (`J >= 0.126` at `k=15` vs. `J >= 0.023` at
+    `k=31`) -- a lab that changed `k` for unrelated reasons would
+    silently stop catching a class of sample swap it used to catch.
+
+    The fix: `metric="mash_distance"` still reports `.score` as the raw
+    Mash distance (unchanged -- it is a genuinely useful number on its
+    own, and `metric` must keep meaning what it says), but the pass/fail
+    decision now compares `threshold` against the Jaccard similarity
+    `mash_distance` was itself derived from, recovered by inverting the
+    formula exactly (`_implied_jaccard_from_mash_distance` -- an exact
+    round trip, not an approximation, because the same `k` folded into
+    `mash_distance` cancels back out when un-folding it). This makes
+    `threshold` mean the *same* thing -- "the two files' sketches must
+    share at least this fraction of their k-mer content" -- for both
+    metrics, at every `k`, rather than pretending two different scales
+    were secretly one. `threshold=0.9` is a deliberately generous default
+    on that now-consistent Jaccard-equivalent scale: it absorbs the
+    MinHash sampling noise a finite `sketch_size` introduces and the
+    coverage differences ordinary between two runs of one library, while
+    still requiring the two files to agree on roughly 90% of their k-mer
+    content -- comfortably above where an actual sample swap (a different
+    specimen, let alone a different species) typically lands, per the
+    module docstring's own numbers (same-organism-different-specimen
+    pairs sit around J = 0.3-0.8). Tighten it (e.g. `threshold=0.98`) for
+    a stricter same-run check when coverage is known to be comparable;
+    loosen it if the two runs are known to differ a lot in depth or
+    library prep and some slack is expected.
 
     Returns a `SampleIdentityResult` (not just a bool): `.score` is the
     raw metric value actually computed (so a caller can see, e.g., "this
@@ -217,7 +312,7 @@ def check_sample_identity(path_a, path_b, *, k=21, sketch_size=1000, threshold=0
 
     if metric == "mash_distance":
         score = sketch_a.mash_distance(sketch_b)
-        similarity = 1.0 - score
+        similarity = _implied_jaccard_from_mash_distance(score, k)
     else:
         score = sketch_a.jaccard(sketch_b)
         similarity = score

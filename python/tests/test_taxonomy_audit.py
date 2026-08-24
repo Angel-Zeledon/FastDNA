@@ -194,22 +194,20 @@ def test_mash_distance_and_jaccard_scales_are_documented_correctly():
 # ---------------------------------------------------------------------------
 
 
-def test_classify_returns_a_named_reference_even_when_nothing_matches(tmp_path):
-    """Characterisation test (currently GREEN): records what `classify`
-    does for a sample that matches nothing in the reference set.
+def test_classify_returns_nothing_when_nothing_matches(tmp_path):
+    """Characterisation test, UPDATED for the `classify` floor fix: records
+    what `classify` now does for a sample that matches nothing in the
+    reference set.
 
-    There is no "unknown" outcome and no minimum score: the query below
-    shares zero k-mers with all three references, and `classify` still
-    returns a full, score-ordered table naming a reference first. A caller
-    that reads `result.column("name")[0]` -- the obvious way to use a
-    function whose docstring says it "ranks the references ... by how well
-    each one explains the query" -- gets a confident-looking pathogen name
-    for a sample with no evidence behind it.
-
-    The saving grace, pinned here so a change is noticed: the score really
-    is exactly 0.0, so a caller who checks it can tell. Contrast `gather`,
-    which has a `min_containment` floor and correctly returns nothing --
-    also pinned below.
+    Previously (see git history) `classify` had no "unknown" outcome and
+    no minimum score: a query sharing zero k-mers with every reference
+    still got back a full, score-ordered table naming a reference first --
+    `result.column("name")[0]` handed back a confident-looking pathogen
+    name for a sample with no evidence behind it. `classify` now takes a
+    `min_score` parameter (default `0.0`, the weakest floor that still
+    excludes exact non-matches -- see its docstring), so a query with
+    literally zero overlap against every reference now returns an empty
+    table, matching `gather`'s own `min_containment` floor in spirit.
     """
     unrelated = random_loci(seed=3, count=4, length=200)
     query = write_fastq(tmp_path, "patient_sample.fastq", [unrelated[0]] * 30)
@@ -224,11 +222,9 @@ def test_classify_returns_a_named_reference_even_when_nothing_matches(tmp_path):
 
     result = classify(query, db, k=21)
 
-    assert result.num_rows == 3, "no floor: every reference is reported"
-    assert result.column("score").to_pylist() == [0.0, 0.0, 0.0]
-    assert result.column("name").to_pylist()[0] in {"ebola", "sars_cov_2", "influenza_a"}
+    assert result.num_rows == 0, "the floor now excludes references with zero real overlap"
 
-    # gather, given the identical inputs, declines to name anything.
+    # gather, given the identical inputs, likewise declines to name anything.
     assert gather(query, db, k=21).num_rows == 0
 
 
