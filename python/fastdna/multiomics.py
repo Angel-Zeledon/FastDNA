@@ -160,9 +160,14 @@ def kmer_feature_table(sample_paths, *, k=31, min_count=1, top_features=None, id
         vocabulary = sorted(totals)
 
     sample_ids = list(id_to_path)
+    # The per-sample dicts, resolved once rather than once per cell of the
+    # output: a 10,000-k-mer vocabulary over 50 samples used to do 500,000
+    # lookups into `per_sample_counts` on top of the 500,000 count lookups
+    # the table actually needs -- the sample order is fixed, so 50 suffice.
+    counts_in_order = [per_sample_counts[sid] for sid in sample_ids]
     columns = {"sample_id": sample_ids}
     for kmer in vocabulary:
-        columns[kmer] = [per_sample_counts[sid].get(kmer, 0) for sid in sample_ids]
+        columns[kmer] = [counts.get(kmer, 0) for counts in counts_in_order]
 
     return pa.table(columns)
 

@@ -365,11 +365,18 @@ class CohortOutlierFlagger:
         feature space depending on batching, making scores incomparable
         across calls.
         """
-        n_cohort = len(self._cohort_sketches)
-        X = np.empty((len(sketches), n_cohort), dtype=np.float64)
+        # The Rust-side sketches, unwrapped once for the whole matrix.
+        # `Sketch.mash_distance` is a one-line forwarder to exactly this
+        # call, so going through it per cell added a Python frame and two
+        # attribute lookups to each of the `len(sketches) * n_cohort`
+        # comparisons -- 2,500 of each when a 50-sample cohort is fitted,
+        # against 50 + 50 lookups here -- plus one NumPy scalar assignment
+        # per cell where a whole row can be assigned at once.
+        basis = [b._raw for b in self._cohort_sketches]
+        X = np.empty((len(sketches), len(basis)), dtype=np.float64)
         for i, s in enumerate(sketches):
-            for j, b in enumerate(self._cohort_sketches):
-                X[i, j] = s.mash_distance(b)
+            distance = s._raw.mash_distance
+            X[i] = [distance(b) for b in basis]
         return X
 
     def _summarize(self, X, query_paths):
@@ -380,10 +387,16 @@ class CohortOutlierFlagger:
         The exclusion is what makes fit-time and query-time statistics the
         same quantity -- see the module docstring's leave-one-out note.
         """
+        # The cohort's paths are the same for every query row, so they are
+        # turned into an array once instead of being walked in a Python
+        # list comprehension per row: a 50-sample cohort scored against 50
+        # queries did 2,500 Python string comparisons and built 50 lists,
+        # against 50 vectorized comparisons here. `!=` on a NumPy string
+        # array is the same exact-equality test on the same `str` values.
+        members = np.asarray(self.cohort_paths_)
         stats = np.empty(len(query_paths), dtype=np.float64)
         for i, path in enumerate(query_paths):
-            keep = np.array([path != member for member in self.cohort_paths_], dtype=bool)
-            stats[i] = float(np.median(X[i][keep]))
+            stats[i] = float(np.median(X[i][members != path]))
         return stats
 
     def fit(self, paths):

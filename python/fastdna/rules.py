@@ -61,6 +61,7 @@ imported here.
 
 from __future__ import annotations
 
+from itertools import repeat
 from typing import NamedTuple
 
 import numpy as np
@@ -363,6 +364,10 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
 
         remaining = ~positives  # negatives still covered by the conjunction
         rules = []
+        # Loop-invariant: the tiebreaker cannot change while the search
+        # runs, so it is resolved once instead of once per candidate rule
+        # per round.
+        use_coverage = self.tiebreaker == "max_coverage"
         while len(rules) < self.max_rules and remaining.any():
             neg_rows = binary[remaining]
             # A "present(j)" rule removes every remaining negative in which
@@ -377,12 +382,22 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
                 (absent_ok, absent_removes, absent_coverage, False),
             ):
                 candidates = np.flatnonzero(ok & (removes > 0))
-                for j in candidates:
-                    cov = int(coverage[j]) if self.tiebreaker == "max_coverage" else 0
-                    key = (int(removes[j]), cov, -int(j), int(presence))
+                presence_rank = int(presence)
+                # The three per-candidate `int()` calls this loop used to
+                # make each converted one NumPy scalar at a time; `tolist()`
+                # converts the whole selection in one C pass, so a round
+                # over 10,000 candidate features does three bulk
+                # conversions instead of 30,000 individual ones. The
+                # integers, and therefore every key comparison below, are
+                # identical.
+                indices = candidates.tolist()
+                removals = removes[candidates].tolist()
+                coverages = coverage[candidates].tolist() if use_coverage else repeat(0)
+                for j, removed, cov in zip(indices, removals, coverages):
+                    key = (removed, cov, -j, presence_rank)
                     if best is None or key > best:
                         best = key
-                        best_rule = (int(j), presence)
+                        best_rule = (j, presence)
 
             if best_rule is None:
                 # No candidate removes any remaining negative: adding

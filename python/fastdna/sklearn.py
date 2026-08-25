@@ -40,13 +40,39 @@ label).
 from __future__ import annotations
 
 import os
+from typing import NamedTuple
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 from scipy import sparse
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
 import fastdna
+from fastdna import _column_as_array
+
+
+class _CohortCounts(NamedTuple):
+    """Every sample's k-mer table, counted once and stacked end to end.
+
+    The three arrays are the cohort's rows concatenated in `paths` order,
+    so row `r` belongs to the sample whose block contains `r`;
+    `row_counts[i]` is how many rows sample `i` contributed, which is all
+    `np.repeat` needs to recover the row-to-sample mapping without a
+    Python loop over the rows themselves.
+
+    Keeping `sequences` as an Arrow array rather than a Python list is the
+    point of holding this at all: only the k-mers that survive vocabulary
+    selection ever need decoding into Python strings, and there are at
+    most `top_features` of those against a cohort-wide row count that is
+    routinely several orders of magnitude larger.
+    """
+
+    kmers: object  # pyarrow.UInt64Array, one row per (sample, k-mer)
+    sequences: object  # pyarrow.StringArray, aligned with `kmers`
+    frequencies: object  # pyarrow.UInt32Array, aligned with `kmers`
+    row_counts: list  # rows contributed by each sample, in `paths` order
 
 
 def _validate_paths(X, method_name):
@@ -136,6 +162,154 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         self.top_features = top_features
         self.threads = threads
 
+    def _validated_fit_paths(self, X):
+        """The training-path checks `fit()` performs, shared verbatim with
+        `fit_transform()` so both reject the same mistakes with the same
+        messages (including naming `fit()`, which is the step that would
+        have raised either way).
+        """
+        paths = _validate_paths(X, "fit")
+        if not paths:
+            raise ValueError("KmerVectorizer.fit() requires at least one sample path, got an empty X")
+        seen: set[str] = set()
+        for path in paths:
+            if path in seen:
+                raise ValueError(
+                    f"X contains a duplicate path: {path!r}. Each training sample may "
+                    "appear only once -- a duplicated path would double-count its "
+                    "k-mers' prevalence, the vocabulary ranking's primary criterion."
+                )
+            seen.add(path)
+        if self.top_features is not None and (
+            not isinstance(self.top_features, (int, np.integer)) or isinstance(self.top_features, bool) or self.top_features <= 0
+        ):
+            raise ValueError(f"top_features must be a positive int or None, got {self.top_features!r}")
+        return paths
+
+    def _count_cohort(self, paths):
+        """Counts each path **exactly once** and stacks the resulting k-mer
+        tables into one `_CohortCounts`.
+
+        Every caller here needs the same three columns of the same tables,
+        so counting is done in one place and the result is passed around
+        rather than recomputed: `fit_transform()` learns the vocabulary and
+        projects from a single set of counts, where the previous
+        `TransformerMixin.fit_transform` (`fit(X).transform(X)`) re-read and
+        re-counted every training FASTQ a second time -- a 20-sample cohort
+        did 40 counting passes for 20 samples' worth of data, and counting
+        is by far the most expensive thing this class does.
+        """
+        kmer_arrays, sequence_arrays, frequency_arrays, row_counts = [], [], [], []
+        for path in paths:
+            table = fastdna.count(path, k=self.k, min_count=self.min_count, threads=self.threads).table
+            kmer_arrays.append(_column_as_array(table.column("kmer_u64")))
+            sequence_arrays.append(_column_as_array(table.column("kmer_sequence")))
+            frequency_arrays.append(_column_as_array(table.column("frequency")))
+            row_counts.append(table.num_rows)
+        return _CohortCounts(
+            kmers=pa.concat_arrays(kmer_arrays),
+            sequences=pa.concat_arrays(sequence_arrays),
+            frequencies=pa.concat_arrays(frequency_arrays),
+            row_counts=row_counts,
+        )
+
+    def _learn_vocabulary(self, counts):
+        """Ranks the cohort's k-mers and assigns `vocabulary_`,
+        `_feature_sequences_` and `n_features_in_`.
+
+        Two running tallies, keyed by each k-mer's `kmer_u64` encoding:
+
+          prevalence[kmer]  -- in how many of *these training* samples
+                               the k-mer appears at all (0 or 1 per
+                               sample, summed across samples)
+          total_freq[kmer]  -- its summed raw count across those samples
+
+        Prevalence (a.k.a. document frequency), not summed raw frequency,
+        is the primary selection criterion -- matching the design doc's
+        own choice (§7.6: "Ranked by descending prevalence"). A k-mer
+        present at moderate depth in *every* training sample is a more
+        trustworthy, sample-general signal than one present at enormous
+        depth in a single sample and absent from the rest (a PCR
+        duplicate, a contaminant, a library-prep artifact unique to one
+        file) -- the latter would dominate a total-frequency ranking
+        without being a feature that generalizes across samples at all,
+        which is the entire purpose of selecting features in the first
+        place. Ties in prevalence are broken by total_freq (still a
+        meaningful tiebreaker: among equally prevalent k-mers, more total
+        signal is preferable), and remaining ties by the raw `kmer_u64`
+        value purely for determinism, so `fit()` on identical input
+        always yields an identical `vocabulary_`.
+
+        Both tallies are computed with one hash pass over the stacked
+        cohort rather than a Python loop: `dictionary_encode` assigns each
+        distinct k-mer a code (one C++ hash probe per row, replacing three
+        Python dict operations per row), after which prevalence is just
+        "how many rows carry this code" -- a k-mer appears at most once in
+        a sample's count table, so its row count *is* its sample count --
+        and total_freq is the same tally weighted by `frequency`. For a
+        20-sample cohort of a million k-mers each, that is 20 million
+        Python-level dict updates replaced by two `bincount` passes.
+        """
+        codes = pc.dictionary_encode(counts.kmers)
+        row_code = np.asarray(codes.indices).astype(np.intp, copy=False)
+        distinct = np.asarray(codes.dictionary)
+        n_distinct = distinct.size
+
+        prevalence = np.bincount(row_code, minlength=n_distinct).astype(np.int64)
+        # float64 weights hold these sums exactly: `frequency` is uint32
+        # and no partial sum comes anywhere near 2**53 (that bound is
+        # ~9e15 occurrences of one k-mer), so the ordering below is the one
+        # a Python `+=` loop over the same integers would have produced.
+        total_freq = np.bincount(row_code, weights=np.asarray(counts.frequencies), minlength=n_distinct)
+
+        # `lexsort` takes its primary key last, so this is exactly the
+        # `(-prevalence, -total_freq, kmer)` ordering described above.
+        ranked = np.lexsort((distinct, -total_freq, -prevalence))
+        if self.top_features is not None:
+            ranked = ranked[: self.top_features]
+
+        self.vocabulary_ = distinct[ranked]
+        # get_feature_names_out() needs the *decoded* sequence for each
+        # selected k-mer, not its u64 encoding. The Rust core already
+        # decoded every k-mer it counted into `kmer_sequence` (see
+        # `KmerCounts.table`); no pure-Python 2-bit decoder exists anywhere
+        # in this package (checked: only `src/kmer.rs::decode_kmer` does,
+        # Rust-side), so this reuses that table column -- but takes only
+        # the rows the selected k-mers first appeared in, so the number of
+        # Python strings built is `len(vocabulary_)` rather than one per
+        # k-mer of every training sample.
+        first_row = np.empty(n_distinct, dtype=np.int64)
+        descending = np.arange(row_code.size - 1, -1, -1)
+        first_row[row_code[descending]] = descending
+        self._feature_sequences_ = counts.sequences.take(pa.array(first_row[ranked])).to_pylist()
+        self.n_features_in_ = len(self.vocabulary_)
+
+    def _project(self, counts, n_samples):
+        """The sparse `(n_samples, len(vocabulary_))` count matrix for an
+        already-counted cohort.
+
+        `index_in` resolves every row's `kmer_u64` against the vocabulary
+        in one C++ hash pass (k-mers outside it come back null, i.e. the
+        "silently ignored" case documented on `transform()`), replacing one
+        Python dict lookup and up to three `list.append` calls per row of
+        every sample's table.
+        """
+        column = np.asarray(pc.fill_null(pc.index_in(counts.kmers, value_set=pa.array(self.vocabulary_)), -1))
+        kept = column >= 0
+        rows = np.repeat(np.arange(n_samples, dtype=np.int64), counts.row_counts)[kept]
+        # float64: most downstream consumers (LogisticRegression, other
+        # linear models, and anything that normalizes counts before
+        # fitting) expect a floating dtype and would otherwise silently
+        # upcast anyway; producing it directly avoids a hidden copy inside
+        # whatever comes next in the pipeline. Matches what
+        # `TfidfVectorizer` (scikit-learn's own closest analogue) returns.
+        data = np.asarray(counts.frequencies)[kept].astype(np.float64)
+        return sparse.csr_matrix(
+            (data, (rows, column[kept].astype(np.int64))),
+            shape=(n_samples, len(self.vocabulary_)),
+            dtype=np.float64,
+        )
+
     def fit(self, X, y=None):
         """Learns `self.vocabulary_` from `X` alone.
 
@@ -161,83 +335,32 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         self, per the scikit-learn convention that `fit()` always returns
         the (now-fitted) estimator, so calls chain: `vectorizer.fit(X).transform(X)`.
         """
-        paths = _validate_paths(X, "fit")
-        if not paths:
-            raise ValueError("KmerVectorizer.fit() requires at least one sample path, got an empty X")
-        seen: set[str] = set()
-        for path in paths:
-            if path in seen:
-                raise ValueError(
-                    f"X contains a duplicate path: {path!r}. Each training sample may "
-                    "appear only once -- a duplicated path would double-count its "
-                    "k-mers' prevalence, the vocabulary ranking's primary criterion."
-                )
-            seen.add(path)
-        if self.top_features is not None and (
-            not isinstance(self.top_features, (int, np.integer)) or isinstance(self.top_features, bool) or self.top_features <= 0
-        ):
-            raise ValueError(f"top_features must be a positive int or None, got {self.top_features!r}")
-
-        # Two running tallies, keyed by each k-mer's `kmer_u64` encoding:
-        #
-        #   prevalence[kmer]  -- in how many of *these training* samples
-        #                        the k-mer appears at all (0 or 1 per
-        #                        sample, summed across samples)
-        #   total_freq[kmer]  -- its summed raw count across those samples
-        #
-        # Prevalence (a.k.a. document frequency), not summed raw frequency,
-        # is the primary selection criterion -- matching the design doc's
-        # own choice (§7.6: "Ranked by descending prevalence"). A k-mer
-        # present at moderate depth in *every* training sample is a more
-        # trustworthy, sample-general signal than one present at enormous
-        # depth in a single sample and absent from the rest (a PCR
-        # duplicate, a contaminant, a library-prep artifact unique to one
-        # file) -- the latter would dominate a total-frequency ranking
-        # without being a feature that generalizes across samples at all,
-        # which is the entire purpose of selecting features in the first
-        # place. Ties in prevalence are broken by total_freq (still a
-        # meaningful tiebreaker: among equally prevalent k-mers, more total
-        # signal is preferable), and remaining ties by the raw `kmer_u64`
-        # value purely for determinism, so `fit()` on identical input
-        # always yields an identical `vocabulary_`, independent of Python
-        # dict/set iteration order.
-        prevalence: dict[int, int] = {}
-        total_freq: dict[int, int] = {}
-        sequence_of: dict[int, str] = {}
-
-        for path in paths:
-            counted = fastdna.count(path, k=self.k, min_count=self.min_count, threads=self.threads)
-            table = counted.table
-            kmers = table.column("kmer_u64").to_pylist()
-            seqs = table.column("kmer_sequence").to_pylist()
-            freqs = table.column("frequency").to_pylist()
-
-            for kmer, seq, freq in zip(kmers, seqs, freqs):
-                prevalence[kmer] = prevalence.get(kmer, 0) + 1
-                total_freq[kmer] = total_freq.get(kmer, 0) + freq
-                if kmer not in sequence_of:
-                    sequence_of[kmer] = seq
-
-        ranked = sorted(prevalence, key=lambda kmer: (-prevalence[kmer], -total_freq[kmer], kmer))
-        if self.top_features is not None:
-            ranked = ranked[: self.top_features]
-
-        self.vocabulary_ = np.array(ranked, dtype=np.uint64)
-        # Built once here, not recomputed per transform() call: an O(1)
-        # dict lookup from kmer_u64 to its column index in the output
-        # matrix.
-        self._vocab_index_ = {kmer: i for i, kmer in enumerate(ranked)}
-        # get_feature_names_out() needs the *decoded* sequence for each
-        # selected k-mer, not its u64 encoding. The Rust core already
-        # decoded every k-mer it counted into `kmer_sequence` (see
-        # `KmerCounts.table`); no pure-Python 2-bit decoder exists anywhere
-        # in this package (checked: only `src/kmer.rs::decode_kmer` does,
-        # Rust-side), so this reuses that per-fit-sample table lookup
-        # (`sequence_of`, populated above) instead of reimplementing
-        # decoding here.
-        self._feature_sequences_ = [sequence_of[kmer] for kmer in ranked]
-        self.n_features_in_ = len(self.vocabulary_)
+        paths = self._validated_fit_paths(X)
+        self._learn_vocabulary(self._count_cohort(paths))
         return self
+
+    def fit_transform(self, X, y=None):
+        """`fit(X)` and `transform(X)` over **one** pass of counting.
+
+        `TransformerMixin.fit_transform`'s default is
+        `self.fit(X, y).transform(X)`, which counts every training FASTQ
+        file twice -- once to rank the vocabulary, once to project onto it.
+        This override counts each file once and reuses those counts for
+        both steps, so a 20-sample cohort does 20 counting passes instead
+        of 40. Nothing else changes: the vocabulary is still decided by
+        `_learn_vocabulary()` from `X` alone before `_project()` is
+        reached, and `_project()` still reads nothing but the vocabulary
+        that decision produced -- the leakage guarantee in the module
+        docstring is a property of that ordering, not of how many times
+        the files were read. `fastdna.count()` is deterministic, so the
+        matrix is identical to the one two passes produced.
+
+        `y` is ignored, exactly as in `fit()`.
+        """
+        paths = self._validated_fit_paths(X)
+        counts = self._count_cohort(paths)
+        self._learn_vocabulary(counts)
+        return self._project(counts, len(paths))
 
     def transform(self, X):
         """Projects `X` onto the vocabulary `fit()` already decided.
@@ -264,30 +387,7 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         """
         check_is_fitted(self, "vocabulary_")
         paths = _validate_paths(X, "transform")
-        n_features = len(self.vocabulary_)
-
-        rows: list[int] = []
-        cols: list[int] = []
-        data: list[int] = []
-        for i, path in enumerate(paths):
-            counted = fastdna.count(path, k=self.k, min_count=self.min_count, threads=self.threads)
-            table = counted.table
-            kmers = table.column("kmer_u64").to_pylist()
-            freqs = table.column("frequency").to_pylist()
-            for kmer, freq in zip(kmers, freqs):
-                col = self._vocab_index_.get(kmer)
-                if col is not None:
-                    rows.append(i)
-                    cols.append(col)
-                    data.append(freq)
-
-        # float64: most downstream consumers (LogisticRegression, other
-        # linear models, and anything that normalizes counts before
-        # fitting) expect a floating dtype and would otherwise silently
-        # upcast anyway; producing it directly avoids a hidden copy inside
-        # whatever comes next in the pipeline. Matches what
-        # `TfidfVectorizer` (scikit-learn's own closest analogue) returns.
-        return sparse.csr_matrix((data, (rows, cols)), shape=(len(paths), n_features), dtype=np.float64)
+        return self._project(self._count_cohort(paths), len(paths))
 
     def get_feature_names_out(self, input_features=None):
         """The selected vocabulary as decoded k-mer sequence strings, in
@@ -310,15 +410,3 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         """
         check_is_fitted(self, "vocabulary_")
         return np.asarray(self._feature_sequences_, dtype=object)
-
-    # `TransformerMixin.fit_transform` already does the right thing here
-    # (`self.fit(X, y, **fit_params).transform(X)`) without an override:
-    # `transform()` only ever reads `self.vocabulary_`/`self._vocab_index_`,
-    # both of which `fit()` will have just finished setting, so there is no
-    # correctness reason to special-case this. It does mean `fit_transform`
-    # counts each training FASTQ file twice (once to build the vocabulary
-    # in `fit()`, once to project in `transform()`) rather than once --
-    # a real but deliberate cost, left as the simple, obviously-correct
-    # choice for this first version rather than adding a same-call cache
-    # (see the task's own guidance to prefer a working simple version over
-    # a half-finished optimization).

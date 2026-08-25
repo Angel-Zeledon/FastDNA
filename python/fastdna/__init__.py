@@ -17,6 +17,54 @@ from .spectrum import suggest_min_count as _suggest_min_count
 __version__ = _core.__version__
 
 
+def _column_as_array(column):
+    """One contiguous `pyarrow.Array` from a `pyarrow.Table` column.
+
+    `Table.column()` hands back a `ChunkedArray`, and whether
+    `ChunkedArray.combine_chunks()` returns an `Array` or another
+    `ChunkedArray` has changed across the pyarrow versions this package
+    supports (`pyarrow>=14`). Doing the flattening explicitly keeps
+    `pa.concat_arrays()` -- which every cohort-level module uses to stack
+    per-sample count tables into one array before a single vectorized pass
+    over them -- working on all of them.
+    """
+    if isinstance(column, pa.ChunkedArray):
+        chunks = column.chunks
+        if len(chunks) == 1:
+            return chunks[0]
+        if not chunks:
+            return pa.array([], type=column.type)
+        return pa.concat_arrays(chunks)
+    return column
+
+
+def _pair_positions(table, paths):
+    """Row and column indices, into `paths`, for every row of a
+    :func:`compare_all` long-format table.
+
+    Every consumer of that table (`embed`, `cv`, `gwas.kinship_matrix`)
+    needs the same thing: turn each `(sample_a, sample_b)` pair of path
+    strings into the pair of positions it occupies in a dense `n x n`
+    matrix. Doing it here, once, with Arrow's own hash lookup resolves all
+    `n*(n-1)/2` rows in two C++ passes instead of two Python dict lookups
+    per row -- a 200-sample cohort has 19,900 of those rows.
+
+    Raises `KeyError` naming the offending path if the table mentions a
+    sample that is not in `paths`, which is what the dict lookup this
+    replaced did (silently mapping it to nothing would leave a row of the
+    matrix all zeros).
+    """
+    value_set = pa.array([str(p) for p in paths], type=pa.string())
+    positions = []
+    for column_name in ("sample_a", "sample_b"):
+        samples = _column_as_array(table.column(column_name))
+        found = pc.index_in(samples, value_set=value_set)
+        if found.null_count:
+            raise KeyError(pc.filter(samples, pc.is_null(found))[0].as_py())
+        positions.append(found.to_numpy(zero_copy_only=False))
+    return positions[0], positions[1]
+
+
 def _fallback_table_html(table):
     """A minimal hand-built HTML `<table>` over a small `pyarrow.Table`,
     used by `_repr_html_` methods when `pandas` (their preferred renderer)
@@ -443,15 +491,26 @@ def compare_all(paths, *, k=21, sketch_size=1000, metric="jaccard"):
         raise ValueError(f"metric must be 'jaccard' or 'mash_distance', got {metric!r}")
 
     str_paths = [str(p) for p in paths]
-    sketches = [sketch(p, k=k, sketch_size=sketch_size) for p in str_paths]
+    # The Rust-side sketch objects, unwrapped once. `Sketch.jaccard` /
+    # `Sketch.mash_distance` are one-line forwarders to exactly these, so
+    # calling them per pair added a Python frame and two `._raw` attribute
+    # lookups to each of the `n*(n-1)/2` comparisons -- 19,900 of each for
+    # a 200-sample cohort, against `n` lookups here. Same Rust call, same
+    # value, same `ValueError` on a mismatched `k` (it is raised by the
+    # Rust method, not by the wrapper).
+    raw_sketches = [sketch(p, k=k, sketch_size=sketch_size)._raw for p in str_paths]
 
     sample_a, sample_b, values = [], [], []
-    for i in range(len(str_paths)):
-        for j in range(i + 1, len(str_paths)):
-            value = getattr(sketches[i], metric)(sketches[j])
-            sample_a.append(str_paths[i])
-            sample_b.append(str_paths[j])
-            values.append(value)
+    for i, path in enumerate(str_paths):
+        # Bound once per row instead of once per pair, and the row's
+        # results are extended in one call rather than appended one at a
+        # time: `n` bindings and `3n` list operations replace `n*(n-1)/2`
+        # of each.
+        compare = getattr(raw_sketches[i], metric)
+        others = raw_sketches[i + 1:]
+        values.extend([compare(other) for other in others])
+        sample_a.extend([path] * len(others))
+        sample_b.extend(str_paths[i + 1:])
 
     return pa.table({"sample_a": sample_a, "sample_b": sample_b, metric: values})
 

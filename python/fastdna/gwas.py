@@ -78,13 +78,15 @@ import os
 import pathlib
 import warnings
 from collections.abc import Mapping
+from functools import partial
 from typing import NamedTuple
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from scipy import sparse
 
-from . import compare_all as _compare_all, count as _count
+from . import _column_as_array, _pair_positions, compare_all as _compare_all, count as _count
 
 __all__ = [
     "ScreeningOnlyWarning",
@@ -301,42 +303,64 @@ def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers
             f"Use min_samples <= {n_samples}."
         )
 
-    prevalence: dict[int, int] = {}
-    total_freq: dict[int, int] = {}
-    sequence_of: dict[int, str] = {}
-    per_sample: list[tuple[np.ndarray, np.ndarray]] = []
-
+    # Every sample counted once, then stacked end to end so the whole
+    # cohort is tallied, filtered and turned into a matrix by vectorized
+    # passes over one pair of arrays. The version this replaced walked the
+    # concatenation twice in Python -- once building three dicts keyed by
+    # `kmer_u64` (three dict operations per row) and once looking every row
+    # up again to emit a (row, column, value) triple -- so a 200-sample
+    # cohort of a million k-mers each did 4x10^8 Python-level dict
+    # operations. The counting itself, which dominates either way, is
+    # unchanged: one `count()` per sample, exactly as before.
+    kmer_arrays, sequence_arrays, frequency_arrays, row_counts = [], [], [], []
     for path in path_strings:
         table = _count(path, k=k, min_count=min_count).table
-        kmers = table.column("kmer_u64").to_pylist()
-        seqs = table.column("kmer_sequence").to_pylist()
-        freqs = table.column("frequency").to_pylist()
+        kmer_arrays.append(_column_as_array(table.column("kmer_u64")))
+        sequence_arrays.append(_column_as_array(table.column("kmer_sequence")))
+        frequency_arrays.append(_column_as_array(table.column("frequency")))
+        row_counts.append(table.num_rows)
 
-        for kmer, seq, freq in zip(kmers, seqs, freqs):
-            prevalence[kmer] = prevalence.get(kmer, 0) + 1
-            total_freq[kmer] = total_freq.get(kmer, 0) + freq
-            if kmer not in sequence_of:
-                sequence_of[kmer] = seq
+    all_kmers = pa.concat_arrays(kmer_arrays)
+    all_sequences = pa.concat_arrays(sequence_arrays)
+    all_frequencies = np.asarray(pa.concat_arrays(frequency_arrays))
 
-        per_sample.append((np.asarray(kmers, dtype=np.uint64), np.asarray(freqs, dtype=np.uint32)))
+    # `dictionary_encode` gives each distinct k-mer a code in one C++ hash
+    # pass; `dictionary` holds the distinct `kmer_u64` values in order of
+    # first appearance, which is the order the dict this replaced iterated
+    # in. A k-mer appears at most once in a sample's count table, so "how
+    # many rows carry this code" *is* its prevalence across samples.
+    codes = pc.dictionary_encode(all_kmers)
+    row_code = np.asarray(codes.indices).astype(np.intp, copy=False)
+    distinct = np.asarray(codes.dictionary)
+    n_distinct = distinct.size
 
-    surviving = [kmer for kmer, seen_in in prevalence.items() if seen_in >= min_samples]
+    prevalence = np.bincount(row_code, minlength=n_distinct).astype(np.int64)
+    # float64 weights are exact here: `frequency` is uint32 and no partial
+    # sum comes anywhere near 2**53, so this recovers the same integers the
+    # Python `+=` loop produced.
+    total_freq = np.bincount(row_code, weights=all_frequencies, minlength=n_distinct)
 
-    if max_kmers is not None and len(surviving) > max_kmers:
-        def minor_sample_count(kmer):
-            present = prevalence[kmer]
-            return min(present, n_samples - present)
+    # Positions into `distinct`, ascending -- i.e. first-appearance order,
+    # matching the dict iteration this replaced.
+    surviving = np.flatnonzero(prevalence >= min_samples)
+
+    if max_kmers is not None and surviving.size > max_kmers:
+        surviving_prevalence = prevalence[surviving]
+        minor_sample_count = np.minimum(surviving_prevalence, n_samples - surviving_prevalence)
 
         # Ranked by minor-sample-count first (the MAF analogue), then by
         # prevalence and total depth, then by the raw u64 encoding purely
-        # so the result is reproducible independent of dict iteration
-        # order.
-        ranked = sorted(surviving, key=lambda kmer: (-minor_sample_count(kmer), -prevalence[kmer], -total_freq[kmer], kmer))
+        # so the result is reproducible independent of iteration order.
+        # `lexsort` takes its primary key last.
+        order = np.lexsort(
+            (distinct[surviving], -total_freq[surviving], -surviving_prevalence, -minor_sample_count)
+        )
+        ranked = surviving[order]
         kept, dropped = ranked[:max_kmers], ranked[max_kmers:]
-        cutoff = minor_sample_count(dropped[0])
+        cutoff = int(min(prevalence[dropped[0]], n_samples - prevalence[dropped[0]]))
         warnings.warn(
-            f"max_kmers={max_kmers} truncated the cohort matrix: {len(surviving)} k-mers passed "
-            f"min_samples={min_samples}, {len(dropped)} of them were dropped. Kept the "
+            f"max_kmers={max_kmers} truncated the cohort matrix: {surviving.size} k-mers passed "
+            f"min_samples={min_samples}, {dropped.size} of them were dropped. Kept the "
             f"{max_kmers} with the highest minor-sample-count (min(present, absent) across the "
             f"{n_samples} samples, the minor-allele-count analogue); every dropped k-mer had a "
             f"minor-sample-count of {cutoff} or lower. Raise max_kmers, or raise min_count/"
@@ -346,26 +370,42 @@ def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers
         )
         surviving = kept
 
-    # Lexicographic column order: stable, hand-checkable, and independent
-    # of how the ranking above happened to break ties.
-    selected = sorted(surviving, key=lambda kmer: sequence_of[kmer])
-    column_of = {kmer: j for j, kmer in enumerate(selected)}
-    kmer_sequences = [sequence_of[kmer] for kmer in selected]
+    # The decoded sequence of each surviving k-mer, taken from the row it
+    # first appeared in. Only the surviving k-mers are ever materialized as
+    # Python strings -- the version this replaced built one string per row
+    # of every sample's table, i.e. the whole cohort, to keep a handful.
+    first_row = np.empty(n_distinct, dtype=np.int64)
+    descending = np.arange(row_code.size - 1, -1, -1)
+    first_row[row_code[descending]] = descending
+    surviving_sequences = all_sequences.take(pa.array(first_row[surviving]))
 
-    rows: list[int] = []
-    cols: list[int] = []
-    data: list[int] = []
-    for i, (kmers, freqs) in enumerate(per_sample):
-        for kmer, freq in zip(kmers.tolist(), freqs.tolist()):
-            column = column_of.get(kmer)
-            if column is not None:
-                rows.append(i)
-                cols.append(column)
-                data.append(freq)
+    # Lexicographic column order: stable, hand-checkable, and independent
+    # of how the ranking above happened to break ties. Arrow sorts these
+    # byte-wise, which for equal-length ACGT strings is the same order
+    # Python's `sorted` gives, and no two distinct k-mer encodings decode
+    # to the same sequence, so there are no ties to break.
+    lexicographic = np.asarray(pc.sort_indices(surviving_sequences))
+    selected = surviving[lexicographic]
+    kmer_sequences = surviving_sequences.take(pa.array(lexicographic)).to_pylist()
+
+    # One lookup table from k-mer code to output column (-1 = not selected)
+    # turns the whole cohort's rows into (row, column, value) triples with
+    # a single fancy-index, replacing the per-row dict lookup and three
+    # `list.append` calls the previous version did.
+    column_of_code = np.full(n_distinct, -1, dtype=np.int64)
+    column_of_code[selected] = np.arange(selected.size, dtype=np.int64)
+    column_of_row = column_of_code[row_code]
+    kept_rows = column_of_row >= 0
 
     matrix = sparse.csr_matrix(
-        (np.asarray(data, dtype=np.uint32), (np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64))),
-        shape=(n_samples, len(selected)),
+        (
+            all_frequencies[kept_rows].astype(np.uint32),
+            (
+                np.repeat(np.arange(n_samples, dtype=np.int64), row_counts)[kept_rows],
+                column_of_row[kept_rows],
+            ),
+        ),
+        shape=(n_samples, selected.size),
         dtype=np.uint32,
     )
     return matrix, sample_ids, kmer_sequences
@@ -558,18 +598,18 @@ def kinship_matrix(paths, *, k=21, sketch_size=10_000):
     n = len(sample_ids)
 
     table = _compare_all(path_strings, k=k, sketch_size=sketch_size, metric="mash_distance")
-    position = {path: i for i, path in enumerate(path_strings)}
 
     similarity = np.eye(n, dtype=np.float64)
-    for path_a, path_b, distance in zip(
-        table.column("sample_a").to_pylist(),
-        table.column("sample_b").to_pylist(),
-        table.column("mash_distance").to_pylist(),
-    ):
-        i, j = position[path_a], position[path_b]
-        value = 1.0 - float(distance)
-        similarity[i, j] = value
-        similarity[j, i] = value
+    # Filled in one vectorized pass rather than row by row: the table has
+    # `n*(n-1)/2` rows, each of which cost two Python dict lookups, a
+    # scalar subtract and two element assignments (19,900 iterations for a
+    # 200-sample cohort). `1.0 - d` elementwise on float64 is the same IEEE
+    # subtraction, so every entry is bit-identical; `np.eye`'s exact 1.0
+    # diagonal is left alone, since the table carries no self-pairs.
+    i, j = _pair_positions(table, path_strings)
+    value = 1.0 - np.asarray(_column_as_array(table.column("mash_distance")))
+    similarity[i, j] = value
+    similarity[j, i] = value
 
     return similarity, sample_ids
 
@@ -771,6 +811,19 @@ def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", t
     p_values = np.ones(n_kmers, dtype=np.float64)
     odds_ratios = np.full(n_kmers, np.nan, dtype=np.float64)
 
+    # Chosen once rather than re-tested per k-mer.
+    run_test = stats.fisher_exact if test == "fisher" else partial(stats.chi2_contingency, correction=False)
+
+    # A k-mer's 2x2 table is fully determined by `(a, c)`: `b` is
+    # `n_case - a` and `d` is `n_control - c`, both fixed for the cohort.
+    # There are therefore at most `(n_case + 1) * (n_control + 1)` distinct
+    # tables no matter how many k-mers were tested, and the same table
+    # always yields the same p-value -- so each one is handed to scipy
+    # once. A 200-sample cohort (100 cases, 100 controls) has at most
+    # 10,201 distinct tables, so a 10-million-k-mer screen makes ~10^4
+    # `fisher_exact` calls instead of 10^7. The cached value is the number
+    # scipy returned for that exact table, so no p-value moves.
+    p_value_of = {}
     for j in range(n_kmers):
         aj, bj, cj, dj = int(a[j]), int(b[j]), int(c[j]), int(d[j])
         # A column that is all-present or all-absent has a zero marginal:
@@ -781,15 +834,15 @@ def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", t
             odds_ratios[j] = (aj * dj) / (bj * cj)
         elif aj * dj:
             odds_ratios[j] = np.inf
-        table_2x2 = [[aj, bj], [cj, dj]]
-        if test == "fisher":
-            result = stats.fisher_exact(table_2x2)
-        else:
-            result = stats.chi2_contingency(table_2x2, correction=False)
-        # scipy >= 1.11 returns a result object with `.pvalue`; older
-        # releases return a plain tuple whose second element is the
-        # p-value for both tests.
-        p_values[j] = float(result.pvalue if hasattr(result, "pvalue") else result[1])
+        cached = p_value_of.get((aj, cj))
+        if cached is None:
+            result = run_test([[aj, bj], [cj, dj]])
+            # scipy >= 1.11 returns a result object with `.pvalue`; older
+            # releases return a plain tuple whose second element is the
+            # p-value for both tests.
+            cached = float(result.pvalue if hasattr(result, "pvalue") else result[1])
+            p_value_of[(aj, cj)] = cached
+        p_values[j] = cached
 
     sequences = np.asarray(list(kmer_sequences), dtype=object)
     # Primary key is the last argument to lexsort: p ascending, ties broken

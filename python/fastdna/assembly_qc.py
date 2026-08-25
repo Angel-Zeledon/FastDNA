@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import gzip
 import math
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,42 +107,27 @@ import fastdna
 #: pure-Python FASTA fallback.
 _FASTQ_EXTENSIONS = (".fastq", ".fastq.gz", ".fq", ".fq.gz")
 
-#: A k-mer containing any base outside this alphabet breaks the current
-#: window, exactly like `kmer.rs::extract_canonical_kmers`'s `None` branch
-#: (an ambiguous base such as 'N' cannot be assigned 2 bits, so no k-mer
-#: window may span it).
-_VALID_BASES = frozenset("ACGT")
+#: A k-mer containing any base outside A/C/G/T breaks the current window,
+#: exactly like `kmer.rs::extract_canonical_kmers`'s `None` branch (an
+#: ambiguous base such as 'N' cannot be assigned 2 bits, so no k-mer window
+#: may span it). Splitting on this pattern yields the maximal runs of valid
+#: bases -- the windows that may exist -- without testing every base
+#: individually in Python.
+_INVALID_RUN = re.compile("[^ACGT]+")
 
 #: `str.translate` table for reverse-complementing an already-uppercased,
 #: already-U-to-T-normalized sequence made only of A/C/G/T.
 _COMPLEMENT = str.maketrans("ACGT", "TGCA")
 
+#: `dict.get` default marking "this k-mer is not in the assembly at all",
+#: which `None` and `0` cannot: a caller-supplied mapping may legitimately
+#: store a k-mer with a count of 0, and that k-mer is shared with the reads
+#: even though it buckets as `missing`. See `_compare`.
+_ABSENT = object()
+
 
 def _revcomp(seq: str) -> str:
     return seq.translate(_COMPLEMENT)[::-1]
-
-
-def _canonical(kmer: str) -> str:
-    """The canonical form of `kmer`: itself, or its reverse complement,
-    whichever is lexicographically smaller.
-
-    This matches `kmer.rs::canonical_kmer_u64` (`kmer.min(reverse_complement)`
-    as **u64 values**) without reimplementing its 2-bit packing, because the
-    two orderings coincide exactly: `kmer.rs::base_to_bits` assigns
-    A=0b00 < C=0b01 < G=0b10 < T=0b11, the same order as plain ASCII/
-    lexicographic `'A' < 'C' < 'G' < 'T'`; and a k-mer's u64 encoding packs
-    its *first* base into the *most significant* bits
-    (`current_kmer = (current_kmer << 2) | bits`), so comparing two k-mers'
-    u64 values numerically is the same operation, digit by digit from the
-    first base onward, as comparing their ACGT strings lexicographically.
-    Whichever orientation the Rust core would pick as canonical is
-    therefore always the same one plain Python string comparison picks
-    here -- so a k-mer string produced by this module and one produced by
-    `KmerCounts.table`'s `kmer_sequence` column are directly comparable
-    without ever touching the u64 encoding.
-    """
-    rc = _revcomp(kmer)
-    return kmer if kmer <= rc else rc
 
 
 def _canonical_kmers(seq: str, k: int):
@@ -151,17 +137,55 @@ def _canonical_kmers(seq: str, k: int):
     than `k` produces nothing, and a base outside A/C/G/T (case-
     insensitively; U/u is treated as T, matching the Rust core) discards
     the current run instead of poisoning the next `k - 1` windows with it.
+
+    A k-mer's canonical form is itself or its reverse complement, whichever
+    is lexicographically smaller. That matches `kmer.rs::canonical_kmer_u64`
+    (`kmer.min(reverse_complement)` as **u64 values**) without
+    reimplementing its 2-bit packing, because the two orderings coincide
+    exactly: `kmer.rs::base_to_bits` assigns A=0b00 < C=0b01 < G=0b10 <
+    T=0b11, the same order as plain ASCII/lexicographic
+    `'A' < 'C' < 'G' < 'T'`; and a k-mer's u64 encoding packs its *first*
+    base into the *most significant* bits
+    (`current_kmer = (current_kmer << 2) | bits`), so comparing two k-mers'
+    u64 values numerically is the same operation, digit by digit from the
+    first base onward, as comparing their ACGT strings lexicographically.
+    Whichever orientation the Rust core would pick as canonical is
+    therefore always the same one plain Python string comparison picks
+    here -- so a k-mer string produced by this module and one produced by
+    `KmerCounts.table`'s `kmer_sequence` column are directly comparable
+    without ever touching the u64 encoding.
+
+    Two things are done once per *run* rather than once per *base* or once
+    per *window*, which is what makes this the module's pure-Python
+    fallback rather than its bottleneck:
+
+    * Splitting on `_INVALID_RUN` finds the valid runs in C, instead of
+      testing every one of the contig's bases for membership in an ACGT
+      set and tracking the run start in Python -- one pass over a 5 Mb
+      contig used to be 5 million set lookups plus 5 million `enumerate`
+      steps.
+    * The reverse complement of the whole run is built once, and each
+      window's reverse complement is then a *slice* of it. The reverse
+      complement of `run[end - k:end]` is exactly
+      `rc_run[length - end:length - end + k]`, because `rc_run[j]` is the
+      complement of `run[length - 1 - j]`. That replaces a `str.translate`
+      plus a reversal -- two length-k string builds and two Python calls --
+      per window with a single slice: a 5 Mb contig at k=21 does one
+      length-5,000,000 reverse complement instead of five million
+      length-21 ones.
     """
     if k <= 0 or k > len(seq):
         return
     seq = seq.upper().replace("U", "T")
-    run_start = 0  # index where the current all-valid run began
-    for i, base in enumerate(seq):
-        if base not in _VALID_BASES:
-            run_start = i + 1
+    for run in _INVALID_RUN.split(seq):
+        length = len(run)
+        if length < k:
             continue
-        if i - run_start + 1 >= k:
-            yield _canonical(seq[i - k + 1 : i + 1])
+        rc_run = _revcomp(run)
+        for end in range(k, length + 1):
+            forward = run[end - k : end]
+            reverse = rc_run[length - end : length - end + k]
+            yield forward if forward <= reverse else reverse
 
 
 def _open_text(path):
@@ -393,32 +417,49 @@ def evaluate_kmers(
     reads_table = reads_counts.table
     all_seqs = reads_table.column("kmer_sequence").to_pylist()
     all_freqs = reads_table.column("frequency").to_pylist()
-    read_kmer_set = set(all_seqs)
 
     k_total = len(assembly_kmers)
-    k_shared = sum(1 for kmer in assembly_kmers if kmer in read_kmer_set)
-    error_rate, qv = _qv_from_counts(k_shared, k_total, k)
-
     min_count_used = min_count if min_count is not None else reads_counts.suggest_min_count()
 
+    # One pass over the reads' k-mer table, one hash lookup per row. The
+    # version this replaced walked the same rows twice -- once for
+    # completeness, once for the spectrum buckets -- with a lookup in each,
+    # and separately built a `set` of every read k-mer only to count how
+    # many assembly k-mers it contained. Against R read k-mers and A
+    # assembly k-mers that was 2R iterations and 3R + A hash operations;
+    # this is R and R. For a 30-million-k-mer read set the difference is
+    # 60 million Python-level operations.
+    #
+    # `k_shared` is counted from this side instead: both `assembly_kmers`
+    # and the reads' table hold each canonical k-mer exactly once, so
+    # "assembly k-mers also seen in the reads" and "read k-mers also seen
+    # in the assembly" are the same intersection and the same number. The
+    # `_ABSENT` sentinel keeps that distinct from an assembly k-mer stored
+    # with an explicit count of 0, which is *shared* but still buckets as
+    # `missing`, exactly as before.
+    lookup = assembly_kmers.get
+    k_shared = 0
     reliable_total = 0
     reliable_found = 0
-    for seq, freq in zip(all_seqs, all_freqs):
-        if freq >= min_count_used:
-            reliable_total += 1
-            if seq in assembly_kmers:
-                reliable_found += 1
-    completeness = (reliable_found / reliable_total) if reliable_total > 0 else float("nan")
-
     buckets: dict[int, dict[str, int]] = defaultdict(lambda: {"missing": 0, "single": 0, "multi": 0})
     for seq, freq in zip(all_seqs, all_freqs):
-        asm_count = assembly_kmers.get(seq, 0)
-        if asm_count == 0:
+        asm_count = lookup(seq, _ABSENT)
+        shared = asm_count is not _ABSENT
+        if shared:
+            k_shared += 1
+        if freq >= min_count_used:
+            reliable_total += 1
+            if shared:
+                reliable_found += 1
+        if not shared or asm_count == 0:
             buckets[freq]["missing"] += 1
         elif asm_count == 1:
             buckets[freq]["single"] += 1
         else:
             buckets[freq]["multi"] += 1
+
+    error_rate, qv = _qv_from_counts(k_shared, k_total, k)
+    completeness = (reliable_found / reliable_total) if reliable_total > 0 else float("nan")
 
     depths = sorted(buckets)
     spectra = pa.table(

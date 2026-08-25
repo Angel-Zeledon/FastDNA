@@ -40,20 +40,22 @@ def _distance_matrix(table, paths, metric):
     `compare_all`'s two metrics produced it.
     """
     str_paths = [str(p) for p in paths]
-    index = {p: i for i, p in enumerate(str_paths)}
     n = len(str_paths)
 
     dist = np.zeros((n, n), dtype=np.float64)
 
-    col_a = table.column("sample_a").to_pylist()
-    col_b = table.column("sample_b").to_pylist()
-    col_v = table.column(metric).to_pylist()
+    # One vectorized fill rather than a Python loop over the table's
+    # `n*(n-1)/2` rows: each row cost two dict lookups, a scalar subtract
+    # and two element assignments, which for a 200-sample cohort is 19,900
+    # iterations doing work NumPy does in four array operations. `1.0 - v`
+    # elementwise on float64 is the same IEEE subtraction the scalar
+    # version performed, so the matrix is unchanged value for value.
+    i, j = fastdna._pair_positions(table, str_paths)
+    values = np.asarray(fastdna._column_as_array(table.column(metric)))
+    d = (1.0 - values) if metric == "jaccard" else values
 
-    for a, b, v in zip(col_a, col_b, col_v):
-        d = (1.0 - v) if metric == "jaccard" else v
-        i, j = index[a], index[b]
-        dist[i, j] = d
-        dist[j, i] = d
+    dist[i, j] = d
+    dist[j, i] = d
 
     # Diagonal is always 0 after the conversion above: mash_distance(x, x)
     # would be 0 anyway, and 1 - jaccard(x, x) is 1 - 1 = 0 -- both

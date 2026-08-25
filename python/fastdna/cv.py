@@ -108,18 +108,17 @@ def _mash_distance_matrix(paths, k, sketch_size):
     """
     table = fastdna.compare_all(paths, k=k, sketch_size=sketch_size, metric="mash_distance")
 
-    index = {p: i for i, p in enumerate(paths)}
     n = len(paths)
     matrix = np.zeros((n, n), dtype=np.float64)
 
-    for a, b, value in zip(
-        table.column("sample_a").to_pylist(),
-        table.column("sample_b").to_pylist(),
-        table.column("mash_distance").to_pylist(),
-    ):
-        i, j = index[a], index[b]
-        matrix[i, j] = value
-        matrix[j, i] = value
+    # Filled in one vectorized pass rather than row by row: the table has
+    # `n*(n-1)/2` rows, each of which cost two Python dict lookups and two
+    # element assignments (19,900 iterations for a 200-sample cohort). The
+    # values are copied through untouched, so the matrix is identical.
+    i, j = fastdna._pair_positions(table, paths)
+    values = np.asarray(fastdna._column_as_array(table.column("mash_distance")))
+    matrix[i, j] = values
+    matrix[j, i] = values
 
     np.fill_diagonal(matrix, 0.0)
     return matrix

@@ -515,12 +515,13 @@ def test_leakage_guarantee_check_actually_catches_a_leaky_transform(tmp_path):
                 table = fastdna.count(
                     path, k=self.k, min_count=self.min_count, threads=self.threads
                 ).table
+                known = set(int(x) for x in self.vocabulary_.tolist())
                 for kmer, seq in zip(
                     table.column("kmer_u64").to_pylist(),
                     table.column("kmer_sequence").to_pylist(),
                 ):
-                    if kmer not in self._vocab_index_:
-                        self._vocab_index_[kmer] = len(self._vocab_index_)
+                    if kmer not in known:
+                        known.add(kmer)
                         self._feature_sequences_.append(seq)
                         self.vocabulary_ = np.append(self.vocabulary_, np.uint64(kmer))
             return super().transform(X)

@@ -189,9 +189,13 @@ def classify(
 
     query = _resolve_sketch(query_path_or_sketch, k=k, sketch_size=sketch_size)
 
+    # Resolved once, not once per reference: `metric` cannot change during
+    # the loop, so a database of 10,000 references did 10,000 attribute
+    # lookups where one suffices.
+    score_fn = getattr(query, metric)
+
     names, scores = [], []
     for name, reference in reference_db.items():
-        score_fn = getattr(query, metric)
         score = score_fn(reference)
         if score <= min_score:
             continue
@@ -416,25 +420,34 @@ def gather(query_path_or_sketch, reference_db, *, k=21, sketch_size=1000, min_co
     query = _resolve_sketch(query_path_or_sketch, k=k, sketch_size=sketch_size)
 
     remaining = dict(reference_db)
-    picked = []  # [(name, Sketch), ...] in pick order
+
+    # `query.containment(reference)` depends only on the query and that one
+    # reference, neither of which changes between rounds, so it is measured
+    # once per reference rather than once per reference per round: R sketch
+    # comparisons instead of R*P for P picks (100 instead of 1,000 for a
+    # 100-reference database and 10 picks).
+    raw_of = {name: query.containment(reference) for name, reference in remaining.items()}
+
+    # The redundancy discount is a running maximum over the references
+    # picked so far. Rebuilding it from scratch each round re-measured
+    # every surviving candidate against every earlier pick, which is
+    # R*P*(P-1)/2 comparisons in total (4,500 at R=100, P=10); only the
+    # newest pick is new information, so the maximum is instead extended by
+    # one comparison per surviving candidate after each pick -- at most R*P
+    # (900 for the same numbers). It is the same maximum over the same set
+    # of pairwise comparisons, so every `adjusted_score` is unchanged.
+    redundancy_of = {name: 0.0 for name in remaining}
 
     names, raw_scores, adjusted_scores = [], [], []
 
-    while remaining and (max_references is None or len(picked) < max_references):
+    while remaining and (max_references is None or len(names) < max_references):
         best_name = None
         best_raw = None
         best_adjusted = -1.0
 
-        for name, reference in remaining.items():
-            raw = query.containment(reference)
-
-            redundancy = 0.0
-            for _, picked_reference in picked:
-                overlap = reference.containment(picked_reference)
-                if overlap > redundancy:
-                    redundancy = overlap
-
-            adjusted = raw * (1.0 - redundancy)
+        for name in remaining:
+            raw = raw_of[name]
+            adjusted = raw * (1.0 - redundancy_of[name])
             if adjusted > best_adjusted:
                 best_name, best_raw, best_adjusted = name, raw, adjusted
 
@@ -444,6 +457,12 @@ def gather(query_path_or_sketch, reference_db, *, k=21, sketch_size=1000, min_co
         names.append(best_name)
         raw_scores.append(best_raw)
         adjusted_scores.append(best_adjusted)
-        picked.append((best_name, remaining.pop(best_name)))
+
+        picked_reference = remaining.pop(best_name)
+        del redundancy_of[best_name]
+        for name, reference in remaining.items():
+            overlap = reference.containment(picked_reference)
+            if overlap > redundancy_of[name]:
+                redundancy_of[name] = overlap
 
     return pa.table({"name": names, "containment": raw_scores, "adjusted_score": adjusted_scores})

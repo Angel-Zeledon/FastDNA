@@ -114,13 +114,19 @@ def top_features(importances, feature_names, *, n=20, ascending=False):
     n = min(n, len(importances))
 
     indices = range(len(importances))
+    # The sort key is a plain lookup into an already-computed list rather
+    # than a Python-level lambda, so ranking F features runs F C-level
+    # `list.__getitem__` calls instead of F interpreted frames that each
+    # re-index and re-`abs()`. Python's sort is stable and sees exactly the
+    # same key values in the same order either way, so ties still keep
+    # their original relative order and the ranking is unchanged.
     if ascending:
-        # Literal value, ascending -- Python's sort is stable, so ties keep
-        # their original relative order.
-        order = sorted(indices, key=lambda i: importances[i])
+        # Literal value, ascending.
+        order = sorted(indices, key=importances.__getitem__)
     else:
         # Magnitude, descending.
-        order = sorted(indices, key=lambda i: -abs(importances[i]))
+        magnitudes = [-abs(value) for value in importances]
+        order = sorted(indices, key=magnitudes.__getitem__)
 
     top_idx = order[:n]
     return pa.table(
