@@ -19,6 +19,12 @@ use crate::mem_estimate;
 use crate::progress::{Progress, ProgressFn, PROGRESS_INTERVAL};
 use crate::qc::QcSummary;
 
+// `Clone`: every field is `Copy`, so this is a plain field-for-field copy.
+// Added for `cohort::batch::count_paired_samples`, which builds one
+// `PipelineConfig` per discovered sample from a single caller-supplied
+// template rather than requiring the caller to reconstruct it by hand for
+// every sample.
+#[derive(Clone)]
 pub struct PipelineConfig {
     pub k: usize,
     pub min_quality: f64,
