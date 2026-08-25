@@ -182,27 +182,87 @@ seed 9001; exact install and run commands in
 `k=31`, singleton k-mers included on all three (`kmc -ci1`, `FastK -t1`,
 FastDNA's own `min_count=1` default):
 
-| Tool | Time | Peak RAM | Disk (output) | Distinct k-mers |
-|---|---:|---:|---:|---:|
-| FASTK (2023) | 119.3 s | 2.99 GB | 412 MB | 53,776,394 |
-| **FastDNA** (in-memory strategy) | **~101 s** (median of 3: 97 / 101 / 131 s) | **8.02 GB** | 431 MB (Parquet) | 53,774,150 |
-| KMC3 | 293.4 s | 9.77 GB | 412 MB | 53,776,394 |
+**Re-measured 2026-08-25, and the conclusion inverted. See
+[Measurement history and corrections](#measurement-history-and-corrections)
+for the retracted table.** Two methodology changes make this run stricter
+than the previous one: FastDNA is run with `-q 0` so all three tools count
+exactly the same k-mers (previously FastDNA quality-trimmed while KMC3 and
+FASTK did not, leaving a 2,244-k-mer discrepancy that had to be explained
+away), and FastDNA was additionally compiled for Linux and run inside the
+same WSL2 environment as the other two, removing the native-Windows vs.
+WSL confound entirely.
 
-FastDNA's in-memory strategy is the fastest of the three on this file, and
-the most memory-hungry: it beats FASTK on wall-clock by roughly 15% and
-KMC3 by almost 3x, while using 2.7x more RAM than FASTK. The trade is
-structural: FastDNA's in-memory strategy sorts in RAM, where FASTK
-partitions to disk. (At the time these runs were taken, in-memory was
-FastDNA's *only* strategy; the disk-partitioned strategy and the automatic
-chooser described in the README's
-[memory section](../README.md#memory-use-and-limitations) were added
-afterwards and have not yet been benchmarked into this table.)
+All three in the **same environment** (WSL2 Ubuntu, ext4, 8 threads,
+`k=31`, singletons kept -- `kmc -ci1`, `FastK -t1`, `fastdna -m 1 -q 0`):
 
-The 2,244-k-mer (0.004%) difference between FastDNA's count and
-KMC3/FASTK's is the same quality-trimming effect documented above (KMC3
-and FASTK do not trim; FastDNA does by default), not a counting bug --
-consistent with the ~0.001% gap already measured against the pure-Python
-implementations on the small dataset.
+| Tool | Time | Peak RAM | Distinct k-mers |
+|---|---:|---:|---:|
+| **FASTK** | **38.3 s** | 2.86 GB | 53,776,394 |
+| KMC3 | 110.4 s | 9.06 GB | 53,776,394 |
+| FastDNA (in-memory strategy) | 388.2 s | 10.34 GB | 53,776,394 |
+| FastDNA (disk strategy) | 553.6 s | **1.21 GB** | 53,776,394 |
+
+The same FastDNA source built natively for Windows, on the same machine
+and the same input file:
+
+| Configuration | Time | Peak RAM | Distinct k-mers |
+|---|---:|---:|---:|
+| FastDNA (in-memory) | 133.1 s | 8.34 GB | 53,776,394 |
+| FastDNA (disk) | 281.8 s | 1.10 GB | 53,776,394 |
+| FastDNA (auto -> disk) | 284.7 s | 1.09 GB | 53,776,394 |
+
+All three FastDNA outputs are byte-identical to each other.
+
+**All four counts agree exactly**: 53,776,394 distinct k-mers out of
+840,000,000 total, across three independently written tools. Correctness is
+not in question here; speed is.
+
+**FastDNA is substantially slower than both dedicated counters, and
+substantially more frugal than both with memory.** FASTK is 10x faster than
+FastDNA's in-memory strategy in the shared environment (3.5x faster than the
+Windows build); KMC3 is 3.5x faster (1.2x). Against that, FastDNA's disk
+strategy peaks at 1.21 GB -- less than half FASTK's 2.86 GB and a seventh of
+KMC3's 9.06 GB -- and is the only one of the three whose peak memory is
+configurable against a budget.
+
+One caveat that does not rescue the result but does explain part of it: the
+WSL2 VM has 12 GB of RAM and FastDNA's in-memory strategy peaked at
+10.34 GB, so that run was memory-constrained in a way the other two were
+not. The Windows figures, where more memory was available, are the fairer
+reading of the in-memory strategy -- and it is still 3.5x behind FASTK there.
+
+### Why
+
+Diagnosed by measurement, not inspection. Counting with near-zero export
+(`-m 100`, so the table is built and traversed but almost nothing is
+written) takes 110.1 s of the Windows in-memory run's 133.1 s, so Parquet
+export costs about 23 s and is not the bottleneck.
+
+The bottleneck is the volume of data sorted. FastDNA materializes **every
+k-mer occurrence** as an independent 8-byte `u64` and sorts all 840,000,000
+of them. KMC3's own run output reports what it does instead:
+
+```
+Total no. of k-mers        : 840,000,000
+Total no. of super-k-mers  :  70,635,757
+```
+
+An 11.9x reduction in what is sorted and moved. Consecutive k-mers in a read
+overlap by k-1 bases -- a 150 bp read yields 120 k-mers at `k=31`, but those
+are 120 sliding windows over the same 150 bases, not 120 independent values.
+A *super-k-mer* is a run of consecutive k-mers sharing a minimizer, stored
+once. 110 s over 840M k-mers is 131 ns per k-mer, which is far too slow for
+the handful of bit operations the extraction itself costs; the time is in
+the sort, and the sort is over 12x more items than it needs to be.
+
+A second, compounding factor: each worker builds its own private
+`KmerCounter`, so peak memory scales with threads x occurrences. The crate's
+own calibrated model (`src/mem_estimate.rs`) predicts
+`1.168 bytes x 8 threads x 840M occurrences` = 7.85 GB against 8.34 GB
+measured -- the model is sound, and the scaling with thread count is real.
+
+See [`design-minimizer-counting.md`](design-minimizer-counting.md) for the
+super-k-mer design this motivates.
 
 ### Measurement history and corrections
 
