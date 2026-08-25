@@ -394,3 +394,66 @@ class TestPlotting:
         cached = workflow._distance_matrix
         workflow.plot_population_structure()
         assert workflow._distance_matrix is cached
+
+
+# ---------------------------------------------------------------------------
+# HTML report export
+# ---------------------------------------------------------------------------
+
+
+class TestToReport:
+    def test_to_report_bundles_this_results_own_classifier_and_calibration(self, cohort, tmp_path):
+        pytest.importorskip("matplotlib")
+        paths, phenotype, _, _ = cohort
+        result = _workflow(paths, phenotype).run()
+
+        out = tmp_path / "report.html"
+        result.to_report(out)
+
+        assert out.exists()
+        text = out.read_text(encoding="utf-8")
+        assert result.classifier.explain() in text
+        assert "data:image/png;base64," in text  # result.calibration was not None (cv=True by default)
+
+    def test_to_report_auto_fills_sample_and_feature_counts(self, cohort, tmp_path):
+        pytest.importorskip("matplotlib")
+        paths, phenotype, _, _ = cohort
+        result = _workflow(paths, phenotype).run()
+
+        out = tmp_path / "report.html"
+        result.to_report(out)
+
+        text = out.read_text(encoding="utf-8")
+        assert str(len(result.sample_ids)) in text
+        assert str(len(result.kmer_sequences)) in text
+
+    def test_to_report_with_cv_false_has_no_calibration_but_still_writes(self, cohort, tmp_path):
+        pytest.importorskip("matplotlib")
+        paths, phenotype, _, _ = cohort
+        result = _workflow(paths, phenotype, cv=False).run()
+        assert result.calibration is None
+
+        out = tmp_path / "report.html"
+        result.to_report(out)
+
+        text = out.read_text(encoding="utf-8")
+        assert "No calibration report or interval was provided" in text
+        assert "data:image/png;base64," not in text
+
+    def test_to_report_forwards_calibration_interval_and_extra_kwargs(self, cohort, tmp_path):
+        np_ = pytest.importorskip("numpy")
+        pytest.importorskip("matplotlib")
+        paths, phenotype, _, _ = cohort
+        result = _workflow(paths, phenotype).run()
+
+        out = tmp_path / "report.html"
+        result.to_report(
+            out,
+            calibration_interval=(np_.array([0.1]), np_.array([0.3])),
+            title="Custom Title",
+            metadata={"n_samples": "overridden"},
+        )
+
+        text = out.read_text(encoding="utf-8")
+        assert "Custom Title" in text
+        assert "overridden" in text

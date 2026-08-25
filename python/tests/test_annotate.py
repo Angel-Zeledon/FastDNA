@@ -35,7 +35,9 @@ import pathlib
 
 import pytest
 
-from fastdna.annotate import Annotation, Hit, annotate_rule, load_annotation, locate_kmer
+import pyarrow as pa
+
+from fastdna.annotate import Annotation, Hit, annotate_rule, export_bed, load_annotation, locate_kmer
 
 _K = 12
 
@@ -486,3 +488,100 @@ def test_full_set_covering_classifier_round_trip(reference_and_gff3):
     # which sits inside geneA, tracks resistance" -- just expressed as the
     # negation of the positive class's rule.
     assert row["presence"] is False
+
+
+# ---------------------------------------------------------------------------
+# export_bed() -- BED6 conversion
+# ---------------------------------------------------------------------------
+
+
+def test_export_bed_converts_1_based_inclusive_to_0_based_half_open(reference_and_gff3, tmp_path):
+    """`SINGLE_GENE_KMER` is a hand-checkable case: `annotate_rule()` reports
+    seqid=chr1, start=21, end=32 (1-based inclusive, an 12 bp span) -- BED's
+    0-based half-open form of the same span is chromStart=20, chromEnd=32.
+    """
+    fasta_path, gff3_path = reference_and_gff3
+    annotation = load_annotation(fasta_path, gff3_path)
+    table = annotate_rule(SINGLE_GENE_KMER, annotation)
+
+    out = tmp_path / "hits.bed"
+    export_bed(table, out)
+
+    lines = out.read_text().splitlines()
+    assert len(lines) == 1
+    chrom, start, end, name, score, strand = lines[0].split("\t")
+    assert chrom == "chr1"
+    assert start == "20"
+    assert end == "32"
+    assert name == SINGLE_GENE_KMER
+    assert score == "0"
+    assert strand == "+"
+
+
+def test_export_bed_uses_lf_line_endings(reference_and_gff3, tmp_path):
+    fasta_path, gff3_path = reference_and_gff3
+    annotation = load_annotation(fasta_path, gff3_path)
+    table = annotate_rule(REPEAT_MOTIF, annotation)  # two hits
+
+    out = tmp_path / "hits.bed"
+    export_bed(table, out)
+
+    raw = out.read_bytes()
+    assert b"\r\n" not in raw
+    assert raw.count(b"\n") == 2
+
+
+def test_export_bed_writes_zero_rows_as_an_empty_but_valid_file(reference_and_gff3, tmp_path):
+    fasta_path, gff3_path = reference_and_gff3
+    annotation = load_annotation(fasta_path, gff3_path)
+    table = annotate_rule(ZERO_HIT_KMER, annotation)
+    assert table.num_rows == 0
+
+    out = tmp_path / "hits.bed"
+    export_bed(table, out)
+
+    assert out.exists()
+    assert out.read_text() == ""
+
+
+def test_export_bed_falls_back_to_intergenic_for_a_null_gene_name(reference_and_gff3, tmp_path):
+    fasta_path, gff3_path = reference_and_gff3
+    annotation = load_annotation(fasta_path, gff3_path)
+    table = annotate_rule(RC_ONLY_KMER, annotation)  # its one hit is intergenic
+    assert table.to_pylist()[0]["gene_name"] is None
+
+    out = tmp_path / "hits.bed"
+    export_bed(table, out, name_column="gene_name")
+
+    name = out.read_text().splitlines()[0].split("\t")[3]
+    assert name == "intergenic"
+
+
+def test_export_bed_rejects_a_table_missing_required_columns(tmp_path):
+    table = pa.table({"seqid": ["chr1"], "start": [1], "end": [10]})  # no strand column
+
+    with pytest.raises(ValueError, match="strand"):
+        export_bed(table, tmp_path / "hits.bed")
+
+
+def test_export_bed_rejects_an_unknown_name_column(reference_and_gff3, tmp_path):
+    fasta_path, gff3_path = reference_and_gff3
+    annotation = load_annotation(fasta_path, gff3_path)
+    table = annotate_rule(SINGLE_GENE_KMER, annotation)
+
+    with pytest.raises(ValueError, match="not_a_real_column"):
+        export_bed(table, tmp_path / "hits.bed", name_column="not_a_real_column")
+
+
+def test_export_bed_handles_multiple_concatenated_rule_tables(reference_and_gff3, tmp_path):
+    fasta_path, gff3_path = reference_and_gff3
+    annotation = load_annotation(fasta_path, gff3_path)
+    combined = pa.concat_tables(
+        [annotate_rule(SINGLE_GENE_KMER, annotation), annotate_rule(REPEAT_MOTIF, annotation)]
+    )
+
+    out = tmp_path / "hits.bed"
+    export_bed(combined, out)
+
+    lines = out.read_text().splitlines()
+    assert len(lines) == 3  # 1 hit + 2 hits

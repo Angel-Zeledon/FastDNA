@@ -114,6 +114,7 @@ __all__ = [
     "load_annotation",
     "locate_kmer",
     "annotate_rule",
+    "export_bed",
 ]
 
 _VALID_BASES = frozenset("ACGTN")
@@ -634,3 +635,83 @@ def annotate_rule(rule, annotation: Annotation, *, max_mismatches: int = 0) -> p
             "feature_strand": pa.array([h.feature_strand for h in hits], type=pa.string()),
         }
     )
+
+
+def export_bed(table: pa.Table, path, *, name_column: str = "kmer_sequence") -> None:
+    """Writes `table` -- `annotate_rule()`'s output, or `pa.concat_tables()`
+    of several such tables -- as a standard BED6 file, for loading a rule's
+    genomic hit positions into IGV, the UCSC Genome Browser, or any other
+    BED-reading tool.
+
+    This is a plain genomic-interval export, not a genotype export: it
+    carries positions, not a `PLINK` BED/BIM/FAM-style biallelic-SNP-per-
+    shared-reference-position genotype matrix. That format assumes every
+    sample was called against the same fixed set of reference coordinates,
+    which contradicts this project's deliberately reference-free k-mer
+    approach (see `docs/philosophy-narrow-not-broad.md`) -- a caller who
+    needs that specific format is better served by pyseer's own PLINK/VCF
+    export paths (`fastdna.gwas.PyseerExport`) than by pretending a handful
+    of annotated k-mer hits is a population-wide genotype call.
+
+    Coordinate conversion: `annotate_rule()`/`Hit` report 1-based inclusive
+    `start`/`end` (the GFF3/GenBank convention this module uses throughout
+    -- see `Feature`'s docstring). BED is 0-based, half-open
+    (`[chromStart, chromEnd)`, the UCSC convention): `chromStart = start -
+    1`, `chromEnd = end` (the 1-based inclusive end and the 0-based
+    half-open end are numerically identical, so only `start` shifts).
+
+    Parameters
+    ----------
+    table : pyarrow.Table
+        Must carry `seqid`, `start`, `end`, `strand` columns -- every table
+        `annotate_rule()` returns does. Zero rows writes an empty (but
+        valid) BED file.
+    path : path-like
+        Output file path. Written as plain TSV with LF line endings
+        (`newline="\\n"`), matching `SetCoveringClassifier.
+        export_rules_fasta`'s convention, so a Windows run produces the
+        same bytes as a Linux one.
+    name_column : str, default "kmer_sequence"
+        Which column of `table` becomes BED's `name` field. The default is
+        always populated (every `annotate_rule()` row carries the queried
+        k-mer). Pass `"gene_name"` to label features by gene instead --
+        rows with a null `gene_name` (e.g. `feature_type="intergenic"`
+        hits) fall back to the literal string `"intergenic"` rather than
+        writing an empty BED field, which is not valid BED.
+
+    BED's `score` field (column 5) is always written as `0`: nothing in
+    `table` is a score in BED's `0-1000` sense, and inventing one here
+    would be exactly the kind of fabricated threshold this project's other
+    modules (`gwas.prefilter_association`, `plotting.plot_significance`)
+    are written to avoid.
+
+    Raises
+    ------
+    ValueError
+        `table` is missing a required column, or `name_column` is not one
+        of its columns.
+    """
+    required = ("seqid", "start", "end", "strand")
+    missing = [c for c in required if c not in table.column_names]
+    if missing:
+        raise ValueError(
+            f"export_bed() needs column(s) {missing}, but table only has "
+            f"{list(table.column_names)}. Pass the pyarrow.Table annotate_rule() returns "
+            "(or pa.concat_tables() of several)."
+        )
+    if name_column not in table.column_names:
+        raise ValueError(
+            f"export_bed() name_column={name_column!r} is not a column of table "
+            f"({list(table.column_names)})."
+        )
+
+    seqids = table.column("seqid").to_pylist()
+    starts = table.column("start").to_pylist()
+    ends = table.column("end").to_pylist()
+    strands = table.column("strand").to_pylist()
+    names = table.column(name_column).to_pylist()
+
+    with open(path, "w", newline="\n") as f:
+        for seqid, start, end, strand, name in zip(seqids, starts, ends, strands, names):
+            bed_name = name if name else "intergenic"
+            f.write(f"{seqid}\t{start - 1}\t{end}\t{bed_name}\t0\t{strand}\n")

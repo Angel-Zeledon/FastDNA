@@ -169,6 +169,42 @@ class AssociationResult(NamedTuple):
     importance: Optional[pa.Table]
     annotations: Optional[pa.Table]
 
+    def to_report(self, path, *, calibration_interval=None, metadata=None, **kwargs):
+        """`fastdna.report.to_report()`, populated from this result's own
+        `classifier` and `calibration` (`None` when `run()` was called with
+        `cv=False` -- the report then shows "no calibration report was
+        provided" rather than raising), plus `n_samples`/
+        `n_features_evaluated` filled in from `sample_ids`/`kmer_sequences`.
+
+        `calibration_interval` is not one of `run()`'s own outputs (this
+        workflow never calls `fastdna.calibration.calibrate` itself -- see
+        that module's docstring for why a `CalibratedEstimator` cannot
+        stand in for `classifier=` here, since it wraps an already-fitted
+        estimator rather than being one itself). Pass the `(p0, p1)` result
+        of a `CalibratedEstimator.predict_interval()` call you made
+        separately, if you have one, to include it in the figure.
+
+        `metadata`, if given, is merged over (not replacing) the two
+        auto-derived entries above -- pass `metadata={"n_samples": ...}` to
+        override one specifically. `**kwargs` (e.g. `title=`) are forwarded
+        to `fastdna.report.to_report()` unchanged.
+        """
+        from .report import to_report as _to_report
+
+        resolved_metadata = {
+            "n_samples": len(self.sample_ids),
+            "n_features_evaluated": len(self.kmer_sequences),
+        }
+        resolved_metadata.update(metadata or {})
+        return _to_report(
+            path,
+            classifier=self.classifier,
+            calibration=self.calibration,
+            calibration_interval=calibration_interval,
+            metadata=resolved_metadata,
+            **kwargs,
+        )
+
 
 def _align_phenotype(phenotype, sample_ids):
     """`phenotype` as a `numpy.ndarray` in `sample_ids` order.
