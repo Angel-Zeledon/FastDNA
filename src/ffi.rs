@@ -103,6 +103,10 @@ impl From<FastDnaError> for PyErr {
     }
 }
 
+/// `count()`'s own polling loop result: the pipeline's outcome (counter,
+/// QC summary, total reads read) or the error that ended it.
+type CountOutcome = Result<(KmerCounter, QcSummary, u64), FastDnaError>;
+
 /// Wraps an Arrow failure from `build_record_batch`. Mirrors
 /// `export.rs::export_err`, but the "path" is a placeholder: nothing here
 /// touches a disk, and `FastDnaError::Export` maps to `RuntimeError` on the
@@ -546,7 +550,7 @@ fn count(
     // `count()`, polling for the worker's result without blocking on it
     // indefinitely, so it can also poll `check_signals` on the one thread
     // where doing so actually has an effect (see the comment above).
-    let (outcome, signal_error): (Result<(KmerCounter, QcSummary, u64), FastDnaError>, Option<PyErr>) =
+    let (outcome, signal_error): (CountOutcome, Option<PyErr>) =
         py.allow_threads(move || {
             // `check_signals` returning `Err` means CPython consumed the
             // pending signal (its flag is cleared) and handed us the
