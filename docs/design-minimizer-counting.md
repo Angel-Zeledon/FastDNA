@@ -1,10 +1,33 @@
 # Design: minimizer-partitioned super-k-mer counting
 
-Status: **proposal, not implemented.** This document is the argument that
-decides whether we implement. Nothing else in this repository changed as a
-result of writing it.
+Status: **step 0 passed; implementation in progress.** This document is the
+argument that decided whether we implement. See the update below for the
+gate measurement; the rest of the document is unchanged from the proposal.
 
 Date: 2026-08-25.
+
+### Step 0 result (2026-08-25, later the same day)
+
+Measured directly rather than inferred from wall-clock comparisons across
+separate process launches (unreliable on the machine available — see
+§4.2's own admission that time predictions are lower-confidence for exactly
+this reason). Isolated the producer's own cost: parse `mid.fastq` (376 MB,
+144,000,000 k-mer occurrences, the same generator scaled down) end to end,
+discarding every record, with no channel, no workers, no k-mer extraction —
+a direct upper bound, not an inference.
+
+| Pass | Time | Note |
+|---|---:|---:|
+| Parse only (producer, isolated) | 781 ms / 785 ms (two runs) | Upper bound on producer cost |
+| Parse + canonical k-mer extraction (still single-threaded, no counting) | 1353 ms / 1485 ms | Isolates extraction's own marginal cost: ~600 ms |
+| Full single-threaded pipeline (producer + one worker: extraction + insertion + sort + compact) | 16,735 ms / 16,679 ms | The denominator |
+
+**Producer upper bound: 4.7% of total, both runs, nearly identical absolute
+times (785 ms vs 781 ms; 16,679 ms vs 16,735 ms).** Extraction adds another
+~3.6%. The remaining **~92% is insertion, sorting and compaction** —
+confirming §1.1's diagnosis directly rather than by elimination. Gate
+threshold was producer >~36% of total (design's ~40s/110.1s); actual result
+is roughly 8x under it. **Gate passed. Proceeding to steps 1-4.**
 
 ---
 
