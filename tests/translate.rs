@@ -136,7 +136,7 @@ fn six_frames_of_a_sequence_and_its_reverse_complement_are_the_same_set() {
 
 /// Every reverse frame must equal the corresponding forward frame of an
 /// independently reverse-complemented sequence. This is the direct check on
-/// the "reuse `reverse_complement_u64` per codon instead of materializing a
+/// the "complement each codon as it is packed instead of materializing a
 /// reverse-complemented copy" implementation choice.
 #[test]
 fn reverse_frames_agree_with_translating_an_explicit_reverse_complement() {

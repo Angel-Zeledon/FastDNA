@@ -11,9 +11,10 @@ one substantive reason rather than habit: `kmer.rs` already packs a base
 into two bits, so a codon is exactly six bits and a genetic code is a plain
 64-entry array indexed by that integer. Translating is then one array index
 per amino acid, with no string comparison and no per-codon allocation --
-and the reverse-strand frames reuse the same O(1)
-`reverse_complement_u64` bit trick the k-mer hot path uses, on one codon at
-a time, instead of building a reverse-complemented copy of the sequence.
+and the reverse-strand frames cost three extra XORs per codon, because
+complementing a 2-bit base is a single XOR, so a reverse frame packs each
+codon's reverse complement directly as it reads the original bytes from the
+3' end. No reverse-complemented copy of the sequence is ever built.
 
 Genetic codes
 -------------

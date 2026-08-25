@@ -45,8 +45,10 @@
 //! `[u8; 64]` lookup indexed by that integer: no string comparison, no
 //! hashing, no per-codon allocation, one array index per amino acid. This
 //! is the same 2-bit packing the k-mer path uses, reused rather than
-//! reinvented, which is also why `reverse_complement_u64` drops straight in
-//! for the reverse-strand frames (see `translate`).
+//! reinvented, which is also what makes the reverse-strand frames cheap:
+//! complementing a 2-bit base is a single XOR, so a reverse frame packs the
+//! reverse complement of a codon directly as it reads it, with no
+//! reverse-complemented copy of the sequence anywhere (see `pack_codon`).
 
 use crate::error::{FastDnaError, Result};
 use crate::kmer;
@@ -255,15 +257,76 @@ impl Frame {
     }
 }
 
-/// Packs the three bases at `seq[start..start + 3]` into a 6-bit codon, or
-/// `None` if any of them is not A/C/G/T (`N`, an IUPAC ambiguity code, or
-/// junk). The caller is responsible for `start + 3 <= seq.len()`.
+/// The 2-bit complement of a base. A(`00`) <-> T(`11`) and C(`01`) <->
+/// G(`10`), so complementing a packed base is exactly `^ 0b11` -- the same
+/// relationship `kmer::reverse_complement_u64` opens with its `!kmer`,
+/// applied to one base instead of thirty-two.
+const BASE_COMPLEMENT: u64 = 0b11;
+
+/// Packs one codon-sized window into a 6-bit codon, or `None` if any of its
+/// bases is not A/C/G/T (`N`, an IUPAC ambiguity code, or junk). `REVERSE`
+/// packs the window's reverse complement instead of the window itself.
+///
+/// **Why `REVERSE` is a const parameter and not a runtime flag.** It is
+/// resolved when the compiler monomorphizes this function, so a reverse
+/// frame's loop contains no strand test at all; the previous form branched
+/// on `frame.is_reverse()` twice per codon (once to compute the window's
+/// start, once to decide whether to flip it).
+///
+/// **Why the reverse case is assembled rather than flipped.** The reverse
+/// complement of the window `b0 b1 b2` is `comp(b2) comp(b1) comp(b0)`, and
+/// complementing a 2-bit base is one XOR, so packing it directly costs three
+/// XORs more than the forward case: 7 operations against 4. Producing the
+/// same six bits by packing forwards and calling
+/// `kmer::reverse_complement_u64(packed, 3)` costs the forward packing plus
+/// one `!`, two shift/mask/shift/mask/or groups, a `swap_bytes` and a final
+/// shift -- roughly 16 operations. The saving is per codon of every reverse
+/// frame: a six-frame scan of a 4.6 Mb bacterial genome packs ~4.6 million
+/// reverse codons.
 #[inline(always)]
-fn pack_codon(seq: &[u8], start: usize) -> Option<u64> {
-    let first = kmer::base_to_bits(*seq.get(start)?)?;
-    let second = kmer::base_to_bits(*seq.get(start + 1)?)?;
-    let third = kmer::base_to_bits(*seq.get(start + 2)?)?;
-    Some((first << 4) | (second << 2) | third)
+fn pack_codon<const REVERSE: bool>(window: &[u8]) -> Option<u64> {
+    let &[first, second, third] = window else { return None };
+    let first = kmer::base_to_bits(first)?;
+    let second = kmer::base_to_bits(second)?;
+    let third = kmer::base_to_bits(third)?;
+    if REVERSE {
+        Some(
+            ((third ^ BASE_COMPLEMENT) << 4)
+                | ((second ^ BASE_COMPLEMENT) << 2)
+                | (first ^ BASE_COMPLEMENT),
+        )
+    } else {
+        Some((first << 4) | (second << 2) | third)
+    }
+}
+
+/// Translates a stream of codon-sized windows onto the end of `protein`.
+///
+/// The windows arrive from `chunks_exact(3)`/`rchunks_exact(3)`, which is
+/// what removes the per-codon `offset + 3 * codon_index` multiply-add and
+/// the three bounds checks the old index-based `pack_codon` paid on every
+/// codon: the iterator does the striding, and the `&[u8; 3]` pattern is one
+/// length test the optimizer can hoist out of the chunked loop.
+#[inline]
+fn translate_codons<'a, const REVERSE: bool, I>(
+    codons: I,
+    table: &TranslationTable,
+    stop_handling: StopHandling,
+    protein: &mut Vec<u8>,
+) where
+    I: Iterator<Item = &'a [u8]>,
+{
+    for window in codons {
+        let amino_acid = match pack_codon::<REVERSE>(window) {
+            Some(codon) => table.translate_codon(codon),
+            None => AMBIGUOUS_AA,
+        };
+
+        if amino_acid == STOP_AA && stop_handling == StopHandling::StopAtFirst {
+            break;
+        }
+        protein.push(amino_acid);
+    }
 }
 
 /// Translates `seq` in one reading frame.
@@ -283,58 +346,86 @@ fn pack_codon(seq: &[u8], start: usize) -> Option<u64> {
 /// - **`U` is read as `T`**, again inherited from `kmer::base_to_bits`, so
 ///   an RNA sequence translates without being transcribed back first.
 ///
-/// Reverse frames reuse `kmer::reverse_complement_u64` rather than
-/// materializing a reverse-complemented copy of the sequence: a codon is
-/// exactly 3 bases, and `reverse_complement_u64(packed, 3)` is precisely the
-/// reverse complement of a 3-base packed window. So a reverse frame walks
-/// the original bytes from the 3' end, packs each codon-sized window
-/// forwards, and flips it with the same O(1) bit trick the k-mer hot path
-/// uses -- no second reverse-complement implementation, and no allocation
-/// proportional to the sequence length.
+/// Reverse frames never materialize a reverse-complemented copy of the
+/// sequence. A codon is exactly three bases, and the reverse complement of a
+/// three-base window is just its three complemented bases assembled in the
+/// other order -- three XORs (see `pack_codon`). So a reverse frame walks the
+/// original bytes from the 3' end with `rchunks_exact(3)` and complements
+/// each window as it packs it: no second reverse-complement implementation,
+/// and no allocation proportional to the sequence length.
+///
+/// Allocates once, for the returned `String`. Callers translating many
+/// sequences in a row should use [`translate_into`], which fills a buffer
+/// they own and therefore allocates once in total rather than once per
+/// sequence.
 pub fn translate(
     seq: &[u8],
     frame: Frame,
     table: &TranslationTable,
     stop_handling: StopHandling,
 ) -> String {
-    let offset = frame.offset();
-    if seq.len() < offset + 3 {
-        return String::new();
-    }
-    let n_codons = (seq.len() - offset) / 3;
-
-    let mut protein = Vec::with_capacity(n_codons);
-    for codon_index in 0..n_codons {
-        // Forward: the codon starts `offset + 3 * i` from the 5' end.
-        // Reverse: it *ends* `offset + 3 * i` from the 3' end, so it starts
-        // three bases earlier than that -- which is where reading the
-        // original bytes forwards and flipping the packed value lands.
-        let start = if frame.is_reverse() {
-            seq.len() - offset - 3 * (codon_index + 1)
-        } else {
-            offset + 3 * codon_index
-        };
-
-        let amino_acid = match pack_codon(seq, start) {
-            Some(packed) => {
-                let codon =
-                    if frame.is_reverse() { kmer::reverse_complement_u64(packed, 3) } else { packed };
-                table.translate_codon(codon)
-            }
-            None => AMBIGUOUS_AA,
-        };
-
-        if amino_acid == STOP_AA && stop_handling == StopHandling::StopAtFirst {
-            break;
-        }
-        protein.push(amino_acid);
-    }
+    // Sized exactly, so `translate_into`'s `reserve` is a no-op and the
+    // vector never regrows: one allocation for the whole call, as before.
+    let mut protein = Vec::with_capacity(seq.len().saturating_sub(frame.offset()) / 3);
+    translate_into(seq, frame, table, stop_handling, &mut protein);
 
     // Every byte pushed came either from a `TranslationTable`'s code array
     // (an NCBI `AAs` row, ASCII by construction) or from `AMBIGUOUS_AA`, so
     // this cannot fail -- the same argument `kmer::decode_kmer` makes for
-    // its own `from_utf8`.
+    // its own `from_utf8`. It moves the buffer rather than copying it.
     String::from_utf8(protein).unwrap_or_default()
+}
+
+/// [`translate`], writing into a caller-owned buffer instead of returning a
+/// fresh `String`.
+///
+/// `protein` is cleared and then filled with the frame's residues, as ASCII
+/// bytes. Its existing capacity is reused, so a caller that translates N
+/// sequences through one buffer performs **one** heap allocation in total
+/// where N calls to `translate` perform N allocations and N frees. That is
+/// the whole reason this variant exists: `src/ffi.rs` translates every
+/// record of a file in up to six frames, which is `6 * records` allocations
+/// saved on a path whose per-row work is otherwise a memcpy into an Arrow
+/// buffer.
+///
+/// The bytes are ASCII by construction (see `translate`), so
+/// `std::str::from_utf8` over the result is the same validation `translate`
+/// already runs -- moved to the caller, not added.
+pub fn translate_into(
+    seq: &[u8],
+    frame: Frame,
+    table: &TranslationTable,
+    stop_handling: StopHandling,
+    protein: &mut Vec<u8>,
+) {
+    protein.clear();
+    let offset = frame.offset();
+    if seq.len() < offset + 3 {
+        return;
+    }
+    protein.reserve((seq.len() - offset) / 3);
+
+    if frame.is_reverse() {
+        // A reverse frame reads from the 3' end, so its codon boundaries are
+        // anchored there: `offset` bases are dropped off the 3' end and the
+        // windows walk backwards from what is left. `rchunks_exact` produces
+        // exactly those windows, in exactly that order, and leaves the 1-2
+        // unusable bases at the 5' end -- which is where a reverse frame's
+        // partial codon belongs.
+        translate_codons::<true, _>(
+            seq[..seq.len() - offset].rchunks_exact(3),
+            table,
+            stop_handling,
+            protein,
+        );
+    } else {
+        translate_codons::<false, _>(
+            seq[offset..].chunks_exact(3),
+            table,
+            stop_handling,
+            protein,
+        );
+    }
 }
 
 /// Translates `seq` in all six frames, in `ALL_FRAMES` order, returning
@@ -344,11 +435,21 @@ pub fn translate_six_frames(
     table: &TranslationTable,
     stop_handling: StopHandling,
 ) -> Vec<(i8, String)> {
-    ALL_FRAMES
-        .iter()
-        .filter_map(|&frame_id| Frame::from_i8(frame_id).ok().map(|frame| (frame_id, frame)))
-        .map(|(frame_id, frame)| (frame_id, translate(seq, frame, table, stop_handling)))
-        .collect()
+    // `Vec::with_capacity(6)` and a plain loop rather than `collect()`: a
+    // `filter_map` reports a lower size hint of 0, so the collected vector
+    // started at capacity 0 and grew 4 -> 8, which is two allocations, one
+    // free and a 128-byte move for a result whose length is known to be
+    // exactly six.
+    let mut proteins = Vec::with_capacity(ALL_FRAMES.len());
+    for frame_id in ALL_FRAMES {
+        // Built directly instead of through `Frame::from_i8`: every id in
+        // `ALL_FRAMES` is a valid frame by construction, so parsing them
+        // would be six range matches and six `Result`s discarded on the spot.
+        let frame =
+            Frame { offset: (frame_id.unsigned_abs() - 1) as usize, reverse: frame_id < 0 };
+        proteins.push((frame_id, translate(seq, frame, table, stop_handling)));
+    }
+    proteins
 }
 
 /// Extracts every k-mer of *amino acids* from a translated protein, as
@@ -485,6 +586,29 @@ mod tests {
         ];
         for (codon, expected) in known {
             assert_eq!(tr(codon, 1, 1), expected.to_string(), "codon {codon}");
+        }
+    }
+
+    /// `pack_codon::<true>` assembles a codon's reverse complement from three
+    /// XORs instead of packing it forwards and calling
+    /// `kmer::reverse_complement_u64(packed, 3)`. The two must agree on all
+    /// 64 codons -- exhaustively, since the domain is 64 values and a
+    /// spot-check would leave the other 60 untested.
+    #[test]
+    fn the_reverse_codon_packing_agrees_with_the_kmer_bit_trick_on_all_64_codons() {
+        for first in b"ACGT" {
+            for second in b"ACGT" {
+                for third in b"ACGT" {
+                    let window = [*first, *second, *third];
+                    let forward = pack_codon::<false>(&window).unwrap();
+                    assert_eq!(
+                        pack_codon::<true>(&window).unwrap(),
+                        kmer::reverse_complement_u64(forward, 3),
+                        "codon {}",
+                        std::str::from_utf8(&window).unwrap()
+                    );
+                }
+            }
         }
     }
 
