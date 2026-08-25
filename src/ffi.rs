@@ -22,6 +22,7 @@
 // `#[pyfunction]`/`#[pymethods]` items that all share this pattern.
 #![allow(clippy::useless_conversion)]
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -847,31 +848,93 @@ fn resolve_translation_args(
     Ok((table, resolved, stop_handling))
 }
 
-/// Collects `(sequence_id, frame, protein)` rows into an Arrow batch under
-/// `proteins_schema`. Shared by `translate_sequences` and `translate_file`
-/// so the two cannot drift into producing differently-shaped tables --
+/// Builds a `proteins_schema` batch one translated frame at a time.
+///
+/// Shared by `translate_sequences` and `translate_file` so the two cannot
+/// drift into producing differently-shaped tables --
 /// `python/tests/test_translate.py` asserts they agree, and this is what
 /// makes that hold structurally rather than by coincidence.
-fn build_proteins_batch(rows: Vec<(String, i8, String)>) -> Result<RecordBatch, FastDnaError> {
-    let n = rows.len();
-    let mut id_builder = StringBuilder::with_capacity(n, n * 16);
-    let mut frame_builder = Int8Builder::with_capacity(n);
-    let mut protein_builder = StringBuilder::with_capacity(n, n * 64);
+///
+/// **What this replaced, and what it costs instead.** The previous form
+/// collected `Vec<(String, i8, String)>` and then walked it to fill the
+/// Arrow builders. Per row that was two heap allocations and two frees --
+/// the sequence id, cloned once for *each* requested frame, and the protein
+/// `String` -- plus a 56-byte tuple moved into a vector that existed only to
+/// be walked once. Rows now go straight into the builders, so per row: no
+/// allocation, and the id and protein bytes are copied once (they were
+/// copied once anyway, out of the temporaries). For a file of N records in
+/// six frames that is `12 * N` allocations and `12 * N` frees removed.
+///
+/// Arrow's `StringBuilder` is already the "one contiguous value buffer plus
+/// offsets" representation, so nothing needs to change there. What does
+/// change is who grows: the intermediate row vector used to grow by
+/// doubling and the builders were then sized exactly, whereas the builders
+/// now do the growing. That is the one part of this that is a swap rather
+/// than a removal, and it is a favourable one -- growth copies plain bytes,
+/// where the row vector's growth copied 56-byte tuples *and* every row cost
+/// two `malloc`/`free` pairs on top.
+struct ProteinsBatchBuilder {
+    ids: StringBuilder,
+    frames: Int8Builder,
+    proteins: StringBuilder,
+    /// Reused by every `push`: `translate_into` clears and refills it, so
+    /// translating N sequences in F frames allocates this buffer once
+    /// instead of `N * F` times.
+    scratch: Vec<u8>,
+}
 
-    for (id, frame, protein) in rows {
-        id_builder.append_value(id);
-        frame_builder.append_value(frame);
-        protein_builder.append_value(protein);
+impl ProteinsBatchBuilder {
+    /// For a caller that knows its row count up front (`translate_sequences`
+    /// does: ids times frames).
+    fn with_capacity(rows: usize) -> Self {
+        ProteinsBatchBuilder {
+            ids: StringBuilder::with_capacity(rows, rows * 16),
+            frames: Int8Builder::with_capacity(rows),
+            proteins: StringBuilder::with_capacity(rows, rows * 64),
+            scratch: Vec::new(),
+        }
     }
 
-    in_memory_batch(
-        proteins_schema(),
-        vec![
-            Arc::new(id_builder.finish()) as ArrayRef,
-            Arc::new(frame_builder.finish()) as ArrayRef,
-            Arc::new(protein_builder.finish()) as ArrayRef,
-        ],
-    )
+    /// For a caller streaming an input of unknown length (`translate_file`).
+    fn new() -> Self {
+        ProteinsBatchBuilder {
+            ids: StringBuilder::new(),
+            frames: Int8Builder::new(),
+            proteins: StringBuilder::new(),
+            scratch: Vec::new(),
+        }
+    }
+
+    /// Translates one (sequence, frame) pair and appends it as a row.
+    fn push(
+        &mut self,
+        id: &str,
+        sequence: &[u8],
+        frame: Frame,
+        table: &TranslationTable,
+        stop_handling: StopHandling,
+    ) {
+        translate::translate_into(sequence, frame, table, stop_handling, &mut self.scratch);
+        self.ids.append_value(id);
+        self.frames.append_value(frame.as_i8());
+        // Every byte in `scratch` came from an NCBI `AAs` row or from
+        // `translate::AMBIGUOUS_AA`, so this always succeeds. It is the same
+        // check `translate` runs internally via `String::from_utf8`, moved
+        // here rather than added: what is saved is the `String` that used to
+        // carry the result the two feet from there to `append_value`.
+        self.proteins.append_value(std::str::from_utf8(&self.scratch).unwrap_or_default());
+    }
+
+    fn finish(mut self) -> Result<RecordBatch, FastDnaError> {
+        in_memory_batch(
+            proteins_schema(),
+            vec![
+                Arc::new(self.ids.finish()) as ArrayRef,
+                Arc::new(self.frames.finish()) as ArrayRef,
+                Arc::new(self.proteins.finish()) as ArrayRef,
+            ],
+        )
+    }
 }
 
 /// The identifier part of a FASTA/FASTQ header: the marker byte (`>` or
@@ -881,7 +944,14 @@ fn build_proteins_batch(rows: Vec<(String, i8, String)>) -> Result<RecordBatch, 
 /// is the part every other tool keys on. Keeping the whole line would make
 /// `sequence_id` unjoinable against anything else the user has, and would
 /// put arbitrary text into a column callers group by.
-fn header_to_sequence_id(header: &[u8]) -> String {
+///
+/// Borrows from `header` whenever it is valid UTF-8, which every real
+/// header is; only genuinely malformed bytes take the owned branch that
+/// `from_utf8_lossy` allocates for its replacement characters. Returning
+/// `String` meant `into_owned()` on an otherwise-`Borrowed` `Cow`: one
+/// allocation, one copy and one free per record, for bytes that were about
+/// to be copied into an Arrow buffer anyway.
+fn header_to_sequence_id(header: &[u8]) -> Cow<'_, str> {
     let without_marker = match header.first() {
         Some(b'>') | Some(b'@') => &header[1..],
         _ => header,
@@ -890,7 +960,7 @@ fn header_to_sequence_id(header: &[u8]) -> String {
         .iter()
         .position(|b| b.is_ascii_whitespace())
         .unwrap_or(without_marker.len());
-    String::from_utf8_lossy(&without_marker[..end]).into_owned()
+    String::from_utf8_lossy(&without_marker[..end])
 }
 
 /// Translates in-memory sequences in the requested reading frames,
@@ -926,17 +996,17 @@ fn translate_sequences(
 
     let batch = py.allow_threads(move || {
         let (table, frames, stop_handling) = resolve_translation_args(&frames, table, to_stop)?;
-        let mut rows = Vec::with_capacity(ids.len() * frames.len());
-        for (id, sequence) in ids.into_iter().zip(sequences.into_iter()) {
+        let mut builder = ProteinsBatchBuilder::with_capacity(ids.len() * frames.len());
+        // `iter()`, not `into_iter()`: the id is appended straight into the
+        // Arrow buffer, so it no longer has to be cloned once per requested
+        // frame -- six sequences' worth of `String` allocation per sequence
+        // in the common six-frame call.
+        for (id, sequence) in ids.iter().zip(sequences.iter()) {
             for frame in &frames {
-                rows.push((
-                    id.clone(),
-                    frame.as_i8(),
-                    translate::translate(sequence.as_bytes(), *frame, table, stop_handling),
-                ));
+                builder.push(id, sequence.as_bytes(), *frame, table, stop_handling);
             }
         }
-        build_proteins_batch(rows)
+        builder.finish()
     })?;
 
     batch.to_pyarrow(py)
@@ -971,7 +1041,7 @@ fn translate_file(
         let (table, frames, stop_handling) = resolve_translation_args(&frames, table, to_stop)?;
         let mut reader = open_fastq_reader(&path_buf)?;
 
-        let mut rows = Vec::new();
+        let mut builder = ProteinsBatchBuilder::new();
         let mut record_number: u64 = 0;
         loop {
             let record = reader.next_record().map_err(|e| FastDnaError::MalformedFastq {
@@ -984,14 +1054,10 @@ fn translate_file(
 
             let id = header_to_sequence_id(&record.id);
             for frame in &frames {
-                rows.push((
-                    id.clone(),
-                    frame.as_i8(),
-                    translate::translate(&record.seq, *frame, table, stop_handling),
-                ));
+                builder.push(id.as_ref(), &record.seq, *frame, table, stop_handling);
             }
         }
-        build_proteins_batch(rows)
+        builder.finish()
     })?;
 
     batch.to_pyarrow(py)
@@ -1020,21 +1086,23 @@ fn protein_kmers(
     }
 
     let batch = py.allow_threads(move || {
-        let mut rows: Vec<(String, String, u32)> = Vec::new();
+        // Straight into the builders. The previous form collected
+        // `Vec<(String, String, u32)>` first, which cost per row: one
+        // `String` for the id (cloned once per k-mer of the protein), one
+        // `String` for the k-mer itself, and a 56-byte tuple pushed into a
+        // vector that was then walked once to fill these very builders. All
+        // three are gone -- `count_amino_acid_kmers_borrowed` hands back
+        // k-mers that borrow from the protein, and both strings are copied
+        // exactly once, into the Arrow value buffers they were destined for.
+        let mut id_builder = StringBuilder::new();
+        let mut kmer_builder = StringBuilder::new();
+        let mut count_builder = UInt32Builder::new();
         for (id, protein) in ids.iter().zip(proteins.iter()) {
-            for (aa_kmer, count) in translate::count_amino_acid_kmers(protein, k)? {
-                rows.push((id.clone(), aa_kmer, count));
+            for (aa_kmer, count) in translate::count_amino_acid_kmers_borrowed(protein, k)? {
+                id_builder.append_value(id);
+                kmer_builder.append_value(aa_kmer);
+                count_builder.append_value(count);
             }
-        }
-
-        let n = rows.len();
-        let mut id_builder = StringBuilder::with_capacity(n, n * 16);
-        let mut kmer_builder = StringBuilder::with_capacity(n, n * (k + 1));
-        let mut count_builder = UInt32Builder::with_capacity(n);
-        for (id, aa_kmer, count) in rows {
-            id_builder.append_value(id);
-            kmer_builder.append_value(aa_kmer);
-            count_builder.append_value(count);
         }
 
         in_memory_batch(
