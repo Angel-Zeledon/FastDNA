@@ -5,13 +5,14 @@
 // silent, not this entry point.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use fastdna_core::cli::{Cli, CliHistogramFormat, CliStrategy};
+use fastdna_core::cli::{Cli, CliHistogramFormat, CliOutputFormat, CliStrategy};
+use fastdna_core::cohort;
 use fastdna_core::error::{FastDnaError, Result};
 use fastdna_core::export;
 use fastdna_core::fastq::{InputSpec, MultiSourceReader};
@@ -150,11 +151,98 @@ fn format_inputs(inputs: &[InputSpec]) -> String {
     }
 }
 
+/// The `--paired-dir` mode: discover every sample under `dir` via
+/// `cohort::discover_paired_samples`'s strict R1/R2 pairing (an unpaired
+/// file or an empty directory is rejected there, loudly, before any
+/// counting starts), then run one counting pass per sample, each writing
+/// its own `<sample_id>.<format>` file into `--paired-output`.
+///
+/// Deliberately narrower than the single-run path in `run`: no QC JSON, no
+/// histogram, no memory-policy auto-strategy banner per sample -- those all
+/// keep their existing single-run semantics and are unused here. See
+/// `cohort::batch::count_paired_samples`'s doc comment for the full
+/// rationale; this function is thin CLI glue around it plus the console
+/// output every other invocation already has.
+fn run_paired_dir(args: &Cli, dir: &Path) -> Result<()> {
+    // Guaranteed `Some` by `Cli::validate`, called by this function's only
+    // caller before `paired_dir` is ever inspected.
+    let output_dir = args.paired_output.as_ref().ok_or_else(|| FastDnaError::InvalidConfig {
+        parameter: "--paired-output",
+        reason: "required together with --paired-dir".to_string(),
+    })?;
+
+    println!("==================================================");
+    println!(" FastDNA: Paired-End Cohort Counting (Rust)        ");
+    println!("==================================================");
+    println!("Sample directory: {}", dir.display());
+    println!("Output directory: {}", output_dir.display());
+    println!("k-mer Size:       {}", args.kmer_size);
+    println!("Quality Cutoff:   Q >= {}", args.min_quality);
+    if args.hpc {
+        println!("Homopolymer Compression: on");
+    }
+
+    let default_config = PipelineConfig::default();
+    let threads = args.threads.unwrap_or(default_config.num_threads);
+    println!("Worker Threads:   {threads}");
+    println!("--------------------------------------------------");
+
+    let config = PipelineConfig {
+        k: args.kmer_size,
+        quality_window: 4,
+        min_quality: args.min_quality,
+        batch_size: 10_000,
+        num_threads: threads,
+        progress_interval: default_config.progress_interval,
+        hpc: args.hpc,
+    };
+
+    let format = match args.paired_format {
+        CliOutputFormat::Parquet => cohort::PairedOutputFormat::Parquet,
+        CliOutputFormat::Csv => cohort::PairedOutputFormat::Csv,
+    };
+
+    let start_time = Instant::now();
+    let results = cohort::count_paired_samples(
+        dir,
+        output_dir,
+        format,
+        &config,
+        args.min_count,
+        args.max_count,
+    )?;
+    let elapsed = start_time.elapsed().as_secs_f64();
+
+    for r in &results {
+        println!(
+            "{}: {} reads, {} records written -> {}",
+            r.sample_id,
+            r.total_reads,
+            r.records_written,
+            r.output_path.display()
+        );
+    }
+    println!("--------------------------------------------------");
+    println!("Samples Counted: {} in {elapsed:.2}s", results.len());
+
+    Ok(())
+}
+
 fn run(args: Cli) -> Result<()> {
     args.validate().map_err(|reason| FastDnaError::InvalidConfig {
         parameter: "count filters",
         reason,
     })?;
+
+    // `--paired-dir` is a wholly separate mode: discover-then-loop instead
+    // of a single run. `Cli::validate` above already guarantees `--input`
+    // is empty and `--paired-output` is `Some` whenever `paired_dir` is
+    // `Some`, so this branch owns none of the single-run guards below (they
+    // read `args.input`/`args.output`, which are meaningless here).
+    if let Some(dir) = args.paired_dir.clone() {
+        return run_paired_dir(&args, &dir);
+    }
+
     guard_against_input_overwrite(&args)?;
     preflight_outputs(&args)?;
 

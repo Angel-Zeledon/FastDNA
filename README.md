@@ -369,8 +369,8 @@ writes CSV. Every exporter writes the same three columns: `kmer_u64`
 
 | Flag | Default | Description |
 |---|---|---|
-| `-i, --input <FILE>` | (required) | Input FASTQ file (`.fastq` or `.fastq.gz`) |
-| `-o, --output <FILE>` | `kmer_counts.parquet` | Output path for k-mer frequencies (`.csv` or `.parquet`) |
+| `-i, --input <FILE>` | (required unless `--paired-dir` is given) | Input FASTQ file (`.fastq` or `.fastq.gz`); several may be given (R1/R2, extra lanes) and are aggregated into one run |
+| `-o, --output <FILE>` | `kmer_counts.parquet` | Output path for k-mer frequencies (`.csv` or `.parquet`). Ignored with `--paired-dir` (see `--paired-output`) |
 | `-k, --kmer-size <N>` | `31` | Length of k-mers (`1 <= k <= 32`) |
 | `-q, --min-quality <Q>` | `20` | Minimum Phred quality score cutoff (0-40) for 3'-end trimming |
 | `-m, --min-count <COUNT>` | `1` | Filter out k-mers with frequency below this cutoff |
@@ -381,6 +381,9 @@ writes CSV. Every exporter writes the same three columns: `kmer_u64`
 | `--strategy <auto\|memory\|disk>` | `auto` | Counting strategy: `auto` picks based on the estimated peak memory versus `--max-ram`; `memory` and `disk` force one strategy outright |
 | `--max-ram <SIZE>` | half of available RAM; 4 GB if undetectable | Memory budget the automatic chooser targets before switching to the disk strategy. Plain byte count or `K`/`M`/`G`/`T` suffix (binary, 1024-based units; `4G`, `4GB`, `4gb` are equivalent) |
 | `--hpc` | off | Collapse homopolymer runs (e.g. `AAAAAA` -> `A`) before k-mer extraction. With the flag absent, output is byte-for-byte identical to today's. Meant for long-read input (Oxford Nanopore, PacBio), where an indel inside a homopolymer run -- not a substitution -- is the dominant sequencing error and, left uncompressed, shifts every k-mer downstream of it; short-read Illumina data has no need for it. Trades exact base-level positional correspondence with the original read for that robustness: a downstream tool mapping a k-mer back to a reference coordinate (e.g. `fastdna.annotate`) is working with compressed-sequence offsets, not the original read's |
+| `--paired-dir <DIR>` | unset | Directory of FASTQ files to discover and count as samples, one counting run per sample, instead of naming files by hand with `--input`. See [Paired-end batch counting](#paired-end-batch-counting) below. Requires `--paired-output`; mutually exclusive with `--input` |
+| `--paired-output <DIR>` | unset | Output directory for `--paired-dir`: each discovered sample writes its own `<sample_id>.<parquet\|csv>` file here. Created if it does not exist. Required together with `--paired-dir` |
+| `--paired-format <parquet\|csv>` | `parquet` | File format for `--paired-dir`'s per-sample outputs |
 
 At startup the CLI prints the strategy decision it will act on, alongside
 the estimated peak memory and the budget it was compared against:
@@ -404,6 +407,43 @@ Precedence, highest first: `--strategy memory|disk`, then
 `FASTDNA_STRATEGY`, then the automatic estimate compared against the budget
 (`--max-ram`, then `FASTDNA_MAX_RAM_BYTES`, then the half-of-available-RAM
 default).
+
+### Paired-end batch counting
+
+A real paired-end sample is two files -- R1 and R2 -- that must be counted
+*together*, not as two separate samples. Doing that for one sample is just
+`--input r1.fastq.gz --input r2.fastq.gz` (FastDNA already merges k-mers
+across multiple `--input` files). Doing it for a whole directory of
+patients by hand means grouping mates yourself for every one of them.
+`--paired-dir` automates that grouping:
+
+```bash
+fastdna --paired-dir samples/ --paired-output counts/ -k 31
+```
+
+This discovers every sample under `samples/` using the same R1/R2 pairing
+logic (`cohort::discover_samples` in the Rust core) already used internally
+for cohort listing (suffixes `_R1`/`_R2`, `_1`/`_2`, either `_` or `.` as
+the separator, plus Illumina's demultiplexed `..._R1_001.fastq.gz` form --
+matched case-insensitively), then runs one counting pass per sample, each
+mate file fed in together exactly like two `--input` files would be, and
+writes that sample's counts to `counts/<sample_id>.parquet` (or `.csv` with
+`--paired-format csv`).
+
+**Unlike ad hoc cohort listing, an unpaired file is a hard error here, not
+a warning.** `discover_samples` treats a lone `_R1` file with no `_R2` mate
+as single-end and keeps going, recording a warning for a human to read
+later. `--paired-dir` exists to run counting unattended across many
+samples, so the same situation stops the whole run instead: silently
+falling back to a single-end sample would produce a normal-looking output
+for a directory that was actually half-paired. An empty (or entirely
+non-FASTQ) directory is rejected the same way `discover_samples` already
+rejects it.
+
+`--paired-dir` is deliberately narrower than a single `--input` run: every
+sample uses the same `-k`/`-q`/`-m`/`-M`/`--hpc`/`--threads` settings, and
+there is no per-sample QC JSON or histogram (`--qc`/`--histogram` keep their
+existing single-file meaning and are not part of this mode).
 
 ---
 

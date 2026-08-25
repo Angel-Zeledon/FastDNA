@@ -34,6 +34,18 @@ pub enum CliHistogramFormat {
     GenomeScope,
 }
 
+/// Output file format for `--paired-dir`'s per-sample exports, forwarded
+/// into `cohort::batch::PairedOutputFormat`. `--output`'s format is chosen
+/// by the extension of its single file path (see `main.rs`'s `wants_parquet`);
+/// a directory of per-sample files has no such extension to read, so
+/// `--paired-dir` mode needs this explicit enum instead.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CliOutputFormat {
+    #[default]
+    Parquet,
+    Csv,
+}
+
 /// Parses a `--max-ram` value: a plain byte count, or a number with a
 /// `K`/`M`/`G`/`T` suffix (case-insensitive, an optional trailing `B`
 /// ignored -- `4G`, `4GB`, and `4gb` all mean the same 4*1024^3 bytes).
@@ -94,7 +106,14 @@ pub struct Cli {
     /// Several may be given (R1/R2, extra lanes); their counts and QC are
     /// aggregated. The format of each is detected from its content, not its
     /// extension.
-    #[arg(short, long, value_name = "FILE", num_args = 1..)]
+    ///
+    /// Mutually exclusive with `--paired-dir`: a run either counts the files
+    /// named here, or discovers and counts every sample in a directory (see
+    /// `--paired-dir`'s doc comment). Not `required` at the derive level
+    /// (unlike before `--paired-dir` existed) because that alternative can
+    /// satisfy the "give me something to count" requirement instead; `Cli::
+    /// validate` enforces that exactly one of the two is actually given.
+    #[arg(short, long, value_name = "FILE", num_args = 1.., required = false)]
     pub input: Vec<PathBuf>,
 
     /// Output path for k-mer frequencies (.csv or .parquet)
@@ -175,6 +194,43 @@ pub struct Cli {
     /// read's.
     #[arg(long)]
     pub hpc: bool,
+
+    /// Directory of FASTQ files to discover and count as paired-end (or
+    /// single-end) samples, one counting run per sample, instead of naming
+    /// files by hand with `--input`. Uses `cohort::discover_samples`'s R1/R2
+    /// pairing (`_R1`/`_R2`, `_1`/`_2`, and Illumina's `_R1_001` form -- see
+    /// that module's doc comment for the exact rules); a discovered sample's
+    /// mate files are fed into one counting run together, exactly as
+    /// multiple `--input` files already are.
+    ///
+    /// Unlike ad hoc cohort listing, a file that carries a recognized pair
+    /// suffix with no matching mate is a hard error here, not a recorded
+    /// warning: this mode exists specifically for unattended counting across
+    /// many samples, and a half-paired directory silently falling back to a
+    /// single-end sample would produce a normal-looking run over corrupted
+    /// grouping. An empty (or all-non-FASTQ) directory is also an error, not
+    /// an empty cohort.
+    ///
+    /// Requires `--paired-output`; mutually exclusive with `--input`.
+    /// `--output` is ignored in this mode (see `--paired-output`).
+    #[arg(long, value_name = "DIR")]
+    pub paired_dir: Option<PathBuf>,
+
+    /// Output directory for `--paired-dir` mode: each discovered sample
+    /// writes its own `<sample_id>.<parquet|csv>` file here (see
+    /// `--paired-format`), named from `discover_samples`'s `sample_id`.
+    /// Created if it does not already exist. Required together with
+    /// `--paired-dir`; rejected otherwise.
+    #[arg(long, value_name = "DIR")]
+    pub paired_output: Option<PathBuf>,
+
+    /// File format for `--paired-dir`'s per-sample outputs. Ignored without
+    /// `--paired-dir` (not rejected: unlike `--paired-output`, a clap
+    /// `default_value` makes "the user explicitly asked for the default"
+    /// and "the user never touched this flag" indistinguishable here, so
+    /// `Cli::validate` cannot draw a reliable line to reject on).
+    #[arg(long, value_enum, default_value = "parquet")]
+    pub paired_format: CliOutputFormat,
 }
 
 impl Cli {
@@ -207,6 +263,54 @@ impl Cli {
                 ));
             }
         }
+
+        // `--paired-dir` and `--input` name two different ways to say "here
+        // is what to count" -- accepting both would leave no defined order
+        // to run them in, and neither has a self-evident priority over the
+        // other. Checked here, before the counting run, rather than letting
+        // one of the two silently win.
+        if self.paired_dir.is_some() && !self.input.is_empty() {
+            return Err(
+                "--input and --paired-dir are mutually exclusive: a run either counts the files \
+                 named by --input, or discovers samples from a directory with --paired-dir, not both"
+                    .to_string(),
+            );
+        }
+
+        match &self.paired_dir {
+            Some(_) => {
+                // Without an output directory there is nowhere for N
+                // per-sample files to go; unlike `--output`'s single-file
+                // default, guessing one here (the cohort directory itself?
+                // the current directory?) would silently place a cohort's
+                // worth of output somewhere the user did not ask for.
+                if self.paired_output.is_none() {
+                    return Err(
+                        "--paired-dir requires --paired-output, naming the directory each \
+                         discovered sample's counts are written into"
+                            .to_string(),
+                    );
+                }
+            }
+            None => {
+                if self.paired_output.is_some() {
+                    return Err(
+                        "--paired-output is only meaningful together with --paired-dir".to_string(),
+                    );
+                }
+                // Mirrors the check `fastq::MultiSourceReader::validate` already
+                // makes deeper in the run, but stated here means it fires
+                // before the startup banner prints or any file is touched,
+                // not after -- "bad input fails fast, loudly, and before the
+                // counting run".
+                if self.input.is_empty() {
+                    return Err(
+                        "no input given: pass --input <FILE>... or --paired-dir <DIR>".to_string(),
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
