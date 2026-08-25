@@ -7,23 +7,26 @@
 # It was written by hand, matching bioconda's standard meta.yaml layout
 # and the conventions other Rust+PyO3/maturin packages on bioconda use
 # (a `rust`/`maturin` host requirement, `script: {{ PYTHON }} -m pip
-# install . -vv --no-deps --no-build-isolation`, an `abi3`-style noarch
-# exclusion since this wheel is platform-specific, not noarch: python).
+# install . -vv --no-deps --no-build-isolation`, and a platform-specific
+# build rather than `noarch: python`, since this ships a compiled
+# extension module).
 #
-# To actually publish this to bioconda:
-#   1. Fork https://github.com/bioconda/bioconda-recipes
-#   2. Copy this file to recipes/fastdna/meta.yaml in that fork (bioconda's
-#      own layout nests every recipe one level deeper than this repo's
-#      own copy under recipe/meta.yaml -- keep this copy in sync manually,
-#      or generate the fork's copy from this one).
-#   3. Update the `source.sha256` below to the real sha256 of the version
-#      you're packaging (compute it from the actual PyPI/GitHub release
-#      tarball, e.g. `sha256sum fastdna-0.1.0.tar.gz` -- the placeholder
-#      here is NOT a real checksum).
-#   4. Open a PR against bioconda-recipes; their CI (`bioconda-utils`)
-#      does the actual build/lint verification this repo's own CI cannot.
-#   5. Address any review feedback from the bioconda maintainers.
-# See recipe/README.md for more detail on this process.
+# Exactly one blocker remains before this can be submitted: there is no
+# tagged release to point `source.url` at, so `source.sha256` is still a
+# placeholder. Everything else below is filled in from the real project
+# metadata.
+#
+# To publish:
+#   1. Tag and publish a release (e.g. v0.1.0) so a release tarball exists.
+#   2. Replace the placeholder sha256 with the real digest of that tarball
+#      (`sha256sum fastdna-0.1.0.tar.gz`).
+#   3. Fork https://github.com/bioconda/bioconda-recipes and copy this file
+#      to recipes/fastdna/meta.yaml there (bioconda nests every recipe one
+#      level deeper than this repo's own copy under recipe/meta.yaml --
+#      keep the two in sync manually).
+#   4. Open a PR; bioconda's CI (`bioconda-utils`) performs the build and
+#      lint verification this repo's own CI cannot.
+# See recipe/README.md for more detail.
 # -----------------------------------------------------------------------
 
 package:
@@ -32,22 +35,21 @@ package:
 
 source:
   # Bioconda recipes normally source from a PyPI sdist or a GitHub release
-  # tarball, not a git checkout. Point this at whichever one carries a
-  # real Cargo.lock (needed for a reproducible, vendored-deps build) --
-  # a GitHub release tag tarball is shown here since the sdist on PyPI is
-  # built by maturin and may or may not include Cargo.lock depending on
-  # how it was produced; check before switching this to `pypi.org/...`.
-  url: https://github.com/REPLACE_WITH_ORG/fastdna/archive/refs/tags/v{{ version }}.tar.gz
+  # tarball, not a git checkout. A GitHub release tag tarball is used here
+  # because it reliably carries Cargo.lock, which a reproducible
+  # vendored-deps build needs; a maturin-built PyPI sdist may or may not,
+  # depending on how it was produced. Check before switching to pypi.org.
+  url: https://github.com/anzeledon/fastdna/archive/refs/tags/v{{ version }}.tar.gz
   # PLACEHOLDER -- 64 zeros, the right shape for a sha256 but not a real
-  # checksum of anything. Replace with the real digest before submitting.
+  # checksum of anything. There is no tagged release yet to compute one
+  # from. Replace before submitting.
   sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 
 build:
   number: 0
   # Not noarch: this ships a compiled PyO3 extension module (abi3, stable
   # ABI across CPython 3.8+), so one build is needed per platform, but NOT
-  # per Python minor version -- reflected in the `python_min`-style pin
-  # below rather than a full `{{ PY_VER }}*` build matrix.
+  # per Python minor version.
   script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
   run_exports:
     - {{ pin_subpackage(name, max_pin="x.x") }}
@@ -56,7 +58,7 @@ requirements:
   build:
     - {{ compiler('rust') }}
     - maturin >=1.5,<2.0
-    - cargo-bundle-licenses  # optional but conventional for Rust recipes: bundles THIRD_PARTY_LICENSES for the vendored crates
+    - cargo-bundle-licenses  # conventional for Rust recipes: bundles THIRD_PARTY_LICENSES for the vendored crates
   host:
     - python >=3.8
     - pip
@@ -71,44 +73,51 @@ test:
   commands:
     - python -c "import fastdna; info = fastdna.build_info(); assert 'version' in info and 'max_k' in info, info"
     - python -c "import fastdna; assert callable(fastdna.count) and callable(fastdna.sketch)"
-  # A real bioconda test would also exercise fastdna.count() against a
-  # small bundled FASTQ fixture -- omitted here since this recipe is
-  # unverified and no fixture is packaged with it yet; add one before
-  # submitting for real (bioconda-recipes convention: a tiny test data
+  # A real bioconda test would also count k-mers in a small bundled FASTQ
+  # fixture. Omitted while this recipe is unverified and no fixture is
+  # packaged; add one before submitting (bioconda convention: a tiny data
   # file checked in alongside meta.yaml, referenced via `test/source_files`
   # or copied in a `run_test.sh`).
 
 about:
-  home: https://github.com/REPLACE_WITH_ORG/fastdna
-  # PLACEHOLDER: at the time this recipe was written, this repository
-  # declares no license anywhere (no LICENSE file, no `license` field in
-  # Cargo.toml or pyproject.toml). Bioconda REQUIRES an explicit license
-  # and license_file for every recipe -- this MUST be filled in with the
-  # project's actual chosen license (and a LICENSE file must exist in the
-  # source tree) before this recipe could ever pass bioconda-recipes CI.
-  # MIT is used below only as a common default for small Rust/Python
-  # tools, not because it has been confirmed as this project's license.
-  license: MIT
+  home: https://github.com/anzeledon/fastdna
+  # Dual-licensed, the Rust ecosystem's convention: see Cargo.toml's
+  # `license = "MIT OR Apache-2.0"` and both LICENSE files in the source
+  # tree. Bioconda requires an explicit license and license_file, and both
+  # files must be listed for a dual license.
+  license: MIT OR Apache-2.0
   license_family: MIT
-  license_file: LICENSE  # does not exist in this repo yet -- add one before submitting
+  license_file:
+    - LICENSE-MIT
+    - LICENSE-APACHE
   summary: A fast genomic k-mer counter with a zero-copy Arrow-backed Python binding
   description: |
-    FastDNA is a Rust genomic k-mer counter: it reads FASTQ (optionally
-    gzipped) files and counts canonical k-mers with quality filtering, in
-    parallel, on the CPUs you already have. It hands the result to Python
-    as a zero-copy Arrow table. Also provides MinHash-based sketching/
-    comparison (fastdna.sketch/compare/compare_all) and HyperLogLog
-    cardinality estimation (fastdna.estimate_cardinality). See the project
-    README for full benchmarks, the Python API reference, and stated
-    limitations (in particular: the whole counting table is held in RAM,
-    with no out-of-core path, unlike KMC3/FASTK).
-  doc_url: https://github.com/REPLACE_WITH_ORG/fastdna#readme
-  dev_url: https://github.com/REPLACE_WITH_ORG/fastdna
+    FastDNA is a Rust genomic k-mer counter. It reads FASTA and FASTQ
+    (optionally gzipped, from files, several files at once, or standard
+    input) and counts canonical k-mers with quality filtering, in
+    parallel, on the CPUs you already have, then hands the result to
+    Python as a zero-copy Arrow table.
+
+    Counting runs either wholly in memory or through a disk-partitioned
+    strategy that bounds peak RAM; a calibrated memory estimator chooses
+    between them against a `--max-ram` budget, and either can be forced.
+    Also provides MinHash sketching and comparison, HyperLogLog
+    cardinality estimation, quality-control reports, and frequency
+    spectra in both CSV and GenomeScope-compatible form.
+
+    The Python layer adds a scikit-learn compatible k-mer vectorizer,
+    lineage-aware cross-validation for population-structure-safe model
+    evaluation, genome profiling from the k-mer spectrum, containment-based
+    taxonomic classification, cohort embedding and assembly QC.
+
+    See the project README for benchmarks against KMC3 and FastK, the
+    Python API reference, and stated limitations.
+  doc_url: https://github.com/anzeledon/fastdna#readme
+  dev_url: https://github.com/anzeledon/fastdna
 
 extra:
   recipe-maintainers:
-    - REPLACE_WITH_GITHUB_USERNAME
+    - anzeledon
   # `identifiers:` intentionally omitted -- it would carry a Zenodo/paper
-  # DOI (e.g. `- doi:10.1038/...`), and this project has none yet. An
-  # empty entry parses as a null value and is worse than leaving the key
-  # out entirely; add the block back once a real DOI exists.
+  # DOI, and this project has none yet. An empty entry parses as null and
+  # is worse than leaving the key out; add the block back once a DOI exists.
