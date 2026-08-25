@@ -1,5 +1,6 @@
 // src/lib.rs
 
+pub mod adaptive_bins;
 pub mod atomic;
 pub mod binned;
 pub mod cli;

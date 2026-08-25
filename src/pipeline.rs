@@ -8,6 +8,7 @@ use std::thread;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::prelude::*;
 
+use crate::adaptive_bins::SignatureHistogram;
 use crate::binned::{BinStore, BinnedConfig};
 use crate::counter::KmerCounter;
 use crate::disk_spill::{self, ScratchDir, SpillWriter};
@@ -1026,6 +1027,22 @@ fn process_stream_parallel_disk<S: RecordSource>(
 /// building anything of its own.
 type BinnedWorkerOutcome = std::result::Result<QcSummary, String>;
 
+/// How many leading records of a `binned` run are read directly (not via
+/// the producer/worker pool) to build a data-adaptive bin map before the
+/// main pipeline starts -- the fix for the R3 bin-skew finding in
+/// `docs/design-minimizer-counting.md` (see `adaptive_bins.rs`). Sized as a
+/// compromise: large enough that a real amplicon panel's dominant,
+/// near-identical sequence is measured across many reads rather than
+/// guessed from one or two, small enough that this single-threaded warm-up
+/// pass -- run before any worker starts -- is not where a run's wall clock
+/// goes. Not calibrated by a sweep, the same honest caveat
+/// `DEFAULT_NUM_BINS` and `DEFAULT_CHUNK_BYTES` carry.
+///
+/// These records are never discarded: they are counted for real, through
+/// the very map they were sampled to build, immediately after it exists
+/// (see the warm-up block in `process_stream_parallel_binned`).
+const ADAPTIVE_SAMPLE_RECORDS: usize = 20_000;
+
 /// The minimizer-partitioned counting strategy
 /// (`docs/design-minimizer-counting.md`, and see `binned.rs` for the
 /// algorithm).
@@ -1047,30 +1064,98 @@ type BinnedWorkerOutcome = std::result::Result<QcSummary, String>;
 /// `config` must already be valid (`process_stream_parallel_with_policy`
 /// validates it before choosing a strategy).
 fn process_stream_parallel_binned<S: RecordSource>(
-    reader: S,
+    mut reader: S,
     config: PipelineConfig,
     source: &Path,
     progress: ProgressFn<'_>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(KmerCounter, QcSummary, u64)> {
-    let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(CHANNEL_DEPTH);
-    let (recycle_tx, recycle_rx): (Sender<RecordBatch>, Receiver<RecordBatch>) =
-        bounded(recycle_depth(config.num_threads));
-
     let k = config.k;
     let min_qual = config.min_quality;
     let qual_win = config.quality_window;
     let progress_interval = config.progress_interval;
     let hpc = config.hpc;
+    let binned_config = BinnedConfig::new(k).sanitized();
+
+    // Nothing downstream of the warm-up or the main pipeline reads
+    // `FastqRecord::id` (see `spawn_producer`'s doc comment for the
+    // grep-verified claim); set once, here, before either consumes a
+    // record, rather than only inside `spawn_producer`.
+    reader.set_keep_ids(false);
+
+    // 0. Warm-up: sample a bounded prefix directly off `reader`, before the
+    // producer/worker pool exists, and use it to build a data-adaptive bin
+    // map instead of the static hash-to-bin one -- the fix for the R3
+    // bin-skew finding (`adaptive_bins.rs`). The sampled records are read
+    // via the same `RecordSource` the producer would otherwise have read
+    // them from, so nothing is duplicated or skipped: the producer below
+    // simply continues from wherever this loop stopped.
+    //
+    // These sequences are counted for real a few lines down, through the
+    // very map they were sampled to build, so a run that happens to be
+    // entirely warm-up (an input smaller than `ADAPTIVE_SAMPLE_RECORDS`)
+    // still counts every record -- it just never reaches the producer.
+    let mut warmup_seqs: Vec<Vec<u8>> = Vec::new();
+    let mut warmup_qc = QcSummary::default();
+    let mut histogram = SignatureHistogram::new();
+    let mut hpc_buf: Vec<u8> = Vec::new();
+
+    for _ in 0..ADAPTIVE_SAMPLE_RECORDS {
+        let mut record = FastqRecord::default();
+        match reader.next_record_into(&mut record) {
+            Ok(true) => {
+                warmup_qc.observe_record(&record);
+                record.quality_trim_end(min_qual, qual_win);
+                let seq: Vec<u8> = if hpc {
+                    kmer::homopolymer_compress_into(&record.seq, &mut hpc_buf);
+                    hpc_buf.clone()
+                } else {
+                    record.seq
+                };
+                histogram.observe_sequence(&seq, k, binned_config.m);
+                warmup_seqs.push(seq);
+            }
+            Ok(false) => break,
+            Err(FastqReadError::Io(source_err)) => {
+                let (path, _) = failing_location(&reader, source, warmup_seqs.len() as u64);
+                return Err(FastDnaError::Io { path, source: source_err });
+            }
+            Err(FastqReadError::Malformed(reason)) => {
+                let (path, record) = failing_location(&reader, source, warmup_seqs.len() as u64);
+                return Err(FastDnaError::MalformedFastq { path, record, reason });
+            }
+        }
+    }
+
+    let bin_map = histogram.build_bin_map(binned_config.num_bins);
 
     // The one piece of shared state, and it is shared by design: worker 3's
     // and worker 5's super-k-mers for bin 17 are disjoint pieces of one
     // store rather than two private copies of the same summary. See
     // `binned.rs` for why that is what removes the `threads * occurrences`
     // term from the memory model.
-    let store = BinStore::new(BinnedConfig::new(k));
+    let store = BinStore::with_bin_map(binned_config, bin_map);
 
-    // 1. Producer thread -- the same one the other two strategies use.
+    // Counts the warm-up sample for real, through the adaptive map it was
+    // just used to build, before the main pipeline starts on the rest of
+    // the stream.
+    let mut warmup_occurrences: u64 = 0;
+    {
+        let mut warmup_writer = store.writer();
+        for seq in &warmup_seqs {
+            warmup_occurrences += warmup_writer.push_sequence(&store, seq) as u64;
+        }
+        warmup_writer.finish(&store);
+    }
+    let warmup_reads = warmup_seqs.len() as u64;
+    drop(warmup_seqs);
+
+    let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(CHANNEL_DEPTH);
+    let (recycle_tx, recycle_rx): (Sender<RecordBatch>, Receiver<RecordBatch>) =
+        bounded(recycle_depth(config.num_threads));
+
+    // 1. Producer thread -- the same one the other two strategies use. It
+    // continues reading `reader` exactly where the warm-up loop left off.
     let reader_handle = spawn_producer(
         reader,
         sender,
@@ -1080,12 +1165,13 @@ fn process_stream_parallel_binned<S: RecordSource>(
         cancel.clone(),
     );
 
-    let reads_seen = AtomicU64::new(0);
+    let reads_seen = AtomicU64::new(warmup_reads);
     // Counted exactly the way `KmerCounter::insert_batch` counts its own --
     // every instance handed over, before any per-key saturation -- so that
     // `total_kmers()` matches the other two strategies bit for bit and not
-    // merely the distinct-k-mer table.
-    let total_occurrences = AtomicU64::new(0);
+    // merely the distinct-k-mer table. Seeded with the warm-up's own
+    // occurrences for the same reason `reads_seen` is seeded above.
+    let total_occurrences = AtomicU64::new(warmup_occurrences);
 
     // 2. Parallel consumer pool.
     let results: Vec<BinnedWorkerOutcome> = (0..config.num_threads)
@@ -1172,12 +1258,17 @@ fn process_stream_parallel_binned<S: RecordSource>(
         })
         .collect();
 
-    let total_reads = reader_handle
-        .join()
-        .map_err(|_| FastDnaError::Internal { detail: "FASTQ reader thread panicked".to_string() })??;
+    let total_reads = warmup_reads
+        + reader_handle
+            .join()
+            .map_err(|_| FastDnaError::Internal { detail: "FASTQ reader thread panicked".to_string() })??;
 
     let mut worker_panic: Option<String> = None;
-    let mut master_qc = QcSummary::default();
+    // Starts from the warm-up's own QC rather than `QcSummary::default()`,
+    // so its reads are not silently missing from the totals a report
+    // shows. `merge` is a plain field-wise sum (`qc.rs`), so starting from
+    // any base and merging the rest in is equivalent to any other order.
+    let mut master_qc = warmup_qc;
     for outcome in results {
         match outcome {
             Ok(qc) => master_qc.merge(&qc),

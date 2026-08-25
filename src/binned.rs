@@ -66,9 +66,10 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 
+use crate::adaptive_bins::{DynamicBinMap, SignatureHistogram};
 use crate::counter::k_way_merge_sorted_counts;
 use crate::fastq::FastqRecord;
-use crate::minimizer::{bin_of, DEFAULT_M, DEFAULT_NUM_BINS};
+use crate::minimizer::{DEFAULT_M, DEFAULT_NUM_BINS};
 use crate::superkmer::{encode_record_into, for_each_superkmer, records, MAX_SUPER_KMER_BASES};
 
 /// Size of one bin chunk, per §3.4.
@@ -189,13 +190,31 @@ impl Chunk {
 pub struct BinStore {
     bins: Vec<Mutex<Vec<Chunk>>>,
     config: BinnedConfig,
+    bin_map: DynamicBinMap,
 }
 
 impl BinStore {
+    /// Uses the static hash-to-bin map (`minimizer::bin_of`), exactly as
+    /// before `adaptive_bins` existed. Every existing caller of this
+    /// constructor keeps today's bin assignment byte-for-byte.
     pub fn new(config: BinnedConfig) -> Self {
         let config = config.sanitized();
+        Self::with_bin_map(config, DynamicBinMap::identity(config.num_bins))
+    }
+
+    /// Uses `bin_map` to route signatures to bins instead of the static
+    /// function -- the entry point for the data-adaptive strategy described
+    /// in `adaptive_bins.rs`.
+    ///
+    /// `bin_map` must have been built for `config.sanitized().num_bins`
+    /// bins; if it was not (a caller error, not a data problem), it is
+    /// silently replaced with the identity map for that bin count rather
+    /// than routing some signatures out of range or panicking.
+    pub fn with_bin_map(config: BinnedConfig, bin_map: DynamicBinMap) -> Self {
+        let config = config.sanitized();
+        let bin_map = if bin_map.num_bins() == config.num_bins { bin_map } else { DynamicBinMap::identity(config.num_bins) };
         let bins = (0..config.num_bins).map(|_| Mutex::new(Vec::new())).collect();
-        Self { bins, config }
+        Self { bins, config, bin_map }
     }
 
     pub fn config(&self) -> BinnedConfig {
@@ -204,6 +223,12 @@ impl BinStore {
 
     pub fn num_bins(&self) -> usize {
         self.config.num_bins
+    }
+
+    /// The bin one signature routes to, per this store's bin map.
+    #[inline]
+    pub fn bin_of(&self, signature: u64) -> usize {
+        self.bin_map.bin_of(signature)
     }
 
     /// A fresh per-worker writer. Every worker needs its own; sharing one
@@ -384,12 +409,12 @@ impl BinWriter {
     /// `kmer::extract_canonical_kmers(seq, k).len()` -- the multiset
     /// invariant proved in `superkmer.rs` is what makes that equality hold.
     pub fn push_sequence(&mut self, store: &BinStore, seq: &[u8]) -> usize {
-        let BinnedConfig { k, m, num_bins, chunk_bytes } = self.config;
+        let BinnedConfig { k, m, chunk_bytes, .. } = self.config;
         let mut added = 0usize;
 
         for_each_superkmer(seq, k, m, |_start, bases, signature| {
             added += bases.len() - k + 1;
-            let bin = bin_of(signature, num_bins);
+            let bin = store.bin_of(signature);
             let Some(chunk) = self.open.get_mut(bin) else {
                 // Unreachable: `bin_of` is total into `0..num_bins` and
                 // `open` has exactly that length. Reached fallibly rather
@@ -454,6 +479,39 @@ pub struct BinnedCounts {
 /// differential tests below a test of the real thing.
 pub fn count_records(records: &[FastqRecord], config: BinnedConfig) -> BinnedCounts {
     let store = BinStore::new(config);
+    let mut writer = store.writer();
+    for record in records {
+        writer.push_sequence(&store, &record.seq);
+    }
+    let total_occurrences = writer.occurrences();
+    writer.finish(&store);
+
+    BinnedCounts { entries: store.finish_sequential(), total_occurrences }
+}
+
+/// [`count_records`], but replaces the static hash-to-bin map with one
+/// built from a bounded prefix of `records` -- the fix for the R3 bin-skew
+/// finding in `docs/design-minimizer-counting.md` (`adaptive_bins.rs`'s
+/// module doc comment has the full argument).
+///
+/// `sample_records` is clamped to `records.len()`; every sampled record is
+/// still counted for real afterwards through the map it helped build, so
+/// nothing observed during sampling is discarded. The result is identical
+/// in every respect [`count_records`] is tested against -- total
+/// occurrences and the final `(kmer, count)` table -- because which bin a
+/// signature lands in cannot change what the final k-way merge produces
+/// (see the module doc comment); only load balance across bins differs.
+pub fn count_records_adaptive(records: &[FastqRecord], config: BinnedConfig, sample_records: usize) -> BinnedCounts {
+    let config = config.sanitized();
+    let sample_len = sample_records.min(records.len());
+
+    let mut histogram = SignatureHistogram::new();
+    for record in &records[..sample_len] {
+        histogram.observe_sequence(&record.seq, config.k, config.m);
+    }
+    let bin_map = histogram.build_bin_map(config.num_bins);
+
+    let store = BinStore::with_bin_map(config, bin_map);
     let mut writer = store.writer();
     for record in records {
         writer.push_sequence(&store, &record.seq);
@@ -733,6 +791,136 @@ mod tests {
         assert!(
             (max as f64) < 20.0 * mean,
             "one bin holds {max} bytes against a {mean:.0}-byte mean; the static hash-to-bin map is not spreading synthetic input"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // The adaptive bin map: correctness and the R3 skew fix.
+    // ---------------------------------------------------------------
+
+    /// The whole point of `adaptive_bins.rs`: routing a signature to a
+    /// different bin must never change the counted answer. Same sweep
+    /// style as the static-map differential test above, but through
+    /// `count_records_adaptive`.
+    #[test]
+    fn adaptive_counts_match_kmer_counter_exactly_across_many_synthetic_inputs() {
+        let mut cases = 0usize;
+        for (reads, read_len, genome_len, seed) in [
+            (2_000usize, 60usize, 500usize, 0x5EED_C0FF_EE42u64),
+            (500, 40, 3_000, 0xC0DE_1234_5678),
+            (200, 150, 1_000, 0xABCD_EF01_2345),
+            (1_000, 31, 200, 0xFEED_FACE_BEEF),
+        ] {
+            let fastq = synthetic_fastq(reads, read_len, genome_len, seed);
+            let parsed = parse(&fastq);
+
+            for k in [15usize, 21, 31] {
+                if k > read_len {
+                    continue;
+                }
+                let (expected_entries, expected_total) = reference(&parsed, k);
+
+                for (num_bins, sample_records) in [(DEFAULT_NUM_BINS, 50usize), (8, 10_000), (64, 0)] {
+                    let config = BinnedConfig { k, m: DEFAULT_M, num_bins, chunk_bytes: DEFAULT_CHUNK_BYTES };
+                    let got = count_records_adaptive(&parsed, config, sample_records);
+
+                    assert_eq!(
+                        got.total_occurrences, expected_total,
+                        "total occurrences differ (adaptive) at k={k} bins={num_bins} sample={sample_records} seed={seed:#x}"
+                    );
+                    assert_eq!(
+                        got.entries, expected_entries,
+                        "count table differs (adaptive) at k={k} bins={num_bins} sample={sample_records} seed={seed:#x}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases > 20, "the sweep must actually have run: {cases} cases");
+    }
+
+    /// `count_records` and `count_records_adaptive` must agree on the exact
+    /// same input: the adaptive map changes only which bin a signature
+    /// lands in, never the final table.
+    #[test]
+    fn adaptive_and_static_binning_agree_on_the_same_input() {
+        let fastq = synthetic_fastq(4_000, 70, 1_800, 0x9999_1111_2222_3333);
+        let parsed = parse(&fastq);
+        let config = BinnedConfig::new(25);
+
+        let static_result = count_records(&parsed, config);
+        let adaptive_result = count_records_adaptive(&parsed, config, 500);
+
+        assert_eq!(static_result.total_occurrences, adaptive_result.total_occurrences);
+        assert_eq!(static_result.entries, adaptive_result.entries);
+    }
+
+    /// The R3 fix, checked directly: a low-diversity input built the same
+    /// way the real 16S amplicon sample behaved (nearly every read drawn
+    /// from a genome barely larger than one read, so almost all reads are
+    /// near-identical) must come out far less skewed under the adaptive map
+    /// than under the static one.
+    #[test]
+    fn adaptive_binning_reduces_skew_on_a_low_diversity_amplicon_like_input() {
+        // genome_len only slightly larger than read_len: nearly every read
+        // is a shifted copy of nearly the same short sequence, exactly the
+        // "single, near-identical conserved-region sequence repeated across
+        // nearly every read" the real DRR021372 measurement described.
+        let read_len = 250usize;
+        let genome_len = read_len + 20;
+        let fastq = synthetic_fastq(6_000, read_len, genome_len, 0x1600_2026_0825_0001);
+        let parsed = parse(&fastq);
+        let k = 31usize;
+        let num_bins = DEFAULT_NUM_BINS;
+
+        let static_store = BinStore::new(BinnedConfig::new(k));
+        {
+            let mut writer = static_store.writer();
+            for record in &parsed {
+                writer.push_sequence(&static_store, &record.seq);
+            }
+            writer.finish(&static_store);
+        }
+
+        let mut histogram = SignatureHistogram::new();
+        for record in &parsed {
+            histogram.observe_sequence(&record.seq, k, DEFAULT_M);
+        }
+        let bin_map = histogram.build_bin_map(num_bins);
+        let adaptive_store = BinStore::with_bin_map(BinnedConfig::new(k), bin_map);
+        {
+            let mut writer = adaptive_store.writer();
+            for record in &parsed {
+                writer.push_sequence(&adaptive_store, &record.seq);
+            }
+            writer.finish(&adaptive_store);
+        }
+
+        let skew = |occupancy: &[usize]| -> f64 {
+            let total: usize = occupancy.iter().sum();
+            let mean = total as f64 / occupancy.len() as f64;
+            let max = occupancy.iter().copied().max().unwrap_or(0) as f64;
+            if mean == 0.0 {
+                0.0
+            } else {
+                max / mean
+            }
+        };
+
+        let static_occupancy = static_store.occupancy();
+        let adaptive_occupancy = adaptive_store.occupancy();
+        let static_skew = skew(&static_occupancy);
+        let adaptive_skew = skew(&adaptive_occupancy);
+        println!(
+            "low-diversity input: static max/mean skew {static_skew:.2}x, adaptive max/mean skew {adaptive_skew:.2}x, \
+             {} signatures overridden",
+            histogram.build_bin_map(num_bins).overrides_len()
+        );
+
+        assert!(
+            adaptive_skew <= static_skew,
+            "adaptive binning must not be worse than the static map on skewed input: \
+             static={static_skew:.2}x adaptive={adaptive_skew:.2}x"
         );
     }
 

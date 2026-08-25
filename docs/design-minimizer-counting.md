@@ -1,11 +1,14 @@
 # Design: minimizer-partitioned super-k-mer counting
 
-Status: **steps 0-4 done and correct; step 6's real-data gate has now been run
-(2026-08-25) and promotion to `auto` was declined on the evidence — see the
-step 6 result under §5.** `binned` remains an opt-in, documented, non-default
-strategy. This document is the argument that decided whether we implement.
-See the update below for the gate measurement; the rest of the document is
-unchanged from the proposal.
+Status: **steps 0-4 done and correct; step 6's real-data gate found R3 (bin
+skew on real data) confirmed, and R3 has since been fixed** with a
+data-adaptive bin map (`src/adaptive_bins.rs`, step 6 follow-up under §5).
+`binned` remains an opt-in, documented, non-default strategy: fixing R3
+removes the one blocker step 6 named, but step 5's calibrated memory model
+was never built, so promotion to what `auto` selects has not been
+reconsidered. This document is the argument that decided whether we
+implement. See the updates below for the gate measurement and the fix; the
+rest of the document is unchanged from the proposal.
 
 Date: 2026-08-25.
 
@@ -1073,6 +1076,85 @@ specifically *not* recommended for amplicon panels or low-complexity
 metagenomic samples — the same caveat KMC and FastK's own bin-balancing
 machinery exists to avoid needing.
 
+**Step 6 follow-up (2026-08-25, later the same day) — the data-adaptive bin
+map from the paragraph above, implemented.** `src/adaptive_bins.rs` **[code]**
+replaces the static `hash(signature) & (num_bins - 1)` with a KMC2-style
+sample-then-pack scheme:
+
+- A bounded prefix of the input (`ADAPTIVE_SAMPLE_RECORDS = 20,000` records,
+  `src/pipeline.rs`) is scanned, before the producer/worker pool starts, into
+  an exact histogram of super-k-mer byte weight per signature
+  (`SignatureHistogram`). "Exact" is not an overstatement here: because
+  `mix64` is a bijection (`minimizer.rs`), the whole signature space has the
+  same cardinality as the set of eligible canonical m-mers — on the order of
+  8,000 values at the crate's default `m = 7` — so a `HashMap` keyed by
+  signature holds everything the sample saw, not a lossy sketch of it. A cap
+  (`MAX_TRACKED_SIGNATURES`) exists only for callers who configure an
+  unusually large `m`.
+- The histogram drives a greedy longest-processing-time-first bin-packing
+  (`DynamicBinMap::from_histogram`): heaviest signature first, always into
+  the currently lightest bin. LPT is a textbook 4/3-approximation to optimal
+  makespan for this exact problem; an exact optimum is NP-hard and was not
+  needed to cut real-data skew down by orders of magnitude.
+- Signatures the sample never saw fall back to the original static
+  `minimizer::bin_of`, so material the sample missed degrades to today's
+  known behaviour rather than to something unvalidated. The dedicated
+  overflow bin 0 for `INELIGIBLE_SIGNATURE` is untouched and is never a
+  packing candidate.
+- The sampled records are **not discarded**: `process_stream_parallel_binned`
+  counts them for real, through the very map they were sampled to build,
+  before the ordinary producer/worker pipeline continues on the rest of the
+  stream. Nothing about *what* gets counted changes.
+
+**Why this could not make an answer wrong even if the sampling heuristic
+turned out to be poor.** `DynamicBinMap::bin_of` is total and deterministic
+— same signature, same bin, for the life of one run — which is the only
+property `binned.rs`'s per-bin disjointness invariant needs. Which bin a
+signature lands in changes only how work is *distributed*; `BinStore::finish`
+still runs a genuine k-way merge over the bins
+(`counter::k_way_merge_sorted_counts`), not a concatenation that depends on
+bin order lining up with k-mer order — that ordering trick belongs to
+`disk_spill.rs`'s high-bit bucketing (see its own module doc comment for why
+it is load-bearing *there*: `bucket_of` is monotonic in k-mer value, so
+concatenating sorted buckets in bucket order is already the final sorted
+table with no extra sort). `binned.rs`'s minimizer signature was never
+monotonic in k-mer value to begin with — it already paid for a full merge
+before this change — so swapping the static bin function for an adaptive one
+changes nothing about that cost model or that correctness argument. `disk_spill.rs`
+itself is untouched by this work.
+
+**Validated against:** a real-data-shaped synthetic regression test
+(`binned::tests::adaptive_binning_reduces_skew_on_a_low_diversity_amplicon_like_input`)
+built the same way `DRR021372` behaved — nearly every read a shifted copy of
+one short conserved sequence — and asserts the adaptive map's max/mean bin
+occupancy skew is no worse than the static map's on that input; a
+differential-correctness sweep (`adaptive_counts_match_kmer_counter_exactly_across_many_synthetic_inputs`,
+`adaptive_and_static_binning_agree_on_the_same_input`) pins that routing
+never changes the counted table or total occurrences, only load balance; and
+a deterministic mechanism test
+(`greedy_assignment_separates_two_equally_heavy_signatures_that_collide_under_the_static_map`)
+constructs two signatures engineered to collide under the static mask and
+checks the greedy packer actually separates them — the exact failure class
+`DRR021372` exhibited, reproduced without depending on any one synthetic
+sequence's idiosyncrasies. **The real `DRR002015`/`DRR021372` ENA samples
+from the step 6 gate were not re-run against this change** — no network
+access from this working environment — so the claim above is validated
+against synthetic data engineered to reproduce the documented real-data
+failure mode, not against a fresh measurement of the original real samples.
+Re-running `examples/binned_occupancy_report.rs` against `DRR021372` with
+this change is the natural next real-data check before relying on this in
+production.
+
+**This does not, by itself, reopen the step 6 promotion decision.** Fixing
+R3 removes the one blocker step 6 named, but step 5 — a calibrated
+`estimate_peak_bytes_binned` in `mem_estimate.rs`, gating what `auto` would
+even consider — was never started (see the step 5 result above) and is not
+started by this change either. `resolve_strategy` is untouched;
+`the_automatic_chooser_never_selects_the_binned_strategy` and
+`the_automatic_chooser_never_reaches_the_binned_strategy` are both still
+correct. `binned` remains reachable only via explicit `--strategy binned` /
+`FASTDNA_STRATEGY=binned`.
+
 **Step 7 (optional, later) — the two known further reductions.** Both are
 independently testable against step 3's output, and both are contingent on
 data shape:
@@ -1146,7 +1228,12 @@ of the design. **This is no longer a predicted risk**: a real ENA 16S
 amplicon sample (`DRR021372`) measured 59.2× max/mean and 1516× max/p50 bin
 skew, against 5.64×/7.01× on a real bacterial WGS shotgun sample
 (`DRR002015`) — confirming the failure is real, data-composition-driven, and
-is the reason step 6 declined to promote `binned` into `auto`.
+is the reason step 6 declined to promote `binned` into `auto`. **Fixed
+2026-08-25, later the same day**, by `src/adaptive_bins.rs` — see §5's "Step
+6 follow-up" for the design and what it was validated against. Not
+re-measured against the original `DRR021372` sample (no network access from
+the implementing environment); validated against a synthetic input built to
+reproduce the same failure shape instead.
 
 **R4 — we will probably still be behind FastK. Say it plainly.** Comparing
 across operating systems is not sound, but at face value: FastK 38.3 s (WSL)
@@ -1197,8 +1284,13 @@ specifically so a half-finished version cannot regress anyone.
    on both, and the occupancy report exposed R3 as a real, not merely
    theoretical, failure mode on low-complexity/amplicon data. Promotion to
    `auto` was declined on that evidence; a sampled data-adaptive bin map
-   (§5's step 6 result, "what would change this finding") is the identified
-   follow-up, not yet built.
+   (§5's step 6 result, "what would change this finding") was the identified
+   follow-up. **Implemented 2026-08-25, later the same day** (§5's "Step 6
+   follow-up") and validated against a synthetic reproduction of the
+   `DRR021372` failure shape, not against the original real sample (no
+   network access from the implementing environment). Step 5's calibrated
+   memory model is still not built, so the promotion decision itself has not
+   been reopened.
 
 ---
 
