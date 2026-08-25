@@ -30,7 +30,8 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, StringBuilder, UInt32Builder, UInt64Builder};
+use arrow::array::{ArrayRef, StringArray, UInt32Array, UInt64Array};
+use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use flate2::read::MultiGzDecoder;
@@ -92,41 +93,105 @@ impl From<FastDnaError> for PyErr {
     }
 }
 
+/// Wraps an Arrow failure from `build_record_batch`. Mirrors
+/// `export.rs::export_err`, but the "path" is a placeholder: nothing here
+/// touches a disk, and `FastDnaError::Export` maps to `RuntimeError` on the
+/// Python side either way.
+fn in_memory_export_err<E: std::fmt::Display>(err: E) -> FastDnaError {
+    FastDnaError::Export {
+        path: PathBuf::from("<in-memory Arrow table>"),
+        reason: err.to_string(),
+    }
+}
+
 /// Builds the single in-memory Arrow `RecordBatch` backing `KmerCounts.table`,
 /// using the exact schema `export.rs` writes to Parquet with (§9.2 of the
 /// design doc: the in-memory table and the Parquet files must have identical
 /// columns).
 ///
-/// Builds directly into Arrow's own builders rather than collecting into
-/// intermediate `Vec<u64>`/`Vec<String>`/`Vec<u32>` first: at a realistic
-/// count of distinct k-mers, retaining a second full copy of every decoded
-/// k-mer string just to hand it to `StringArray::from_iter_values` a moment
-/// later is measurable transient memory for no benefit.
+/// Assembles Arrow's own storage layout directly -- a `u64` values buffer, a
+/// `u32` values buffer, and one contiguous value buffer plus an `i32` offsets
+/// buffer for the sequence column -- and hands each `Vec` over by move
+/// (`UInt64Array::from(Vec)` and `Buffer::from_vec` adopt the allocation
+/// rather than copying it). This is the same treatment `export.rs` applies to
+/// its Parquet chunks, and for the same reason: on the benchmark file this
+/// table is 53,776,394 rows, so every per-row cost is paid 53.8 million times.
+///
+/// Against the previous `StringBuilder` version, per row:
+///
+/// 1. one heap allocation for the `String` `decode_kmer` returns -- gone; the
+///    bases are written straight into the value buffer by `decode_kmer_into`,
+/// 2. one `String::from_utf8` scan of `k` bytes that cannot fail (every byte
+///    comes from the `b"ACGT"` literal) -- gone; what remains is a single
+///    `std::str::from_utf8` over the whole buffer inside `StringArray::
+///    try_new`, the same bytes scanned once contiguously instead of in 53.8
+///    million separate calls, plus one `is_char_boundary` per row (a load and
+///    a compare) against the allocate/free pair it replaces,
+/// 3. one `memcpy` of those `k` bytes from the `String` into the builder's
+///    value buffer -- gone; the bases are written once instead of twice
+///    (~1.67 GB not copied at benchmark scale),
+/// 4. one `free` when the `String` is dropped -- gone,
+/// 5. for each of the three columns, one `NullBufferBuilder::append_non_null`
+///    -- an `Option` check plus a counter increment that can never produce a
+///    null here, since no column is nullable -- gone; `Vec::push` does the
+///    capacity check alone. 3 x 53.8 million branches removed.
+///
+/// The `i32` offset cast is proved sound once per call rather than checked
+/// once per row (which is what `StringBuilder`'s internal `expect("offset
+/// overflow")` does): each row contributes exactly `k` bytes, so `n * k` is
+/// the exact final buffer length and bounding it up front bounds every
+/// intermediate offset. That also turns an unwind at the FFI boundary into an
+/// ordinary `Export` error.
 fn build_record_batch(counter: &KmerCounter, k: usize) -> Result<RecordBatch, FastDnaError> {
     let schema = export::counts_schema();
-    let n = counter.distinct_kmers();
 
-    let mut u64_builder = UInt64Builder::with_capacity(n);
-    // `k + 1` is a rough per-string byte estimate (the alphabet is ASCII,
-    // so bytes == characters); a data-capacity hint that undershoots costs
-    // reallocations, not correctness, so it does not need to be exact.
-    let mut seq_builder = StringBuilder::with_capacity(n, n * (k + 1));
-    let mut freq_builder = UInt32Builder::with_capacity(n);
+    // One lock acquisition on the counter rather than two: `Iter` reports its
+    // own exact remaining length, so the row count comes from the same guard
+    // that is about to be iterated, instead of a separate `distinct_kmers()`
+    // call that locks, re-runs `finalize_inner`'s validity check and unlocks
+    // again. It is exact rather than a hint, which is what lets every buffer
+    // below be sized once and never regrow.
+    let rows = counter.iter();
+    let n = rows.size_hint().0;
 
-    for (kmer_bits, count) in counter.iter() {
-        u64_builder.append_value(kmer_bits);
-        seq_builder.append_value(kmer::decode_kmer(kmer_bits, k));
-        freq_builder.append_value(count);
+    // Exact, not an estimate: `decode_kmer_into` appends exactly `k` bytes per
+    // k-mer. `checked_mul` because `usize` is 32 bits on some wheel targets;
+    // the `i32::MAX` bound is Arrow's, for the offsets of a `Utf8` column.
+    let total_seq_bytes = n
+        .checked_mul(k)
+        .filter(|&bytes| bytes <= i32::MAX as usize)
+        .ok_or_else(|| {
+            in_memory_export_err(format!(
+                "{n} k-mers of {k} bases exceed the {} byte limit of an Arrow Utf8 column",
+                i32::MAX
+            ))
+        })?;
+
+    let mut kmers: Vec<u64> = Vec::with_capacity(n);
+    let mut seq_bytes: Vec<u8> = Vec::with_capacity(total_seq_bytes);
+    // An offsets buffer has one more entry than it has values: the leading 0
+    // that opens the first string.
+    let mut seq_offsets: Vec<i32> = Vec::with_capacity(n + 1);
+    seq_offsets.push(0);
+    let mut freqs: Vec<u32> = Vec::with_capacity(n);
+
+    for (kmer_bits, count) in rows {
+        kmers.push(kmer_bits);
+        kmer::decode_kmer_into(kmer_bits, k, &mut seq_bytes);
+        // Bounded by `total_seq_bytes <= i32::MAX` above, so this cast is
+        // value-preserving for every row.
+        seq_offsets.push(seq_bytes.len() as i32);
+        freqs.push(count);
     }
 
-    let u64_arr: ArrayRef = Arc::new(u64_builder.finish());
-    let seq_arr: ArrayRef = Arc::new(seq_builder.finish());
-    let freq_arr: ArrayRef = Arc::new(freq_builder.finish());
+    let u64_arr: ArrayRef = Arc::new(UInt64Array::from(kmers));
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(seq_offsets));
+    let seq_arr: ArrayRef = Arc::new(
+        StringArray::try_new(offsets, Buffer::from_vec(seq_bytes), None).map_err(in_memory_export_err)?,
+    );
+    let freq_arr: ArrayRef = Arc::new(UInt32Array::from(freqs));
 
-    RecordBatch::try_new(schema, vec![u64_arr, seq_arr, freq_arr]).map_err(|e| FastDnaError::Export {
-        path: PathBuf::from("<in-memory Arrow table>"),
-        reason: e.to_string(),
-    })
+    RecordBatch::try_new(schema, vec![u64_arr, seq_arr, freq_arr]).map_err(in_memory_export_err)
 }
 
 /// The Python-visible result of `count()`. Holds the counter and QC summary
@@ -343,16 +408,24 @@ fn count(
     let path_buf = PathBuf::from(path);
     let reader = open_fastq_reader(&path_buf)?;
 
-    let num_threads = threads.unwrap_or_else(|| PipelineConfig::default().num_threads);
-    let progress_interval = progress_interval.unwrap_or_else(|| PipelineConfig::default().progress_interval);
+    // Built once and read four times. `PipelineConfig::default()` is not a
+    // constant: its `num_threads` calls `std::thread::available_parallelism`,
+    // which is a syscall on Windows and a cgroup-quota file read on Linux, so
+    // the previous four separate `default()` calls per `count()` did that work
+    // four times over to answer the same question. Scalar field reads below do
+    // not move it, so it is still whole for the `..defaults` fill-in.
+    let defaults = PipelineConfig::default();
+
+    let num_threads = threads.unwrap_or(defaults.num_threads);
+    let progress_interval = progress_interval.unwrap_or(defaults.progress_interval);
     // Batches are the unit progress is accounted in (pipeline.rs emits at
     // most once per batch received, on interval crossing), so a batch far
     // larger than `progress_interval` would silently coarsen progress no
     // matter how small the caller asks for it. Capped at the core's own
     // default batch size so the common case (no explicit interval) is
     // unaffected.
-    let batch_size = (progress_interval as usize).clamp(1, PipelineConfig::default().batch_size);
-    let config = PipelineConfig { k, min_quality, num_threads, batch_size, progress_interval, ..PipelineConfig::default() };
+    let batch_size = (progress_interval as usize).clamp(1, defaults.batch_size);
+    let config = PipelineConfig { k, min_quality, num_threads, batch_size, progress_interval, ..defaults };
 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_worker = cancel.clone();
