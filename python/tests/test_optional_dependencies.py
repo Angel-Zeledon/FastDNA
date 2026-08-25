@@ -2,7 +2,7 @@
 with *none* of the optional packages installed.
 
 Every module added in the recent batch (`sklearn`, `interpret`, `anomaly`,
-`embed`, `multiomics`, `interop`) declares its heavy dependencies as
+`embed`, `multiomics`, `interop`, `cv`) declares its heavy dependencies as
 test-extra / opt-in rather than runtime. `pyproject.toml`'s
 `project.dependencies` is exactly `["pyarrow>=14"]`, so a plain
 `pip install fastdna` gets pyarrow and nothing else -- which is also what
@@ -199,16 +199,24 @@ def test_pure_python_submodules_import_with_no_optional_packages():
         assert status == "ok", f"{name} failed to import without optional packages: {status}"
 
 
-def test_module_level_numpy_dependency_is_confined_to_three_modules():
+def test_module_level_numpy_dependency_is_confined_to_the_numpy_native_modules():
     """Characterisation test, not an endorsement: `fastdna.embed`,
-    `fastdna.anomaly` and `fastdna.sklearn` hard-import numpy at module
-    scope, so `from fastdna.embed import embed_cohort` raises on a bare
-    install even though `embed.py`'s docstring advertises that its
+    `fastdna.anomaly`, `fastdna.sklearn` and `fastdna.cv` hard-import numpy
+    at module scope, so `from fastdna.embed import embed_cohort` raises on a
+    bare install even though `embed.py`'s docstring advertises that its
     dependencies are lazily imported.
 
-    Pinned here so that if anyone *fixes* that (by deferring numpy) or
-    *worsens* it (by adding numpy to a fourth module), this test says so
-    rather than the fact going unnoticed.
+    All four are modules whose *entire* surface is numeric -- there is no
+    useful call in any of them that does not already produce or consume a
+    numpy array -- so deferring the import would buy an importable module
+    with no callable function. The heavier dependencies each of them layers
+    on top (scikit-learn, scipy, umap-learn) *are* lazily imported, and the
+    tests below check that those raise actionable errors naming the missing
+    package.
+
+    Pinned here so that if anyone *fixes* this (by deferring numpy) or
+    *worsens* it (by adding numpy to a module that does not need it), this
+    test says so rather than the fact going unnoticed.
     """
     result = _run_without(
         _OPTIONAL_PACKAGES,
@@ -217,7 +225,7 @@ def test_module_level_numpy_dependency_is_confined_to_three_modules():
         import importlib
 
         failing = []
-        for name in ("fastdna.embed", "fastdna.anomaly", "fastdna.sklearn"):
+        for name in ("fastdna.embed", "fastdna.anomaly", "fastdna.sklearn", "fastdna.cv"):
             try:
                 importlib.import_module(name)
             except ImportError:
@@ -225,7 +233,7 @@ def test_module_level_numpy_dependency_is_confined_to_three_modules():
         print(json.dumps(failing))
         """,
     )
-    assert result == ["fastdna.embed", "fastdna.anomaly", "fastdna.sklearn"]
+    assert result == ["fastdna.embed", "fastdna.anomaly", "fastdna.sklearn", "fastdna.cv"]
 
 
 def test_embed_names_its_missing_optional_package_actionably():
@@ -253,6 +261,63 @@ def test_embed_names_its_missing_optional_package_actionably():
     assert "umap-learn" in result["umap"] and "pip install" in result["umap"]
     assert "scikit-learn" in result["tsne"] and "pip install" in result["tsne"]
     assert "scikit-learn" in result["pcoa"] and "pip install" in result["pcoa"]
+
+
+def test_cv_names_its_missing_optional_packages_actionably():
+    """`fastdna.cv` layers scipy (single-linkage clustering) and
+    scikit-learn (GroupKFold, clone) on top of numpy. Both are imported
+    lazily inside the functions that need them, so each must name its own
+    package and install command rather than surfacing a raw
+    `ModuleNotFoundError` from inside scipy/sklearn.
+
+    Neither call below reads a FASTQ file: `lineage_groups` reaches its
+    scipy import before any sketching, and `LineageKFold(groups=...)` never
+    sketches at all -- so this stays a pure dependency-posture test.
+    """
+    result = _run_without(
+        ("scipy", "sklearn", "shap", "umap", "numba", "llvmlite"),
+        """
+        import json
+        from fastdna import cv
+
+        messages = {}
+        try:
+            cv.lineage_groups(["a.fastq", "b.fastq"])
+        except ImportError as exc:
+            messages["scipy"] = str(exc)
+        try:
+            list(cv.LineageKFold(n_splits=2, groups=[0, 0, 1, 1]).split([0, 1, 2, 3]))
+        except ImportError as exc:
+            messages["sklearn"] = str(exc)
+        print(json.dumps(messages))
+        """,
+    )
+    assert "scipy" in result["scipy"] and "pip install" in result["scipy"]
+    assert "scikit-learn" in result["sklearn"] and "pip install" in result["sklearn"]
+
+
+def test_anomaly_names_scikit_learn_actionably_for_the_isolation_forest_path():
+    """`fastdna.anomaly`'s default `method="robust_zscore"` needs nothing
+    beyond numpy; only `flag_cohort(..., method="isolation_forest")` reaches
+    for scikit-learn, and it must say so by name. The import is attempted
+    before any sketching, so the nonexistent paths below never get read.
+    """
+    result = _run_without(
+        ("sklearn", "shap", "umap", "numba", "llvmlite"),
+        """
+        import json
+        from fastdna.anomaly import _isolation_forest
+
+        try:
+            _isolation_forest({})
+            message = None
+        except ImportError as exc:
+            message = str(exc)
+        print(json.dumps({"message": message}))
+        """,
+    )
+    assert result["message"] is not None
+    assert "scikit-learn" in result["message"] and "pip install" in result["message"]
 
 
 def test_interpret_names_shap_actionably_when_it_is_missing():

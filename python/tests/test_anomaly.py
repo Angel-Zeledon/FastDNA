@@ -1,26 +1,28 @@
-"""Tests for fastdna.anomaly.GenomicAnomalyDetector -- unsupervised
-outlier detection over a cohort's genomic profiles, built on
-fastdna.sketch()/Sketch.mash_distance().
+"""Tests for fastdna.anomaly.CohortOutlierFlagger -- within-cohort QC
+outlier flagging over MinHash-sketch profiles, built on fastdna.sketch()
+/ Sketch.mash_distance().
 
-**Module status: `fastdna/anomaly.py` has been reverted, not fixed.**
-A post-merge audit found that its shipped implementation still had every
-defect its own module docstring described as solved:
-`method="isolation_forest"` remained reachable and documented while
-scoring a wholly different organism as *more* normal than every baseline
-sample it was fitted on; the default `OneClassSVM` used sklearn's
-`nu=0.5` and flagged 4 of 8 known-good baseline samples as outliers; and
-`score_samples` saturated to exactly `0.0` past a short radius (RBF
-`gamma="scale"` over a near-zero-variance distance feature), making it
-unable to rank severity at all. The module was removed rather than
-patched -- see the fix commit for `fastdna/anomaly.py`'s removal.
+**History (read before changing the framing of this file).** An earlier
+`fastdna/anomaly.py` shipped a `GenomicAnomalyDetector` sold as
+"emerging-pathogen surveillance". A post-merge audit found that framing
+had no literature support *and* that the implementation had every defect
+its own docstring claimed to have solved: a reachable, documented
+`method="isolation_forest"` that scored a wholly different organism as
+*more* normal than the baseline it was fitted on; a default
+`OneClassSVM(nu=0.5)` that flagged 4 of 8 known-good baseline samples;
+and a `score_samples` that saturated to exactly `0.0` past a short
+radius, so it could not rank severity at all. The module was deleted in
+commit c8870e3 rather than patched, and this file was left module-skipped
+as the specification for a replacement.
 
-The tests below are kept, unskipped in spirit and un-deleted, precisely
-because they specify what a correct implementation must do: they are the
-starting point for rebuilding this module, not dead weight. Since the
-module they exercise no longer exists, the whole file is skipped at
-collection time so the suite stays green rather than erroring on a
-`from fastdna.anomaly import ...` that can never succeed -- re-enable this
-file (delete the skip below) as part of implementing a real replacement.
+This is that replacement, re-scoped to the question the mechanics can
+actually answer: *within-cohort QC outlier flagging* -- given a cohort
+that is supposed to be homogeneous, which member does not look like the
+rest (a swapped sample, a contamination suspect, a failed prep)? The
+tests below keep the original file's contract wherever it still holds
+(fit/predict/score_samples semantics, batch-independence, feature-space
+consistency, "don't flag your own known-good cohort") and replace the
+parts that only made sense under the surveillance framing.
 """
 from __future__ import annotations
 
@@ -33,17 +35,9 @@ pytest.importorskip("sklearn")
 
 np = pytest.importorskip("numpy")
 
-pytest.skip(
-    "fastdna.anomaly was reverted (not fixed) after a post-merge audit found "
-    "IsolationForest, the default OneClassSVM nu=0.5, and score_samples all "
-    "unusable for this feature representation -- see fastdna/anomaly.py's "
-    "removal. These tests specify the contract a correct replacement must "
-    "satisfy and are the starting point for rebuilding it; unskip once that "
-    "module exists again.",
-    allow_module_level=True,
-)
+import pyarrow as pa
 
-from fastdna.anomaly import GenomicAnomalyDetector
+from fastdna.anomaly import CohortOutlierFlagger, flag_cohort
 
 
 def write_fastq(tmp_path: pathlib.Path, name: str, reads: list[str]) -> pathlib.Path:
@@ -73,20 +67,21 @@ def _reads_from(reference: str, n_reads: int, read_len: int, mutation_rate: floa
     return reads
 
 
-# A fixed "organism" reference all baseline (and the in-distribution
+# A fixed "organism" reference all cohort (and the in-distribution
 # held-out) samples are drawn from, with a small per-read mutation rate to
 # mimic real sequencing noise/variation between replicates -- distinct
 # FASTQ files that nonetheless represent "the same normal population".
 _REFERENCE = _random_sequence(3000, random.Random(1))
 # A wholly different "organism" -- a fresh random reference, not a mutated
-# copy of _REFERENCE -- for the clearly-anomalous sample.
+# copy of _REFERENCE -- for the clearly-anomalous sample. In QC terms this
+# is the swapped-tube / heavily-contaminated case, not "a novel pathogen".
 _OTHER_REFERENCE = _random_sequence(3000, random.Random(99))
 
 
-def _baseline_sample(tmp_path, idx):
+def _cohort_sample(tmp_path, idx):
     rng = random.Random(1000 + idx)
     reads = _reads_from(_REFERENCE, n_reads=200, read_len=150, mutation_rate=0.01, rng=rng)
-    return write_fastq(tmp_path, f"baseline_{idx}.fastq", reads)
+    return write_fastq(tmp_path, f"cohort_{idx}.fastq", reads)
 
 
 def _in_distribution_sample(tmp_path, name="held_out.fastq"):
@@ -102,7 +97,7 @@ def _out_of_distribution_sample(tmp_path, name="outlier.fastq"):
 
 
 def _mildly_different_sample(tmp_path, name="mild.fastq"):
-    # Same reference as the baseline, but a much higher per-read mutation
+    # Same reference as the cohort, but a much higher per-read mutation
     # rate -- "mildly different", not "a different organism".
     rng = random.Random(7373)
     reads = _reads_from(_REFERENCE, n_reads=200, read_len=150, mutation_rate=0.08, rng=rng)
@@ -110,315 +105,406 @@ def _mildly_different_sample(tmp_path, name="mild.fastq"):
 
 
 @pytest.fixture
-def baseline_paths(tmp_path):
-    return [str(_baseline_sample(tmp_path, i)) for i in range(8)]
+def cohort_paths(tmp_path):
+    return [str(_cohort_sample(tmp_path, i)) for i in range(8)]
 
 
-def test_in_distribution_sample_predicted_inlier(tmp_path, baseline_paths):
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200).fit(baseline_paths)
+class TestFlaggingAgainstAFittedCohort:
+    def test_in_distribution_sample_predicted_inlier(self, tmp_path, cohort_paths):
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
 
-    held_out = str(_in_distribution_sample(tmp_path))
-    label = detector.predict([held_out])[0]
+        held_out = str(_in_distribution_sample(tmp_path))
+        label = flagger.predict([held_out])[0]
 
-    assert label == 1
+        assert label == 1
 
+    def test_out_of_distribution_sample_predicted_outlier(self, tmp_path, cohort_paths):
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
+
+        outlier = str(_out_of_distribution_sample(tmp_path))
+        label = flagger.predict([outlier])[0]
+
+        assert label == -1
+
+    def test_out_of_distribution_sample_scores_more_anomalous_than_in_distribution(self, tmp_path, cohort_paths):
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
 
-def test_out_of_distribution_sample_predicted_outlier(tmp_path, baseline_paths):
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200).fit(baseline_paths)
-
-    outlier = str(_out_of_distribution_sample(tmp_path))
-    label = detector.predict([outlier])[0]
-
-    assert label == -1
-
-
-def test_out_of_distribution_sample_scores_more_anomalous_than_in_distribution(tmp_path, baseline_paths):
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200).fit(baseline_paths)
-
-    held_out = str(_in_distribution_sample(tmp_path))
-    outlier = str(_out_of_distribution_sample(tmp_path))
-
-    scores = detector.score_samples([held_out, outlier])
-    held_out_score, outlier_score = scores[0], scores[1]
-
-    # score_samples: higher = more normal/inlier-like (sklearn convention).
-    assert outlier_score < held_out_score
-
-
-def test_score_samples_ranks_mild_and_severe_anomalies_correctly(tmp_path, baseline_paths):
-    """score_samples should produce a real ranking, not just a threshold:
-    a clearly-different-organism sample should score more anomalous than
-    a same-organism-but-noisier sample, relative to the same baseline.
-    """
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200).fit(baseline_paths)
-
-    mild = str(_mildly_different_sample(tmp_path))
-    severe = str(_out_of_distribution_sample(tmp_path))
-
-    scores = detector.score_samples([mild, severe])
-    mild_score, severe_score = scores[0], scores[1]
-
-    assert severe_score < mild_score
-
-
-def test_predict_is_independent_of_batching(tmp_path, baseline_paths):
-    """Regression test for the fit/predict feature-space consistency
-    requirement: a sample's feature vector must always be computed
-    relative to the *fitted baseline*, never relative to whatever other
-    samples happen to be in the same predict()/score_samples() call. A
-    naive implementation that recomputed a fresh pairwise-distance matrix
-    over "baseline + whatever was just asked about" would give different
-    (and meaningless) scores depending on batching -- this test would
-    catch that regression.
-    """
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200).fit(baseline_paths)
-
-    held_out = str(_in_distribution_sample(tmp_path))
-    outlier = str(_out_of_distribution_sample(tmp_path))
-
-    together = detector.score_samples([held_out, outlier])
-    separate_held_out = detector.score_samples([held_out])
-    separate_outlier = detector.score_samples([outlier])
-
-    assert together[0] == pytest.approx(separate_held_out[0])
-    assert together[1] == pytest.approx(separate_outlier[0])
-
-    labels_together = detector.predict([held_out, outlier])
-    assert labels_together[0] == detector.predict([held_out])[0]
-    assert labels_together[1] == detector.predict([outlier])[0]
-
-
-def test_feature_vector_width_matches_baseline_size_regardless_of_query_batch_size(tmp_path, baseline_paths):
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200).fit(baseline_paths)
-
-    held_out = str(_in_distribution_sample(tmp_path))
-    outlier = str(_out_of_distribution_sample(tmp_path))
-
-    X_one = detector._transform([held_out])
-    X_two = detector._transform([held_out, outlier])
-
-    assert X_one.shape == (1, len(baseline_paths))
-    assert X_two.shape == (2, len(baseline_paths))
-    # The held-out sample's own row is identical whether it's queried
-    # alone or alongside another sample.
-    assert np.allclose(X_one[0], X_two[0])
-
-
-def test_method_isolation_forest_selects_isolation_forest(baseline_paths):
-    from sklearn.ensemble import IsolationForest
-
-    detector = GenomicAnomalyDetector(method="isolation_forest")
-
-    assert isinstance(detector._detector, IsolationForest)
-
-
-def test_method_one_class_svm_selects_one_class_svm(baseline_paths):
-    from sklearn.svm import OneClassSVM
-
-    detector = GenomicAnomalyDetector(method="one_class_svm")
-
-    assert isinstance(detector._detector, OneClassSVM)
-
-
-def test_default_method_is_one_class_svm_not_isolation_forest(baseline_paths):
-    """Pins the default `method=` to `"one_class_svm"`. This is a
-    deliberate, tested choice (see anomaly.py's module docstring, "Why the
-    default `method` is `\"one_class_svm\"`"): `IsolationForest`'s
-    axis-aligned splits cannot reliably separate a query whose feature
-    vector is clamped at the `mash_distance` ceiling of `1.0` in every
-    column from an ordinary baseline point, which
-    `test_out_of_distribution_sample_predicted_outlier` and
-    `test_score_samples_ranks_mild_and_severe_anomalies_correctly` above
-    would catch as a regression if `IsolationForest` became the default
-    again without fixing that underlying issue.
-    """
-    from sklearn.svm import OneClassSVM
-
-    detector = GenomicAnomalyDetector()
-
-    assert isinstance(detector._detector, OneClassSVM)
-
-
-def test_unrecognized_method_raises_at_construction(baseline_paths):
-    with pytest.raises(ValueError):
-        GenomicAnomalyDetector(method="not_a_real_method")
-
-
-def test_one_class_svm_also_flags_the_out_of_distribution_sample(tmp_path, baseline_paths):
-    """Confirms method= actually changes detector behavior, not just its
-    type: both supported methods should agree on the easy, clearly
-    anomalous case.
-    """
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200, method="one_class_svm", nu=0.2).fit(baseline_paths)
-
-    outlier = str(_out_of_distribution_sample(tmp_path))
-    label = detector.predict([outlier])[0]
-
-    assert label == -1
-
-
-def test_detector_kwargs_are_forwarded(baseline_paths):
-    detector = GenomicAnomalyDetector(method="isolation_forest", n_estimators=17, contamination=0.05)
-
-    assert detector._detector.n_estimators == 17
-    assert detector._detector.contamination == 0.05
-
-
-def test_predict_before_fit_raises(tmp_path):
-    detector = GenomicAnomalyDetector()
-
-    with pytest.raises(RuntimeError):
-        detector.predict([str(_in_distribution_sample(tmp_path))])
-
-
-def test_fit_requires_at_least_two_baseline_samples(tmp_path):
-    detector = GenomicAnomalyDetector()
-
-    with pytest.raises(ValueError):
-        detector.fit([str(_baseline_sample(tmp_path, 0))])
-
-
-def test_fit_returns_self(baseline_paths):
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200)
-
-    assert detector.fit(baseline_paths) is detector
-
-
-# ===========================================================================
-# Audit additions (2026-08-24).
-#
-# The three tests in this section are EXPECTED TO FAIL against the module as
-# merged. Each one pins a defect found during a post-merge review and
-# reported to the maintainer; none of them changes `anomaly.py`. They are
-# written as ordinary assertions of the module's own documented contract
-# rather than as `xfail`, so that fixing the module turns them green
-# without anyone having to remember to un-mark them.
-# ===========================================================================
-
-
-def _severity_series(tmp_path, rates):
-    """One FASTQ per requested per-read mutation rate, all drawn from the
-    same `_REFERENCE` the baseline uses -- a monotonically increasing
-    "how far from normal is this" ladder.
-    """
-    paths = []
-    for rate in rates:
-        rng = random.Random(90000 + int(rate * 10000))
-        reads = _reads_from(_REFERENCE, n_reads=200, read_len=150, mutation_rate=rate, rng=rng)
-        paths.append(str(write_fastq(tmp_path, f"sev_{int(rate * 10000)}.fastq", reads)))
-    return paths
-
-
-def test_isolation_forest_also_flags_the_out_of_distribution_sample(tmp_path, baseline_paths):
-    """`method="isolation_forest"` is a documented, publicly reachable
-    option (`GenomicAnomalyDetector._METHODS`, and `__init__`'s docstring
-    offers it by name). Whatever detector `method=` selects, a sample from
-    a wholly different organism must come back `-1`.
-
-    The existing `test_one_class_svm_also_flags_the_out_of_distribution_sample`
-    carries the docstring "Confirms method= actually changes detector
-    behavior, not just its type: both supported methods should agree on the
-    easy, clearly anomalous case" -- but passes `method="one_class_svm"`,
-    i.e. it exercises the default twice and never touches the forest. This
-    is the test that docstring describes.
-    """
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200, method="isolation_forest")
-    detector.fit(baseline_paths)
-
-    outlier = str(_out_of_distribution_sample(tmp_path))
-
-    assert detector.predict([outlier])[0] == -1, (
-        "method='isolation_forest' scored a different-organism sample as an inlier. "
-        "In surveillance this is a silent false negative: a novel pathogen goes "
-        "unflagged. The option is documented and reachable, so the blind spot the "
-        "module docstring describes is still shipping."
-    )
-
-
-def test_isolation_forest_scores_a_novel_organism_below_its_own_baseline(tmp_path, baseline_paths):
-    """A stronger form of the same claim, independent of any decision
-    threshold: whatever `contamination` cut-off is in play, a
-    different-organism sample's raw anomaly score must at least be lower
-    (more anomalous) than the *least* normal of the baseline samples the
-    detector was fitted on.
-    """
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200, method="isolation_forest")
-    detector.fit(baseline_paths)
-
-    outlier = str(_out_of_distribution_sample(tmp_path))
-    outlier_score = float(detector.score_samples([outlier])[0])
-    worst_baseline_score = float(np.max(detector.score_samples(baseline_paths)))
-
-    assert outlier_score < worst_baseline_score, (
-        f"different-organism sample scored {outlier_score} but the most-anomalous "
-        f"baseline sample scored {worst_baseline_score} -- the forest rates the "
-        "novel organism as MORE normal than its own training cohort."
-    )
-
-
-def test_baseline_cohort_is_not_mostly_flagged_as_outliers(baseline_paths):
-    """The cohort passed to `fit()` is, by definition, the established
-    normal baseline. A detector that flags most of it as anomalous is
-    unusable for surveillance regardless of how well it catches true
-    novelties: the alerts are all noise.
-
-    `GenomicAnomalyDetector.__init__` forwards nothing to `OneClassSVM`
-    unless the caller supplies it, so the default `nu=0.5` applies -- an
-    upper bound of 50% training errors. Out of the box, half the known-good
-    baseline comes back `-1`. Nothing in the existing suite ever calls
-    `predict()` on the baseline itself.
-    """
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200).fit(baseline_paths)
-
-    labels = detector.predict(baseline_paths)
-    flagged = int((labels == -1).sum())
-
-    assert flagged <= len(baseline_paths) // 4, (
-        f"{flagged} of {len(baseline_paths)} known-good baseline samples were "
-        f"predicted outliers (labels={labels.tolist()}). With sklearn's default "
-        "nu=0.5 and no default supplied by GenomicAnomalyDetector, roughly half "
-        "the training cohort is flagged."
-    )
-
-
-def test_score_samples_ranks_severity_across_the_full_distance_range(tmp_path, baseline_paths):
-    """`score_samples`'s docstring promises it is "useful for ranking
-    several flagged samples by how unusual they are, rather than only
-    getting a binary predict() label". That requires a score that keeps
-    separating samples as they get further from the baseline.
-
-    It does not. Because `OneClassSVM` is constructed with sklearn's
-    default `gamma="scale"` (= 1 / (n_features * X.var())) and the baseline
-    feature matrix is a set of near-zero mash distances with a tiny
-    variance, gamma is enormous and every RBF kernel term underflows to
-    exactly 0.0 beyond a very short radius. Past roughly mean distance
-    0.13, every sample -- a same-organism sample at a 15% mutation rate and
-    a completely unrelated organism alike -- scores exactly 0.0 and is
-    unrankable.
-
-    The existing `test_score_samples_ranks_mild_and_severe_anomalies_correctly`
-    survives only because its single "mild" point (mutation_rate=0.08)
-    happens to land at ~1.6e-06, a hair above the underflow floor.
-    """
-    detector = GenomicAnomalyDetector(k=15, sketch_size=200).fit(baseline_paths)
-
-    ladder = _severity_series(tmp_path, [0.06, 0.10, 0.15, 0.25])
-    different_organism = str(_out_of_distribution_sample(tmp_path))
-
-    scores = [float(s) for s in detector.score_samples(ladder + [different_organism])]
-
-    # Sanity: the ladder really does get progressively further away, so a
-    # failure below is the scorer's, not the fixture's.
-    mean_distances = detector._transform(ladder + [different_organism]).mean(axis=1)
-    assert list(mean_distances) == sorted(mean_distances), (
-        "the severity ladder is not monotonically increasing in mash distance -- "
-        "the ranking assertion below would not mean anything"
-    )
-
-    for i in range(len(scores) - 1):
-        assert scores[i + 1] < scores[i], (
-            f"score_samples does not rank severity {i} -> {i + 1}: "
-            f"{scores[i]} vs {scores[i + 1]} (mean mash distances "
-            f"{mean_distances[i]:.4f} vs {mean_distances[i + 1]:.4f}). "
-            f"full ladder scores = {scores}"
+        held_out = str(_in_distribution_sample(tmp_path))
+        outlier = str(_out_of_distribution_sample(tmp_path))
+
+        scores = flagger.score_samples([held_out, outlier])
+        held_out_score, outlier_score = scores[0], scores[1]
+
+        # score_samples: higher = more normal/inlier-like (sklearn convention).
+        assert outlier_score < held_out_score
+
+    def test_score_samples_ranks_mild_and_severe_anomalies_correctly(self, tmp_path, cohort_paths):
+        """score_samples should produce a real ranking, not just a threshold:
+        a clearly-different-organism sample should score more anomalous than
+        a same-organism-but-noisier sample, relative to the same cohort.
+        """
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
+
+        mild = str(_mildly_different_sample(tmp_path))
+        severe = str(_out_of_distribution_sample(tmp_path))
+
+        scores = flagger.score_samples([mild, severe])
+        mild_score, severe_score = scores[0], scores[1]
+
+        assert severe_score < mild_score
+
+    def test_outlier_scores_is_the_sign_flipped_view_of_score_samples(self, tmp_path, cohort_paths):
+        """`outlier_scores()` exists because "higher = more outlying" is the
+        reading a QC user wants, while `score_samples()` must keep
+        scikit-learn's opposite convention. They must stay exact negations of
+        each other, or the two would silently disagree about which sample is
+        worst.
+        """
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
+
+        held_out = str(_in_distribution_sample(tmp_path))
+        outlier = str(_out_of_distribution_sample(tmp_path))
+        queries = [held_out, outlier]
+
+        assert np.allclose(flagger.outlier_scores(queries), -flagger.score_samples(queries))
+        assert flagger.outlier_scores(queries)[1] > flagger.outlier_scores(queries)[0]
+
+    def test_predict_is_independent_of_batching(self, tmp_path, cohort_paths):
+        """Regression test for the fit/predict feature-space consistency
+        requirement: a sample's feature vector must always be computed
+        relative to the *fitted cohort*, never relative to whatever other
+        samples happen to be in the same predict()/score_samples() call. A
+        naive implementation that recomputed a fresh pairwise-distance matrix
+        over "cohort + whatever was just asked about" would give different
+        (and meaningless) scores depending on batching -- this test would
+        catch that regression.
+        """
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
+
+        held_out = str(_in_distribution_sample(tmp_path))
+        outlier = str(_out_of_distribution_sample(tmp_path))
+
+        together = flagger.score_samples([held_out, outlier])
+        separate_held_out = flagger.score_samples([held_out])
+        separate_outlier = flagger.score_samples([outlier])
+
+        assert together[0] == pytest.approx(separate_held_out[0])
+        assert together[1] == pytest.approx(separate_outlier[0])
+
+        labels_together = flagger.predict([held_out, outlier])
+        assert labels_together[0] == flagger.predict([held_out])[0]
+        assert labels_together[1] == flagger.predict([outlier])[0]
+
+    def test_feature_vector_width_matches_cohort_size_regardless_of_query_batch_size(self, tmp_path, cohort_paths):
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
+
+        held_out = str(_in_distribution_sample(tmp_path))
+        outlier = str(_out_of_distribution_sample(tmp_path))
+
+        X_one = flagger._transform([held_out])
+        X_two = flagger._transform([held_out, outlier])
+
+        assert X_one.shape == (1, len(cohort_paths))
+        assert X_two.shape == (2, len(cohort_paths))
+        # The held-out sample's own row is identical whether it's queried
+        # alone or alongside another sample.
+        assert np.allclose(X_one[0], X_two[0])
+
+    def test_cohort_distance_excludes_a_samples_own_column(self, cohort_paths):
+        """A cohort member queried back against its own fitted cohort must be
+        summarized leave-one-out: its distance to *itself* is exactly 0.0 by
+        construction and carries no information about whether it fits the
+        cohort. Including that zero would drag every cohort member's summary
+        statistic down relative to a genuinely new sample's, making the two
+        incomparable -- fit-time and query-time statistics must be computed
+        the same way.
+        """
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
+
+        # Re-querying the fitted cohort reproduces the fit-time statistics
+        # exactly, which is only true if the self-column is dropped in both.
+        assert np.allclose(flagger.cohort_distance(cohort_paths), flagger.cohort_distances_)
+        assert (flagger.cohort_distance(cohort_paths) > 0).all()
+
+
+class TestHomogeneousCohortIsNotFlagged:
+    def test_known_good_cohort_flags_nothing(self, cohort_paths):
+        """The cohort passed to `fit()` is, by definition, the established
+        normal baseline. A flagger that flags most of it is unusable for QC
+        regardless of how well it catches true outliers: the alerts are all
+        noise. (The deleted module's default `OneClassSVM(nu=0.5)` flagged 4
+        of these 8.)
+
+        This is also the "all-similar cohort flags nothing" property that
+        makes the default method usable unattended: its threshold is an
+        absolute statistical criterion, so a homogeneous cohort produces
+        *zero* flags rather than a fixed quota of them.
+        """
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
+
+        labels = flagger.predict(cohort_paths)
+        flagged = int((labels == -1).sum())
+
+        assert flagged == 0, (
+            f"{flagged} of {len(cohort_paths)} known-good cohort samples were "
+            f"predicted outliers (labels={labels.tolist()})"
         )
+
+    def test_flag_cohort_on_a_homogeneous_cohort_flags_nothing(self, cohort_paths):
+        table = flag_cohort(cohort_paths, k=15, sketch_size=200)
+
+        assert not any(table.column("is_outlier").to_pylist())
+
+
+class TestFlagCohort:
+    def test_returns_one_arrow_row_per_sample_in_input_order(self, tmp_path, cohort_paths):
+        outlier = str(_out_of_distribution_sample(tmp_path))
+        paths = cohort_paths + [outlier]
+
+        table = flag_cohort(paths, k=15, sketch_size=200)
+
+        assert isinstance(table, pa.Table)
+        assert table.column_names == ["sample", "cohort_distance", "outlier_score", "is_outlier"]
+        assert table.column("sample").to_pylist() == paths
+
+    def test_flags_the_deterministic_outlier_and_nothing_else(self, tmp_path, cohort_paths):
+        """The headline QC claim: drop one wrong sample into an otherwise
+        homogeneous cohort and exactly that sample comes back flagged.
+        """
+        outlier = str(_out_of_distribution_sample(tmp_path))
+        paths = cohort_paths + [outlier]
+
+        table = flag_cohort(paths, k=15, sketch_size=200)
+        flagged = [
+            sample
+            for sample, is_outlier in zip(table.column("sample").to_pylist(), table.column("is_outlier").to_pylist())
+            if is_outlier
+        ]
+
+        assert flagged == [outlier]
+
+    def test_the_outlier_has_the_highest_outlier_score(self, tmp_path, cohort_paths):
+        outlier = str(_out_of_distribution_sample(tmp_path))
+        paths = cohort_paths + [outlier]
+
+        table = flag_cohort(paths, k=15, sketch_size=200)
+        scores = table.column("outlier_score").to_pylist()
+
+        assert scores.index(max(scores)) == len(paths) - 1
+
+    def test_isolation_forest_flags_the_outlier_when_it_is_inside_the_fitted_cohort(self, tmp_path, cohort_paths):
+        """`method="isolation_forest"` is only offered through this
+        transductive path, where the sample being judged is part of the data
+        the forest was fitted on -- see
+        `TestIsolationForestIsCohortInternalOnly` for the measured reason it
+        is not offered for out-of-cohort queries.
+        """
+        outlier = str(_out_of_distribution_sample(tmp_path))
+        paths = cohort_paths + [outlier]
+
+        table = flag_cohort(paths, k=15, sketch_size=200, method="isolation_forest")
+        flagged = [
+            sample
+            for sample, is_outlier in zip(table.column("sample").to_pylist(), table.column("is_outlier").to_pylist())
+            if is_outlier
+        ]
+
+        assert flagged == [outlier]
+
+
+class TestIsolationForestIsCohortInternalOnly:
+    def test_isolation_forest_rates_a_different_organism_as_more_normal_than_its_own_cohort(
+        self, tmp_path, cohort_paths
+    ):
+        """Characterisation test pinning a measured, documented limitation --
+        the exact defect that got the previous module deleted, kept visible
+        here instead of being papered over.
+
+        `IsolationForest`'s splits are axis-aligned thresholds drawn from the
+        range the *training* data spans, so it cannot see how far past that
+        range a query lies -- only which side of each threshold it falls on.
+        Measured here: a wholly different organism, sitting at the
+        `mash_distance` ceiling far beyond every cohort member, is scored
+        *more normal* than the least typical cohort sample. In QC terms that
+        is a silent false negative on the easiest possible case.
+
+        That is why `CohortOutlierFlagger` refuses
+        `method="isolation_forest"` at construction, and why the forest is
+        reachable only through `flag_cohort()`, where every candidate is
+        inside the fitted data.
+        """
+        from sklearn.ensemble import IsolationForest
+
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
+        outlier = str(_out_of_distribution_sample(tmp_path))
+
+        train = flagger.cohort_distances_.reshape(-1, 1)
+        forest = IsolationForest(random_state=0, contamination=0.1).fit(train)
+
+        query = flagger.cohort_distance([outlier]).reshape(-1, 1)
+        assert float(query[0, 0]) > float(train.max()), "fixture no longer puts the query beyond the fitted range"
+
+        worst_cohort_score = float(forest.score_samples(train).min())
+        assert float(forest.score_samples(query)[0]) > worst_cohort_score, (
+            "IsolationForest now scores an out-of-range query as more anomalous than "
+            "every training point -- if this ever becomes reliably true, revisit whether "
+            "method='isolation_forest' can be offered for out-of-cohort scoring"
+        )
+
+    def test_the_default_method_does_rank_beyond_the_fitted_range(self, tmp_path, cohort_paths):
+        """The flip side of the test above: the default robust scorer is
+        unbounded and strictly monotone in cohort distance, so it keeps
+        separating samples arbitrarily far past the cohort's own spread.
+        """
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
+        outlier = str(_out_of_distribution_sample(tmp_path))
+        mild = str(_mildly_different_sample(tmp_path))
+
+        worst_cohort = float(flagger.outlier_scores(cohort_paths).max())
+        assert float(flagger.outlier_scores([mild])[0]) > worst_cohort
+        assert float(flagger.outlier_scores([outlier])[0]) > float(flagger.outlier_scores([mild])[0])
+
+
+class TestSeverityRanking:
+    def _severity_series(self, tmp_path, rates):
+        """One FASTQ per requested per-read mutation rate, all drawn from the
+        same `_REFERENCE` the cohort uses -- a monotonically increasing
+        "how far from normal is this" ladder.
+        """
+        paths = []
+        for rate in rates:
+            rng = random.Random(90000 + int(rate * 10000))
+            reads = _reads_from(_REFERENCE, n_reads=200, read_len=150, mutation_rate=rate, rng=rng)
+            paths.append(str(write_fastq(tmp_path, f"sev_{int(rate * 10000)}.fastq", reads)))
+        return paths
+
+    def test_score_samples_ranks_severity_across_the_full_distance_range(self, tmp_path, cohort_paths):
+        """`score_samples`'s docstring promises a ranking, not just a binary
+        label. The deleted module's `OneClassSVM(gamma="scale")` could not
+        deliver one: over a near-zero-variance distance feature, gamma was
+        enormous and every RBF term underflowed to exactly 0.0 past roughly
+        mean distance 0.13, so a 15%-mutated same-organism sample and a
+        completely unrelated organism both scored exactly 0.0.
+
+        The replacement's score is a modified z-score of the cohort-distance
+        statistic -- unbounded and strictly monotone in that statistic -- so
+        this ladder must come out strictly ordered all the way out to a
+        different organism.
+        """
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200).fit(cohort_paths)
+
+        ladder = self._severity_series(tmp_path, [0.06, 0.10, 0.15, 0.25])
+        different_organism = str(_out_of_distribution_sample(tmp_path))
+        queries = ladder + [different_organism]
+
+        scores = [float(s) for s in flagger.score_samples(queries)]
+
+        # Sanity: the ladder really does get progressively further away, so a
+        # failure below is the scorer's, not the fixture's.
+        distances = flagger.cohort_distance(queries)
+        assert list(distances) == sorted(distances), (
+            "the severity ladder is not monotonically increasing in cohort distance -- "
+            "the ranking assertion below would not mean anything"
+        )
+
+        for i in range(len(scores) - 1):
+            assert scores[i + 1] < scores[i], (
+                f"score_samples does not rank severity {i} -> {i + 1}: "
+                f"{scores[i]} vs {scores[i + 1]} (cohort distances "
+                f"{distances[i]:.4f} vs {distances[i + 1]:.4f}). "
+                f"full ladder scores = {scores}"
+            )
+
+
+class TestConstructionAndValidation:
+    def test_default_method_is_robust_zscore(self):
+        flagger = CohortOutlierFlagger()
+
+        assert flagger.method == "robust_zscore"
+
+    def test_isolation_forest_is_refused_by_the_out_of_cohort_class(self):
+        """The previous module's fatal mistake was leaving a detector it had
+        itself measured as broken for this feature representation reachable
+        and documented. `CohortOutlierFlagger` scores *new* samples against a
+        fitted cohort, which is exactly the case the forest cannot handle, so
+        it is refused here rather than offered with a caveat.
+        """
+        with pytest.raises(ValueError) as exc_info:
+            CohortOutlierFlagger(method="isolation_forest")
+
+        message = str(exc_info.value)
+        assert "flag_cohort" in message
+
+    def test_unrecognized_method_raises_at_construction(self):
+        with pytest.raises(ValueError):
+            CohortOutlierFlagger(method="not_a_real_method")
+
+    def test_non_positive_threshold_raises_at_construction(self):
+        with pytest.raises(ValueError):
+            CohortOutlierFlagger(threshold=0)
+
+    def test_flag_cohort_forwards_detector_kwargs_to_the_forest(self, tmp_path, cohort_paths):
+        outlier = str(_out_of_distribution_sample(tmp_path))
+        table = flag_cohort(
+            cohort_paths + [outlier],
+            k=15,
+            sketch_size=200,
+            method="isolation_forest",
+            n_estimators=17,
+            contamination=0.2,
+        )
+
+        # 9 samples at contamination=0.2 -> roughly two flags, i.e. the
+        # kwargs really did reach the forest rather than being swallowed.
+        assert sum(table.column("is_outlier").to_pylist()) >= 2
+
+    def test_flag_cohort_rejects_detector_kwargs_for_the_robust_method(self, cohort_paths):
+        """The robust scorer has no detector to forward keyword arguments to,
+        so silently accepting (and ignoring) `contamination=` would let a
+        caller believe they had configured something they had not.
+        """
+        with pytest.raises(TypeError):
+            flag_cohort(cohort_paths, k=15, sketch_size=200, contamination=0.1)
+
+    def test_predict_before_fit_raises(self, tmp_path):
+        flagger = CohortOutlierFlagger()
+
+        with pytest.raises(RuntimeError):
+            flagger.predict([str(_in_distribution_sample(tmp_path))])
+
+    def test_fit_requires_a_minimum_cohort_size(self, tmp_path):
+        """A modified z-score needs a median *and* a median absolute
+        deviation of the cohort's own statistics. Below a handful of samples
+        the MAD is not an estimate of anything, and every query would be
+        judged against noise -- so this is refused loudly rather than
+        answered with a confident, meaningless number.
+        """
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200)
+        too_few = [str(_cohort_sample(tmp_path, i)) for i in range(3)]
+
+        with pytest.raises(ValueError) as exc_info:
+            flagger.fit(too_few)
+
+        message = str(exc_info.value)
+        assert "3" in message and "4" in message
+
+    def test_fit_rejects_a_duplicated_cohort_path(self, tmp_path, cohort_paths):
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200)
+        duplicated = cohort_paths + [cohort_paths[0]]
+
+        with pytest.raises(ValueError) as exc_info:
+            flagger.fit(duplicated)
+
+        assert repr(cohort_paths[0]) in str(exc_info.value)
+
+    def test_fit_returns_self(self, cohort_paths):
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200)
+
+        assert flagger.fit(cohort_paths) is flagger
+
+    def test_repr_reports_fitted_state(self, cohort_paths):
+        flagger = CohortOutlierFlagger(k=15, sketch_size=200)
+        assert "unfitted" in repr(flagger)
+
+        flagger.fit(cohort_paths)
+        assert "8" in repr(flagger)
