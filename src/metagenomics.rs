@@ -51,22 +51,36 @@
 //! overhead at all (a `Vec<(u64, u32)>` would be 16, since the tuple is
 //! padded to its 8-byte alignment; that padding is the whole reason for the
 //! parallel-array layout). `KmerDatabase::memory_bytes` reports the live
-//! figure and `resident_memory_is_twelve_bytes_per_kmer` pins it.
+//! figure and `resident_memory_is_twelve_bytes_per_kmer` pins it. Measured
+//! by construction on a 1.1-million-k-mer database: 12.000425 bytes per
+//! k-mer, the excess being 467 bytes of taxonomy for its 5 taxa.
 //!
-//! Building costs more than holding: construction accumulates into an
-//! `FxHashMap<u64, u32>`, whose entry is a padded 16-byte pair plus one
-//! control byte per bucket, in a table that grows to the next power of two
-//! at 87.5% load -- so **17 to 34 bytes per distinct k-mer at peak**,
-//! averaging around 25, plus the 12-byte sorted table built from it before
-//! the map is dropped. Budget roughly **3x** the final size to build one.
+//! Building costs more than holding, and the extra is countable exactly.
+//! Construction buffers one padded 16-byte `(u64, u32)` pair per k-mer
+//! *occurrence*, sorts it, and merges equal runs into the 12-byte-per-
+//! entry final table, which is allocated at its exact size before the
+//! buffer is dropped. So the peak is
 //!
-//! What that means in practice, at k=31:
+//! ```text
+//! 16 * occurrences  +  12 * distinct
+//! ```
+//!
+//! Note which term is which. `occurrences` is the total k-mer count across
+//! every reference sequence, not the distinct count: a k-mer present in ten
+//! near-identical strains is buffered ten times. For a panel of *distinct*
+//! organisms the two are close (most k-mers of a genome are unique to it),
+//! so the peak lands near **28 bytes per distinct k-mer**, a little over
+//! **2x** the finished size -- budget 3x and you will not be surprised.
+//! For a reference set deliberately packed with close relatives, scale the
+//! first term by however many copies of each genome it holds.
+//!
+//! What that means in practice, at k=31, taking occurrences ~= distinct:
 //!
 //! | Reference set | Distinct k-mers | Resident | To build |
 //! |---|---|---|---|
-//! | 1 bacterial genome (~4 Mbp) | ~4 M | ~48 MB | ~150 MB |
-//! | 20 bacterial genomes | ~80 M | ~1.0 GB | ~3 GB |
-//! | 150 bacterial genomes | ~600 M | ~7.2 GB | ~21 GB |
+//! | 1 bacterial genome (~4 Mbp) | ~4 M | ~48 MB | ~110 MB |
+//! | 20 bacterial genomes | ~80 M | ~1.0 GB | ~2.2 GB |
+//! | 150 bacterial genomes | ~600 M | ~7.2 GB | ~17 GB |
 //! | RefSeq complete bacteria (~10^11 k-mers) | ~10^11 | **~1.2 TB** | -- |
 //!
 //! **So: this does not scale to RefSeq, and you must not plan around it

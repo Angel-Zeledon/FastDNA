@@ -18,16 +18,23 @@ decision and documents each of them; the notes below are the ones a user
 of the Python API has to know before trusting a result.
 
 **Scale: this does not hold RefSeq, and it will not tell you so by
-failing gracefully -- it will exhaust memory.** The lookup table costs
-exactly 12 bytes per distinct canonical k-mer, and building it peaks at
-roughly three times the finished size. Concretely, at k=31:
+failing gracefully -- it will exhaust memory.** The lookup table is two
+parallel arrays, costing
+**12 bytes per distinct canonical k-mer** exactly, with no per-entry
+overhead (measured: 12.0004 bytes/k-mer over a 1.1-million-k-mer
+database, the excess being 467 bytes of taxonomy for 5 taxa). Building it
+buffers one 16-byte pair per k-mer *occurrence* before merging into that
+table, so the peak is
+`16 * occurrences + 12 * distinct` -- around 28 bytes per k-mer, a
+little over twice the finished size, for a panel of distinct organisms.
+Budget 3x. Concretely, at k=31:
 
 ===========================  ===============  ==========  =========
 Reference set                Distinct k-mers  Resident    To build
 ===========================  ===============  ==========  =========
-1 bacterial genome (~4 Mbp)  ~4 M             ~48 MB      ~150 MB
-20 bacterial genomes         ~80 M            ~1.0 GB     ~3 GB
-150 bacterial genomes        ~600 M           ~7.2 GB     ~21 GB
+1 bacterial genome (~4 Mbp)  ~4 M             ~48 MB      ~110 MB
+20 bacterial genomes         ~80 M            ~1.0 GB     ~2.2 GB
+150 bacterial genomes        ~600 M           ~7.2 GB     ~17 GB
 RefSeq complete bacteria     ~10^11           **~1.2 TB** --
 ===========================  ===============  ==========  =========
 
