@@ -71,9 +71,12 @@ fn parse_min_quality(raw: &str) -> Result<f64, String> {
 #[derive(Parser, Debug)]
 #[command(name = "fastdna", version = "0.1.0", author = "FastDNA Team")]
 pub struct Cli {
-    /// Input FASTQ file (.fastq or .fastq.gz)
-    #[arg(short, long, value_name = "FILE")]
-    pub input: PathBuf,
+    /// Input FASTQ/FASTA file(s), optionally gzipped, or "-" for stdin.
+    /// Several may be given (R1/R2, extra lanes); their counts and QC are
+    /// aggregated. The format of each is detected from its content, not its
+    /// extension.
+    #[arg(short, long, value_name = "FILE", num_args = 1..)]
+    pub input: Vec<PathBuf>,
 
     /// Output path for k-mer frequencies (.csv or .parquet)
     #[arg(short, long, value_name = "FILE", default_value = "kmer_counts.parquet")]
@@ -129,6 +132,23 @@ impl Cli {
     /// `main` right after parsing; a distinct method so the argument-parsing
     /// tests can exercise it without spawning the binary.
     pub fn validate(&self) -> Result<(), String> {
+        // stdin is a single unnamed stream: there is no meaningful order in
+        // which to read it alongside named files, and accepting the
+        // combination would silently read the pipe once and the files
+        // normally -- not what the command line says. Rejected outright
+        // rather than guessed at.
+        let stdin_count = self
+            .input
+            .iter()
+            .filter(|p| p.as_os_str() == crate::fastq::STDIN_ARG)
+            .count();
+        if stdin_count > 0 && self.input.len() > 1 {
+            return Err(format!(
+                "--input '-' means standard input and must be the only input; got {} inputs",
+                self.input.len()
+            ));
+        }
+
         if let Some(max) = self.max_count {
             if max < self.min_count {
                 return Err(format!(

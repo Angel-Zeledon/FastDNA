@@ -1,6 +1,5 @@
 // src/pipeline.rs
 
-use std::io::BufRead;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,7 +11,7 @@ use rayon::prelude::*;
 use crate::counter::KmerCounter;
 use crate::disk_spill::{self, ScratchDir, SpillWriter};
 use crate::error::{FastDnaError, Result};
-use crate::fastq::{FastqReadError, FastqReader, FastqRecord};
+use crate::fastq::{FastqReadError, FastqRecord, RecordSource};
 use crate::kmer;
 use crate::mem_estimate;
 use crate::progress::{Progress, ProgressFn, PROGRESS_INTERVAL};
@@ -58,6 +57,26 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "worker thread panicked".to_string()
+    }
+}
+
+/// Where to say a producer-side failure happened.
+///
+/// A single-stream source (`FastqReader`) has no path of its own, so the
+/// answer is the `source` the caller named plus the producer's own running
+/// read count -- exactly what this was before multi-file input existed. A
+/// source spanning several files answers for itself, naming the file it was
+/// actually reading and numbering the record within *that* file: told
+/// "record 3 of lane4.fastq.gz", a user can find it; told "record 4,000,003
+/// of <inputs>", they cannot.
+fn failing_location<S: RecordSource>(
+    reader: &S,
+    fallback_path: &Path,
+    reads_so_far: u64,
+) -> (PathBuf, u64) {
+    match reader.current_source() {
+        Some((path, records_in_file)) => (path, records_in_file + 1),
+        None => (fallback_path.to_path_buf(), reads_so_far + 1),
     }
 }
 
@@ -165,14 +184,18 @@ fn validate_config(config: &PipelineConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn process_stream_parallel<R: BufRead + Send + 'static>(
-    reader: FastqReader<R>,
+pub fn process_stream_parallel<S: RecordSource>(
+    reader: S,
     config: PipelineConfig,
     source: &Path,
     progress: ProgressFn<'_>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(KmerCounter, QcSummary, u64)> {
     validate_config(&config)?;
+    // The source gets a say too: an input list that can produce nothing at
+    // all is a caller mistake, and a run that counted zero reads in silence
+    // is indistinguishable from a real sample that happened to be empty.
+    reader.validate()?;
 
     let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(64);
 
@@ -226,16 +249,14 @@ pub fn process_stream_parallel<R: BufRead + Send + 'static>(
                 // hardware/transport fault and attach a record number that
                 // means nothing for it.
                 Err(FastqReadError::Io(source_err)) => {
-                    return Err(FastDnaError::Io { path: source_owned, source: source_err });
+                    let (path, _) = failing_location(&reader, &source_owned, total_reads);
+                    return Err(FastDnaError::Io { path, source: source_err });
                 }
                 // A structural violation in the bytes themselves: attach the
                 // path and the 1-based index of the record that failed.
                 Err(FastqReadError::Malformed(reason)) => {
-                    return Err(FastDnaError::MalformedFastq {
-                        path: source_owned,
-                        record: total_reads + 1,
-                        reason,
-                    });
+                    let (path, record) = failing_location(&reader, &source_owned, total_reads);
+                    return Err(FastDnaError::MalformedFastq { path, record, reason });
                 }
             }
         }
@@ -581,8 +602,8 @@ type DiskWorkerOutcome = std::result::Result<(Vec<Vec<PathBuf>>, QcSummary), Dis
 /// versa. `config` must already be valid
 /// (`process_stream_parallel_with_policy` validates it before choosing a
 /// strategy).
-fn process_stream_parallel_disk<R: BufRead + Send + 'static>(
-    reader: FastqReader<R>,
+fn process_stream_parallel_disk<S: RecordSource>(
+    reader: S,
     config: PipelineConfig,
     source: &Path,
     progress: ProgressFn<'_>,
@@ -634,14 +655,14 @@ fn process_stream_parallel_disk<R: BufRead + Send + 'static>(
                 }
                 Ok(None) => break,
                 Err(FastqReadError::Io(source_err)) => {
-                    return Err(FastDnaError::Io { path: source_owned, source: source_err });
+                    let (path, _) = failing_location(&reader, &source_owned, total_reads);
+                    return Err(FastDnaError::Io { path, source: source_err });
                 }
+                // A structural violation in the bytes themselves: attach the
+                // path and the 1-based index of the record that failed.
                 Err(FastqReadError::Malformed(reason)) => {
-                    return Err(FastDnaError::MalformedFastq {
-                        path: source_owned,
-                        record: total_reads + 1,
-                        reason,
-                    });
+                    let (path, record) = failing_location(&reader, &source_owned, total_reads);
+                    return Err(FastDnaError::MalformedFastq { path, record, reason });
                 }
             }
         }
@@ -786,8 +807,8 @@ fn process_stream_parallel_disk<R: BufRead + Send + 'static>(
 /// it directly, unmodified, for exactly that reason). Pass
 /// `MemoryPolicy::default()` here to reproduce that same in-memory-only
 /// behavior while additionally getting a `CountStrategy` back.
-pub fn process_stream_parallel_with_policy<R: BufRead + Send + 'static>(
-    reader: FastqReader<R>,
+pub fn process_stream_parallel_with_policy<S: RecordSource>(
+    reader: S,
     config: PipelineConfig,
     source: &Path,
     progress: ProgressFn<'_>,
@@ -795,6 +816,7 @@ pub fn process_stream_parallel_with_policy<R: BufRead + Send + 'static>(
     policy: MemoryPolicy,
 ) -> Result<(KmerCounter, QcSummary, u64, StrategyDecision)> {
     validate_config(&config)?;
+    reader.validate()?;
     let decision = resolve_strategy(&policy, &config);
 
     let (counter, qc, total_reads) = match decision.strategy {

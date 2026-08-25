@@ -96,6 +96,72 @@ fn equal_and_ordered_count_bands_pass_validate() {
 }
 
 #[test]
+fn a_single_input_still_parses_into_a_one_element_list() {
+    let cli = Cli::parse_from(["fastdna", "--input", "sample.fastq"]);
+    assert_eq!(
+        cli.input.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        vec!["sample.fastq".to_string()],
+        "-i single.fastq must keep working identically"
+    );
+    assert!(cli.validate().is_ok());
+}
+
+#[test]
+fn several_inputs_are_collected_in_order_after_one_flag() {
+    let cli = Cli::parse_from(["fastdna", "-i", "R1.fastq", "R2.fastq", "lane2.fastq.gz"]);
+    assert_eq!(
+        cli.input.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        vec!["R1.fastq".to_string(), "R2.fastq".to_string(), "lane2.fastq.gz".to_string()]
+    );
+    assert!(cli.validate().is_ok());
+}
+
+/// A repeated flag must accumulate rather than replace: `-i a -i b` is how
+/// generated command lines (Nextflow, Snakemake) usually spell a list.
+#[test]
+fn a_repeated_input_flag_accumulates() {
+    let cli = Cli::parse_from(["fastdna", "-i", "a.fastq", "-i", "b.fastq"]);
+    assert_eq!(cli.input.len(), 2);
+}
+
+/// Collecting several values must stop at the next flag, or `-o` and its
+/// value would be swallowed into the input list.
+#[test]
+fn multi_value_input_does_not_swallow_the_next_flag() {
+    let cli = Cli::parse_from(["fastdna", "-i", "a.fastq", "b.fastq", "-o", "out.csv", "-k", "21"]);
+    assert_eq!(cli.input.len(), 2, "only the two files belong to --input");
+    assert_eq!(cli.output.to_string_lossy(), "out.csv");
+    assert_eq!(cli.kmer_size, 21);
+}
+
+#[test]
+fn a_bare_dash_is_accepted_as_the_stdin_input() {
+    let cli = Cli::parse_from(["fastdna", "-i", "-"]);
+    assert_eq!(cli.input.len(), 1);
+    assert_eq!(cli.input[0].to_string_lossy(), "-");
+    assert!(cli.validate().is_ok(), "`-i -` alone is the documented stdin form");
+}
+
+/// stdin is a single unnamed stream: there is no way to read it "before" or
+/// "after" a file in any meaningful order, and accepting the combination
+/// would silently read the pipe once and the files normally, which is not
+/// what the command line says.
+#[test]
+fn stdin_combined_with_a_file_is_rejected() {
+    for args in [
+        vec!["fastdna", "-i", "-", "a.fastq"],
+        vec!["fastdna", "-i", "a.fastq", "-"],
+        vec!["fastdna", "-i", "-", "-"],
+    ] {
+        let cli = Cli::parse_from(args.clone());
+        let err = cli
+            .validate()
+            .expect_err("`-` must be exclusive, but this was accepted: {args:?}");
+        assert!(err.contains('-'), "message must mention the stdin form: {err}");
+    }
+}
+
+#[test]
 fn qc_and_histogram_paths_are_available_to_the_binary() {
     let cli = Cli::parse_from([
         "fastdna", "--input", "s.fastq",

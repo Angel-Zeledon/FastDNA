@@ -5,18 +5,16 @@
 // silent, not this entry point.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use flate2::read::MultiGzDecoder;
 
 use fastdna_core::cli::{Cli, CliStrategy};
 use fastdna_core::error::{FastDnaError, Result};
 use fastdna_core::export;
-use fastdna_core::fastq::FastqReader;
+use fastdna_core::fastq::{InputSpec, MultiSourceReader};
 use fastdna_core::pipeline::{
     process_stream_parallel_with_policy, CountStrategy, MemoryPolicy, PipelineConfig,
 };
@@ -76,19 +74,24 @@ fn spinner(message: &str) -> ProgressBar {
 /// without this guard `-o` pointed at the input silently replaces the
 /// user's FASTQ with a counts table -- irreversible data loss.
 fn guard_against_input_overwrite(args: &Cli) -> Result<()> {
-    let outputs: [(&str, Option<&std::path::PathBuf>); 3] = [
+    let outputs: [(&str, Option<&PathBuf>); 3] = [
         ("--output", Some(&args.output)),
         ("--qc", Some(&args.qc)),
         ("--histogram", args.histogram.as_ref()),
     ];
     for (flag, path) in outputs.into_iter() {
-        if let Some(path) = path {
-            if fastdna_core::atomic::same_file(&args.input, path) {
+        let Some(path) = path else { continue };
+        // Every input is checked, and the message names the specific one
+        // that collided: with several inputs, "an input file" would leave
+        // the user to work out which of eight lanes was about to be
+        // destroyed.
+        for input in &args.input {
+            if fastdna_core::atomic::same_file(input, path) {
                 return Err(FastDnaError::InvalidConfig {
                     parameter: "output paths",
                     reason: format!(
                         "{flag} points at the input file {} and would overwrite it",
-                        args.input.display()
+                        input.display()
                     ),
                 });
             }
@@ -108,6 +111,45 @@ fn preflight_outputs(args: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// The decompressed size of everything about to be read, for the strategy
+/// estimate. `None` disables size-based estimation entirely (see
+/// `MemoryPolicy::estimated_input_bytes`), which is the conservative
+/// in-memory choice rather than a guess.
+///
+/// Sizes are summed across inputs, since that is what one run will hold.
+/// Best-effort per file: a size that cannot be read (an unusual filesystem,
+/// a named pipe that lies about its length) disables the estimate rather
+/// than failing a whole run over a memory *prediction*. Standard input has
+/// no size at all -- there is no way to know how much is coming down a pipe
+/// -- so any run reading it falls back to in-memory, as documented.
+fn estimate_total_input_bytes(inputs: &[InputSpec]) -> Option<u64> {
+    let mut total: u64 = 0;
+    for input in inputs {
+        let InputSpec::File(path) = input else {
+            return None;
+        };
+        let bytes = std::fs::metadata(path).ok()?.len();
+        let is_gz = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("gz"));
+        let expanded = if is_gz {
+            (bytes as f64 * GZIP_FASTQ_EXPANSION_FACTOR) as u64
+        } else {
+            bytes
+        };
+        total = total.saturating_add(expanded);
+    }
+    Some(total)
+}
+
+/// Renders the input list for the banner: one path, or a count and the
+/// paths, so a mistyped eighth lane is visible before the run starts.
+fn format_inputs(inputs: &[InputSpec]) -> String {
+    let names: Vec<String> = inputs.iter().map(|i| i.display_path().display().to_string()).collect();
+    match names.len() {
+        1 => names.join(""),
+        n => format!("{n} inputs: {}", names.join(", ")),
+    }
+}
+
 fn run(args: Cli) -> Result<()> {
     args.validate().map_err(|reason| FastDnaError::InvalidConfig {
         parameter: "count filters",
@@ -119,7 +161,8 @@ fn run(args: Cli) -> Result<()> {
     println!("==================================================");
     println!(" FastDNA: High-Performance Genomic Kernel (Rust)  ");
     println!("==================================================");
-    println!("Input:          {}", args.input.display());
+    let inputs: Vec<InputSpec> = args.input.iter().map(|p| InputSpec::from_arg(p)).collect();
+    println!("Input:          {}", format_inputs(&inputs));
     println!("Output:         {}", args.output.display());
     println!("k-mer Size:     {}", args.kmer_size);
     println!("Quality Cutoff: Q >= {}", args.min_quality);
@@ -139,25 +182,7 @@ fn run(args: Cli) -> Result<()> {
         progress_interval: default_config.progress_interval,
     };
 
-    let is_gz = args
-        .input
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"));
-    let file = File::open(&args.input).map_err(|e| FastDnaError::Io { path: args.input.clone(), source: e })?;
-
-    // Best-effort: a size we cannot read (an unusual filesystem, a stream
-    // that lies about its length) just disables size-based estimation --
-    // see `MemoryPolicy::estimated_input_bytes`'s doc comment for why that
-    // defaults to the conservative in-memory choice rather than failing
-    // the whole run over a memory *prediction* that could not be made.
-    let on_disk_bytes = file.metadata().ok().map(|m| m.len());
-    let estimated_input_bytes = on_disk_bytes.map(|bytes| {
-        if is_gz {
-            (bytes as f64 * GZIP_FASTQ_EXPANSION_FACTOR) as u64
-        } else {
-            bytes
-        }
-    });
+    let estimated_input_bytes = estimate_total_input_bytes(&inputs);
 
     let policy = MemoryPolicy {
         strategy: match args.strategy {
@@ -187,13 +212,17 @@ fn run(args: Cli) -> Result<()> {
     let start_time = Instant::now();
     let pb = spinner("Analyzing genomic reads in streaming...");
 
-    let buf_reader: Box<dyn BufRead + Send + 'static> = if is_gz {
-        Box::new(BufReader::new(MultiGzDecoder::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
-    };
+    // A fallback label only: `MultiSourceReader` names the file it was
+    // actually reading when something goes wrong, so this is used solely
+    // for the degenerate case where it has not opened anything yet.
+    let source_label = inputs
+        .first()
+        .map(|i| i.display_path())
+        .unwrap_or_else(|| PathBuf::from("<inputs>"));
 
-    let fastq_reader = FastqReader::new(buf_reader);
+    // Files are opened lazily, one at a time, inside the producer thread:
+    // a run over 200 lanes holds one file handle, not 200.
+    let fastq_reader = MultiSourceReader::new(inputs);
 
     // The core stays silent; this closure is what turns events into a spinner.
     let bar = pb.clone();
@@ -206,7 +235,7 @@ fn run(args: Cli) -> Result<()> {
     let (mut counter, qc, total_reads, decision) = process_stream_parallel_with_policy(
         fastq_reader,
         config,
-        &args.input,
+        &source_label,
         Some(&on_progress),
         None, // the CLI has no way to cancel a running call yet
         policy,
