@@ -99,12 +99,14 @@
 //! composition table or a host-removal step needs.
 
 use std::collections::hash_map::Entry;
+use std::io::Write;
 use std::path::Path;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{FastDnaError, Result};
+use crate::fastq::{FastqReadError, RecordSource};
 
 /// The taxon id reported for a read that could not be classified.
 ///
@@ -158,6 +160,19 @@ pub struct Taxonomy {
     /// hand-edited file disagree with itself.
     #[serde(skip)]
     index: FxHashMap<u32, usize>,
+    /// Each taxon's full root-to-self lineage, parallel to `taxa`, computed
+    /// once here rather than walked per query.
+    ///
+    /// This is the single most-repeated computation in the whole module.
+    /// Classifying one read scores every root-to-leaf path through the taxa
+    /// it hit, which is `H^2` ancestor tests for `H` distinct hit taxa. A
+    /// walk-the-parents implementation costs one hash lookup per step, so
+    /// `H^2 * D` hash lookups per read at tree depth `D`. Precomputed, the
+    /// same test is a scan of a contiguous slice of at most `D` `u32`s with
+    /// no hashing at all. At a typical `H = 3`, `D = 8`, that is 72 hash
+    /// lookups saved per read -- half a billion over a 7-million-read file.
+    #[serde(skip)]
+    lineages: Vec<Vec<u32>>,
 }
 
 impl Taxonomy {
@@ -251,7 +266,26 @@ impl Taxonomy {
             }
         }
 
-        Ok(Taxonomy { taxa, root, index })
+        // Safe to walk unguarded now: the loop above proved every chain
+        // reaches the root without revisiting a node.
+        let lineages = taxa
+            .iter()
+            .map(|taxon| {
+                let mut path = Vec::new();
+                let mut current = taxon.tax_id;
+                while current != UNCLASSIFIED_TAX_ID {
+                    path.push(current);
+                    current = match index.get(&current) {
+                        Some(&i) => taxa[i].parent_tax_id,
+                        None => UNCLASSIFIED_TAX_ID,
+                    };
+                }
+                path.reverse();
+                path
+            })
+            .collect();
+
+        Ok(Taxonomy { taxa, root, index, lineages })
     }
 
     /// The single root node's id.
@@ -297,42 +331,31 @@ impl Taxonomy {
         self.get(tax_id).map(|t| t.parent_tax_id)
     }
 
-    /// The root-to-node path, root first. Empty if `tax_id` is unknown.
-    pub fn lineage(&self, tax_id: u32) -> Vec<u32> {
-        let mut path = Vec::new();
-        let mut current = tax_id;
-        while current != UNCLASSIFIED_TAX_ID {
-            let Some(taxon) = self.get(current) else {
-                // Only reachable for an id that is not in the tree, since
-                // validation ruled out dangling parents.
-                return Vec::new();
-            };
-            path.push(current);
-            current = taxon.parent_tax_id;
+    /// The root-to-node path, root first and `tax_id` itself last. Empty if
+    /// `tax_id` is unknown.
+    ///
+    /// A borrowed slice of the table `from_taxa` built once, not a fresh
+    /// walk: see the `lineages` field for the per-read operation count that
+    /// motivates it.
+    pub fn lineage(&self, tax_id: u32) -> &[u32] {
+        match self.index.get(&tax_id) {
+            Some(&i) => &self.lineages[i],
+            None => &[],
         }
-        path.reverse();
-        path
     }
 
     /// Whether `ancestor` is on the root-to-`descendant` path, inclusive of
-    /// `descendant` itself. Walks up from `descendant` rather than down
-    /// from `ancestor`: a node knows its parent, and a downward walk would
-    /// need a child index that exists only to answer this.
+    /// `descendant` itself.
+    ///
+    /// One contiguous scan of at most `depth(descendant)` `u32`s, with no
+    /// hashing after the single index lookup. The alternative -- walking
+    /// parent pointers -- costs one hash lookup per step of that same
+    /// depth, and this runs `H^2` times per read (see `lineages`).
     pub fn is_ancestor_or_self(&self, ancestor: u32, descendant: u32) -> bool {
-        if ancestor == UNCLASSIFIED_TAX_ID || descendant == UNCLASSIFIED_TAX_ID {
+        if ancestor == UNCLASSIFIED_TAX_ID {
             return false;
         }
-        let mut current = descendant;
-        while current != UNCLASSIFIED_TAX_ID {
-            if current == ancestor {
-                return true;
-            }
-            match self.get(current) {
-                Some(taxon) => current = taxon.parent_tax_id,
-                None => return false,
-            }
-        }
-        false
+        self.lineage(descendant).contains(&ancestor)
     }
 
     /// The lowest common ancestor of `a` and `b` -- the deepest node that is
@@ -353,6 +376,10 @@ impl Taxonomy {
         if a == b {
             return a;
         }
+        // Both are borrowed slices of the precomputed table, so an LCA
+        // costs a zip over at most `depth` u32 comparisons and allocates
+        // nothing -- it is folded over every tie in `classify_sequence`
+        // and over every k-mer collision during `build`.
         let path_a = self.lineage(a);
         let path_b = self.lineage(b);
         if path_a.is_empty() {
@@ -451,6 +478,10 @@ pub struct TaxonomyFile {
     pub taxonomy: Taxonomy,
     /// Reference sequence id -> the taxon it belongs to.
     pub sequence_to_tax_id: FxHashMap<String, u32>,
+    /// The 1-based line each sequence id came from, so that a *build*-time
+    /// failure -- a sequence named here that the reference never contains --
+    /// can still point at the row to fix rather than only at the id.
+    sequence_row: FxHashMap<String, usize>,
 }
 
 impl TaxonomyFile {
@@ -589,13 +620,7 @@ impl TaxonomyFile {
         }
 
         let taxonomy = Taxonomy::from_taxa(taxa, &row_of).map_err(load_err)?;
-        Ok(TaxonomyFile { taxonomy, sequence_to_tax_id })
-    }
-
-    /// The 1-based rows sequence ids came from, for build-time errors that
-    /// need to point back at the taxonomy file.
-    pub fn sequence_ids(&self) -> impl Iterator<Item = (&str, u32)> {
-        self.sequence_to_tax_id.iter().map(|(id, tax)| (id.as_str(), *tax))
+        Ok(TaxonomyFile { taxonomy, sequence_to_tax_id, sequence_row })
     }
 }
 
@@ -606,6 +631,529 @@ impl TaxonomyFile {
 /// reference rather than at the real problem here.
 fn split_sequence_ids(cell: &str) -> impl Iterator<Item = &str> {
     cell.split([';', ',']).map(|s| s.trim()).filter(|s| !s.is_empty())
+}
+
+/// The reference sequence id for a FASTA/FASTQ header: the first
+/// whitespace-delimited token, without the leading `>` or `@`. Shared by
+/// database construction and by per-read reporting, so a reference and a
+/// read are named by exactly the same rule.
+fn record_id_of(header: &[u8]) -> String {
+    let text = String::from_utf8_lossy(header);
+    let trimmed = text.trim_start_matches(['>', '@']);
+    trimmed.split_whitespace().next().unwrap_or("").to_string()
+}
+
+/// `kmer::extract_canonical_kmers`, writing into a caller-owned buffer
+/// instead of returning a fresh `Vec`.
+///
+/// This exists purely to remove one allocation and one free per sequence.
+/// Both the builder and the classifier call it once per record, so on a
+/// 7-million-read file it is 14 million heap operations that simply do not
+/// happen; the buffer instead reaches the longest read's length within the
+/// first few reads and never grows again.
+///
+/// TODO: delete this and call `kmer::extract_canonical_kmers_into` once
+/// that lands in `src/kmer.rs` -- it is being added concurrently in the
+/// main tree, and duplicating it here rather than adding a second copy to
+/// `kmer.rs` is what keeps that merge trivial.
+/// `the_local_kmer_extractor_matches_the_shared_one` pins the two together
+/// so this copy cannot drift in the meantime.
+fn extract_canonical_kmers_into(seq: &[u8], k: usize, out: &mut Vec<u64>) {
+    out.clear();
+    if seq.len() < k || k == 0 || k > 32 {
+        return;
+    }
+
+    let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let mut current_kmer: u64 = 0;
+    let mut valid_len = 0;
+
+    for &base in seq {
+        if let Some(bits) = crate::kmer::base_to_bits(base) {
+            current_kmer = ((current_kmer << 2) | bits) & mask;
+            valid_len += 1;
+            if valid_len >= k {
+                out.push(crate::kmer::canonical_kmer_u64(current_kmer, k));
+            }
+        } else {
+            // An ambiguous base resets the window rather than producing a
+            // corrupt k-mer -- the same rule the shared extractor applies.
+            current_kmer = 0;
+            valid_len = 0;
+        }
+    }
+}
+
+// -- the database ---------------------------------------------------------
+
+/// The first 8 bytes of a saved database. Version is carried separately so
+/// a future format change is a clear "this file is version 2, I understand
+/// version 1" rather than an unrecognizable magic.
+const DB_MAGIC: &[u8; 8] = b"FDNAKDB\x00";
+
+/// The on-disk format version this build writes and is willing to read.
+const DB_FORMAT_VERSION: u32 = 1;
+
+/// Bytes before the taxonomy JSON: magic(8) + version(4) + k(4) +
+/// n_entries(8) + taxonomy_len(8).
+const DB_HEADER_BYTES: usize = 32;
+
+/// A canonical-k-mer -> taxon lookup table plus the taxonomy it refers to.
+///
+/// # Representation, and why it is a sorted table rather than a hash map
+///
+/// Two parallel arrays -- `Vec<u64>` of canonical k-mers in ascending
+/// order, `Vec<u32>` of the taxon each maps to -- searched by
+/// `binary_search`. Counted against the obvious alternative, an
+/// `FxHashMap<u64, u32>`:
+///
+/// - **Building is strictly less work.** The sorted table is produced by
+///   pushing one `(k-mer, taxon)` pair per k-mer occurrence into one
+///   contiguous buffer, sorting it once, and merging equal runs through
+///   [`Taxonomy::lca`] in a single linear pass. The hash map does all of
+///   that *plus* a hash computation and a probe per occurrence, plus a
+///   full rehash of everything inserted so far each time it doubles -- and
+///   then still has to be sorted, because the entries have to come out in
+///   some order to be written to disk. There is no work the map saves.
+/// - **Density.** 12 bytes per entry, exactly, with no slack: see
+///   [`BYTES_PER_KMER`]. `hashbrown` runs at up to 87.5% load and doubles
+///   at that point, so it averages nearer 22 bytes for the same data (a
+///   16-byte padded pair plus a control byte, over a table that is between
+///   1.14x and 2.29x the entry count). At this module's documented ceiling
+///   of ~100M k-mers that is 1.2 GB against 2.2 GB -- and memory, not
+///   speed, is what bounds how large a reference set this module can take.
+/// - **The disk path.** The on-disk entry layout is byte-identical to the
+///   in-memory one, so an `mmap`-backed lookup is a change of accessor and
+///   not of format. A hash table has no such property.
+///
+/// What that costs: a lookup is `ceil(log2(n))` comparisons -- 27 at 100M
+/// entries -- against roughly one probe for a hash map. That is the trade
+/// being made deliberately, in favour of fitting a bigger database in RAM.
+#[derive(Debug, Clone)]
+pub struct KmerDatabase {
+    k: usize,
+    taxonomy: Taxonomy,
+    /// Ascending, deduplicated. `lookup`'s binary search assumes both, and
+    /// `load` re-establishes them at the file boundary.
+    kmers: Vec<u64>,
+    /// Parallel to `kmers`.
+    tax_ids: Vec<u32>,
+}
+
+impl KmerDatabase {
+    /// Builds a database from a reference FASTA (or FASTQ) file and a
+    /// taxonomy TSV. See [`TaxonomyFile`] for the taxonomy format.
+    pub fn build<P: AsRef<Path>, Q: AsRef<Path>>(reference: P, taxonomy: Q, k: usize) -> Result<Self> {
+        let reference = reference.as_ref();
+        let taxonomy_path = taxonomy.as_ref();
+        let taxonomy_file = TaxonomyFile::read(taxonomy_path)?;
+        let source = crate::fastq::MultiSourceReader::from_paths(vec![reference]);
+        Self::build_from_source(source, reference, taxonomy_file, taxonomy_path, k)
+    }
+
+    /// The construction logic itself, over any [`RecordSource`] -- kept
+    /// separate from `build` so it is testable against an in-memory buffer
+    /// without touching the filesystem (the same split
+    /// `sketch::GenomeSketch::from_reader` uses).
+    ///
+    /// Every k-mer is mapped to the lowest common ancestor of every taxon
+    /// whose reference sequences contain it. That is the property the
+    /// classifier's correctness rests on, and it is why a collision is
+    /// resolved through [`Taxonomy::lca`] rather than by keeping the first
+    /// or the last writer: keeping either would assign every ambiguous
+    /// k-mer to whichever reference happened to appear first in the file,
+    /// which produces no error and no warning -- just a systematic bias
+    /// toward that organism in every sample ever classified against the
+    /// database.
+    pub fn build_from_source<S: RecordSource>(
+        mut source: S,
+        reference_path: &Path,
+        taxonomy_file: TaxonomyFile,
+        taxonomy_path: &Path,
+        k: usize,
+    ) -> Result<Self> {
+        // Checked before a single record is read: an out-of-range k makes
+        // the extractor return nothing for every sequence, so without this
+        // the whole reference set would "build" into an empty database and
+        // classify every read as unclassified, in silence.
+        if k == 0 || k > 32 {
+            return Err(FastDnaError::InvalidK { k });
+        }
+        source.validate()?;
+
+        let TaxonomyFile { taxonomy, sequence_to_tax_id, sequence_row } = taxonomy_file;
+
+        // One pair per k-mer *occurrence*, in one contiguous buffer. See
+        // the type-level doc comment for why this beats a hash map on
+        // operation count; see the module docstring's "Memory cost"
+        // section for the peak this implies.
+        let mut pairs: Vec<(u64, u32)> = Vec::new();
+        let mut kmer_buf: Vec<u64> = Vec::new();
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        let mut record_no: u64 = 0;
+
+        loop {
+            match source.next_record() {
+                Ok(Some(record)) => {
+                    record_no += 1;
+                    let id = record_id_of(&record.id);
+                    let Some(&tax_id) = sequence_to_tax_id.get(id.as_str()) else {
+                        return Err(FastDnaError::Load {
+                            path: reference_path.to_path_buf(),
+                            reason: format!(
+                                "reference sequence {id:?} (record {record_no}) has no tax_id: add \
+                                 it to a {SEQUENCE_IDS_COLUMN} cell in {}",
+                                taxonomy_path.display()
+                            ),
+                        });
+                    };
+                    seen.insert(id);
+
+                    extract_canonical_kmers_into(&record.seq, k, &mut kmer_buf);
+                    pairs.reserve(kmer_buf.len());
+                    for &kmer in &kmer_buf {
+                        pairs.push((kmer, tax_id));
+                    }
+                }
+                Ok(None) => break,
+                Err(FastqReadError::Io(source_err)) => {
+                    let (path, _) = failing_location(&source, reference_path, record_no);
+                    return Err(FastDnaError::Io { path, source: source_err });
+                }
+                Err(FastqReadError::Malformed(reason)) => {
+                    let (path, record) = failing_location(&source, reference_path, record_no);
+                    return Err(FastDnaError::MalformedFastq { path, record, reason });
+                }
+            }
+        }
+
+        // The mirror of the check above: a taxonomy naming a sequence the
+        // reference does not contain is a typo or a mismatched pair of
+        // files, and skipping it silently means that taxon contributes no
+        // k-mers at all -- so reads from it are never classified to it, and
+        // nothing anywhere says why.
+        let mut missing: Vec<(usize, &String)> = sequence_to_tax_id
+            .keys()
+            .filter(|id| !seen.contains(*id))
+            .map(|id| (sequence_row.get(id).copied().unwrap_or(0), id))
+            .collect();
+        // Sorted so that a file with several mistakes always reports the
+        // same (earliest) one, rather than whichever the hash map's
+        // iteration order happened to yield.
+        missing.sort_unstable();
+        if let Some((row, id)) = missing.first() {
+            return Err(FastDnaError::Load {
+                path: taxonomy_path.to_path_buf(),
+                reason: format!(
+                    "row {row}: sequence id {id:?} does not appear in {}; the taxonomy and the \
+                     reference must name the same sequences",
+                    reference_path.display()
+                ),
+            });
+        }
+
+        Ok(Self::from_pairs(pairs, taxonomy, k))
+    }
+
+    /// Sorts `pairs` and folds every run of equal k-mers into one entry via
+    /// [`Taxonomy::lca`].
+    ///
+    /// The distinct count is taken in its own linear pass before the two
+    /// output arrays are allocated, so each is allocated exactly once at
+    /// exactly the right size. Letting them grow instead would cost
+    /// `log2(n)` reallocations and copies each, and would leave up to
+    /// twice the needed capacity resident in the database that is about to
+    /// be held for the rest of the process's life.
+    fn from_pairs(mut pairs: Vec<(u64, u32)>, taxonomy: Taxonomy, k: usize) -> Self {
+        pairs.sort_unstable();
+
+        let distinct = pairs
+            .windows(2)
+            .filter(|w| w[0].0 != w[1].0)
+            .count()
+            + usize::from(!pairs.is_empty());
+
+        let mut kmers: Vec<u64> = Vec::with_capacity(distinct);
+        let mut tax_ids: Vec<u32> = Vec::with_capacity(distinct);
+
+        let mut i = 0;
+        while i < pairs.len() {
+            let kmer = pairs[i].0;
+            let mut tax_id = pairs[i].1;
+            let mut j = i + 1;
+            while j < pairs.len() && pairs[j].0 == kmer {
+                tax_id = taxonomy.lca(tax_id, pairs[j].1);
+                j += 1;
+            }
+            kmers.push(kmer);
+            tax_ids.push(tax_id);
+            i = j;
+        }
+
+        KmerDatabase { k, taxonomy, kmers, tax_ids }
+    }
+
+    /// The taxon a canonical k-mer maps to, or `None` if the database has
+    /// never seen it.
+    #[inline]
+    pub fn lookup(&self, kmer: u64) -> Option<u32> {
+        self.kmers.binary_search(&kmer).ok().map(|i| self.tax_ids[i])
+    }
+
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// The number of distinct canonical k-mers in the table.
+    pub fn len(&self) -> usize {
+        self.kmers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kmers.is_empty()
+    }
+
+    pub fn taxonomy(&self) -> &Taxonomy {
+        &self.taxonomy
+    }
+
+    /// The two parallel arrays, for tests and for callers that want to walk
+    /// the table directly rather than through `lookup`.
+    pub fn entries(&self) -> (&[u64], &[u32]) {
+        (&self.kmers, &self.tax_ids)
+    }
+
+    /// Bytes held by the lookup table alone: exactly
+    /// `len() * `[`BYTES_PER_KMER`]. This is the number the module
+    /// docstring's scale table is derived from.
+    pub fn table_memory_bytes(&self) -> usize {
+        self.kmers.len() * std::mem::size_of::<u64>() + self.tax_ids.len() * std::mem::size_of::<u32>()
+    }
+
+    /// Bytes held by the whole database: the table plus the taxonomy.
+    ///
+    /// The taxonomy term is small and roughly constant (a few hundred bytes
+    /// per taxon), so for anything but a toy database the table dominates
+    /// completely -- which is exactly why the scale table quotes the
+    /// per-k-mer figure and nothing else.
+    pub fn memory_bytes(&self) -> usize {
+        let taxonomy: usize = self
+            .taxonomy
+            .taxa
+            .iter()
+            .map(|t| std::mem::size_of::<Taxon>() + t.name.len() + t.rank.len())
+            .sum::<usize>()
+            + self
+                .taxonomy
+                .lineages
+                .iter()
+                .map(|l| l.len() * std::mem::size_of::<u32>())
+                .sum::<usize>()
+            + self.taxonomy.index.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<usize>());
+        self.table_memory_bytes() + taxonomy
+    }
+
+    /// Writes the database to `path`.
+    ///
+    /// # Format
+    ///
+    /// ```text
+    /// offset  bytes  content
+    /// 0       8      magic, b"FDNAKDB\0"
+    /// 8       4      format version, u32 little-endian
+    /// 12      4      k, u32 little-endian
+    /// 16      8      entry count n, u64 little-endian
+    /// 24      8      taxonomy JSON length L, u64 little-endian
+    /// 32      L      taxonomy, JSON
+    /// 32+L    12n    entries: (k-mer u64 LE, tax_id u32 LE), ascending
+    /// ```
+    ///
+    /// The entry region is the in-memory table verbatim, which is the whole
+    /// point of choosing it: it makes the file a sorted, fixed-record
+    /// array that a future `mmap`-backed lookup can binary search in place
+    /// without parsing anything, and it makes truncation *exactly*
+    /// detectable -- a file whose length is not `32 + L + 12n` is corrupt,
+    /// with no judgement call involved. A variable-length encoding would
+    /// give up both.
+    ///
+    /// The taxonomy is JSON rather than a bespoke binary block because it
+    /// is a few thousand rows of text at most (the table is the part that
+    /// gets large), and a human being able to read it out of the file with
+    /// `head -c` is worth more than the bytes it saves.
+    ///
+    /// Written through [`AtomicFile`](crate::atomic::AtomicFile) like every
+    /// other writer in this crate: a disk-full error or a Ctrl-C partway
+    /// through must leave the previous good database in place rather than a
+    /// truncated file that `load` would then have to reject.
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let io_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
+
+        let taxonomy_json = serde_json::to_vec(&self.taxonomy).map_err(|e| FastDnaError::Export {
+            path: path.to_path_buf(),
+            reason: format!("could not serialize the taxonomy: {e}"),
+        })?;
+
+        let (file, pending) = crate::atomic::AtomicFile::create(path)?;
+        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+
+        writer.write_all(DB_MAGIC).map_err(io_err)?;
+        writer.write_all(&DB_FORMAT_VERSION.to_le_bytes()).map_err(io_err)?;
+        writer.write_all(&(self.k as u32).to_le_bytes()).map_err(io_err)?;
+        writer.write_all(&(self.kmers.len() as u64).to_le_bytes()).map_err(io_err)?;
+        writer.write_all(&(taxonomy_json.len() as u64).to_le_bytes()).map_err(io_err)?;
+        writer.write_all(&taxonomy_json).map_err(io_err)?;
+
+        // One 12-byte record at a time into a 1 MB buffered writer: the
+        // alternative, building the whole 12n-byte image in memory first,
+        // would double the database's footprint at the exact moment it is
+        // already fully resident.
+        let mut record = [0u8; BYTES_PER_KMER];
+        for (&kmer, &tax_id) in self.kmers.iter().zip(self.tax_ids.iter()) {
+            record[..8].copy_from_slice(&kmer.to_le_bytes());
+            record[8..].copy_from_slice(&tax_id.to_le_bytes());
+            writer.write_all(&record).map_err(io_err)?;
+        }
+
+        writer.flush().map_err(io_err)?;
+        drop(writer);
+        pending.commit()
+    }
+
+    /// Reads a database written by [`save`](Self::save).
+    ///
+    /// Every invariant `lookup` silently assumes is re-established here, at
+    /// the file boundary, and nowhere else: the table is ascending and
+    /// deduplicated, `k` is in range, and every taxon id in the table
+    /// exists in the embedded taxonomy. Checking them per lookup would mean
+    /// paying for them once per k-mer of every read forever, to catch a
+    /// problem that can only be introduced by a corrupt or hand-edited
+    /// file. The failure mode being ruled out is not a crash -- an unsorted
+    /// table makes `binary_search` return confident nonsense.
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let load_err = |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason };
+
+        let bytes = std::fs::read(path)
+            .map_err(|e| FastDnaError::Io { path: path.to_path_buf(), source: e })?;
+
+        if bytes.len() < DB_HEADER_BYTES {
+            return Err(load_err(format!(
+                "the file is {} bytes, shorter than the {DB_HEADER_BYTES}-byte header a FastDNA \
+                 k-mer database starts with",
+                bytes.len()
+            )));
+        }
+        if &bytes[..8] != DB_MAGIC {
+            return Err(load_err(
+                "the file does not start with the FastDNA k-mer database magic bytes; it was \
+                 written by something else, or it is not a database at all"
+                    .to_string(),
+            ));
+        }
+
+        let version = read_u32(&bytes[8..12]);
+        if version != DB_FORMAT_VERSION {
+            return Err(load_err(format!(
+                "the file is format version {version}, and this build of FastDNA reads version \
+                 {DB_FORMAT_VERSION}"
+            )));
+        }
+
+        let k = read_u32(&bytes[12..16]) as usize;
+        if k == 0 || k > 32 {
+            return Err(load_err(format!(
+                "k is {k}, outside the 1..=32 range 2-bit packing supports"
+            )));
+        }
+
+        let n_entries = read_u64(&bytes[16..24]) as usize;
+        let taxonomy_len = read_u64(&bytes[24..32]) as usize;
+
+        // The one length check that makes truncation unambiguous. Both
+        // additions are done in `u128` because `n_entries` and
+        // `taxonomy_len` come straight off disk: a corrupt file can name a
+        // count that overflows `usize` on the multiply, and an overflow
+        // there would wrap to a small number that then *passes* the check.
+        let expected = DB_HEADER_BYTES as u128
+            + taxonomy_len as u128
+            + (n_entries as u128) * (BYTES_PER_KMER as u128);
+        if bytes.len() as u128 != expected {
+            return Err(load_err(format!(
+                "the file is {} bytes but its header describes {expected} ({DB_HEADER_BYTES} \
+                 header + {taxonomy_len} taxonomy + {n_entries} entries x {BYTES_PER_KMER}); it is \
+                 truncated or corrupt",
+                bytes.len()
+            )));
+        }
+
+        let taxonomy_end = DB_HEADER_BYTES + taxonomy_len;
+        let taxonomy: Taxonomy = serde_json::from_slice(&bytes[DB_HEADER_BYTES..taxonomy_end])
+            .map_err(|e| load_err(format!("the embedded taxonomy is not readable: {e}")))?;
+        // `index` and `lineages` are `#[serde(skip)]`, so what came back is
+        // a shell. Re-running the constructor rebuilds both *and* re-runs
+        // every structural check, which is the point: a hand-edited file
+        // must not be able to smuggle in a cycle that every later ancestor
+        // walk would then loop on.
+        let taxonomy = Taxonomy::from_taxa(taxonomy.taxa, &FxHashMap::default())
+            .map_err(|reason| load_err(format!("the embedded taxonomy is invalid: {reason}")))?;
+
+        let mut kmers: Vec<u64> = Vec::with_capacity(n_entries);
+        let mut tax_ids: Vec<u32> = Vec::with_capacity(n_entries);
+        let mut previous: Option<u64> = None;
+        for entry in bytes[taxonomy_end..].chunks_exact(BYTES_PER_KMER) {
+            let kmer = read_u64(&entry[..8]);
+            let tax_id = read_u32(&entry[8..]);
+            if let Some(previous) = previous {
+                if kmer <= previous {
+                    return Err(load_err(format!(
+                        "entry {} is k-mer {kmer} after k-mer {previous}: the table is not in \
+                         strictly ascending order, which is what lookup's binary search assumes",
+                        kmers.len()
+                    )));
+                }
+            }
+            if !taxonomy.contains(tax_id) {
+                return Err(load_err(format!(
+                    "entry {} maps to tax_id {tax_id}, which the embedded taxonomy does not define",
+                    kmers.len()
+                )));
+            }
+            previous = Some(kmer);
+            kmers.push(kmer);
+            tax_ids.push(tax_id);
+        }
+
+        Ok(KmerDatabase { k, taxonomy, kmers, tax_ids })
+    }
+}
+
+/// Where to blame a reader-side failure: the file a multi-file source was
+/// actually reading and that file's own record number, or the caller's
+/// path plus the running count when the source has no path of its own.
+/// The same rule `pipeline.rs` applies, applied here so an error from a
+/// reference file is located the same way an error from a read file is.
+fn failing_location<S: RecordSource>(
+    source: &S,
+    fallback_path: &Path,
+    records_so_far: u64,
+) -> (std::path::PathBuf, u64) {
+    match source.current_source() {
+        Some((path, records_in_file)) => (path, records_in_file + 1),
+        None => (fallback_path.to_path_buf(), records_so_far + 1),
+    }
+}
+
+fn read_u32(bytes: &[u8]) -> u32 {
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&bytes[..4]);
+    u32::from_le_bytes(buf)
+}
+
+fn read_u64(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(buf)
 }
 
 #[cfg(test)]
@@ -787,5 +1335,322 @@ tax_id\tparent_tax_id\trank\tname\tsequence_ids
             "# a comment\ntax_id\tparent_tax_id\trank\tname\n\n1\t1\tno rank\troot\n\n100\t99\tspecies\tOrphan\n",
             &["row 6"],
         );
+    }
+
+    // -- database construction --------------------------------------------
+
+    /// `k` for the toy reference. Small enough that every k-mer set below
+    /// can be listed by hand, large enough that the three blocks do not
+    /// collide by accident -- which `the_toy_reference_blocks_share_no_kmers`
+    /// proves rather than assumes.
+    const TOY_K: usize = 11;
+
+    /// Present in both species, so every k-mer wholly inside it must map to
+    /// the genus, not to either species.
+    const SHARED: &str = "GATTACAGATTACAGGCC";
+    const ONLY_A: &str = "TTGCACCGTAAGCTATCG";
+    const ONLY_B: &str = "ACGCGTTAACCGGATCAT";
+
+    fn toy_reference() -> String {
+        format!(">species_a a description\n{ONLY_A}{SHARED}\n>species_b\n{ONLY_B}{SHARED}\n")
+    }
+
+    fn kmers_of(seq: &str) -> Vec<u64> {
+        crate::kmer::extract_canonical_kmers(seq.as_bytes(), TOY_K)
+    }
+
+    fn source_over(text: &str) -> crate::fastq::FastqReader<std::io::Cursor<Vec<u8>>> {
+        crate::fastq::FastqReader::new(std::io::Cursor::new(text.as_bytes().to_vec()))
+    }
+
+    fn build_toy_db() -> KmerDatabase {
+        KmerDatabase::build_from_source(
+            source_over(&toy_reference()),
+            std::path::Path::new("<toy reference>"),
+            toy(),
+            std::path::Path::new("<toy>"),
+            TOY_K,
+        )
+        .expect("the toy reference and taxonomy agree")
+    }
+
+    /// The local buffer-reusing extractor must agree with the shared one on
+    /// every input, or the classifier and the rest of the crate would be
+    /// counting different k-mers. Pins the duplication until
+    /// `kmer::extract_canonical_kmers_into` lands and this copy goes away.
+    #[test]
+    fn the_local_kmer_extractor_matches_the_shared_one() {
+        let cases: [&[u8]; 8] = [
+            b"",
+            b"ACG",
+            b"ACGTACGTACGTACGT",
+            b"ACGTNACGTNACGTACGTAC",
+            b"NNNNNNNNNNNN",
+            b"acgtacgtacgtacgt",
+            b"ACGTACGTACGTACGTNN",
+            b"TTTTTTTTTTTTTTTTTTTT",
+        ];
+        let mut buffer = Vec::new();
+        for seq in cases {
+            for k in [1usize, 4, 11, 31, 32] {
+                extract_canonical_kmers_into(seq, k, &mut buffer);
+                assert_eq!(
+                    buffer,
+                    crate::kmer::extract_canonical_kmers(seq, k),
+                    "mismatch at k={k} on {:?}",
+                    String::from_utf8_lossy(seq)
+                );
+            }
+        }
+    }
+
+    /// The premise of every assertion below: the unique blocks really are
+    /// unique. Without this, "the shared block maps to the genus" could
+    /// pass for the wrong reason.
+    #[test]
+    fn the_toy_reference_blocks_share_no_kmers() {
+        let a: FxHashSet<u64> = kmers_of(ONLY_A).into_iter().collect();
+        let b: FxHashSet<u64> = kmers_of(ONLY_B).into_iter().collect();
+        let shared: FxHashSet<u64> = kmers_of(SHARED).into_iter().collect();
+        assert!(a.is_disjoint(&b));
+        assert!(a.is_disjoint(&shared));
+        assert!(b.is_disjoint(&shared));
+        assert!(!shared.is_empty());
+    }
+
+    #[test]
+    fn a_kmer_unique_to_one_species_maps_to_that_species() {
+        let db = build_toy_db();
+        for kmer in kmers_of(ONLY_A) {
+            assert_eq!(db.lookup(kmer), Some(100), "a k-mer only in species_a must map to it");
+        }
+        for kmer in kmers_of(ONLY_B) {
+            assert_eq!(db.lookup(kmer), Some(200));
+        }
+    }
+
+    /// The property the whole database exists for: a k-mer occurring in two
+    /// species maps to the taxon covering both, not to whichever reference
+    /// the builder happened to read first.
+    #[test]
+    fn a_kmer_shared_by_two_species_maps_to_their_common_ancestor() {
+        let db = build_toy_db();
+        for kmer in kmers_of(SHARED) {
+            assert_eq!(db.lookup(kmer), Some(10), "a k-mer in both species must map to the genus");
+        }
+    }
+
+    /// Order-independence, stated as a test rather than trusted: reversing
+    /// the two reference records must not change a single assignment.
+    #[test]
+    fn the_lca_assignment_does_not_depend_on_reference_order() {
+        let reversed = format!(">species_b\n{ONLY_B}{SHARED}\n>species_a\n{ONLY_A}{SHARED}\n");
+        let flipped = KmerDatabase::build_from_source(
+            source_over(&reversed),
+            std::path::Path::new("<toy reference>"),
+            toy(),
+            std::path::Path::new("<toy>"),
+            TOY_K,
+        )
+        .expect("valid");
+        assert_eq!(build_toy_db().entries(), flipped.entries());
+    }
+
+    #[test]
+    fn a_reference_sequence_with_no_tax_id_is_rejected_by_name() {
+        let reference = format!(">species_a\n{ONLY_A}\n>mystery_contig\n{ONLY_B}\n");
+        match KmerDatabase::build_from_source(
+            source_over(&reference),
+            std::path::Path::new("ref.fasta"),
+            toy(),
+            std::path::Path::new("taxonomy.tsv"),
+            TOY_K,
+        ) {
+            Err(FastDnaError::Load { reason, .. }) => {
+                assert!(reason.contains("mystery_contig"), "reason: {reason}");
+                assert!(reason.contains("taxonomy.tsv"), "reason must say where to add it: {reason}");
+            }
+            other => panic!("expected Load, got {other:?}"),
+        }
+    }
+
+    /// The mirror case: a taxonomy naming a sequence the reference does not
+    /// contain is a typo or a mismatched pair of files, and quietly ignoring
+    /// it means a taxon silently contributes no k-mers at all.
+    #[test]
+    fn a_taxonomy_sequence_id_missing_from_the_reference_is_rejected_by_row() {
+        let reference = format!(">species_a\n{ONLY_A}\n");
+        match KmerDatabase::build_from_source(
+            source_over(&reference),
+            std::path::Path::new("ref.fasta"),
+            toy(),
+            std::path::Path::new("taxonomy.tsv"),
+            TOY_K,
+        ) {
+            Err(FastDnaError::Load { reason, .. }) => {
+                assert!(reason.contains("species_b"), "reason: {reason}");
+                assert!(reason.contains("row 5"), "reason must name the taxonomy row: {reason}");
+                assert!(reason.contains("ref.fasta"), "reason: {reason}");
+            }
+            other => panic!("expected Load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_k_is_rejected_before_any_reference_is_read() {
+        for k in [0usize, 33, 64] {
+            match KmerDatabase::build_from_source(
+                source_over(&toy_reference()),
+                std::path::Path::new("ref.fasta"),
+                toy(),
+                std::path::Path::new("taxonomy.tsv"),
+                k,
+            ) {
+                Err(FastDnaError::InvalidK { k: reported }) => assert_eq!(reported, k),
+                other => panic!("expected InvalidK for k={k}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The number the module docstring's scale table is derived from. If
+    /// the representation ever changes, this fails and the docstring has to
+    /// be corrected with it.
+    #[test]
+    fn resident_memory_is_twelve_bytes_per_kmer() {
+        let db = build_toy_db();
+        assert_eq!(BYTES_PER_KMER, 12);
+        assert_eq!(db.table_memory_bytes(), db.len() * BYTES_PER_KMER);
+        assert!(db.memory_bytes() > db.table_memory_bytes(), "the taxonomy costs something too");
+    }
+
+    // -- persistence ------------------------------------------------------
+
+    /// A throwaway directory under the system temp dir, removed on drop --
+    /// the same fixture shape `fastq.rs`'s own tests use.
+    struct Fixture {
+        dir: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("fastdna_metagenomics_rs_{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Fixture { dir }
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_to_an_identical_database() {
+        let fx = Fixture::new("round_trip");
+        let path = fx.path("toy.fdb");
+        let original = build_toy_db();
+        original.save(&path).unwrap();
+
+        let loaded = KmerDatabase::load(&path).unwrap();
+        assert_eq!(loaded.k(), original.k());
+        assert_eq!(loaded.entries(), original.entries());
+        assert_eq!(loaded.taxonomy(), original.taxonomy());
+
+        // And saving the loaded copy reproduces the same bytes, which is
+        // what makes the format worth calling deterministic.
+        let second = fx.path("toy_again.fdb");
+        loaded.save(&second).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), std::fs::read(&second).unwrap());
+    }
+
+    #[test]
+    fn a_truncated_database_file_is_a_load_error_not_a_panic() {
+        let fx = Fixture::new("truncated");
+        let path = fx.path("toy.fdb");
+        build_toy_db().save(&path).unwrap();
+
+        let full = std::fs::read(&path).unwrap();
+        for keep in [0, 8, 20, full.len() - 1, full.len() - 6] {
+            std::fs::write(&path, &full[..keep]).unwrap();
+            match KmerDatabase::load(&path) {
+                Err(FastDnaError::Load { .. }) => {}
+                other => panic!("expected Load for a {keep}-byte file, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_foreign_file_is_rejected_by_its_magic_bytes() {
+        let fx = Fixture::new("foreign");
+        let path = fx.path("not_a_db.fdb");
+        std::fs::write(&path, b"this is a text file, not a k-mer database at all").unwrap();
+        match KmerDatabase::load(&path) {
+            Err(FastDnaError::Load { reason, .. }) => {
+                assert!(reason.contains("FastDNA"), "reason: {reason}");
+            }
+            other => panic!("expected Load, got {other:?}"),
+        }
+    }
+
+    /// A hand-edited or bit-rotted table whose entries are out of order
+    /// would make `lookup`'s binary search return quiet nonsense, so the
+    /// ordering invariant is checked at the file boundary -- once -- exactly
+    /// as `sketch.rs` checks its own sorted-hashes invariant.
+    #[test]
+    fn an_unsorted_entry_table_is_rejected_on_load() {
+        let fx = Fixture::new("unsorted");
+        let path = fx.path("toy.fdb");
+        let db = build_toy_db();
+        db.save(&path).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let table_start = bytes.len() - db.len() * BYTES_PER_KMER;
+        // Swap the first two entries, breaking ascending order.
+        for i in 0..BYTES_PER_KMER {
+            bytes.swap(table_start + i, table_start + BYTES_PER_KMER + i);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        match KmerDatabase::load(&path) {
+            Err(FastDnaError::Load { reason, .. }) => {
+                assert!(reason.contains("ascending"), "reason: {reason}");
+            }
+            other => panic!("expected Load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_entry_pointing_at_an_unknown_taxon_is_rejected_on_load() {
+        let fx = Fixture::new("dangling_taxon");
+        let path = fx.path("toy.fdb");
+        let db = build_toy_db();
+        db.save(&path).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let first_tax = bytes.len() - db.len() * BYTES_PER_KMER + 8;
+        bytes[first_tax..first_tax + 4].copy_from_slice(&9_999u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        match KmerDatabase::load(&path) {
+            Err(FastDnaError::Load { reason, .. }) => {
+                assert!(reason.contains("9999"), "reason: {reason}");
+            }
+            other => panic!("expected Load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_of_a_missing_file_is_an_io_error_not_a_load_error() {
+        let fx = Fixture::new("missing");
+        match KmerDatabase::load(fx.path("nope.fdb")) {
+            Err(FastDnaError::Io { .. }) => {}
+            other => panic!("expected Io, got {other:?}"),
+        }
     }
 }
