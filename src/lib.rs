@@ -21,6 +21,7 @@ pub mod preview;
 pub mod progress;
 pub mod qc;
 pub mod sketch;
+pub mod superkmer;
 pub mod translate;
 pub mod wasm;
 
