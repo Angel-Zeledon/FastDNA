@@ -36,11 +36,14 @@ dynamic = ["version"]
 # hand-written fake used when biopython is absent. Without it in this extra,
 # that headline claim is only ever verified because biopython happened to
 # already be installed on whichever machine ran the tests -- never in a
-# clean CI environment.
+# clean CI environment. `matplotlib` backs `python/fastdna/plotting.py` and
+# `genomescope.plot_spectrum_fit`'s own tests, both of which otherwise skip
+# via `pytest.importorskip` rather than genuinely exercising the drawing code.
 [project.optional-dependencies]
 test = [
     "biopython",
     "duckdb>=1.0",
+    "matplotlib",
     "numpy",
     "pandas>=2.0",
     "polars>=1.0",
