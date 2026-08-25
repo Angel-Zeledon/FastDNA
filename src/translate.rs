@@ -479,26 +479,72 @@ pub fn translate_six_frames(
 /// empty result; `k == 0` is rejected.
 pub fn amino_acid_kmers(protein: &str, k: usize) -> Result<Vec<&str>> {
     validate_aa_k(protein, k)?;
-    let bytes = protein.as_bytes();
-    if bytes.len() < k {
-        return Ok(Vec::new());
-    }
-    Ok(bytes
-        .windows(k)
-        .filter_map(|window| std::str::from_utf8(window).ok())
-        .collect())
+    let window_count = aa_window_count(protein, k);
+    // Exact capacity. `windows(k).filter_map(..).collect()` could not do
+    // this: `filter_map` reports a lower size hint of 0, so the vector
+    // started empty and doubled its way up -- about log2(n) allocations and
+    // ~2n 16-byte fat pointers moved, for an n-residue protein whose window
+    // count was known before the first push.
+    let mut kmers = Vec::with_capacity(window_count);
+    kmers.extend(aa_windows(protein, k, window_count));
+    Ok(kmers)
 }
 
 /// Counts amino-acid k-mers (see `amino_acid_kmers` for what they are and
 /// are not), returned sorted by k-mer so the output is deterministic --
 /// a hash map's iteration order is not, and this feeds an Arrow table a
 /// caller may diff between runs.
-pub fn count_amino_acid_kmers(protein: &str, k: usize) -> Result<Vec<(String, u32)>> {
+///
+/// The k-mers borrow from `protein`. Use this rather than
+/// [`count_amino_acid_kmers`] whenever the k-mers are about to be copied
+/// somewhere else anyway -- an Arrow string buffer, say -- since the owned
+/// form allocates and frees one `String` per distinct k-mer purely to hand
+/// it over.
+pub fn count_amino_acid_kmers_borrowed(protein: &str, k: usize) -> Result<Vec<(&str, u32)>> {
+    validate_aa_k(protein, k)?;
+    // Straight into the map: the old form built a `Vec<&str>` of *every*
+    // window first (one allocation plus its doubling, and 16 bytes written
+    // per window) and then walked it once to count. The windows are counted
+    // as they are produced instead.
+    //
+    // The map itself is left as it was: a `BTreeMap` allocates a node per
+    // ~11 entries, not per insertion, so there is nothing per-k-mer to
+    // remove, and its `IntoIter` is exact-sized, so the `collect` below is
+    // one right-sized allocation.
     let mut counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
-    for kmer_str in amino_acid_kmers(protein, k)? {
+    for kmer_str in aa_windows(protein, k, aa_window_count(protein, k)) {
         *counts.entry(kmer_str).or_insert(0) += 1;
     }
-    Ok(counts.into_iter().map(|(kmer_str, count)| (kmer_str.to_string(), count)).collect())
+    Ok(counts.into_iter().collect())
+}
+
+/// [`count_amino_acid_kmers_borrowed`] with the k-mers copied into owned
+/// `String`s, for callers that need the counts to outlive `protein`.
+pub fn count_amino_acid_kmers(protein: &str, k: usize) -> Result<Vec<(String, u32)>> {
+    Ok(count_amino_acid_kmers_borrowed(protein, k)?
+        .into_iter()
+        .map(|(kmer_str, count)| (kmer_str.to_string(), count))
+        .collect())
+}
+
+/// How many length-`k` windows an amino-acid sequence has. `k` is assumed
+/// non-zero (`validate_aa_k` has already refused 0).
+#[inline]
+fn aa_window_count(protein: &str, k: usize) -> usize {
+    (protein.len() + 1).saturating_sub(k)
+}
+
+/// The overlapping length-`k` windows of `protein`, as `&str`.
+///
+/// `validate_aa_k` has already established that the whole protein is ASCII,
+/// so slicing it by byte offsets is two O(1) `is_char_boundary` checks per
+/// window. Running `std::str::from_utf8` over each byte window instead --
+/// which is what this replaces -- re-validated `k` bytes per window, i.e.
+/// roughly `n * k` byte inspections per n-residue protein, to reach a
+/// conclusion the function had already reached once.
+#[inline]
+fn aa_windows(protein: &str, k: usize, window_count: usize) -> impl Iterator<Item = &str> {
+    (0..window_count).filter_map(move |start| protein.get(start..start + k))
 }
 
 /// Shared validation for the amino-acid k-mer path: a usable `k`, and a
