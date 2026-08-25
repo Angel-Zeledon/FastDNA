@@ -60,6 +60,7 @@ use crate::qc::QcSummary;
 use crate::sketch::GenomeSketch;
 use crate::translate::{self, Frame, StopHandling, TranslationTable};
 use crate::hll;
+use crate::metagenomics;
 
 /// The single place the spec's error-to-exception table (design doc §12) is
 /// implemented. No call site maps a `FastDnaError` to a `PyErr` directly, so
@@ -1196,12 +1197,121 @@ fn protein_kmers(
     batch.to_pyarrow(py)
 }
 
+/// The Python-visible k-mer -> lowest-common-ancestor database behind
+/// `fastdna.metagenomics`. Wraps `metagenomics::KmerDatabase`; every
+/// algorithm, format and validation decision lives there, with no PyO3
+/// dependency, so all of it stays testable under `cargo test` alone.
+#[pyclass(name = "KmerDatabase", module = "fastdna._core")]
+struct PyKmerDatabase {
+    inner: metagenomics::KmerDatabase,
+}
+
+#[pymethods]
+impl PyKmerDatabase {
+    /// Loads a database written by `save`.
+    ///
+    /// Released under `py.allow_threads` like every other bulk operation in
+    /// this module: a database is hundreds of megabytes of file to read and
+    /// validate, and holding the GIL for it would freeze the calling
+    /// interpreter with no way to interrupt it.
+    #[staticmethod]
+    fn load(py: Python<'_>, path: String) -> PyResult<PyKmerDatabase> {
+        let inner = py.allow_threads(|| metagenomics::KmerDatabase::load(path))?;
+        Ok(PyKmerDatabase { inner })
+    }
+
+    fn save(&self, py: Python<'_>, path: String) -> PyResult<()> {
+        py.allow_threads(|| self.inner.save(path))?;
+        Ok(())
+    }
+
+    #[getter]
+    fn k(&self) -> usize {
+        self.inner.k()
+    }
+
+    /// The number of distinct canonical k-mers in the table.
+    #[getter]
+    fn n_kmers(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Resident bytes. Exposed rather than left to be discovered by OOM:
+    /// this representation costs 12 bytes per k-mer and does not scale to
+    /// RefSeq, and a user planning a reference set needs to be able to see
+    /// the number before committing to one.
+    #[getter]
+    fn memory_bytes(&self) -> usize {
+        self.inner.memory_bytes()
+    }
+
+    /// Classifies every read of a FASTA/FASTQ(.gz) file, returning a
+    /// `pyarrow.RecordBatch` with columns `read_id`, `tax_id`,
+    /// `confidence`, `n_kmers`, `n_classified_kmers`.
+    #[pyo3(signature = (reads, confidence_threshold=0.0))]
+    fn classify(&self, py: Python<'_>, reads: String, confidence_threshold: f64) -> PyResult<PyObject> {
+        let batch = py.allow_threads(|| {
+            let rows = self.inner.classify_path(&reads, confidence_threshold)?;
+            metagenomics::classification_batch(&rows)
+        })?;
+        batch.to_pyarrow(py)
+    }
+
+    /// Aggregates a list of per-read taxon ids into the abundance report.
+    ///
+    /// Takes the ids rather than the classification table itself: pulling
+    /// one column out of an Arrow table is a line of pyarrow on the Python
+    /// side, and keeping it there rather than teaching this binding to
+    /// consume an Arrow table keeps the FFI surface to what genuinely needs
+    /// compiling on five platforms.
+    fn abundance(&self, py: Python<'_>, tax_ids: Vec<u32>) -> PyResult<PyObject> {
+        let batch = py.allow_threads(|| self.inner.abundance_batch(&tax_ids))?;
+        batch.to_pyarrow(py)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "KmerDatabase(k={}, n_kmers={}, taxa={}, memory_bytes={})",
+            self.inner.k(),
+            self.inner.len(),
+            self.inner.taxonomy().len(),
+            self.inner.memory_bytes()
+        )
+    }
+}
+
+/// Builds a k-mer -> lowest-common-ancestor database from a reference
+/// FASTA and a taxonomy TSV, optionally saving it to `output`.
+///
+/// The database is returned whether or not `output` is given, so a caller
+/// that wants to build and classify in one session never pays a save and a
+/// reload for it.
+#[pyfunction]
+#[pyo3(signature = (reference, taxonomy, k=31, output=None))]
+fn build_database(
+    py: Python<'_>,
+    reference: String,
+    taxonomy: String,
+    k: usize,
+    output: Option<String>,
+) -> PyResult<PyKmerDatabase> {
+    let inner = py.allow_threads(|| -> Result<metagenomics::KmerDatabase, FastDnaError> {
+        let db = metagenomics::KmerDatabase::build(&reference, &taxonomy, k)?;
+        if let Some(output) = &output {
+            db.save(output)?;
+        }
+        Ok(db)
+    })?;
+    Ok(PyKmerDatabase { inner })
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PyKmerCounts>()?;
     m.add_class::<PyPreview>()?;
     m.add_class::<PySketch>()?;
+    m.add_class::<PyKmerDatabase>()?;
     m.add_function(wrap_pyfunction!(count, m)?)?;
     m.add_function(wrap_pyfunction!(peek, m)?)?;
     m.add_function(wrap_pyfunction!(build_info, m)?)?;
@@ -1211,5 +1321,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(translate_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(translate_file, m)?)?;
     m.add_function(wrap_pyfunction!(protein_kmers, m)?)?;
+    m.add_function(wrap_pyfunction!(build_database, m)?)?;
     Ok(())
 }
