@@ -1,4 +1,4 @@
-//! Task 8's spec calls out two FASTQ edge cases that had no coverage: CRLF
+﻿//! Task 8's spec calls out two FASTQ edge cases that had no coverage: CRLF
 //! line endings (the likeliest silent-corruption path on the Windows wheel)
 //! and zero-byte input. Both are exercised through the public pipeline API.
 //!
@@ -29,6 +29,7 @@ fn config(k: usize) -> PipelineConfig {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        hpc: false,
     }
 }
 

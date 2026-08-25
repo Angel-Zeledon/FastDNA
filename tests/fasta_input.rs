@@ -1,4 +1,4 @@
-//! FASTA input, end to end through the counting pipeline.
+﻿//! FASTA input, end to end through the counting pipeline.
 //!
 //! The reader-level parsing rules live in `src/fastq.rs`'s own test module.
 //! What this file pins down is the property that makes FASTA support
@@ -29,6 +29,7 @@ fn config(k: usize) -> PipelineConfig {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        hpc: false,
     }
 }
 

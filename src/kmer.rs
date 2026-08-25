@@ -202,6 +202,52 @@ pub fn extract_canonical_kmers_into(seq: &[u8], k: usize, out: &mut Vec<u64>) {
     }
 }
 
+/// Collapses runs of the same base to a single occurrence, so that an
+/// insertion or deletion inside a homopolymer run -- the dominant error mode
+/// on long-read platforms such as Oxford Nanopore and PacBio, as opposed to
+/// the substitution errors that dominate short-read Illumina data -- does
+/// not shift every k-mer downstream of it in the compressed sequence. Two
+/// consecutive bytes are the same base when [`base_to_bits`] maps them to
+/// the same 2-bit code, so runs are matched case-insensitively and treat
+/// `U` as `T`, exactly as k-mer extraction already does.
+///
+/// An ambiguous byte (`base_to_bits` returns `None`, e.g. `N`) is never
+/// merged with its neighbours, in either direction: it is always emitted on
+/// its own, so a run of `N`s is **not** collapsed. This keeps homopolymer
+/// compression a conservative transform of the sequence alphabet itself,
+/// rather than a transform reasoned about in terms of the k-mer window's
+/// own reset behaviour (which would happen to make either choice
+/// observationally equivalent downstream, but that is not a reason to let
+/// this function assume it).
+///
+/// `out` is cleared first, matching [`extract_canonical_kmers_into`]'s
+/// buffer-reuse convention. The output is always the same length as or
+/// shorter than `seq`; it is a sequence, not a set of k-mers, so this is a
+/// preprocessing step that runs *before* k-mer extraction, not a variant of
+/// it.
+///
+/// This trades exact base-level positional correspondence with the
+/// original read for robustness to indel errors: a compressed sequence's
+/// byte offsets no longer line up one-to-one with the uncompressed read's,
+/// which matters for anything doing reference-coordinate mapping downstream
+/// (for example `python/fastdna/annotate.py`'s `locate_kmer`, which assumes
+/// uncompressed coordinates). Re-deriving compressed-to-original coordinate
+/// mapping is a separate concern this function does not attempt.
+pub fn homopolymer_compress_into(seq: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(seq.len());
+
+    let mut prev_bits: Option<u64> = None;
+    for &base in seq {
+        let bits = base_to_bits(base);
+        if bits.is_some() && bits == prev_bits {
+            continue;
+        }
+        out.push(base);
+        prev_bits = bits;
+    }
+}
+
 /// Extracts every canonical k-mer from a DNA sequence into a fresh `Vec`.
 ///
 /// A thin wrapper over [`extract_canonical_kmers_into`]; identical results.
@@ -353,6 +399,91 @@ mod tests {
 
         extract_canonical_kmers_into(b"TTTTGGGG", 4, &mut buf);
         assert_eq!(buf, extract_canonical_kmers(b"TTTTGGGG", 4));
+    }
+
+    #[test]
+    fn homopolymer_compress_collapses_runs_of_the_same_base() {
+        let mut out = Vec::new();
+        homopolymer_compress_into(b"AAACCGGGGT", &mut out);
+        assert_eq!(out, b"ACGT");
+    }
+
+    #[test]
+    fn homopolymer_compress_matches_runs_case_insensitively() {
+        let mut out = Vec::new();
+        homopolymer_compress_into(b"AaAaCcGgGgTt", &mut out);
+        // Each byte in a matched run is dropped, keeping the first byte's
+        // case, exactly as `base_to_bits` treats them as one code.
+        assert_eq!(out, b"ACGT");
+    }
+
+    #[test]
+    fn homopolymer_compress_does_not_collapse_a_run_of_ambiguous_bases() {
+        let mut out = Vec::new();
+        homopolymer_compress_into(b"AANNNAAA", &mut out);
+        // The leading "AA" and trailing "AAA" are each their own homopolymer
+        // run and collapse to one 'A' apiece; "NNN" in between must not
+        // collapse at all.
+        assert_eq!(out, b"ANNNA", "a run of N must be passed through untouched, not collapsed");
+    }
+
+    #[test]
+    fn homopolymer_compress_treats_a_single_ambiguous_byte_between_runs_as_a_break() {
+        let mut out = Vec::new();
+        homopolymer_compress_into(b"AAANAAA", &mut out);
+        assert_eq!(out, b"ANA");
+    }
+
+    #[test]
+    fn homopolymer_compress_of_an_empty_sequence_is_empty() {
+        let mut out = vec![0xAA];
+        homopolymer_compress_into(b"", &mut out);
+        assert!(out.is_empty(), "must clear the buffer, not just fail to grow it");
+    }
+
+    #[test]
+    fn homopolymer_compress_of_a_sequence_with_no_run_is_unchanged() {
+        let mut out = Vec::new();
+        homopolymer_compress_into(b"ACGTACGT", &mut out);
+        assert_eq!(out, b"ACGTACGT");
+    }
+
+    /// The falsifiable claim behind `--hpc`: a deletion strictly inside a
+    /// homopolymer run changes the raw canonical k-mer set (the error
+    /// propagates downstream, corrupting every k-mer that overlaps it), but
+    /// after homopolymer compression the two reads become byte-identical,
+    /// so their k-mer sets agree exactly. Constructed by hand, not
+    /// probabilistically: "GATCAAAAAATCG" (a run of six A's) versus the same
+    /// read with one A deleted from inside that run.
+    #[test]
+    fn a_deletion_inside_a_homopolymer_run_is_absorbed_by_compression() {
+        let clean = b"GATCAAAAAATCG"; // run of 6 A's
+        let with_deletion = b"GATCAAAAATCG"; // run of 5 A's: one deleted
+
+        let k = 4;
+        let raw_clean = extract_canonical_kmers(clean, k);
+        let raw_deleted = extract_canonical_kmers(with_deletion, k);
+        assert_ne!(
+            raw_clean, raw_deleted,
+            "without --hpc the indel must still change the k-mer set -- otherwise this test \
+             proves nothing"
+        );
+
+        let mut compressed_clean = Vec::new();
+        let mut compressed_deleted = Vec::new();
+        homopolymer_compress_into(clean, &mut compressed_clean);
+        homopolymer_compress_into(with_deletion, &mut compressed_deleted);
+        assert_eq!(
+            compressed_clean, compressed_deleted,
+            "a run-internal indel must be fully absorbed by compression"
+        );
+
+        let hpc_clean = extract_canonical_kmers(&compressed_clean, k);
+        let hpc_deleted = extract_canonical_kmers(&compressed_deleted, k);
+        assert_eq!(
+            hpc_clean, hpc_deleted,
+            "with --hpc the two reads must agree on their k-mer set"
+        );
     }
 
     #[test]

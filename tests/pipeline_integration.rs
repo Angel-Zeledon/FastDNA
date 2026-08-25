@@ -1,4 +1,4 @@
-//! End-to-end tests for the parallel pipeline.
+﻿//! End-to-end tests for the parallel pipeline.
 //!
 //! These cover the contract that `pipeline` must extract k-mers using the same
 //! canonical, ambiguity-aware logic as `kmer::extract_canonical_kmers`. The
@@ -30,6 +30,7 @@ fn config(k: usize) -> PipelineConfig {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        hpc: false,
     }
 }
 
@@ -50,6 +51,72 @@ fn pipeline_resets_kmer_window_on_ambiguous_base() {
         "expected only the two N-free windows to yield k-mers"
     );
     assert_eq!(counter.distinct_kmers(), 1, "both windows are ACGT");
+}
+
+/// End-to-end version of `kmer::homopolymer_compress_into`'s own
+/// `a_deletion_inside_a_homopolymer_run_is_absorbed_by_compression` unit
+/// test: run the same clean-vs-deleted pair of reads through the actual
+/// pipeline, once with `hpc` off and once with it on, and confirm the flag
+/// changes the counted output exactly the way the unit test predicts.
+#[test]
+fn pipeline_hpc_flag_absorbs_a_run_internal_indel_end_to_end() {
+    let k = 4;
+    let clean = "GATCAAAAAATCG"; // run of 6 A's
+    let with_deletion = "GATCAAAAATCG"; // run of 5 A's: one deleted
+    let fastq = format!(
+        "@clean\n{clean}\n+\n{}\n@deleted\n{with_deletion}\n+\n{}\n",
+        "I".repeat(clean.len()),
+        "I".repeat(with_deletion.len())
+    );
+
+    let without_hpc_config = config(k);
+    let (without_hpc, _qc, _reads) = process_stream_parallel(
+        reader_for(&fastq),
+        without_hpc_config,
+        std::path::Path::new("<memory>"),
+        None,
+        None,
+    )
+    .expect("valid input");
+
+    let with_hpc_config = PipelineConfig { hpc: true, ..config(k) };
+    let (with_hpc, _qc, _reads) = process_stream_parallel(
+        reader_for(&fastq),
+        with_hpc_config,
+        std::path::Path::new("<memory>"),
+        None,
+        None,
+    )
+    .expect("valid input");
+
+    // Without --hpc, the two reads keep their raw (different) lengths --
+    // 13 and 12 bases -- so extraction yields (13-4+1) + (12-4+1) = 19 total
+    // occurrences.
+    assert_eq!(without_hpc.total_kmers(), 19, "raw read lengths must be untouched without --hpc");
+
+    // With --hpc, both reads compress to the identical sequence "GATCATCG"
+    // (the run of A's collapses to one, regardless of whether it started as
+    // 6 or 5 long), so the run's total occurrence count is exactly double
+    // what a single compressed read alone produces: (8-4+1) * 2 = 10.
+    let mut compressed_once = Vec::new();
+    kmer::homopolymer_compress_into(clean.as_bytes(), &mut compressed_once);
+    assert_eq!(compressed_once, b"GATCATCG");
+    let single_read_kmers = kmer::extract_canonical_kmers(&compressed_once, k);
+    let single_read_distinct: std::collections::HashSet<u64> = single_read_kmers.iter().copied().collect();
+    assert_eq!(with_hpc.total_kmers(), single_read_kmers.len() as u64 * 2);
+    assert_eq!(
+        with_hpc.distinct_kmers(),
+        single_read_distinct.len(),
+        "the two reads are byte-identical after compression, so together they must contribute no \
+         distinct k-mers beyond a single compressed read's own set"
+    );
+
+    assert_ne!(
+        with_hpc.total_kmers(),
+        without_hpc.total_kmers(),
+        "the --hpc flag must actually change the counted output on this fixture, or the test \
+         proves nothing"
+    );
 }
 
 #[test]
@@ -139,6 +206,7 @@ fn progress_callback_receives_a_final_event() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 20,
+        hpc: false,
     };
 
     let (_counter, _qc, reads) = process_stream_parallel(

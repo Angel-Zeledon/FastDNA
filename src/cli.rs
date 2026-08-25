@@ -159,6 +159,22 @@ pub struct Cli {
     /// selects it.
     #[arg(long, value_enum, default_value = "auto")]
     pub strategy: CliStrategy,
+
+    /// Collapse homopolymer runs (e.g. "AAAAAA" -> "A") before extracting
+    /// k-mers. Off by default: with the flag absent, output is byte-for-byte
+    /// identical to today's. Turn it on for long-read input (Oxford Nanopore,
+    /// PacBio), where the dominant sequencing error is an insertion or
+    /// deletion inside a homopolymer run rather than a substitution -- left
+    /// uncompressed, that single indel shifts and corrupts every k-mer
+    /// downstream of it. Short-read Illumina data has no need for this.
+    ///
+    /// This trades exact base-level positional correspondence with the
+    /// original read for robustness to those indels: downstream tools that
+    /// map a k-mer back to a reference coordinate (e.g. `fastdna.annotate`)
+    /// are working with compressed-sequence offsets, not the original
+    /// read's.
+    #[arg(long)]
+    pub hpc: bool,
 }
 
 impl Cli {

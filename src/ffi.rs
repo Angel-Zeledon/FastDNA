@@ -407,7 +407,7 @@ fn open_fastq_reader(path: &PathBuf) -> Result<FastqReader<Box<dyn BufRead + Sen
 /// returns `FastDnaError::Cancelled`, which `impl From<..> for PyErr`
 /// above maps to `KeyboardInterrupt`.
 #[pyfunction]
-#[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=None))]
+#[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=None, hpc=false))]
 #[allow(clippy::too_many_arguments)]
 fn count(
     py: Python<'_>,
@@ -419,6 +419,12 @@ fn count(
     threads: Option<usize>,
     progress: Option<PyObject>,
     progress_interval: Option<u64>,
+    // Collapse homopolymer runs before k-mer extraction. See
+    // `pipeline::PipelineConfig::hpc` and the CLI's `--hpc` for the full
+    // rationale: off by default (byte-identical to today's output), meant
+    // for long-read (Nanopore/PacBio) input where indels inside homopolymer
+    // runs, not substitutions, are the dominant sequencing error.
+    hpc: bool,
 ) -> PyResult<PyKmerCounts> {
     let path_buf = PathBuf::from(path);
     let reader = open_fastq_reader(&path_buf)?;
@@ -440,7 +446,7 @@ fn count(
     // default batch size so the common case (no explicit interval) is
     // unaffected.
     let batch_size = (progress_interval as usize).clamp(1, defaults.batch_size);
-    let config = PipelineConfig { k, min_quality, num_threads, batch_size, progress_interval, ..defaults };
+    let config = PipelineConfig { k, min_quality, num_threads, batch_size, progress_interval, hpc, ..defaults };
 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_worker = cancel.clone();
@@ -1477,8 +1483,15 @@ fn cohort_presence_matrix(
 
         let path_buf = PathBuf::from(path);
         let reader = open_fastq_reader(&path_buf)?;
-        let config =
-            PipelineConfig { k, min_quality, quality_window, batch_size, num_threads, progress_interval };
+        let config = PipelineConfig {
+            k,
+            min_quality,
+            quality_window,
+            batch_size,
+            num_threads,
+            progress_interval,
+            hpc: defaults.hpc,
+        };
 
         let mut counter = py
             .allow_threads(|| {

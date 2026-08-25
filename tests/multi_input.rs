@@ -1,4 +1,4 @@
-//! Multiple `--input` files, and `-` for stdin.
+﻿//! Multiple `--input` files, and `-` for stdin.
 //!
 //! Real samples arrive as R1/R2 across several lanes, and the standard HPC
 //! idiom is `fasterq-dump ... | fastdna -i -`. Both funnel into the same
@@ -24,6 +24,7 @@ fn config(k: usize) -> PipelineConfig {
         batch_size: 4,
         num_threads: 2,
         progress_interval: 100_000,
+        hpc: false,
     }
 }
 

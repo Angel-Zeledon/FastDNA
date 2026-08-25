@@ -29,6 +29,13 @@ pub struct PipelineConfig {
     /// otherwise a run of fewer than the interval never emits a single
     /// `ReadsProcessed` event, only `Finished` at the end.
     pub progress_interval: u64,
+    /// Collapse homopolymer runs (`kmer::homopolymer_compress_into`) before
+    /// k-mer extraction. `false` by default: every existing caller keeps
+    /// today's output byte-for-byte. Opt in for long-read (Nanopore/PacBio)
+    /// input, where indels inside homopolymer runs -- not substitutions --
+    /// are the dominant error mode; short-read Illumina data has no need
+    /// for this and should leave it off.
+    pub hpc: bool,
 }
 
 impl Default for PipelineConfig {
@@ -40,6 +47,7 @@ impl Default for PipelineConfig {
             batch_size: 8192,
             num_threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             progress_interval: PROGRESS_INTERVAL,
+            hpc: false,
         }
     }
 }
@@ -393,6 +401,7 @@ pub fn process_stream_parallel<S: RecordSource>(
     let min_qual = config.min_quality;
     let qual_win = config.quality_window;
     let progress_interval = config.progress_interval;
+    let hpc = config.hpc;
 
     // 1. Producer thread. Returns the read count, or the record it choked on.
     //    `cancel` is cloned rather than borrowed: the reader thread is
@@ -464,6 +473,10 @@ pub fn process_stream_parallel<S: RecordSource>(
                 // high-water mark within the first few reads and never
                 // allocates again.
                 let mut canon_kmers: Vec<u64> = Vec::new();
+                // Only ever populated when `hpc` is set; otherwise k-mer
+                // extraction reads `record.seq` directly, so a run with the
+                // flag off pays no allocation and no extra pass at all.
+                let mut hpc_buf: Vec<u8> = Vec::new();
 
                 while let Ok(mut batch) = receiver.recv() {
                     if let Some(tok) = &cancel {
@@ -484,7 +497,13 @@ pub fn process_stream_parallel<S: RecordSource>(
                         // Canonical k-mers: 2-bit packed, O(1) rolling window
                         // on both strands, and ambiguous bases ('N') reset the
                         // window rather than producing corrupt k-mers.
-                        kmer::extract_canonical_kmers_into(&record.seq, k, &mut canon_kmers);
+                        let seq: &[u8] = if hpc {
+                            kmer::homopolymer_compress_into(&record.seq, &mut hpc_buf);
+                            &hpc_buf
+                        } else {
+                            &record.seq
+                        };
+                        kmer::extract_canonical_kmers_into(seq, k, &mut canon_kmers);
                         local_counter.insert_batch(&canon_kmers);
                     }
 
@@ -827,6 +846,7 @@ fn process_stream_parallel_disk<S: RecordSource>(
     let min_qual = config.min_quality;
     let qual_win = config.quality_window;
     let progress_interval = config.progress_interval;
+    let hpc = config.hpc;
 
     // 1. Producer thread -- the same one the in-memory strategy uses. This
     // is the one piece the two strategies share, because it is the one
@@ -864,6 +884,9 @@ fn process_stream_parallel_disk<S: RecordSource>(
                 // strategy above -- one allocation per worker instead of one
                 // per record.
                 let mut canon_kmers: Vec<u64> = Vec::new();
+                // Same "only populated when `hpc` is set" rationale as the
+                // in-memory strategy's worker loop.
+                let mut hpc_buf: Vec<u8> = Vec::new();
 
                 while let Ok(mut batch) = receiver.recv() {
                     if let Some(tok) = &cancel {
@@ -895,7 +918,13 @@ fn process_stream_parallel_disk<S: RecordSource>(
                         local_qc.observe_record(record);
                         record.quality_trim_end(min_qual, qual_win);
 
-                        kmer::extract_canonical_kmers_into(&record.seq, k, &mut canon_kmers);
+                        let seq: &[u8] = if hpc {
+                            kmer::homopolymer_compress_into(&record.seq, &mut hpc_buf);
+                            &hpc_buf
+                        } else {
+                            &record.seq
+                        };
+                        kmer::extract_canonical_kmers_into(seq, k, &mut canon_kmers);
                         batch_occurrences += canon_kmers.len() as u64;
                         spill.insert_batch(&canon_kmers)?;
                     }
@@ -1032,6 +1061,7 @@ fn process_stream_parallel_binned<S: RecordSource>(
     let min_qual = config.min_quality;
     let qual_win = config.quality_window;
     let progress_interval = config.progress_interval;
+    let hpc = config.hpc;
 
     // The one piece of shared state, and it is shared by design: worker 3's
     // and worker 5's super-k-mers for bin 17 are disjoint pieces of one
@@ -1064,6 +1094,9 @@ fn process_stream_parallel_binned<S: RecordSource>(
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let mut writer = store.writer();
                 let mut local_qc = QcSummary::default();
+                // Same "only populated when `hpc` is set" rationale as the
+                // other two strategies' worker loops.
+                let mut hpc_buf: Vec<u8> = Vec::new();
 
                 while let Ok(mut batch) = receiver.recv() {
                     if let Some(tok) = &cancel {
@@ -1082,14 +1115,21 @@ fn process_stream_parallel_binned<S: RecordSource>(
                         local_qc.observe_record(record);
                         record.quality_trim_end(min_qual, qual_win);
 
+                        let seq: &[u8] = if hpc {
+                            kmer::homopolymer_compress_into(&record.seq, &mut hpc_buf);
+                            &hpc_buf
+                        } else {
+                            &record.seq
+                        };
+
                         // The binned counterpart of
                         // `extract_canonical_kmers_into` + `insert_batch`.
                         // The returned occurrence count is exactly
-                        // `extract_canonical_kmers(&record.seq, k).len()` --
-                        // that equality is the multiset invariant
-                        // `superkmer.rs` proves, and it is what keeps
-                        // `total_kmers()` identical across strategies.
-                        batch_occurrences += writer.push_sequence(&store, &record.seq) as u64;
+                        // `extract_canonical_kmers(seq, k).len()` -- that
+                        // equality is the multiset invariant `superkmer.rs`
+                        // proves, and it is what keeps `total_kmers()`
+                        // identical across strategies (hpc on or off).
+                        batch_occurrences += writer.push_sequence(&store, seq) as u64;
                     }
 
                     total_occurrences.fetch_add(batch_occurrences, Ordering::Relaxed);
@@ -1247,6 +1287,7 @@ mod tests {
                 batch_size: BATCH,
                 num_threads: 3,
                 progress_interval: 1,
+                hpc: false,
             };
             let reader = FastqReader::new(Cursor::new(text.into_bytes()));
             let (counter, qc, total_reads) =
