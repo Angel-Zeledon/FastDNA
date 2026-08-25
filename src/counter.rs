@@ -583,9 +583,9 @@ impl KmerCounter {
     /// does `O(entries x log(sources))` with `sources` bounded by the worker
     /// count either way.
     ///
-    /// Not yet reachable from `pipeline.rs`, whose combine phase still uses
-    /// rayon's pairwise `reduce`; switching that call site over is what
-    /// turns this into an actual saving.
+    /// `pipeline.rs`'s combine phase calls this once over the collected
+    /// worker counters. `QcSummary::merge` deliberately stays pairwise
+    /// there: it is `O(1)`, so a k-way form would buy nothing.
     pub fn merge_all(counters: Vec<KmerCounter>) -> KmerCounter {
         let mut total_kmers: u64 = 0;
         let mut sources: Vec<Vec<(u64, u32)>> = Vec::with_capacity(counters.len());

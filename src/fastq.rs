@@ -184,6 +184,17 @@ fn preview_for_error(buf: &[u8]) -> String {
 /// every cutoff a user is likely to pass.
 const SYNTHETIC_FASTA_QUALITY: u8 = b'I';
 
+/// The outcome of `FastqReader::skip_marked_line`: a line consumed without
+/// being copied, a line whose first byte was not the expected marker (and
+/// which is therefore left *unconsumed* for the caller's error path), or
+/// end of stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkedLine {
+    Eof,
+    Mismatch,
+    Skipped,
+}
+
 /// Which parser `next_record` is running. Decided once, from the first
 /// non-blank byte of the stream (see `sniff_format`), and never revisited:
 /// a file is FASTA or FASTQ, not both, and re-sniffing per record would turn
@@ -337,6 +348,10 @@ pub struct FastqReader<R: BufRead> {
     /// which can only be discovered by reading it, so it is parked here for
     /// the following call instead of being pushed back into the stream.
     pending_header: Option<Vec<u8>>,
+    /// Whether the FASTQ parser fills `FastqRecord::id`. See
+    /// `set_keep_ids`; `true` in every constructor, so no existing caller
+    /// sees a change.
+    keep_ids: bool,
 }
 
 impl FastqReader<Box<dyn BufRead + Send>> {
@@ -365,6 +380,7 @@ impl FastqReader<Box<dyn BufRead + Send>> {
             line_buf: Vec::with_capacity(512),
             format: Format::Unknown,
             pending_header: None,
+            keep_ids: true,
         })
     }
 }
@@ -376,7 +392,65 @@ impl<R: BufRead> FastqReader<R> {
             line_buf: Vec::with_capacity(512),
             format: Format::Unknown,
             pending_header: None,
+            keep_ids: true,
         }
+    }
+
+    /// Tells this reader whether the caller will read `FastqRecord::id`.
+    ///
+    /// Default `true`: every existing caller keeps today's behaviour
+    /// byte-for-byte, and the public field stays populated for anything
+    /// that asserts on it. Set to `false` -- as the counting pipeline's
+    /// producer does, since nothing downstream of it reads `id` -- the
+    /// FASTQ parser consumes the header line without copying it (see
+    /// `skip_marked_line` for the counts) and leaves `record.id` empty.
+    ///
+    /// FASTA is deliberately unaffected: a FASTA header is one per contig,
+    /// not one per read, so its copy is not on any hot path, and the bytes
+    /// are needed verbatim for `pending_header` and for the "record has no
+    /// sequence" diagnostic.
+    pub fn set_keep_ids(&mut self, keep: bool) {
+        self.keep_ids = keep;
+    }
+
+    /// Consumes one line, up to and including its `\n`, without copying it,
+    /// after checking that it starts with `marker`.
+    ///
+    /// Returns `Mismatch` *without consuming anything* when the first byte
+    /// is not `marker`, so the caller's error path can still `read_until`
+    /// the same line and quote it exactly as it did before.
+    ///
+    /// `read_until` scans for the newline and then copies the bytes into a
+    /// caller buffer; `skip_until` runs the same scan and skips the copy.
+    /// For the two FASTQ lines whose content is never read -- the `@`
+    /// header when `keep_ids` is off, and the `+` separator always -- that
+    /// copy is pure waste: on the 7-million-record benchmark file, headers
+    /// are ~40-60 bytes each, so ~350 MB is memcpy'd and immediately
+    /// discarded, plus one `strip_newline` (two `ends_with` and up to two
+    /// `pop`s) per record. The added cost is the one `fill_buf` peek below,
+    /// which for a `BufReader` holding buffered bytes -- 128 KB against
+    /// ~250-byte records, so ~500 records per refill -- is an inlined
+    /// `pos < cap` test returning an already-filled slice, not a read.
+    fn skip_marked_line(&mut self, marker: u8) -> io::Result<MarkedLine> {
+        match self.reader.fill_buf()?.first().copied() {
+            None => Ok(MarkedLine::Eof),
+            Some(byte) if byte != marker => Ok(MarkedLine::Mismatch),
+            Some(_) => {
+                self.reader.skip_until(b'\n')?;
+                Ok(MarkedLine::Skipped)
+            }
+        }
+    }
+
+    /// Reads the line `skip_marked_line` reported as `Mismatch` (it left the
+    /// line unconsumed) into the reader's own scratch buffer and strips its
+    /// line ending, ready to be quoted in a malformed-record error. Cold
+    /// path only -- one call per run, immediately before returning an error.
+    fn read_mismatched_line(&mut self) -> io::Result<()> {
+        self.line_buf.clear();
+        self.reader.read_until(b'\n', &mut self.line_buf)?;
+        strip_newline(&mut self.line_buf);
+        Ok(())
     }
 
     /// Reads the next record, in whichever format this stream turned out to
@@ -521,17 +595,39 @@ impl<R: BufRead> FastqReader<R> {
     /// record) still pays. `read_until` is kept rather than hand-rolled so
     /// the newline scan stays std's word-at-a-time `memchr` and the number
     /// of `fill_buf` calls per record is unchanged at four.
+    ///
+    /// When `keep_ids` is off the header line is consumed by
+    /// `skip_marked_line` instead, which does the same newline scan without
+    /// the copy and without the `strip_newline` that only existed to make
+    /// the stored id presentable.
     fn next_fastq_record_into(&mut self, record: &mut FastqRecord) -> ReadResult<bool> {
         record.id.clear();
-        if self.reader.read_until(b'\n', &mut record.id)? == 0 {
-            return Ok(false);
-        }
-        strip_newline(&mut record.id);
-        if !record.id.starts_with(b"@") {
-            return Err(FastqReadError::Malformed(format!(
-                "header line must start with '@', got {:?}",
-                preview_for_error(&record.id)
-            )));
+        if self.keep_ids {
+            if self.reader.read_until(b'\n', &mut record.id)? == 0 {
+                return Ok(false);
+            }
+            strip_newline(&mut record.id);
+            if !record.id.starts_with(b"@") {
+                return Err(FastqReadError::Malformed(format!(
+                    "header line must start with '@', got {:?}",
+                    preview_for_error(&record.id)
+                )));
+            }
+        } else {
+            match self.skip_marked_line(b'@')? {
+                MarkedLine::Skipped => {}
+                MarkedLine::Eof => return Ok(false),
+                MarkedLine::Mismatch => {
+                    // Cold path: nothing was consumed, so the offending line
+                    // is quoted byte-for-byte as the `keep_ids` branch above
+                    // quotes it.
+                    self.read_mismatched_line()?;
+                    return Err(FastqReadError::Malformed(format!(
+                        "header line must start with '@', got {:?}",
+                        preview_for_error(&self.line_buf)
+                    )));
+                }
+            }
         }
 
         record.seq.clear();
@@ -542,26 +638,29 @@ impl<R: BufRead> FastqReader<R> {
         }
         strip_newline(&mut record.seq);
 
-        // The separator line is the one line whose content is discarded, so
-        // it goes through the reader's own scratch buffer (reused, never
-        // reallocated) and is not newline-stripped on the success path: a
-        // trailing "\n" or "\r\n" cannot change `starts_with(b"+")`. That
-        // drops one `strip_newline` -- two `ends_with` plus up to two
-        // `pop`s -- per record, 7 million times. The strip is still done
-        // before the error message is built, so a malformed separator is
-        // quoted back byte-for-byte as it was before.
-        self.line_buf.clear();
-        if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
-            return Err(FastqReadError::Malformed(
-                "file ends mid-record: missing separator line after sequence".to_string(),
-            ));
-        }
-        if !self.line_buf.starts_with(b"+") {
-            strip_newline(&mut self.line_buf);
-            return Err(FastqReadError::Malformed(format!(
-                "separator line must start with '+', got {:?}",
-                preview_for_error(&self.line_buf)
-            )));
+        // The separator line is the one line whose content is *never* read,
+        // in either id mode, so it is always skipped rather than copied:
+        // `skip_marked_line` checks the `+` from the peeked buffer and then
+        // consumes the line with no `memcpy` and no `strip_newline`. Files
+        // that repeat the header after the `+` -- an older but still common
+        // Illumina convention -- make this the same ~40-60 bytes per record
+        // the header skip saves. The strip is still done before the error
+        // message is built, so a malformed separator is quoted back
+        // byte-for-byte as it was before.
+        match self.skip_marked_line(b'+')? {
+            MarkedLine::Skipped => {}
+            MarkedLine::Eof => {
+                return Err(FastqReadError::Malformed(
+                    "file ends mid-record: missing separator line after sequence".to_string(),
+                ))
+            }
+            MarkedLine::Mismatch => {
+                self.read_mismatched_line()?;
+                return Err(FastqReadError::Malformed(format!(
+                    "separator line must start with '+', got {:?}",
+                    preview_for_error(&self.line_buf)
+                )));
+            }
         }
 
         record.qual.clear();
@@ -599,13 +698,13 @@ pub trait RecordSource: Send + 'static {
     /// returning `false` at end of stream. Semantics are identical to
     /// `next_record`; only the allocation is different.
     ///
-    /// Worth adopting in the pipeline's producer: `next_record` allocates
+    /// This is what the pipeline's producer uses: `next_record` allocates
     /// `id`, `seq` and `qual` fresh for every record and the consuming
     /// worker frees them, which is 21 million allocate/free pairs on the
-    /// 7-million-record benchmark file. Exploiting this needs the producer
-    /// to get record buffers back after a batch has been consumed (a return
-    /// channel alongside the existing `bounded(64)` one), because a record
-    /// pushed into a batch has been moved away and cannot be refilled.
+    /// 7-million-record benchmark file. The producer gets its record
+    /// buffers back over a non-blocking recycling channel once a worker has
+    /// consumed a batch (see `pipeline.rs`), because a record pushed into a
+    /// batch has been moved away and cannot be refilled.
     ///
     /// The default implementation is the allocating one, so an implementor
     /// with no buffer of its own keeps working unchanged.
@@ -618,6 +717,15 @@ pub trait RecordSource: Send + 'static {
             None => Ok(false),
         }
     }
+
+    /// Tells the source whether the caller will read `FastqRecord::id`. See
+    /// `FastqReader::set_keep_ids` for what turning it off buys and for the
+    /// FASTA carve-out.
+    ///
+    /// The default is a no-op -- ids are kept -- so an implementor with no
+    /// cheaper path, and every existing caller that never calls this, keeps
+    /// today's behaviour exactly.
+    fn set_keep_ids(&mut self, _keep: bool) {}
 
     /// The file currently being read, and how many records have been read
     /// *from that file* so far -- so the record that failed is this count
@@ -646,6 +754,10 @@ impl<R: BufRead + Send + 'static> RecordSource for FastqReader<R> {
     fn next_record_into(&mut self, record: &mut FastqRecord) -> ReadResult<bool> {
         FastqReader::next_record_into(self, record)
     }
+
+    fn set_keep_ids(&mut self, keep: bool) {
+        FastqReader::set_keep_ids(self, keep);
+    }
 }
 
 /// Reads several inputs back to back as one record stream.
@@ -663,6 +775,9 @@ pub struct MultiSourceReader {
     current_path: Option<PathBuf>,
     records_in_current: u64,
     total_inputs: usize,
+    /// Applied to every file this reader opens, including the ones it has
+    /// not reached yet. `true` by default, as in `FastqReader`.
+    keep_ids: bool,
 }
 
 impl MultiSourceReader {
@@ -673,6 +788,17 @@ impl MultiSourceReader {
             current: None,
             current_path: None,
             records_in_current: 0,
+            keep_ids: true,
+        }
+    }
+
+    /// See `FastqReader::set_keep_ids`. Recorded here so that files opened
+    /// later in the run inherit it, and forwarded to the file currently
+    /// open, if any.
+    pub fn set_keep_ids(&mut self, keep: bool) {
+        self.keep_ids = keep;
+        if let Some(reader) = self.current.as_mut() {
+            reader.set_keep_ids(keep);
         }
     }
 
@@ -703,7 +829,9 @@ impl MultiSourceReader {
                 // open is still attributable to this file.
                 self.current_path = Some(spec.display_path());
                 self.records_in_current = 0;
-                self.current = Some(FastqReader::new(spec.open()?));
+                let mut opened = FastqReader::new(spec.open()?);
+                opened.set_keep_ids(self.keep_ids);
+                self.current = Some(opened);
             }
 
             // `current` was just set, or was already `Some` -- but reach for
@@ -732,6 +860,10 @@ impl RecordSource for MultiSourceReader {
 
     fn next_record_into(&mut self, record: &mut FastqRecord) -> ReadResult<bool> {
         MultiSourceReader::next_record_into(self, record)
+    }
+
+    fn set_keep_ids(&mut self, keep: bool) {
+        MultiSourceReader::set_keep_ids(self, keep);
     }
 
     fn current_source(&self) -> Option<(PathBuf, u64)> {
@@ -1150,6 +1282,122 @@ mod tests {
         assert_eq!(reader.current_source(), Some((b, 1)));
 
         assert!(!reader.next_record_into(&mut record).unwrap());
+    }
+
+    // -- skipping the id copy -------------------------------------------
+
+    /// `set_keep_ids(false)` may only drop the id: every other byte of
+    /// every record must be exactly what the id-keeping parser produced, or
+    /// the pipeline's counts change the moment it opts in.
+    #[test]
+    fn skipping_ids_parses_exactly_what_keeping_them_parses() {
+        for text in [
+            "@r1\nACGTACGT\n+\n!!!!!!!!\n@r2\nTT\n+\nII\n",
+            "@r1\r\nACGTACGT\r\n+r1\r\nIIIIIIII\r\n",
+            // The separator repeating the header -- the older Illumina
+            // convention, and the case the separator skip saves most on.
+            "@r1\nACGT\n+r1 the whole header again\nIIII\n@r2\nGG\n+r2\nII\n",
+            // A file whose last record has no trailing newline.
+            "@r1\nACGT\n+\nIIII",
+            "",
+        ] {
+            let kept = collect(reader_over(text));
+
+            let mut reader = reader_over(text);
+            reader.set_keep_ids(false);
+            let mut skipped = Vec::new();
+            let mut scratch = FastqRecord::default();
+            while reader.next_record_into(&mut scratch).expect("valid input") {
+                skipped.push(scratch.clone());
+            }
+
+            assert_eq!(skipped.len(), kept.len(), "record count changed on {text:?}");
+            for (with_id, without) in kept.iter().zip(skipped.iter()) {
+                assert_eq!(with_id.seq, without.seq, "seq changed on {text:?}");
+                assert_eq!(with_id.qual, without.qual, "qual changed on {text:?}");
+                assert!(without.id.is_empty(), "id must be left empty when skipped");
+            }
+        }
+    }
+
+    /// The header and separator lines are consumed without being copied, so
+    /// the malformed-line diagnostics have to be rebuilt from a line that
+    /// was deliberately left unconsumed. They must come out identical.
+    #[test]
+    fn skipping_ids_keeps_the_malformed_line_diagnostics_intact() {
+        for (text, expected_fragment) in [
+            ("r1\nACGT\n+\nIIII\n", "\"r1\""),
+            ("@r1\nACGT\n*sep\nIIII\n", "\"*sep\""),
+            ("@r1\r\nACGT\r\n*sep\r\nIIII\r\n", "\"*sep\""),
+            ("@r1\nACGT\n\nIIII\n", "\"\""),
+        ] {
+            let mut reader = reader_over(text);
+            reader.set_keep_ids(false);
+            match reader.next_record() {
+                Err(FastqReadError::Malformed(reason)) => assert!(
+                    reason.contains(expected_fragment),
+                    "on {text:?} expected {expected_fragment} in: {reason}"
+                ),
+                other => panic!("expected Malformed on {text:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Truncation must still be reported as truncation, not as a silent
+    /// short record, when the lines that detect it are skipped rather than
+    /// read.
+    #[test]
+    fn skipping_ids_still_detects_a_truncated_record() {
+        for (text, fragment) in [
+            ("@r1\nACGT\n+\nIIII\n@r2\n", "sequence line"),
+            ("@r1\nACGT\n+\nIIII\n@r2\nGGGG\n", "separator line"),
+            ("@r1\nACGT\n+\nIIII\n@r2\nGGGG\n+\n", "quality line"),
+        ] {
+            let mut reader = reader_over(text);
+            reader.set_keep_ids(false);
+            let mut record = FastqRecord::default();
+            assert!(reader.next_record_into(&mut record).expect("first record is fine"));
+            match reader.next_record_into(&mut record) {
+                Err(FastqReadError::Malformed(reason)) => {
+                    assert!(reason.contains(fragment), "on {text:?}: {reason}")
+                }
+                other => panic!("expected Malformed on {text:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// FASTA is outside the carve-out: its headers are per contig, not per
+    /// read, so they stay populated even with ids switched off.
+    #[test]
+    fn skipping_ids_leaves_fasta_headers_alone() {
+        let mut reader = reader_over(">chr1\nACGT\n>chr2\nGG\n");
+        reader.set_keep_ids(false);
+        let mut record = FastqRecord::default();
+
+        assert!(reader.next_record_into(&mut record).unwrap());
+        assert_eq!(record.id, b">chr1");
+        assert_eq!(record.seq, b"ACGT");
+    }
+
+    /// A multi-file run must apply the setting to files it has not opened
+    /// yet, not just to the one open when it was set.
+    #[test]
+    fn the_multi_source_reader_applies_the_id_setting_to_later_files() {
+        let fx = Fixture::new("multi_skip_ids");
+        let a = fx.write("a.fastq", b"@a1\nACGTACGT\n+\nIIIIIIII\n");
+        let b = fx.write("b.fastq", b"@b1\nGG\n+\nII\n");
+
+        let mut reader = MultiSourceReader::from_paths(vec![a, b]);
+        reader.set_keep_ids(false);
+        let mut record = FastqRecord::default();
+
+        assert!(reader.next_record_into(&mut record).unwrap());
+        assert!(record.id.is_empty());
+        assert_eq!(record.seq, b"ACGTACGT");
+
+        assert!(reader.next_record_into(&mut record).unwrap(), "second file");
+        assert!(record.id.is_empty(), "the second file must inherit the setting");
+        assert_eq!(record.seq, b"GG");
     }
 
     // -- rolling-window quality trimming --------------------------------

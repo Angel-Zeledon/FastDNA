@@ -45,6 +45,21 @@ impl Default for PipelineConfig {
 
 type RecordBatch = Vec<FastqRecord>;
 
+/// The depth of the producer -> worker channel. Bounded on purpose: the
+/// backpressure is what keeps memory flat on multi-GB inputs.
+const CHANNEL_DEPTH: usize = 64;
+
+/// Capacity of the worker -> producer batch-recycling channel (see
+/// `spawn_producer`).
+///
+/// Sized so `try_send` can never fail for lack of room, which is what keeps
+/// the buffer pool from shrinking under load: the pool can never hold more
+/// than `CHANNEL_DEPTH + num_threads + 1` batches (see the argument in
+/// `spawn_producer`), so a channel of that size can always take one back.
+fn recycle_depth(num_threads: usize) -> usize {
+    CHANNEL_DEPTH + num_threads + 1
+}
+
 /// A worker's result: its private counter and QC state, or the message from
 /// a panic that occurred while it was processing (see `catch_unwind` below).
 type WorkerOutcome = std::result::Result<(KmerCounter, QcSummary), String>;
@@ -145,7 +160,7 @@ fn validate_config(config: &PipelineConfig) -> Result<()> {
 
     // The producer loop only ships a batch once `current_batch.len() >=
     // batch_size`; with `batch_size == 0` that is trivially true after every
-    // single record, so each read crosses the `bounded(64)` channel in its
+    // single record, so each read crosses the `CHANNEL_DEPTH` channel in its
     // own one-element `Vec`. That is not a hang or a wrong answer, but a
     // severe throughput cliff plus per-record allocation churn from a
     // plausible caller mistake (e.g. an off-by-one default), so it is
@@ -184,50 +199,115 @@ fn validate_config(config: &PipelineConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn process_stream_parallel<S: RecordSource>(
+/// Spawns the producer thread that both counting strategies share.
+///
+/// Each strategy used to carry its own byte-identical copy of this loop --
+/// see `process_stream_parallel_disk`'s doc comment for the reasoning, which
+/// held while the loop was six lines of `next_record` and `push`. It is no
+/// longer six lines: it refills record buffers in place and takes drained
+/// batches back over a recycling channel, and two copies of that would be
+/// two chances for the strategies to drift on something
+/// `tests/dual_strategy.rs` requires to be bit-identical. What stays
+/// per-strategy is what genuinely differs -- what a worker does with a batch
+/// -- not how batches are produced.
+///
+/// # Allocation
+///
+/// `next_record` allocates `id`, `seq` and `qual` fresh for every record and
+/// the consuming worker frees them: 3 x 7 million = 21 million
+/// allocate/free pairs on the 7-million-record benchmark file. This loop
+/// instead writes into a record slot the batch already owns, via
+/// `RecordSource::next_record_into`, and gets whole batches back from the
+/// workers over `recycle_rx`. Each slot's three `Vec`s reach their
+/// high-water mark within the first batch and never reallocate after that,
+/// so the steady-state cost is zero allocations per record. What remains is
+/// the one-time fill of the pool: at most
+/// `CHANNEL_DEPTH + num_threads + 1` batches x `batch_size` records x 3
+/// `Vec`s -- ~2.2 million for the default 8 threads and a 10 000-record
+/// batch, against 21 million repeated, i.e. ~19 million allocate/free pairs
+/// removed.
+///
+/// # Why the recycling channel cannot deadlock
+///
+/// Every use of it is non-blocking: `try_recv` here, `try_send` in the
+/// workers. No thread ever waits on it, so it adds no edge to the wait-for
+/// graph and cannot participate in a cycle -- the forward channel's
+/// discipline (bounded, workers drain to disconnect on every exit path) is
+/// untouched and remains the only place anything blocks. A worker that dies
+/// holding a batch costs this loop one allocation, not a hang; once this
+/// thread returns and drops `recycle_rx`, every worker's `try_send` reports
+/// `Disconnected` and the batch is simply dropped.
+///
+/// # Why it cannot inflate peak memory
+///
+/// A new batch is allocated only when `try_recv` finds the pool empty, and
+/// at that instant every other batch is either in the forward channel
+/// (<= `CHANNEL_DEPTH`) or in a worker's hand (<= `num_threads`). So the
+/// pool never exceeds `CHANNEL_DEPTH + num_threads + 1` batches -- the same
+/// number that are live simultaneously today -- and the recycling channel,
+/// sized to hold all of them, is drawing from that same fixed pool rather
+/// than adding to it.
+fn spawn_producer<S: RecordSource>(
     reader: S,
-    config: PipelineConfig,
-    source: &Path,
-    progress: ProgressFn<'_>,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<(KmerCounter, QcSummary, u64)> {
-    validate_config(&config)?;
-    // The source gets a say too: an input list that can produce nothing at
-    // all is a caller mistake, and a run that counted zero reads in silence
-    // is indistinguishable from a real sample that happened to be empty.
-    reader.validate()?;
-
-    let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(64);
-
-    let batch_size = config.batch_size;
-    let k = config.k;
-    let min_qual = config.min_quality;
-    let qual_win = config.quality_window;
-    let progress_interval = config.progress_interval;
-    let source_owned: PathBuf = source.to_path_buf();
-    // Cloned before the move below: the reader thread needs its own 'static
-    // owned handle to the flag, distinct from the one the rayon workers
-    // check (see the function doc comment for why this must be Arc).
-    let cancel_for_reader = cancel.clone();
-
-    // 1. Producer thread. Returns the read count, or the record it choked on.
-    let reader_handle = thread::spawn(move || -> Result<u64> {
+    sender: Sender<RecordBatch>,
+    recycle_rx: Receiver<RecordBatch>,
+    batch_size: usize,
+    source_owned: PathBuf,
+    cancel_for_reader: Option<Arc<AtomicBool>>,
+) -> thread::JoinHandle<Result<u64>> {
+    thread::spawn(move || -> Result<u64> {
         let mut reader = reader;
-        let mut current_batch = Vec::with_capacity(batch_size);
+        // Nothing downstream of this producer reads `FastqRecord::id`:
+        // grep-verified across the crate -- `qc::observe_record`, both
+        // worker loops, `kmer` and `export` touch only `seq` and `qual`.
+        // So the reader is told it may consume each FASTQ header line
+        // without copying it: headers are ~40-60 bytes across 7 million
+        // records, i.e. ~350 MB memcpy'd and immediately discarded. Set
+        // here, on the reader this run owns, so every other caller of
+        // `FastqReader` keeps the default and still gets ids.
+        reader.set_keep_ids(false);
+
+        let mut current_batch: RecordBatch = Vec::with_capacity(batch_size);
+        // Slots `0..filled` of `current_batch` hold this batch's reads.
+        // Anything past that is a recycled slot still waiting to be
+        // refilled -- present on every batch after the first, which is
+        // exactly what makes the refill allocation-free.
+        let mut filled: usize = 0;
         let mut total_reads: u64 = 0;
         let mut cancelled = false;
 
         loop {
-            match reader.next_record() {
-                Ok(Some(record)) => {
-                    current_batch.push(record);
+            if filled == current_batch.len() {
+                // Grows the batch by one slot. This fires only while a
+                // freshly allocated batch is filling for the first time: a
+                // recycled batch always comes back with exactly
+                // `batch_size` slots, because the only batch ever sent
+                // shorter than that is the final partial one, which is sent
+                // at end of stream and so is never refilled. Every record
+                // after the pool has warmed up therefore skips this and
+                // reuses the three `Vec`s the slot already owns.
+                current_batch.push(FastqRecord::default());
+            }
+            let Some(slot) = current_batch.get_mut(filled) else {
+                // Unreachable: the push above guarantees
+                // `filled < current_batch.len()`. Reached fallibly rather
+                // than by `unwrap` (denied crate-wide) or `unsafe`.
+                return Err(FastDnaError::Internal {
+                    detail: "producer record slot missing".to_string(),
+                });
+            };
+
+            match reader.next_record_into(slot) {
+                Ok(true) => {
+                    filled += 1;
                     total_reads += 1;
 
-                    if current_batch.len() >= batch_size {
-                        // Checked once per batch dispatch, not per record: an
-                        // atomic load in the per-record hot path would cost
-                        // measurable throughput for no benefit -- a human
-                        // pressing Ctrl-C does not need sub-batch latency.
+                    if filled >= batch_size {
+                        // Checked once per batch dispatch, not per record:
+                        // an atomic load in the per-record hot path would
+                        // cost measurable throughput for no benefit -- a
+                        // human pressing Ctrl-C does not need sub-batch
+                        // latency.
                         if let Some(tok) = &cancel_for_reader {
                             if tok.load(Ordering::Relaxed) {
                                 cancelled = true;
@@ -235,14 +315,21 @@ pub fn process_stream_parallel<S: RecordSource>(
                             }
                         }
 
-                        let batch_to_send =
-                            std::mem::replace(&mut current_batch, Vec::with_capacity(batch_size));
+                        // `filled == batch_size` and no batch ever grows
+                        // past `batch_size`, so the batch is exactly full
+                        // here and needs no truncation.
+                        debug_assert_eq!(current_batch.len(), filled);
+                        let next = recycle_rx
+                            .try_recv()
+                            .unwrap_or_else(|_| Vec::with_capacity(batch_size));
+                        let batch_to_send = std::mem::replace(&mut current_batch, next);
+                        filled = 0;
                         if sender.send(batch_to_send).is_err() {
                             break;
                         }
                     }
                 }
-                Ok(None) => break,
+                Ok(false) => break,
                 // A genuine I/O failure (a corrupt gzip member, an NFS read
                 // error) is not a data problem, so it must not be reported
                 // as MalformedFastq -- that would blame the bytes for a
@@ -261,17 +348,64 @@ pub fn process_stream_parallel<S: RecordSource>(
             }
         }
 
+        // Drops the slot pushed but never filled by the final iteration,
+        // plus any recycled slots this last batch did not reach. Without
+        // it a worker would count blank records that were never read.
+        current_batch.truncate(filled);
+
         // On cancellation, drop the leftover batch instead of sending it:
-        // the whole result is discarded by the Cancelled check below, so
-        // there is no point handing workers more to chew through. `sender`
-        // is dropped when this closure returns either way, which disconnects
-        // the channel and lets any worker still consuming exit its loop.
+        // the whole result is discarded by the Cancelled check in the
+        // caller, so there is no point handing workers more to chew
+        // through. `sender` is dropped when this closure returns either
+        // way, which disconnects the channel and lets any worker still
+        // consuming exit its loop.
         if !cancelled && !current_batch.is_empty() {
             let _ = sender.send(current_batch);
         }
 
         Ok(total_reads)
-    });
+    })
+}
+
+pub fn process_stream_parallel<S: RecordSource>(
+    reader: S,
+    config: PipelineConfig,
+    source: &Path,
+    progress: ProgressFn<'_>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(KmerCounter, QcSummary, u64)> {
+    validate_config(&config)?;
+    // The source gets a say too: an input list that can produce nothing at
+    // all is a caller mistake, and a run that counted zero reads in silence
+    // is indistinguishable from a real sample that happened to be empty.
+    reader.validate()?;
+
+    let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(CHANNEL_DEPTH);
+    // Drained batches travel back to the producer here so their record
+    // buffers can be refilled in place instead of reallocated per record.
+    // See `spawn_producer` for the allocation count, the deadlock argument,
+    // and why this cannot raise peak memory.
+    let (recycle_tx, recycle_rx): (Sender<RecordBatch>, Receiver<RecordBatch>) =
+        bounded(recycle_depth(config.num_threads));
+
+    let k = config.k;
+    let min_qual = config.min_quality;
+    let qual_win = config.quality_window;
+    let progress_interval = config.progress_interval;
+
+    // 1. Producer thread. Returns the read count, or the record it choked on.
+    //    `cancel` is cloned rather than borrowed: the reader thread is
+    //    'static and needs its own owned handle to the flag, distinct from
+    //    the one the rayon workers check (see the function doc comment for
+    //    why this must be Arc).
+    let reader_handle = spawn_producer(
+        reader,
+        sender,
+        recycle_rx,
+        config.batch_size,
+        source.to_path_buf(),
+        cancel.clone(),
+    );
 
     // Shared across workers so `ReadsProcessed` is genuinely cumulative.
     // A per-worker counter would report roughly reads/num_threads and jump
@@ -337,8 +471,9 @@ pub fn process_stream_parallel<S: RecordSource>(
                         }
                     }
 
-                    // Computed before the record loop below consumes the
-                    // batch, per the batch-granularity progress accounting.
+                    // Computed before the record loop below, per the
+                    // batch-granularity progress accounting, and before the
+                    // batch is handed back to the producer.
                     let n = batch.len() as u64;
 
                     for record in &mut batch {
@@ -351,6 +486,14 @@ pub fn process_stream_parallel<S: RecordSource>(
                         kmer::extract_canonical_kmers_into(&record.seq, k, &mut canon_kmers);
                         local_counter.insert_batch(&canon_kmers);
                     }
+
+                    // Hand the record buffers back so the producer can refill
+                    // them in place. Non-blocking and best-effort by design:
+                    // a disconnected pool (the producer has finished) just
+                    // drops the batch, exactly as this loop did before the
+                    // pool existed, and the pool is sized so a full one is
+                    // impossible. See `spawn_producer`.
+                    let _ = recycle_tx.try_send(batch);
 
                     // Accounted once per batch, not once per record: at
                     // production batch sizes (~10k) against a 100k default
@@ -401,10 +544,21 @@ pub fn process_stream_parallel<S: RecordSource>(
         .map_err(|_| FastDnaError::Internal { detail: "FASTQ reader thread panicked".to_string() })??;
 
     let mut worker_panic: Option<String> = None;
-    let mut outcomes: Vec<(KmerCounter, QcSummary)> = Vec::with_capacity(results.len());
+    let mut counters: Vec<KmerCounter> = Vec::with_capacity(results.len());
+    // `QcSummary::merge` is O(1) -- five `u64` additions -- so it is folded
+    // in right here, sequentially, exactly as the disk strategy already
+    // does. A k-way form of it would buy nothing, and doing it here rather
+    // than in a second pass keeps the counters unpaired for `merge_all`
+    // below. `merge` deliberately touches only the raw counters, never the
+    // percentages, which is what makes folding in this order equivalent to
+    // any other; `finalize` runs once at the end.
+    let mut master_qc = QcSummary::default();
     for outcome in results {
         match outcome {
-            Ok(v) => outcomes.push(v),
+            Ok((counter, qc)) => {
+                counters.push(counter);
+                master_qc.merge(&qc);
+            }
             Err(detail) => {
                 if worker_panic.is_none() {
                     worker_panic = Some(detail);
@@ -427,15 +581,25 @@ pub fn process_stream_parallel<S: RecordSource>(
         return Err(FastDnaError::Cancelled);
     }
 
-    // 3. Map-reduce combine phase.
-    let (master_counter, mut master_qc) = outcomes.into_par_iter().reduce(
-        || (KmerCounter::new(), QcSummary::default()),
-        |(mut acc_cnt, mut acc_qc), (local_cnt, local_qc)| {
-            acc_cnt.merge(local_cnt);
-            acc_qc.merge(&local_qc);
-            (acc_cnt, acc_qc)
-        },
-    );
+    // 3. Combine phase: one k-way merge, not a pairwise reduction tree.
+    //
+    // `reduce` folded two counters at a time, so every entry was rewritten
+    // once per level of the tree. At benchmark scale (8 workers, 53.8
+    // million distinct k-mers, 16 bytes per entry) that is 4 merges
+    // producing 13.4M entries, 2 producing 26.9M and 1 producing 53.8M:
+    // 161 million entries written, ~2.6 GB of `memcpy`, in 7 allocations
+    // the largest of which is 860 MB. `merge_all` writes each of the 53.8
+    // million final entries exactly once -- 860 MB in one allocation, so
+    // ~1.7 GB of copying and 6 large allocations removed.
+    //
+    // Giving up the tree's parallelism costs nothing even on the critical
+    // path: the tree's longest chain is 13.4M + 26.9M + 53.8M = 94.1M
+    // entries written even if every level ran perfectly in parallel, and
+    // the levels compete for the same memory bandwidth rather than
+    // multiplying it. The per-entry comparison count is unchanged too --
+    // an entry crossing `log2(workers)` merge levels at one compare each
+    // is the same `log(sources)` the k-way heap charges it.
+    let master_counter = KmerCounter::merge_all(counters);
 
     master_qc.finalize();
 
@@ -604,13 +768,20 @@ impl DiskWorkerFailure {
 type DiskWorkerOutcome = std::result::Result<(Vec<Vec<PathBuf>>, QcSummary), DiskWorkerFailure>;
 
 /// The disk-partitioned counting strategy. Structurally a sibling of
-/// `process_stream_parallel`, not a variant of it: the producer thread and
-/// channel setup below are intentionally re-implemented rather than
-/// factored out from that function, so this strategy's own bugs cannot
-/// reach back into the in-memory path's already-tested behavior, and vice
-/// versa. `config` must already be valid
-/// (`process_stream_parallel_with_policy` validates it before choosing a
-/// strategy).
+/// `process_stream_parallel`, not a variant of it: the consumer pool and
+/// reduce phase below are intentionally kept separate rather than factored
+/// out from that function, so this strategy's own bugs cannot reach back
+/// into the in-memory path's already-tested behavior, and vice versa.
+///
+/// The one exception is the producer thread (`spawn_producer`), which the
+/// two strategies now share. It was duplicated while it was a six-line
+/// `next_record`/`push` loop; it is now a buffer-recycling loop whose
+/// behaviour `tests/dual_strategy.rs` requires to be bit-identical across
+/// the two strategies, and one shared implementation is the safer way to
+/// guarantee that than two copies. Nothing strategy-specific lives in it.
+///
+/// `config` must already be valid (`process_stream_parallel_with_policy`
+/// validates it before choosing a strategy).
 fn process_stream_parallel_disk<S: RecordSource>(
     reader: S,
     config: PipelineConfig,
@@ -621,67 +792,27 @@ fn process_stream_parallel_disk<S: RecordSource>(
     let scratch = ScratchDir::new()?;
     let bucket_bits = disk_spill::DEFAULT_BUCKET_BITS;
 
-    let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(64);
+    let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(CHANNEL_DEPTH);
+    let (recycle_tx, recycle_rx): (Sender<RecordBatch>, Receiver<RecordBatch>) =
+        bounded(recycle_depth(config.num_threads));
 
-    let batch_size = config.batch_size;
     let k = config.k;
     let min_qual = config.min_quality;
     let qual_win = config.quality_window;
     let progress_interval = config.progress_interval;
-    let source_owned: PathBuf = source.to_path_buf();
-    let cancel_for_reader = cancel.clone();
 
-    // 1. Producer thread -- same shape and same reasoning as
-    // `process_stream_parallel`'s (see that function's inline comments for
-    // why each piece is there); duplicated rather than shared, see this
-    // function's own doc comment for why.
-    let reader_handle = thread::spawn(move || -> Result<u64> {
-        let mut reader = reader;
-        let mut current_batch = Vec::with_capacity(batch_size);
-        let mut total_reads: u64 = 0;
-        let mut cancelled = false;
-
-        loop {
-            match reader.next_record() {
-                Ok(Some(record)) => {
-                    current_batch.push(record);
-                    total_reads += 1;
-
-                    if current_batch.len() >= batch_size {
-                        if let Some(tok) = &cancel_for_reader {
-                            if tok.load(Ordering::Relaxed) {
-                                cancelled = true;
-                                break;
-                            }
-                        }
-
-                        let batch_to_send =
-                            std::mem::replace(&mut current_batch, Vec::with_capacity(batch_size));
-                        if sender.send(batch_to_send).is_err() {
-                            break;
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(FastqReadError::Io(source_err)) => {
-                    let (path, _) = failing_location(&reader, &source_owned, total_reads);
-                    return Err(FastDnaError::Io { path, source: source_err });
-                }
-                // A structural violation in the bytes themselves: attach the
-                // path and the 1-based index of the record that failed.
-                Err(FastqReadError::Malformed(reason)) => {
-                    let (path, record) = failing_location(&reader, &source_owned, total_reads);
-                    return Err(FastDnaError::MalformedFastq { path, record, reason });
-                }
-            }
-        }
-
-        if !cancelled && !current_batch.is_empty() {
-            let _ = sender.send(current_batch);
-        }
-
-        Ok(total_reads)
-    });
+    // 1. Producer thread -- the same one the in-memory strategy uses. This
+    // is the one piece the two strategies share, because it is the one
+    // piece that must behave identically for `tests/dual_strategy.rs` to
+    // hold; see `spawn_producer` for why it is no longer duplicated.
+    let reader_handle = spawn_producer(
+        reader,
+        sender,
+        recycle_rx,
+        config.batch_size,
+        source.to_path_buf(),
+        cancel.clone(),
+    );
 
     let reads_seen = AtomicU64::new(0);
     // Tracks total k-mer occurrences the same way `KmerCounter::insert_batch`
@@ -716,14 +847,38 @@ fn process_stream_parallel_disk<S: RecordSource>(
 
                     let n = batch.len() as u64;
 
+                    // Accumulated in a local and published once per batch
+                    // rather than once per record. `fetch_add` on a shared
+                    // counter is a contended atomic read-modify-write on one
+                    // cache line, and every worker was hitting it on every
+                    // read: 7 million on the benchmark file, versus one per
+                    // batch (~700 for the whole run at a 10 000-record
+                    // batch). The total is unchanged -- addition is
+                    // associative and commutative, so the order the
+                    // per-batch sums land in does not matter -- and the
+                    // value is still only read after every worker has
+                    // finished and `results` has been collected, which is
+                    // what makes `Relaxed` sound here as it was before. A
+                    // worker that panics or hits a spill error loses its
+                    // current batch's partial sum, which is unobservable:
+                    // both paths make the whole call return `Err`.
+                    let mut batch_occurrences: u64 = 0;
+
                     for record in &mut batch {
                         local_qc.observe_record(record);
                         record.quality_trim_end(min_qual, qual_win);
 
                         kmer::extract_canonical_kmers_into(&record.seq, k, &mut canon_kmers);
-                        total_occurrences.fetch_add(canon_kmers.len() as u64, Ordering::Relaxed);
+                        batch_occurrences += canon_kmers.len() as u64;
                         spill.insert_batch(&canon_kmers)?;
                     }
+
+                    total_occurrences.fetch_add(batch_occurrences, Ordering::Relaxed);
+
+                    // See the in-memory strategy's worker loop: non-blocking
+                    // and best-effort, so this can neither block nor fail in
+                    // a way that matters.
+                    let _ = recycle_tx.try_send(batch);
 
                     if let Some(emit) = progress {
                         let prev = reads_seen.fetch_add(n, Ordering::Relaxed);
@@ -846,6 +1001,57 @@ pub fn process_stream_parallel_with_policy<S: RecordSource>(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::fastq::FastqReader;
+    use std::io::Cursor;
+
+    /// The producer refills record slots a recycled batch already owns, so
+    /// the failure modes it can have and an allocating one cannot are: a
+    /// slot keeping the tail of a longer predecessor, and a final partial
+    /// batch shipping the recycled slots it never reached as if they were
+    /// real reads. Both would show up as a wrong read count or wrong k-mer
+    /// total, so this walks every relationship between the record count and
+    /// the batch size with alternating record lengths.
+    #[test]
+    fn recycled_batches_count_exactly_the_records_that_were_read() {
+        const BATCH: usize = 8;
+        const K: usize = 5;
+
+        for n_records in [1usize, BATCH - 1, BATCH, BATCH + 1, 2 * BATCH, 3 * BATCH + 3] {
+            let mut text = String::new();
+            let mut expected_kmers: u64 = 0;
+            for i in 0..n_records {
+                // A long record followed by a short one: the arrangement
+                // that catches a slot whose buffers were not cleared.
+                let len = if i % 2 == 0 { 40 } else { 8 };
+                let seq = "ACGT".repeat(len / 4);
+                // Q40 throughout, so quality trimming is a no-op and the
+                // k-mer total stays analytic.
+                text.push_str(&format!("@r{i}\n{seq}\n+\n{}\n", "I".repeat(len)));
+                expected_kmers += (len - K + 1) as u64;
+            }
+
+            let config = PipelineConfig {
+                k: K,
+                min_quality: 20.0,
+                quality_window: 4,
+                batch_size: BATCH,
+                num_threads: 3,
+                progress_interval: 1,
+            };
+            let reader = FastqReader::new(Cursor::new(text.into_bytes()));
+            let (counter, qc, total_reads) =
+                process_stream_parallel(reader, config, Path::new("<memory>"), None, None)
+                    .expect("valid input must succeed");
+
+            assert_eq!(total_reads, n_records as u64, "producer read count, n={n_records}");
+            assert_eq!(qc.total_reads, n_records as u64, "QC read count, n={n_records}");
+            assert_eq!(
+                counter.total_kmers(),
+                expected_kmers,
+                "k-mer total, n={n_records}: a recycled slot leaked or a blank slot was counted"
+            );
+        }
+    }
 
     /// A disk-strategy worker's real `FastDnaError` (e.g. disk-full while
     /// spilling) must reach the caller typed, with its path and source
