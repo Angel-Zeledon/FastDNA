@@ -208,14 +208,14 @@ fn iupac_ambiguity_codes_parse_fine_and_yield_no_kmers_spanning_them() {
     );
 }
 
-/// `read_until(b'\n', ..)` has no length cap, and a FASTA file handed to
-/// this FASTQ reader by mistake -- a routine user error -- has no early
-/// newline at all, so its first "line" can be the entire file. The error
-/// message must not become a second full copy of that content.
+/// `read_until(b'\n', ..)` has no length cap, so a file with no early
+/// newline -- a mangled download, a binary handed over by mistake -- can
+/// have a first "line" that is the entire file. The error message must not
+/// become a second full copy of that content.
 #[test]
-fn oversized_malformed_header_produces_a_bounded_error_message() {
+fn oversized_malformed_fastq_header_produces_a_bounded_error_message() {
     let mut fastq = Vec::new();
-    fastq.push(b'>'); // not '@' -- e.g. the start of a FASTA record
+    fastq.push(b'A'); // neither '@' (FASTQ) nor '>' (FASTA)
     fastq.extend(std::iter::repeat_n(b'A', 5_000));
     fastq.push(b'\n');
 
@@ -229,6 +229,34 @@ fn oversized_malformed_header_produces_a_bounded_error_message() {
                 reason.len()
             );
             assert!(reason.contains('@'), "reason must still say what was expected: {reason}");
+        }
+        other => panic!("expected MalformedFastq, got {other:?}"),
+    }
+}
+
+/// The same cap applies to the FASTA parser, which quotes the offending
+/// header back: a 5,000-character description line (not unusual in a
+/// reference assembly) must not be reproduced whole in the error.
+#[test]
+fn oversized_fasta_header_produces_a_bounded_error_message() {
+    let mut fasta = Vec::new();
+    fasta.push(b'>');
+    fasta.extend(std::iter::repeat_n(b'A', 5_000));
+    fasta.push(b'\n'); // header with no sequence under it
+
+    let result = process_stream_parallel(reader_for(&fasta), config(4), Path::new("<memory>"), None, None);
+
+    match result {
+        Err(FastDnaError::MalformedFastq { reason, .. }) => {
+            assert!(
+                reason.len() < 200,
+                "reason must be bounded regardless of input size, got {} bytes",
+                reason.len()
+            );
+            assert!(
+                reason.contains("no sequence"),
+                "reason must still say what was wrong: {reason}"
+            );
         }
         other => panic!("expected MalformedFastq, got {other:?}"),
     }
