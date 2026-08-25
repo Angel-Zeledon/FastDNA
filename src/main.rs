@@ -11,7 +11,7 @@ use std::time::Instant;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use fastdna_core::cli::{Cli, CliStrategy};
+use fastdna_core::cli::{Cli, CliHistogramFormat, CliStrategy};
 use fastdna_core::error::{FastDnaError, Result};
 use fastdna_core::export;
 use fastdna_core::fastq::{InputSpec, MultiSourceReader};
@@ -280,7 +280,11 @@ fn run(args: Cli) -> Result<()> {
     println!("QC report written to: {}", args.qc.display());
 
     if let Some(histogram_path) = &args.histogram {
-        export::export_histogram_csv(&counter, histogram_path)?;
+        let format = match args.histogram_format {
+            CliHistogramFormat::Csv => export::HistogramFormat::Csv,
+            CliHistogramFormat::GenomeScope => export::HistogramFormat::GenomeScope,
+        };
+        export::export_histogram(&counter, histogram_path, format, args.histogram_max)?;
         println!("Histogram written to: {}", histogram_path.display());
     }
 

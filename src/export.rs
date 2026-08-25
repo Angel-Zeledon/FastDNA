@@ -161,30 +161,94 @@ pub fn export_csv<P: AsRef<Path>>(
     export_counts_csv(counter, output_path, k, min_count)
 }
 
-pub fn export_histogram_csv<P: AsRef<Path>>(
+/// How to serialize a k-mer frequency spectrum.
+///
+/// Two formats rather than one because the file has two audiences that
+/// cannot both be served: a human or a pandas script wants a named-column
+/// CSV, and GenomeScope 2.0 -- the standard route to genome size,
+/// heterozygosity and ploidy -- wants precisely what `jellyfish histo`
+/// emits and rejects anything else, header included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistogramFormat {
+    /// `coverage_depth,kmer_distinct_count` header, then `depth,count`.
+    /// The format `--histogram` has always written; the default, so no
+    /// existing script changes behavior.
+    #[default]
+    Csv,
+    /// Headerless, space-separated `depth count`, ascending. Byte-for-byte
+    /// what `jellyfish histo` produces and GenomeScope 2.0 consumes; also
+    /// what `kmc_tools transform histogram`, ntCard and meryl emit.
+    GenomeScope,
+}
+
+/// Builds the spectrum: how many *distinct* k-mers were seen at each depth.
+///
+/// `max_depth`, if given, is KMC's `-cx` convention: depths above the cap
+/// are summed into the cap's own row rather than dropped, so the total
+/// number of distinct k-mers the spectrum accounts for is preserved. That
+/// matters because GenomeScope fits a coverage model against that total; a
+/// truncated tail makes the fit quietly wrong rather than visibly missing.
+/// The cap row is created even when no k-mer had exactly that depth --
+/// otherwise the folded k-mers would vanish, which is the very thing the
+/// convention exists to prevent.
+fn spectrum(counter: &KmerCounter, max_depth: Option<u32>) -> Vec<(u32, u64)> {
+    let mut hist_map: FxHashMap<u32, u64> = FxHashMap::default();
+    for count in counter.iter().map(|(_, c)| c) {
+        let depth = match max_depth {
+            Some(cap) => count.min(cap),
+            None => count,
+        };
+        *hist_map.entry(depth).or_insert(0) += 1;
+    }
+
+    let mut sorted: Vec<(u32, u64)> = hist_map.into_iter().collect();
+    sorted.sort_unstable_by_key(|&(depth, _)| depth);
+    sorted
+}
+
+/// Writes the k-mer frequency spectrum in `format`, capping depths at
+/// `max_depth` if given (see `spectrum`).
+///
+/// Goes through `AtomicFile` like every other exporter: a disk-full error
+/// or a Ctrl+C partway through must leave the previous good histogram in
+/// place rather than a truncated file that a downstream fitter will happily
+/// read as a real spectrum.
+pub fn export_histogram<P: AsRef<Path>>(
     counter: &KmerCounter,
     output_path: P,
+    format: HistogramFormat,
+    max_depth: Option<u32>,
 ) -> Result<()> {
     let path = output_path.as_ref();
     let (file, pending) = AtomicFile::create(path)?;
     let mut writer = BufWriter::with_capacity(64 * 1024, file);
-    writeln!(writer, "coverage_depth,kmer_distinct_count").map_err(|e| io_err(path, e))?;
 
-    let mut hist_map: FxHashMap<u32, u64> = FxHashMap::default();
-    for count in counter.iter().map(|(_, c)| c) {
-        *hist_map.entry(count).or_insert(0) += 1;
+    if format == HistogramFormat::Csv {
+        writeln!(writer, "coverage_depth,kmer_distinct_count").map_err(|e| io_err(path, e))?;
     }
 
-    let mut sorted: Vec<(u32, u64)> = hist_map.into_iter().collect();
-    sorted.sort_unstable_by_key(|&(cov, _)| cov);
-
-    for (coverage, count) in sorted {
-        writeln!(writer, "{},{}", coverage, count).map_err(|e| io_err(path, e))?;
+    for (depth, distinct) in spectrum(counter, max_depth) {
+        match format {
+            HistogramFormat::Csv => writeln!(writer, "{depth},{distinct}"),
+            HistogramFormat::GenomeScope => writeln!(writer, "{depth} {distinct}"),
+        }
+        .map_err(|e| io_err(path, e))?;
     }
+
     writer.flush().map_err(|e| io_err(path, e))?;
     drop(writer);
     pending.commit()?;
     Ok(())
+}
+
+/// The uncapped CSV spectrum -- the exact bytes `--histogram` produced
+/// before a format flag existed. Kept as its own entry point so callers
+/// that already use it are untouched.
+pub fn export_histogram_csv<P: AsRef<Path>>(
+    counter: &KmerCounter,
+    output_path: P,
+) -> Result<()> {
+    export_histogram(counter, output_path, HistogramFormat::Csv, None)
 }
 
 #[cfg(test)]

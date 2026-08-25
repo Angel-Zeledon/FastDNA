@@ -4,7 +4,7 @@
 #![allow(clippy::expect_used)]
 
 use clap::Parser;
-use fastdna_core::cli::Cli;
+use fastdna_core::cli::{Cli, CliHistogramFormat};
 
 #[test]
 fn max_count_defaults_to_no_upper_bound() {
@@ -159,6 +159,46 @@ fn stdin_combined_with_a_file_is_rejected() {
             .expect_err("`-` must be exclusive, but this was accepted: {args:?}");
         assert!(err.contains('-'), "message must mention the stdin form: {err}");
     }
+}
+
+#[test]
+fn the_histogram_format_defaults_to_csv() {
+    let cli = Cli::parse_from(["fastdna", "--input", "s.fastq", "--histogram", "h.csv"]);
+    assert_eq!(
+        cli.histogram_format,
+        CliHistogramFormat::Csv,
+        "the format that already shipped must stay the default"
+    );
+    assert_eq!(cli.histogram_max, None, "no cap unless asked for");
+}
+
+#[test]
+fn the_genomescope_histogram_format_is_selectable() {
+    let cli = Cli::parse_from([
+        "fastdna", "--input", "s.fastq",
+        "--histogram", "h.hist",
+        "--histogram-format", "genomescope",
+        "--histogram-max", "10000",
+    ]);
+    assert_eq!(cli.histogram_format, CliHistogramFormat::GenomeScope);
+    assert_eq!(cli.histogram_max, Some(10_000));
+    assert!(cli.validate().is_ok());
+}
+
+/// Depths start at 1, so a cap of 0 would keep nothing at all.
+#[test]
+fn a_histogram_cap_of_zero_is_rejected() {
+    assert!(
+        Cli::try_parse_from(["fastdna", "-i", "s.fastq", "--histogram-max", "0"]).is_err()
+    );
+}
+
+#[test]
+fn an_unknown_histogram_format_is_rejected() {
+    assert!(
+        Cli::try_parse_from(["fastdna", "-i", "s.fastq", "--histogram-format", "jellyfish"])
+            .is_err()
+    );
 }
 
 #[test]

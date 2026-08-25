@@ -15,6 +15,18 @@ pub enum CliStrategy {
     Disk,
 }
 
+/// User-facing choice of spectrum file format, forwarded into
+/// `export::HistogramFormat`. A separate enum from that one so the CLI's
+/// spelling of the values (`csv`, `genomescope`) is a CLI decision and the
+/// library type stays free to be named for what it is.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CliHistogramFormat {
+    #[default]
+    Csv,
+    #[value(name = "genomescope")]
+    GenomeScope,
+}
+
 /// Parses a `--max-ram` value: a plain byte count, or a number with a
 /// `K`/`M`/`G`/`T` suffix (case-insensitive, an optional trailing `B`
 /// ignored -- `4G`, `4GB`, and `4gb` all mean the same 4*1024^3 bytes).
@@ -106,9 +118,22 @@ pub struct Cli {
     #[arg(long, value_name = "FILE", default_value = "qc_report.json")]
     pub qc: PathBuf,
 
-    /// Optional path to export frequency spectrum (Histogram CSV)
+    /// Optional path to export the k-mer frequency spectrum
     #[arg(long, value_name = "FILE")]
     pub histogram: Option<PathBuf>,
+
+    /// Spectrum file format. "csv" (the default) writes the named-column
+    /// CSV that has always shipped; "genomescope" writes the headerless
+    /// space-separated `depth count` that `jellyfish histo` emits and
+    /// GenomeScope 2.0 consumes.
+    #[arg(long, value_enum, default_value = "csv")]
+    pub histogram_format: CliHistogramFormat,
+
+    /// Cap the spectrum at this depth: everything deeper is summed into
+    /// this row rather than dropped (KMC's -cx convention), keeping the
+    /// total number of distinct k-mers intact.
+    #[arg(long, value_name = "DEPTH", value_parser = clap::value_parser!(u32).range(1..))]
+    pub histogram_max: Option<u32>,
 
     /// Maximum RAM the automatic strategy chooser will target before
     /// switching from the in-memory to the disk-partitioned counting
