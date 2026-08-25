@@ -15,6 +15,7 @@ pub mod ffi;
 pub mod kmer;
 pub mod mem_estimate;
 pub mod metagenomics;
+pub mod minimizer;
 pub mod pipeline;
 pub mod preview;
 pub mod progress;
