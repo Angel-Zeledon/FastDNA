@@ -1128,6 +1128,449 @@ impl KmerDatabase {
     }
 }
 
+// -- classification -------------------------------------------------------
+
+/// What the classifier decided about one sequence, without its name.
+///
+/// Separate from [`ReadClassification`] so that `classify_sequence` is
+/// usable on a bare byte slice -- which is what makes the confidence
+/// arithmetic testable against a hand-counted example rather than only
+/// through a FASTQ file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReadAssignment {
+    /// The assigned taxon, or [`UNCLASSIFIED_TAX_ID`].
+    pub tax_id: u32,
+    /// Kraken 2's confidence: see [`KmerDatabase::classify_sequence`].
+    pub confidence: f64,
+    /// How many k-mers the read yielded at all. Windows containing an
+    /// ambiguous base yield none, so this is not simply `len - k + 1`.
+    pub n_kmers: u32,
+    /// How many of those were found in the database, whatever taxon they
+    /// mapped to. Reported even for an unclassified read, because "matched
+    /// nothing" and "matched plenty but not confidently enough" are
+    /// different situations that would otherwise look identical.
+    pub n_classified_kmers: u32,
+}
+
+/// One row of the per-read output table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadClassification {
+    pub read_id: String,
+    pub tax_id: u32,
+    pub confidence: f64,
+    pub n_kmers: u32,
+    pub n_classified_kmers: u32,
+}
+
+/// Buffers a classification run reuses for every read.
+///
+/// Both fields would otherwise be allocated and freed once per read. On a
+/// 7-million-read file that is 28 million heap operations; reused, it is
+/// four, because each buffer reaches the largest size any read needs within
+/// the first handful of reads and then never grows again.
+#[derive(Debug, Default)]
+struct ClassifyScratch {
+    kmers: Vec<u64>,
+    /// `(tax_id, k-mers hitting exactly that taxon)`, in first-seen order.
+    ///
+    /// A `Vec` scanned linearly, not a hash map. A read hits a handful of
+    /// distinct taxa -- one to five in ordinary data -- so finding one
+    /// costs on average `H/2` `u32` comparisons over a slice that is
+    /// already in L1, against a hash computation plus a probe. At `H = 3`
+    /// that is 1.5 comparisons per k-mer, and it allocates nothing per
+    /// read. The worst case is a read whose every k-mer hits a different
+    /// taxon, bounded by `n_kmers^2 / 2` comparisons -- about 7,000 for a
+    /// 150 bp read, and unreachable outside adversarial input.
+    hits: Vec<(u32, u32)>,
+}
+
+impl KmerDatabase {
+    /// Classifies one sequence with Kraken 2's rule.
+    ///
+    /// # The rule
+    ///
+    /// Every canonical k-mer of the sequence is looked up, giving a
+    /// multiset of hit taxa. Each hit taxon `t` is then scored by its
+    /// **root-to-leaf path**: the number of the read's k-mers that hit `t`
+    /// or any ancestor of `t`. The highest-scoring taxon wins; a tie is
+    /// resolved to the lowest common ancestor of everything tied, which is
+    /// the conservative direction -- an ancestor claims less than either of
+    /// two incompatible descendants would.
+    ///
+    /// # Confidence
+    ///
+    /// Kraken 2's own definition, and it matters which one: **the number of
+    /// the read's k-mers that fall in the clade rooted at the assigned
+    /// taxon, divided by the total number of k-mers the read yielded.**
+    ///
+    /// The denominator is every k-mer, not every *hit* k-mer. A read of 20
+    /// k-mers where 8 hit one species and 12 hit nothing has confidence
+    /// 0.4, not 1.0. Using hit k-mers instead would report near-total
+    /// confidence for reads that mostly matched nothing at all -- which is
+    /// exactly the population you most need the confidence score to warn
+    /// you about.
+    ///
+    /// Windows containing an ambiguous base produce no k-mer and so appear
+    /// in neither the numerator nor the denominator, as in Kraken 2.
+    ///
+    /// # `confidence_threshold`
+    ///
+    /// Also Kraken 2's semantics. The call must be supported by at least
+    /// `ceil(confidence_threshold * n_kmers)` k-mers in its clade; while it
+    /// is not, the call moves to its parent, whose clade is strictly
+    /// larger and so can only gain support. If it reaches past the root
+    /// without ever meeting the bar, the read is unclassified. Raising the
+    /// threshold therefore trades sensitivity for precision by making calls
+    /// less specific, never by making them wrong.
+    ///
+    /// Reference: Wood, Lu & Langmead, "Improved metagenomic analysis with
+    /// Kraken 2", *Genome Biology* 20:257 (2019).
+    pub fn classify_sequence(&self, seq: &[u8], confidence_threshold: f64) -> Result<ReadAssignment> {
+        validate_threshold(confidence_threshold)?;
+        let mut scratch = ClassifyScratch::default();
+        Ok(self.classify_into(seq, confidence_threshold, &mut scratch))
+    }
+
+    /// The classification body, over caller-owned scratch. Private because
+    /// `ClassifyScratch` is an optimization detail, and because the
+    /// threshold is validated once per run by the caller rather than once
+    /// per read -- which is the whole point of having a separate entry
+    /// point for a stream.
+    fn classify_into(
+        &self,
+        seq: &[u8],
+        confidence_threshold: f64,
+        scratch: &mut ClassifyScratch,
+    ) -> ReadAssignment {
+        extract_canonical_kmers_into(seq, self.k, &mut scratch.kmers);
+        let n_kmers = scratch.kmers.len() as u32;
+
+        scratch.hits.clear();
+        let mut n_classified_kmers: u32 = 0;
+        for &kmer in &scratch.kmers {
+            let Some(tax_id) = self.lookup(kmer) else { continue };
+            n_classified_kmers += 1;
+            match scratch.hits.iter_mut().find(|(seen, _)| *seen == tax_id) {
+                Some((_, count)) => *count += 1,
+                None => scratch.hits.push((tax_id, 1)),
+            }
+        }
+
+        // Three ways to have nothing to work with: a read shorter than k, a
+        // read whose every window held an ambiguous base, and a read whose
+        // k-mers are all absent from the database. All three are
+        // unclassified -- reported as a row, never dropped -- and all three
+        // report confidence 0.0 rather than the 0/0 that a naive division
+        // would make NaN.
+        if scratch.hits.is_empty() {
+            return ReadAssignment {
+                tax_id: UNCLASSIFIED_TAX_ID,
+                confidence: 0.0,
+                n_kmers,
+                n_classified_kmers,
+            };
+        }
+
+        // Root-to-leaf path scoring. `hits` is short, so the H^2 pass over
+        // it is a handful of contiguous-slice scans; the ancestor test
+        // itself is a `contains` over a precomputed lineage (see
+        // `Taxonomy::lineages`), not a walk.
+        let mut best_score = 0u32;
+        let mut best_tax_id = UNCLASSIFIED_TAX_ID;
+        for &(candidate, _) in scratch.hits.iter() {
+            let score: u32 = scratch
+                .hits
+                .iter()
+                .filter(|(other, _)| self.taxonomy.is_ancestor_or_self(*other, candidate))
+                .map(|(_, count)| count)
+                .sum();
+            if score > best_score {
+                best_score = score;
+                best_tax_id = candidate;
+            } else if score == best_score {
+                // Fold, rather than replace: LCA is associative and
+                // commutative, so folding it over every taxon tied at the
+                // maximum gives the same answer whatever order the hits
+                // were seen in. That determinism is the reason this is
+                // written as a fold and not as Kraken's in-place update.
+                best_tax_id = self.taxonomy.lca(best_tax_id, candidate);
+            }
+        }
+
+        // Kraken 2 starts the promotion walk from the *direct* hits at the
+        // called taxon -- which is 0 whenever a tie moved the call to an
+        // ancestor that nothing hit directly -- and only then widens to the
+        // clade. Reproduced exactly, because starting from the clade score
+        // instead would let a tie-resolved call clear a threshold on the
+        // first test that Kraken 2 makes it walk further for.
+        let required = (confidence_threshold * n_kmers as f64).ceil() as u32;
+        let mut assigned = best_tax_id;
+        let mut score = direct_hits(&scratch.hits, assigned);
+        while assigned != UNCLASSIFIED_TAX_ID && score < required {
+            score = self.clade_score(&scratch.hits, assigned);
+            if score >= required {
+                break;
+            }
+            assigned = self.taxonomy.parent_of(assigned).unwrap_or(UNCLASSIFIED_TAX_ID);
+        }
+
+        let confidence = if assigned == UNCLASSIFIED_TAX_ID || n_kmers == 0 {
+            0.0
+        } else {
+            self.clade_score(&scratch.hits, assigned) as f64 / n_kmers as f64
+        };
+
+        ReadAssignment { tax_id: assigned, confidence, n_kmers, n_classified_kmers }
+    }
+
+    /// The number of the read's k-mers that hit `clade_root` or anything
+    /// below it -- the numerator of Kraken 2's confidence.
+    fn clade_score(&self, hits: &[(u32, u32)], clade_root: u32) -> u32 {
+        hits.iter()
+            .filter(|(tax_id, _)| self.taxonomy.is_ancestor_or_self(clade_root, *tax_id))
+            .map(|(_, count)| count)
+            .sum()
+    }
+
+    /// Classifies every read of a file, streaming.
+    pub fn classify_path<P: AsRef<Path>>(
+        &self,
+        reads: P,
+        confidence_threshold: f64,
+    ) -> Result<Vec<ReadClassification>> {
+        let reads = reads.as_ref();
+        let source = crate::fastq::MultiSourceReader::from_paths(vec![reads]);
+        self.classify_source(source, reads, confidence_threshold)
+    }
+
+    /// Classifies every read of a [`RecordSource`], streaming, in input
+    /// order.
+    ///
+    /// One pass, one record at a time, through the crate's existing reader
+    /// -- so FASTA and FASTQ, plain and gzip, files and stdin all work here
+    /// exactly as they do for counting, without this module knowing which
+    /// it was handed.
+    ///
+    /// Single-threaded, and honestly so: the crate's parallel pipeline
+    /// (`pipeline::process_stream_parallel`) reduces per-worker
+    /// `KmerCounter`s into one result, which is the wrong shape for output
+    /// that is one ordered row per read, and reshaping it is not something
+    /// this module may do to a hot path shared with counting.
+    ///
+    /// The result is materialized in full: one `ReadClassification` per
+    /// read, ~48 bytes plus the read's name, so roughly 5 GB for a
+    /// 100-million-read file. For inputs that large, classify in chunks.
+    pub fn classify_source<S: RecordSource>(
+        &self,
+        mut source: S,
+        reads_path: &Path,
+        confidence_threshold: f64,
+    ) -> Result<Vec<ReadClassification>> {
+        // Once per run, not once per read: the check is loop-invariant and
+        // a caller who passed NaN needs to hear about it before the first
+        // read, not after the last.
+        validate_threshold(confidence_threshold)?;
+        source.validate()?;
+
+        let mut scratch = ClassifyScratch::default();
+        let mut rows: Vec<ReadClassification> = Vec::new();
+        let mut record_no: u64 = 0;
+
+        loop {
+            match source.next_record() {
+                Ok(Some(record)) => {
+                    record_no += 1;
+                    let assignment = self.classify_into(&record.seq, confidence_threshold, &mut scratch);
+                    let mut read_id = record_id_of(&record.id);
+                    if read_id.is_empty() {
+                        // A header with nothing after its marker still has
+                        // to be identifiable in the output table, and its
+                        // position in the file is the only name it has.
+                        read_id = format!("read_{record_no}");
+                    }
+                    rows.push(ReadClassification {
+                        read_id,
+                        tax_id: assignment.tax_id,
+                        confidence: assignment.confidence,
+                        n_kmers: assignment.n_kmers,
+                        n_classified_kmers: assignment.n_classified_kmers,
+                    });
+                }
+                Ok(None) => break,
+                Err(FastqReadError::Io(source_err)) => {
+                    let (path, _) = failing_location(&source, reads_path, record_no);
+                    return Err(FastDnaError::Io { path, source: source_err });
+                }
+                Err(FastqReadError::Malformed(reason)) => {
+                    let (path, record) = failing_location(&source, reads_path, record_no);
+                    return Err(FastDnaError::MalformedFastq { path, record, reason });
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    /// Aggregates per-read assignments into a composition table.
+    ///
+    /// # This is read abundance, not organism abundance
+    ///
+    /// `reads` counts the reads assigned to each taxon and
+    /// `relative_abundance` divides that by the total number of reads,
+    /// unclassified included -- so the column sums to exactly 1 and the
+    /// unclassified fraction is visible rather than hidden by
+    /// renormalization.
+    ///
+    /// It is **not corrected for genome length**, and that correction is
+    /// not optional for the question people usually mean. A 6 Mbp organism
+    /// and a 1.5 Mbp organism present in identical cell numbers yield
+    /// roughly four times as many reads from the former, so a report like
+    /// this overstates it fourfold as a fraction of the *community*.
+    /// Comparing taxa with different genome sizes -- or comparing a
+    /// bacterium with a virus, where the ratio is a thousandfold -- needs
+    /// that correction, and it is what Bracken exists to do (Lu,
+    /// Breitwieser, Thielen & Salzberg, "Bracken: estimating species
+    /// abundance in metagenomics data", *PeerJ Computer Science* 3:e104,
+    /// 2017). **FastDNA does not implement it.** Read these numbers as
+    /// "share of reads", never as "share of organisms".
+    ///
+    /// Counts are per *assigned* taxon, not cumulative down the clade: a
+    /// read called at the genus is counted at the genus and nowhere else.
+    /// Kraken's own report format also gives clade-cumulative totals; this
+    /// does not.
+    pub fn abundance_batch(&self, tax_ids: &[u32]) -> Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{ArrayRef, Float64Array, StringArray, UInt32Array, UInt64Array};
+
+        let total = tax_ids.len() as f64;
+        let mut counts: FxHashMap<u32, u64> = FxHashMap::default();
+        for &tax_id in tax_ids {
+            *counts.entry(tax_id).or_insert(0) += 1;
+        }
+
+        // Most reads first, and ties broken by tax_id so that two runs over
+        // the same data always produce byte-identical tables -- otherwise a
+        // diff between two reports would show phantom changes from hash
+        // iteration order alone.
+        let mut rows: Vec<(u32, u64)> = counts.into_iter().collect();
+        rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut names = Vec::with_capacity(rows.len());
+        let mut ranks = Vec::with_capacity(rows.len());
+        let mut reads = Vec::with_capacity(rows.len());
+        let mut abundance = Vec::with_capacity(rows.len());
+
+        for (tax_id, count) in rows {
+            ids.push(tax_id);
+            if tax_id == UNCLASSIFIED_TAX_ID {
+                names.push(UNCLASSIFIED_LABEL.to_string());
+                ranks.push(UNCLASSIFIED_LABEL.to_string());
+            } else {
+                // A taxon id with no entry can only come from a caller
+                // passing ids this database did not produce; naming it
+                // rather than dropping the row keeps the read counts
+                // adding up.
+                names.push(self.taxonomy.name_of(tax_id).unwrap_or("unknown").to_string());
+                ranks.push(self.taxonomy.rank_of(tax_id).unwrap_or("unknown").to_string());
+            }
+            reads.push(count);
+            abundance.push(count as f64 / total);
+        }
+
+        let columns: Vec<ArrayRef> = vec![
+            std::sync::Arc::new(UInt32Array::from(ids)),
+            std::sync::Arc::new(StringArray::from(names)),
+            std::sync::Arc::new(StringArray::from(ranks)),
+            std::sync::Arc::new(UInt64Array::from(reads)),
+            std::sync::Arc::new(Float64Array::from(abundance)),
+        ];
+        arrow::record_batch::RecordBatch::try_new(abundance_schema(), columns).map_err(|e| {
+            FastDnaError::Export {
+                path: std::path::PathBuf::from("<in-memory Arrow table>"),
+                reason: e.to_string(),
+            }
+        })
+    }
+}
+
+/// The name and rank given to the unclassified row of an abundance report.
+const UNCLASSIFIED_LABEL: &str = "unclassified";
+
+/// The k-mers hitting exactly `tax_id`, ignoring its descendants.
+fn direct_hits(hits: &[(u32, u32)], tax_id: u32) -> u32 {
+    hits.iter().find(|(seen, _)| *seen == tax_id).map(|(_, count)| *count).unwrap_or(0)
+}
+
+fn validate_threshold(confidence_threshold: f64) -> Result<()> {
+    // NaN is rejected explicitly rather than falling out of the range
+    // check: every comparison against NaN is false, so `ceil(NaN * n)`
+    // would make `required` 0 and silently disable the threshold entirely
+    // -- a wrong answer that completes successfully, which is the class of
+    // failure this crate's validation exists to rule out.
+    if !confidence_threshold.is_finite() || !(0.0..=1.0).contains(&confidence_threshold) {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "confidence_threshold",
+            reason: format!("must be a finite number in [0.0, 1.0], got {confidence_threshold}"),
+        });
+    }
+    Ok(())
+}
+
+/// The schema of the per-read classification table.
+pub fn classification_schema() -> std::sync::Arc<arrow::datatypes::Schema> {
+    use arrow::datatypes::{DataType, Field, Schema};
+    std::sync::Arc::new(Schema::new(vec![
+        Field::new("read_id", DataType::Utf8, false),
+        // 0 means unclassified, Kraken's convention -- not null, so that a
+        // consumer cannot accidentally drop unclassified reads by filtering
+        // nulls and then report a composition that sums to 1 over a
+        // population it silently shrank.
+        Field::new("tax_id", DataType::UInt32, false),
+        Field::new("confidence", DataType::Float64, false),
+        Field::new("n_kmers", DataType::UInt32, false),
+        Field::new("n_classified_kmers", DataType::UInt32, false),
+    ]))
+}
+
+/// The schema of the abundance report. See
+/// [`KmerDatabase::abundance_batch`] for what `relative_abundance` does and
+/// does not mean.
+pub fn abundance_schema() -> std::sync::Arc<arrow::datatypes::Schema> {
+    use arrow::datatypes::{DataType, Field, Schema};
+    std::sync::Arc::new(Schema::new(vec![
+        Field::new("tax_id", DataType::UInt32, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("rank", DataType::Utf8, false),
+        Field::new("reads", DataType::UInt64, false),
+        Field::new("relative_abundance", DataType::Float64, false),
+    ]))
+}
+
+/// Builds the per-read Arrow table from classification rows.
+pub fn classification_batch(rows: &[ReadClassification]) -> Result<arrow::record_batch::RecordBatch> {
+    use arrow::array::{ArrayRef, Float64Array, StringArray, UInt32Array};
+
+    let ids = StringArray::from_iter_values(rows.iter().map(|r| r.read_id.as_str()));
+    let tax_ids = UInt32Array::from_iter_values(rows.iter().map(|r| r.tax_id));
+    let confidence = Float64Array::from_iter_values(rows.iter().map(|r| r.confidence));
+    let n_kmers = UInt32Array::from_iter_values(rows.iter().map(|r| r.n_kmers));
+    let n_classified = UInt32Array::from_iter_values(rows.iter().map(|r| r.n_classified_kmers));
+
+    let columns: Vec<ArrayRef> = vec![
+        std::sync::Arc::new(ids),
+        std::sync::Arc::new(tax_ids),
+        std::sync::Arc::new(confidence),
+        std::sync::Arc::new(n_kmers),
+        std::sync::Arc::new(n_classified),
+    ];
+    arrow::record_batch::RecordBatch::try_new(classification_schema(), columns).map_err(|e| {
+        FastDnaError::Export {
+            path: std::path::PathBuf::from("<in-memory Arrow table>"),
+            reason: e.to_string(),
+        }
+    })
+}
+
 /// Where to blame a reader-side failure: the file a multi-file source was
 /// actually reading and that file's own record number, or the caller's
 /// path plus the running count when the source has no path of its own.
@@ -1652,5 +2095,300 @@ tax_id\tparent_tax_id\trank\tname\tsequence_ids
             Err(FastDnaError::Io { .. }) => {}
             other => panic!("expected Io, got {other:?}"),
         }
+    }
+
+    // -- classification ---------------------------------------------------
+
+    /// 12 bases present in neither reference, so every k-mer touching them
+    /// hits nothing. Starts with `C` where `SHARED` starts with `G`, so the
+    /// k-mers spanning the `ONLY_A`/`NOVEL` junction differ from the ones
+    /// spanning `ONLY_A`/`SHARED` in the real species_a sequence and are
+    /// therefore absent too.
+    const NOVEL: &str = "CTCTAGGACTGA";
+
+    fn classify(db: &KmerDatabase, read: &str, threshold: f64) -> ReadAssignment {
+        db.classify_sequence(read.as_bytes(), threshold).expect("a threshold in [0, 1]")
+    }
+
+    #[test]
+    fn a_read_of_species_specific_kmers_classifies_to_that_species() {
+        let db = build_toy_db();
+        assert_eq!(classify(&db, ONLY_A, 0.0).tax_id, 100);
+        assert_eq!(classify(&db, ONLY_B, 0.0).tax_id, 200);
+    }
+
+    /// The k-mers shared by both species map to the genus, so a read made
+    /// only of them must be called at the genus -- not at either species,
+    /// and not at the root.
+    #[test]
+    fn a_read_of_shared_kmers_classifies_to_the_genus() {
+        let db = build_toy_db();
+        let assignment = classify(&db, SHARED, 0.0);
+        assert_eq!(assignment.tax_id, 10);
+        assert_eq!(assignment.confidence, 1.0, "every k-mer is inside the genus clade");
+    }
+
+    /// A chimeric read, half from each species: the tie between the two
+    /// root-to-leaf path scores resolves to their common ancestor, which is
+    /// the conservative direction.
+    #[test]
+    fn a_read_split_between_two_species_classifies_to_their_common_ancestor() {
+        let db = build_toy_db();
+        let read = format!("{ONLY_A}{ONLY_B}");
+        let assignment = classify(&db, &read, 0.0);
+        assert_eq!(assignment.tax_id, 10, "must be the genus, not either species");
+    }
+
+    /// Confidence, checked by hand.
+    ///
+    /// The read is `ONLY_A` (18 bases) followed by `NOVEL` (12 bases) = 30
+    /// bases, so at k=11 it has 30 - 11 + 1 = 20 k-mers. The first 8 lie
+    /// wholly inside `ONLY_A` and map to species 100; the remaining 12
+    /// either span the junction or lie inside `NOVEL`, and are in neither
+    /// reference, so they map to nothing.
+    ///
+    /// Kraken 2's confidence is the fraction of *all* the read's k-mers
+    /// that fall in the clade rooted at the assigned taxon -- 8/20 = 0.4 --
+    /// not the fraction of the *hit* k-mers, which would be 8/8 = 1.0 and
+    /// would report full confidence in a read that 60% of the time matched
+    /// nothing at all.
+    #[test]
+    fn confidence_is_hit_kmers_over_all_kmers_not_over_hit_kmers() {
+        let db = build_toy_db();
+        let read = format!("{ONLY_A}{NOVEL}");
+        let assignment = classify(&db, &read, 0.0);
+
+        assert_eq!(assignment.n_kmers, 20, "30 bases at k=11");
+        assert_eq!(assignment.n_classified_kmers, 8, "only the k-mers wholly inside ONLY_A");
+        assert_eq!(assignment.tax_id, 100);
+        assert_eq!(assignment.confidence, 0.4, "8 / 20, not 8 / 8");
+    }
+
+    /// The promotion rule: when the assigned taxon cannot meet the
+    /// threshold, the call moves up the tree until an ancestor's clade does
+    /// meet it.
+    ///
+    /// The read is species_a's own sequence, `ONLY_A` + `SHARED` = 36
+    /// bases = 26 k-mers at k=11. 18 of them (those inside `ONLY_A` or
+    /// spanning the junction) are unique to species_a and map to 100; the
+    /// other 8 lie wholly inside `SHARED` and map to the genus 10.
+    ///
+    /// - Root-to-leaf scores: 100 scores 18 + 8 = 26 (the genus is on its
+    ///   path), the genus alone scores 8. So the call is species 100.
+    /// - At threshold 0, that stands: confidence 18/26 ~= 0.692, since only
+    ///   the 18 direct hits are inside species 100's clade.
+    /// - At threshold 0.7 it needs ceil(0.7 * 26) = 19 and has 18, so it
+    ///   moves up to the genus, whose clade holds all 26 -- confidence 1.0.
+    #[test]
+    fn a_confidence_threshold_pushes_a_borderline_read_up_the_tree() {
+        let db = build_toy_db();
+        let read = format!("{ONLY_A}{SHARED}");
+
+        let unfiltered = classify(&db, &read, 0.0);
+        assert_eq!(unfiltered.n_kmers, 26);
+        assert_eq!(unfiltered.n_classified_kmers, 26);
+        assert_eq!(unfiltered.tax_id, 100);
+        assert!(
+            (unfiltered.confidence - 18.0 / 26.0).abs() < 1e-12,
+            "confidence was {}",
+            unfiltered.confidence
+        );
+
+        let promoted = classify(&db, &read, 0.7);
+        assert_eq!(promoted.tax_id, 10, "must be promoted to the genus");
+        assert_eq!(promoted.confidence, 1.0, "all 26 k-mers are inside the genus clade");
+    }
+
+    /// At threshold 1.0 every single k-mer of the read has to agree, so a
+    /// read with k-mers matching nothing walks all the way past the root
+    /// and comes back unclassified.
+    #[test]
+    fn a_threshold_of_one_leaves_a_partly_matching_read_unclassified() {
+        let db = build_toy_db();
+        let read = format!("{ONLY_A}{NOVEL}");
+
+        // 8 of 20 k-mers hit, so no clade -- not the species, not the
+        // genus, not the root -- can reach 20.
+        let assignment = classify(&db, &read, 1.0);
+        assert_eq!(assignment.tax_id, UNCLASSIFIED_TAX_ID);
+        assert_eq!(assignment.confidence, 0.0);
+        assert_eq!(assignment.n_classified_kmers, 8, "the evidence is still reported");
+
+        // Whereas a read every one of whose k-mers is inside one clade
+        // survives the same threshold.
+        assert_eq!(classify(&db, SHARED, 1.0).tax_id, 10);
+    }
+
+    // -- the three degenerate reads ---------------------------------------
+
+    #[test]
+    fn a_read_shorter_than_k_is_unclassified_with_no_kmers() {
+        let db = build_toy_db();
+        let assignment = classify(&db, "ACGTA", 0.0);
+        assert_eq!(assignment.tax_id, UNCLASSIFIED_TAX_ID);
+        assert_eq!(assignment.n_kmers, 0);
+        assert_eq!(assignment.n_classified_kmers, 0);
+        assert_eq!(assignment.confidence, 0.0, "0/0 must be reported as 0.0, never as NaN");
+    }
+
+    #[test]
+    fn an_all_ambiguous_read_is_unclassified_with_no_kmers() {
+        let db = build_toy_db();
+        let assignment = classify(&db, "NNNNNNNNNNNNNNNNNNNN", 0.0);
+        assert_eq!(assignment.tax_id, UNCLASSIFIED_TAX_ID);
+        assert_eq!(assignment.n_kmers, 0, "an ambiguous base yields no k-mer at all");
+        assert_eq!(assignment.confidence, 0.0);
+    }
+
+    /// A read with *some* ambiguity still classifies on the windows that
+    /// have none -- those windows are simply absent from both the numerator
+    /// and the denominator, which is how Kraken 2 treats them too.
+    #[test]
+    fn a_partly_ambiguous_read_classifies_on_its_unambiguous_windows() {
+        let db = build_toy_db();
+        let read = format!("{ONLY_A}NNNN{ONLY_B}");
+        let assignment = classify(&db, &read, 0.0);
+        assert_eq!(assignment.n_kmers, 16, "8 windows in each half, none spanning the Ns");
+        assert_eq!(assignment.n_classified_kmers, 16);
+        assert_eq!(assignment.tax_id, 10, "half from each species -> their genus");
+    }
+
+    #[test]
+    fn a_read_matching_nothing_at_all_is_unclassified() {
+        let db = build_toy_db();
+        let assignment = classify(&db, &format!("{NOVEL}{NOVEL}"), 0.0);
+        assert_eq!(assignment.tax_id, UNCLASSIFIED_TAX_ID);
+        assert!(assignment.n_kmers > 0, "the read does have k-mers");
+        assert_eq!(assignment.n_classified_kmers, 0, "none of them are in the database");
+    }
+
+    #[test]
+    fn an_out_of_range_confidence_threshold_is_rejected() {
+        let db = build_toy_db();
+        for threshold in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            match db.classify_sequence(ONLY_A.as_bytes(), threshold) {
+                Err(FastDnaError::InvalidConfig { parameter, .. }) => {
+                    assert_eq!(parameter, "confidence_threshold");
+                }
+                other => panic!("expected InvalidConfig for {threshold}, got {:?}", other.map(|a| a.tax_id)),
+            }
+        }
+    }
+
+    // -- streaming, and the Arrow tables ----------------------------------
+
+    fn fastq_of(reads: &[(&str, &str)]) -> String {
+        reads
+            .iter()
+            .map(|(id, seq)| format!("@{id}\n{seq}\n+\n{}\n", "I".repeat(seq.len())))
+            .collect()
+    }
+
+    #[test]
+    fn classifying_a_stream_reports_one_row_per_read_in_order() {
+        let db = build_toy_db();
+        let reads = fastq_of(&[
+            ("read_a description here", ONLY_A),
+            ("read_b", ONLY_B),
+            ("read_none", NOVEL),
+        ]);
+
+        let rows = db
+            .classify_source(source_over(&reads), std::path::Path::new("<reads>"), 0.0)
+            .expect("valid reads");
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].read_id, "read_a", "the id stops at the first whitespace");
+        assert_eq!(rows[0].tax_id, 100);
+        assert_eq!(rows[1].tax_id, 200);
+        assert_eq!(rows[2].tax_id, UNCLASSIFIED_TAX_ID);
+    }
+
+    #[test]
+    fn an_empty_read_file_produces_a_well_formed_empty_table() {
+        let db = build_toy_db();
+        let rows = db
+            .classify_source(source_over(""), std::path::Path::new("<reads>"), 0.0)
+            .expect("an empty file is not an error");
+        assert!(rows.is_empty());
+
+        let batch = classification_batch(&rows).expect("an empty batch is still a batch");
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema(), classification_schema());
+    }
+
+    #[test]
+    fn the_classification_table_has_the_documented_schema() {
+        let db = build_toy_db();
+        let rows = db
+            .classify_source(source_over(&fastq_of(&[("r1", ONLY_A)])), std::path::Path::new("<r>"), 0.0)
+            .unwrap();
+        let batch = classification_batch(&rows).unwrap();
+
+        let fields: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| format!("{}:{}", f.name(), f.data_type()))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "read_id:Utf8",
+                "tax_id:UInt32",
+                "confidence:Float64",
+                "n_kmers:UInt32",
+                "n_classified_kmers:UInt32",
+            ]
+        );
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    // -- abundance --------------------------------------------------------
+
+    fn column_as_strings(batch: &arrow::record_batch::RecordBatch, name: &str) -> Vec<String> {
+        let column = batch.column_by_name(name).expect("column exists");
+        (0..column.len()).map(|i| arrow::util::display::array_value_to_string(column, i).unwrap()).collect()
+    }
+
+    #[test]
+    fn the_abundance_report_counts_reads_and_normalizes_over_all_of_them() {
+        let db = build_toy_db();
+        // Two reads assigned to species 100, one unclassified.
+        let batch = db.abundance_batch(&[100, 100, UNCLASSIFIED_TAX_ID]).unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(column_as_strings(&batch, "tax_id"), vec!["100", "0"], "sorted by read count");
+        assert_eq!(column_as_strings(&batch, "name"), vec!["Toyella alpha", "unclassified"]);
+        assert_eq!(column_as_strings(&batch, "rank"), vec!["species", "unclassified"]);
+        assert_eq!(column_as_strings(&batch, "reads"), vec!["2", "1"]);
+
+        let abundance = column_as_strings(&batch, "relative_abundance");
+        // 2/3 and 1/3: the denominator is every read, including the
+        // unclassified one, so the column sums to exactly 1.
+        assert!(abundance[0].starts_with("0.666"), "{abundance:?}");
+        assert!(abundance[1].starts_with("0.333"), "{abundance:?}");
+    }
+
+    #[test]
+    fn an_abundance_report_over_no_reads_is_empty_not_a_division_by_zero() {
+        let db = build_toy_db();
+        let batch = db.abundance_batch(&[]).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema(), abundance_schema());
+    }
+
+    /// Ties in read count must not come out in whatever order a hash map
+    /// happened to iterate: two runs of the same data must produce the same
+    /// table, or a diff between two reports is meaningless.
+    #[test]
+    fn the_abundance_report_is_deterministic_under_ties() {
+        let db = build_toy_db();
+        let first = db.abundance_batch(&[100, 200, 10]).unwrap();
+        for _ in 0..8 {
+            let again = db.abundance_batch(&[10, 100, 200]).unwrap();
+            assert_eq!(column_as_strings(&first, "tax_id"), column_as_strings(&again, "tax_id"));
+        }
+        assert_eq!(column_as_strings(&first, "tax_id"), vec!["10", "100", "200"]);
     }
 }
