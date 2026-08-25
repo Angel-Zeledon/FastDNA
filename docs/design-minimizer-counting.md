@@ -1,8 +1,11 @@
 # Design: minimizer-partitioned super-k-mer counting
 
-Status: **step 0 passed; implementation in progress.** This document is the
-argument that decided whether we implement. See the update below for the
-gate measurement; the rest of the document is unchanged from the proposal.
+Status: **steps 0-4 done and correct; step 6's real-data gate has now been run
+(2026-08-25) and promotion to `auto` was declined on the evidence — see the
+step 6 result under §5.** `binned` remains an opt-in, documented, non-default
+strategy. This document is the argument that decided whether we implement.
+See the update below for the gate measurement; the rest of the document is
+unchanged from the proposal.
 
 Date: 2026-08-25.
 
@@ -1001,15 +1004,74 @@ tell, from the counts alone, which strategy actually ran" — from two strategie
 to three. **The memory and disk paths are not modified at all, so all 252 tests
 pass by construction.** This is where §4's benchmark gets run for real.
 
-**Step 5 — new memory model.** Add `estimate_peak_bytes_binned` to
-`mem_estimate.rs`, calibrated against step 4's measurements. **Add, do not
-change**: `estimate_matches_calibration_runs_within_reported_error`
-(`src/mem_estimate.rs:286`) pins the *old* model's arithmetic against real runs
-and must stay green.
+**Step 5 result (2026-08-25) — not started; superseded by the step 6 finding
+below.** No calibrated `estimate_peak_bytes_binned` was added, because step 6's
+real-data test failed its own gate first — there is nothing to calibrate a
+promotion threshold against until R3 is actually resolved (see below). The
+`examples/binned_occupancy_report.rs` tool added for step 6 uses the exact
+production types (`fastq::FastqReader`, `binned::BinStore`,
+`binned::BinWriter::push_sequence` — the same call `pipeline.rs`'s worker
+makes) rather than a reimplementation, so its numbers are what a real run
+actually does.
 
-**Step 6 — promote to default in `auto`,** above an input-size threshold, once
-§4's predictions are confirmed or refuted. Only now does user-visible behaviour
-change.
+**Step 6 result (2026-08-25) — real-data gate run, promotion declined.**
+§7's own instruction ("Do not start step 6 until a real SRA sample has been
+counted correctly and a per-bin occupancy report has been examined") was
+followed literally, on two real ENA accessions, k=31, defaults otherwise:
+
+| Sample | ENA accession | Reads | Occurrences | Bins occupied | max/mean skew | max/p50 skew |
+|---|---|---:|---:|---:|---:|---:|
+| *E. coli* WGS shotgun, Illumina | `DRR002015` (taxid 562) | 2,343,637 | 163,051,083 | 510/512 | **5.64×** | 7.01× |
+| 16S amplicon, metagenomic, Illumina | `DRR021372` | 18,497 | 1,756,349 | 428/512 | **59.20×** | **1515.89×** |
+
+Correctness held on both: `--strategy binned` and `--strategy auto` produced
+byte-identical Parquet output (SHA-256) on both samples, including the badly
+skewed amplicon one — confirmed with `sha256sum`, not asserted. R2 (silent
+split counts) is not implicated; this is purely a load-balance finding.
+
+**This is exactly the R3 risk, reproduced on real data rather than inferred
+from theory.** The generic bacterial WGS shotgun sample is well-behaved — 510
+of 512 bins occupied, 5.64× skew, unsurprising for a hash-order hash-to-bin
+map over a compositionally diverse genome. The 16S amplicon sample —
+real 16S reads are ~250 bp of a single, near-identical conserved-region
+sequence repeated across nearly all reads, exactly the low-complexity/
+low-diversity case Discount (§2.4) and this design's own §6 R3 named as the
+danger — put **11.6% of the entire super-k-mer store (212,224 of 1,835,575
+bytes) into one of 512 bins**, an imbalance three orders of magnitude beyond
+the median bin. A phase-2 worker assigned that bin does roughly 1,500× the
+work of a worker assigned the median bin; at scale (a real amplicon panel or
+a low-complexity metagenome, not this 1 MB test sample) that worker becomes
+the wall-clock and peak-memory bottleneck the whole partitioned design exists
+to avoid, defeating exactly the property §3.6 depends on to promise bounded,
+thread-independent memory.
+
+**Decision: `binned` is not promoted into what `auto` selects.** The evidence
+does not support even a conditional promotion gated on input size or byte
+count, because the failure mode is driven by sequence *composition*
+(low diversity), not input *size* — the amplicon sample that skewed 59×/1515×
+was 1 MB, smaller than almost anything `auto`'s size-based chooser would ever
+route to `binned` in the first place, so a size threshold would not protect
+against the actual failure case; a much larger low-complexity metagenome would
+hit the identical imbalance at a scale where it costs real wall-clock and
+memory, which is worse, not better. No change was made to `resolve_strategy`
+or `mem_estimate.rs`; `binned` remains reachable only via explicit
+`--strategy binned` / `FASTDNA_STRATEGY=binned`, exactly as before this
+measurement. `the_automatic_chooser_never_selects_the_binned_strategy`
+(`src/pipeline.rs`) is still correct and was not touched.
+
+**What would change this finding.** Per §7's own framing (KMC's frequency-
+histogram bin merge; FastK's learned, data-adaptive partition trie — both
+§2.2/§2.3), the fix is a *sampled, data-adaptive* bin map rather than the
+current static `hash(signature) & (num_bins - 1)`: sample a fraction of the
+input up front, histogram observed signature frequencies, and merge the
+heaviest signatures across more of the 512 bins before phase 1 proper begins
+— the same idea KMC2 §2.4 already documents for exactly this reason. That is
+new design work, not a parameter tweak, and is out of scope for this
+measurement pass. Until it exists, `binned` should be documented as
+opt-in and best-suited to high-diversity input (generic WGS shotgun), and
+specifically *not* recommended for amplicon panels or low-complexity
+metagenomic samples — the same caveat KMC and FastK's own bin-balancing
+machinery exists to avoid needing.
 
 **Step 7 (optional, later) — the two known further reductions.** Both are
 independently testable against step 3's output, and both are contingent on
@@ -1072,15 +1134,19 @@ code can produce, and it is why steps 1–3 front-load property tests before a
 differential test before a benchmark. It is also why §3.3's strand-invariance
 argument is written out as a proof rather than asserted.
 
-**R3 — bin skew on real (non-synthetic) data.** The benchmark input is
-synthetic (`scripts/bench/generate_reads_large.py`, seed 9001) and therefore
+**R3 — bin skew on real (non-synthetic) data. CONFIRMED on real data,
+2026-08-25 — see §5's step 6 result.** The benchmark input is synthetic
+(`scripts/bench/generate_reads_large.py`, seed 9001) and therefore
 compositionally well-behaved. Real amplicon panels, poly-A-rich RNA-seq and
 low-complexity metagenomes are exactly what KMC's exclusion rules and FastK's
 learned trie exist to survive, and Discount (§2.4) names the problem outright:
 "minimizers are known to generate bins of very different sizes". Our narrower
 exclusion rule (§3.3) and static hash-to-bin map are the least defended point
-of the design. Mitigation: report per-bin occupancy behind a debug flag from
-step 4, and benchmark on at least one real SRA sample before step 6.
+of the design. **This is no longer a predicted risk**: a real ENA 16S
+amplicon sample (`DRR021372`) measured 59.2× max/mean and 1516× max/p50 bin
+skew, against 5.64×/7.01× on a real bacterial WGS shotgun sample
+(`DRR002015`) — confirming the failure is real, data-composition-driven, and
+is the reason step 6 declined to promote `binned` into `auto`.
 
 **R4 — we will probably still be behind FastK. Say it plainly.** Comparing
 across operating systems is not sound, but at face value: FastK 38.3 s (WSL)
@@ -1126,7 +1192,13 @@ specifically so a half-finished version cannot regress anyone.
    predictions in §4 — recorded here in advance precisely so that decision can
    be made on evidence rather than on sunk cost.
 4. **Do not start step 6 until a real SRA sample has been counted correctly and
-   a per-bin occupancy report has been examined** (R3).
+   a per-bin occupancy report has been examined** (R3). **Done 2026-08-25**:
+   two real ENA samples, correctness confirmed byte-identical against `auto`
+   on both, and the occupancy report exposed R3 as a real, not merely
+   theoretical, failure mode on low-complexity/amplicon data. Promotion to
+   `auto` was declined on that evidence; a sampled data-adaptive bin map
+   (§5's step 6 result, "what would change this finding") is the identified
+   follow-up, not yet built.
 
 ---
 
