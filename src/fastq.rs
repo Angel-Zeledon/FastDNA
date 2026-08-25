@@ -15,7 +15,12 @@ use crate::error::{FastDnaError, Result};
 /// parsed into: the reader synthesizes a `qual` string for FASTA input (see
 /// `SYNTHETIC_FASTA_QUALITY`) so that every stage downstream -- quality
 /// trimming, QC, k-mer extraction -- stays exactly as it was.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Default` is derived so a caller can hold one record across a whole
+/// stream and refill it through `FastqReader::next_record_into`, which
+/// reuses the three buffers instead of allocating three fresh `Vec`s per
+/// record. See that method for the counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FastqRecord {
     pub id: Vec<u8>,
     pub seq: Vec<u8>,
@@ -28,6 +33,19 @@ impl FastqRecord {
         qual_byte.saturating_sub(33)
     }
 
+    /// Trims low-quality bases from the 3' end: the read is shortened until
+    /// the trailing `window_size` bases average at least `min_qual`.
+    ///
+    /// The window sum is carried between steps instead of being recomputed.
+    /// Sliding the window one base towards the 5' end drops exactly one base
+    /// and admits exactly one, so a step costs one subtraction plus one
+    /// addition rather than `window_size` additions. A 150 bp read whose
+    /// whole tail has to be trimmed at the CLI defaults (`-q 20`, window 4)
+    /// costs 4 + 2*146 = 296 phred lookups instead of 147*4 = 588, and the
+    /// saving grows linearly with `window_size`. The first window still costs
+    /// `window_size` additions and the loop still breaks on the first passing
+    /// window, so a read that needs no trimming -- the common case -- does
+    /// exactly the work it did before, never more.
     pub fn quality_trim_end(&mut self, min_qual: f64, window_size: usize) {
         // The reader guarantees seq and qual are the same length, but this
         // is a public method on a struct with public fields: a structurally
@@ -39,19 +57,35 @@ impl FastqRecord {
             self.qual.truncate(end_pos);
             return;
         }
-        let qual_slice = &self.qual;
 
-        while end_pos >= window_size {
-            let start = end_pos - window_size;
-            let window = &qual_slice[start..end_pos];
+        // Hoisted out of the loop because it is loop-invariant: one
+        // usize -> f64 conversion per record instead of one per step. The
+        // division itself stays -- rewriting `sum / window_len >= min_qual`
+        // as `sum >= min_qual * window_len` rounds differently and could
+        // move a trim boundary by a base, which is a behaviour change, not
+        // an optimization.
+        let window_len = window_size as f64;
+        let mut sum: u64 = self.qual[end_pos - window_size..end_pos]
+            .iter()
+            .map(|&q| Self::phred_score(q) as u64)
+            .sum();
 
-            let sum: u64 = window.iter().map(|&q| Self::phred_score(q) as u64).sum();
-            let avg_qual = sum as f64 / window_size as f64;
-
-            if avg_qual >= min_qual {
+        loop {
+            // Invariant: `end_pos >= window_size`, and `sum` is the phred sum
+            // of `qual[end_pos - window_size..end_pos]`.
+            if sum as f64 / window_len >= min_qual {
                 break;
             }
             end_pos -= 1;
+            if end_pos < window_size {
+                break;
+            }
+            // The base leaving the window is the one now just past its end
+            // (`end_pos`); the base entering is its new first
+            // (`end_pos - window_size`). Both indices are < the original
+            // `end_pos`, which was clamped to `qual.len()` above.
+            sum -= Self::phred_score(self.qual[end_pos]) as u64;
+            sum += Self::phred_score(self.qual[end_pos - window_size]) as u64;
         }
 
         self.seq.truncate(end_pos);
@@ -346,25 +380,54 @@ impl<R: BufRead> FastqReader<R> {
     }
 
     /// Reads the next record, in whichever format this stream turned out to
-    /// hold. See `sniff_format` for how that is decided and `next_fastq_record`
-    /// / `next_fasta_record` for the two parsers.
+    /// hold. See `sniff_format` for how that is decided and
+    /// `next_fastq_record_into` / `next_fasta_record_into` for the two
+    /// parsers.
+    ///
+    /// Allocates a fresh record. `next_record_into` is the same parse
+    /// writing into buffers the caller already owns; prefer it on any path
+    /// that reads more than a handful of records.
     pub fn next_record(&mut self) -> ReadResult<Option<FastqRecord>> {
+        let mut record = FastqRecord::default();
+        if self.next_record_into(&mut record)? {
+            Ok(Some(record))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reads the next record into `record`'s existing buffers, returning
+    /// `false` at end of stream. The three `Vec`s are cleared and refilled,
+    /// so a caller that keeps one record across a whole stream pays the
+    /// allocation once rather than three times per record -- 21 million
+    /// allocate/free pairs on the 7-million-record benchmark file.
+    ///
+    /// The record is left in an unspecified (cleared) state when this
+    /// returns `false` or an error; only a `true` return promises contents.
+    ///
+    /// Note for callers that batch: a record moved into a batch cannot be
+    /// refilled, so exploiting this needs the buffers handed back once the
+    /// batch has been consumed (see `RecordSource::next_record_into`).
+    pub fn next_record_into(&mut self, record: &mut FastqRecord) -> ReadResult<bool> {
         if self.format == Format::Unknown {
-            // `fill_buf` peeks without consuming, so whichever parser runs
-            // next still sees the very first byte of the stream. A prefix
-            // shorter than the whole leading run of blanks is not a real
-            // case (the first fill is at least a page, and no file starts
-            // with kilobytes of whitespace), and `sniff_format` degrades to
-            // today's FASTQ behavior if it ever were.
+            // Sniffed once per stream, not once per record: `format` is
+            // sticky, so all that survives in the per-record path is this
+            // one enum compare. `fill_buf` peeks without consuming, so
+            // whichever parser runs next still sees the very first byte of
+            // the stream. A prefix shorter than the whole leading run of
+            // blanks is not a real case (the first fill is at least a page,
+            // and no file starts with kilobytes of whitespace), and
+            // `sniff_format` degrades to today's FASTQ behavior if it ever
+            // were.
             let prefix = self.reader.fill_buf()?;
             self.format = sniff_format(prefix);
         }
 
         match self.format {
-            Format::Fasta => self.next_fasta_record(),
+            Format::Fasta => self.next_fasta_record_into(record),
             // `Unknown` cannot survive the block above; treating it as FASTQ
             // keeps this match exhaustive without an unreachable panic.
-            Format::Fastq | Format::Unknown => self.next_fastq_record(),
+            Format::Fastq | Format::Unknown => self.next_fastq_record_into(record),
         }
     }
 
@@ -374,16 +437,18 @@ impl<R: BufRead> FastqReader<R> {
     /// The sequence alphabet is passed through verbatim, lowercase and
     /// ambiguity codes included, for the same reason the FASTQ parser does
     /// not validate it: `kmer::extract_canonical_kmers` already handles both.
-    fn next_fasta_record(&mut self) -> ReadResult<Option<FastqRecord>> {
+    fn next_fasta_record_into(&mut self, record: &mut FastqRecord) -> ReadResult<bool> {
         // The header is either one left over from the previous call (the
         // line that ended that record's sequence) or the next non-blank
-        // line of the stream.
-        let id = match self.pending_header.take() {
-            Some(header) => header,
+        // line of the stream. Either way it lands in `record.id` directly:
+        // no `line_buf.clone()`, so no per-record allocation for it.
+        record.id.clear();
+        match self.pending_header.take() {
+            Some(header) => record.id.extend_from_slice(&header),
             None => loop {
                 self.line_buf.clear();
                 if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 strip_newline(&mut self.line_buf);
                 if self.line_buf.is_empty() {
@@ -395,11 +460,12 @@ impl<R: BufRead> FastqReader<R> {
                         preview_for_error(&self.line_buf)
                     )));
                 }
-                break self.line_buf.clone();
+                record.id.extend_from_slice(&self.line_buf);
+                break;
             },
-        };
+        }
 
-        let mut seq: Vec<u8> = Vec::with_capacity(256);
+        record.seq.clear();
         loop {
             self.line_buf.clear();
             if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
@@ -413,22 +479,26 @@ impl<R: BufRead> FastqReader<R> {
                 self.pending_header = Some(self.line_buf.clone());
                 break;
             }
-            seq.extend_from_slice(&self.line_buf);
+            record.seq.extend_from_slice(&self.line_buf);
         }
 
-        if seq.is_empty() {
+        if record.seq.is_empty() {
             // A header with nothing under it is not a zero-length sequence
             // to count silently: it means the file is truncated or was
             // concatenated wrongly, and the caller needs to know which
             // record so it can be found.
             return Err(FastqReadError::Malformed(format!(
                 "FASTA record {:?} has no sequence",
-                preview_for_error(&id)
+                preview_for_error(&record.id)
             )));
         }
 
-        let qual = vec![SYNTHETIC_FASTA_QUALITY; seq.len()];
-        Ok(Some(FastqRecord { id, seq, qual }))
+        // `clear` + `resize` rather than `vec![..; len]`: on a reused record
+        // this reuses the buffer the previous record left behind instead of
+        // allocating a new one.
+        record.qual.clear();
+        record.qual.resize(record.seq.len(), SYNTHETIC_FASTA_QUALITY);
+        Ok(true)
     }
 
     /// Reads the next four-line FASTQ record, validating its structure.
@@ -441,61 +511,76 @@ impl<R: BufRead> FastqReader<R> {
     /// IUPAC ambiguity codes beyond `N` are legitimate FASTQ content, and
     /// `kmer::extract_canonical_kmers` already treats any non-ACGT byte as
     /// a window reset.
-    fn next_fastq_record(&mut self) -> ReadResult<Option<FastqRecord>> {
-        self.line_buf.clear();
-        if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
-            return Ok(None);
+    ///
+    /// Each of the three kept lines is read straight into its field on
+    /// `record`. The previous version read every line into `self.line_buf`
+    /// and then `clone()`d it into the record, which copied the bytes twice
+    /// and allocated once per field: on the 7-million-record benchmark file
+    /// that is 21 million redundant `memcpy`s, plus 21 million
+    /// allocate/free pairs that only `next_record` (which owns a throwaway
+    /// record) still pays. `read_until` is kept rather than hand-rolled so
+    /// the newline scan stays std's word-at-a-time `memchr` and the number
+    /// of `fill_buf` calls per record is unchanged at four.
+    fn next_fastq_record_into(&mut self, record: &mut FastqRecord) -> ReadResult<bool> {
+        record.id.clear();
+        if self.reader.read_until(b'\n', &mut record.id)? == 0 {
+            return Ok(false);
         }
-        strip_newline(&mut self.line_buf);
-        if !self.line_buf.starts_with(b"@") {
+        strip_newline(&mut record.id);
+        if !record.id.starts_with(b"@") {
             return Err(FastqReadError::Malformed(format!(
                 "header line must start with '@', got {:?}",
-                preview_for_error(&self.line_buf)
+                preview_for_error(&record.id)
             )));
         }
-        let id = self.line_buf.clone();
 
-        self.line_buf.clear();
-        if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
+        record.seq.clear();
+        if self.reader.read_until(b'\n', &mut record.seq)? == 0 {
             return Err(FastqReadError::Malformed(
                 "file ends mid-record: missing sequence line after header".to_string(),
             ));
         }
-        strip_newline(&mut self.line_buf);
-        let seq = self.line_buf.clone();
+        strip_newline(&mut record.seq);
 
+        // The separator line is the one line whose content is discarded, so
+        // it goes through the reader's own scratch buffer (reused, never
+        // reallocated) and is not newline-stripped on the success path: a
+        // trailing "\n" or "\r\n" cannot change `starts_with(b"+")`. That
+        // drops one `strip_newline` -- two `ends_with` plus up to two
+        // `pop`s -- per record, 7 million times. The strip is still done
+        // before the error message is built, so a malformed separator is
+        // quoted back byte-for-byte as it was before.
         self.line_buf.clear();
         if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
             return Err(FastqReadError::Malformed(
                 "file ends mid-record: missing separator line after sequence".to_string(),
             ));
         }
-        strip_newline(&mut self.line_buf);
         if !self.line_buf.starts_with(b"+") {
+            strip_newline(&mut self.line_buf);
             return Err(FastqReadError::Malformed(format!(
                 "separator line must start with '+', got {:?}",
                 preview_for_error(&self.line_buf)
             )));
         }
 
-        self.line_buf.clear();
-        if self.reader.read_until(b'\n', &mut self.line_buf)? == 0 {
+        record.qual.clear();
+        if self.reader.read_until(b'\n', &mut record.qual)? == 0 {
             return Err(FastqReadError::Malformed(
                 "file ends mid-record: missing quality line after separator".to_string(),
             ));
         }
-        strip_newline(&mut self.line_buf);
-        let qual = self.line_buf.clone();
+        strip_newline(&mut record.qual);
 
-        if seq.len() != qual.len() {
+        if record.seq.len() != record.qual.len() {
             return Err(FastqReadError::Malformed(format!(
                 "sequence length {} does not match quality length {}",
-                seq.len(),
-                qual.len()
+                record.seq.len(),
+                record.qual.len()
             )));
         }
 
-        Ok(Some(FastqRecord { id, seq, qual }))
+        Ok(true)
     }
 }
 
@@ -509,6 +594,30 @@ impl<R: BufRead> FastqReader<R> {
 /// handling in one place instead of forking it per input kind.
 pub trait RecordSource: Send + 'static {
     fn next_record(&mut self) -> ReadResult<Option<FastqRecord>>;
+
+    /// Reads the next record into buffers the caller already owns,
+    /// returning `false` at end of stream. Semantics are identical to
+    /// `next_record`; only the allocation is different.
+    ///
+    /// Worth adopting in the pipeline's producer: `next_record` allocates
+    /// `id`, `seq` and `qual` fresh for every record and the consuming
+    /// worker frees them, which is 21 million allocate/free pairs on the
+    /// 7-million-record benchmark file. Exploiting this needs the producer
+    /// to get record buffers back after a batch has been consumed (a return
+    /// channel alongside the existing `bounded(64)` one), because a record
+    /// pushed into a batch has been moved away and cannot be refilled.
+    ///
+    /// The default implementation is the allocating one, so an implementor
+    /// with no buffer of its own keeps working unchanged.
+    fn next_record_into(&mut self, record: &mut FastqRecord) -> ReadResult<bool> {
+        match self.next_record()? {
+            Some(fresh) => {
+                *record = fresh;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
 
     /// The file currently being read, and how many records have been read
     /// *from that file* so far -- so the record that failed is this count
@@ -532,6 +641,10 @@ pub trait RecordSource: Send + 'static {
 impl<R: BufRead + Send + 'static> RecordSource for FastqReader<R> {
     fn next_record(&mut self) -> ReadResult<Option<FastqRecord>> {
         FastqReader::next_record(self)
+    }
+
+    fn next_record_into(&mut self, record: &mut FastqRecord) -> ReadResult<bool> {
+        FastqReader::next_record_into(self, record)
     }
 }
 
@@ -570,10 +683,21 @@ impl MultiSourceReader {
     }
 
     pub fn next_record(&mut self) -> ReadResult<Option<FastqRecord>> {
+        let mut record = FastqRecord::default();
+        if self.next_record_into(&mut record)? {
+            Ok(Some(record))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The buffer-reusing form of `next_record`; see
+    /// `RecordSource::next_record_into` for why a caller should prefer it.
+    pub fn next_record_into(&mut self, record: &mut FastqRecord) -> ReadResult<bool> {
         loop {
             if self.current.is_none() {
                 let Some(spec) = self.remaining.next() else {
-                    return Ok(None);
+                    return Ok(false);
                 };
                 // Recorded *before* the open attempt so that a failure to
                 // open is still attributable to this file.
@@ -586,19 +710,17 @@ impl MultiSourceReader {
             // it fallibly rather than unwrapping, since `unwrap` is denied
             // crate-wide and a panic here would cross the FFI boundary.
             let Some(reader) = self.current.as_mut() else {
-                return Ok(None);
+                return Ok(false);
             };
 
-            match reader.next_record()? {
-                Some(record) => {
-                    self.records_in_current += 1;
-                    return Ok(Some(record));
-                }
-                // This input is exhausted; drop it (closing the file) and
-                // move to the next one. `current_path` is deliberately left
-                // pointing at it so the last file read stays nameable.
-                None => self.current = None,
+            if reader.next_record_into(record)? {
+                self.records_in_current += 1;
+                return Ok(true);
             }
+            // This input is exhausted; drop it (closing the file) and
+            // move to the next one. `current_path` is deliberately left
+            // pointing at it so the last file read stays nameable.
+            self.current = None;
         }
     }
 }
@@ -606,6 +728,10 @@ impl MultiSourceReader {
 impl RecordSource for MultiSourceReader {
     fn next_record(&mut self) -> ReadResult<Option<FastqRecord>> {
         MultiSourceReader::next_record(self)
+    }
+
+    fn next_record_into(&mut self, record: &mut FastqRecord) -> ReadResult<bool> {
+        MultiSourceReader::next_record_into(self, record)
     }
 
     fn current_source(&self) -> Option<(PathBuf, u64)> {
@@ -915,5 +1041,173 @@ mod tests {
     #[test]
     fn an_empty_input_list_yields_no_records() {
         assert!(collect_multi(MultiSourceReader::new(Vec::new())).is_empty());
+    }
+
+    // -- buffer-reusing reads ------------------------------------------
+
+    /// `next_record_into` exists purely to avoid three allocations per
+    /// record; it must parse byte-for-byte what `next_record` parses, or the
+    /// counts change the moment the pipeline adopts it.
+    fn collect_into(mut reader: FastqReader<impl BufRead>) -> Vec<FastqRecord> {
+        let mut out = Vec::new();
+        let mut scratch = FastqRecord::default();
+        while reader.next_record_into(&mut scratch).expect("valid input") {
+            out.push(scratch.clone());
+        }
+        out
+    }
+
+    #[test]
+    fn reusing_one_record_parses_exactly_what_allocating_reads_parse() {
+        for text in [
+            "@r1\nACGTACGT\n+\n!!!!!!!!\n@r2\nTT\n+\nII\n",
+            "@r1\r\nACGTACGT\r\n+r1\r\nIIIIIIII\r\n",
+            ">chr1\nACGT\nACGT\n>chr2\nGG\n",
+            "",
+        ] {
+            assert_eq!(
+                collect_into(reader_over(text)),
+                collect(reader_over(text)),
+                "next_record_into disagreed with next_record on {text:?}"
+            );
+        }
+    }
+
+    /// The failure mode a `clear`-and-refill reader can have and an
+    /// allocating one cannot: a short record following a long one keeping
+    /// the tail of its predecessor.
+    #[test]
+    fn a_short_record_after_a_long_one_leaves_no_stale_bytes() {
+        let mut reader = reader_over("@long\nACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIII\n@s\nAC\n+\nII\n");
+        let mut record = FastqRecord::default();
+
+        assert!(reader.next_record_into(&mut record).unwrap());
+        assert_eq!(record.seq, b"ACGTACGTACGTACGT");
+
+        assert!(reader.next_record_into(&mut record).unwrap());
+        assert_eq!(record.id, b"@s");
+        assert_eq!(record.seq, b"AC");
+        assert_eq!(record.qual, b"II");
+    }
+
+    #[test]
+    fn a_reused_record_survives_a_fasta_record_shorter_than_its_predecessor() {
+        let mut reader = reader_over(">big\nACGTACGTACGT\n>small\nTT\n");
+        let mut record = FastqRecord::default();
+
+        assert!(reader.next_record_into(&mut record).unwrap());
+        assert_eq!(record.seq.len(), 12);
+
+        assert!(reader.next_record_into(&mut record).unwrap());
+        assert_eq!(record.id, b">small");
+        assert_eq!(record.seq, b"TT");
+        assert_eq!(record.qual, b"II", "the synthetic quality must be resized, not left long");
+    }
+
+    /// A separator line is no longer newline-stripped on the success path,
+    /// so the malformed case must still quote the line exactly as it did.
+    #[test]
+    fn a_malformed_separator_is_quoted_without_its_line_ending() {
+        for text in ["@r1\nACGT\n*sep\nIIII\n", "@r1\r\nACGT\r\n*sep\r\nIIII\r\n"] {
+            match reader_over(text).next_record() {
+                Err(FastqReadError::Malformed(reason)) => {
+                    assert!(
+                        reason.contains("\"*sep\""),
+                        "the offending separator must be quoted verbatim and unterminated: {reason}"
+                    );
+                }
+                other => panic!("expected Malformed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_separator_line_is_still_malformed() {
+        match reader_over("@r1\nACGT\n\nIIII\n").next_record() {
+            Err(FastqReadError::Malformed(reason)) => assert!(reason.contains('+'), "{reason}"),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    /// `MultiSourceReader` forwards the reusing read across a file boundary,
+    /// including the per-file record numbering the error messages rely on.
+    #[test]
+    fn the_multi_source_reader_reuses_a_record_across_file_boundaries() {
+        let fx = Fixture::new("multi_into");
+        let a = fx.write("a.fastq", b"@a1\nACGTACGT\n+\nIIIIIIII\n");
+        let b = fx.write("b.fastq", b"@b1\nGG\n+\nII\n");
+
+        let mut reader = MultiSourceReader::from_paths(vec![a.clone(), b.clone()]);
+        let mut record = FastqRecord::default();
+
+        assert!(reader.next_record_into(&mut record).unwrap());
+        assert_eq!(record.seq, b"ACGTACGT");
+        assert_eq!(reader.current_source(), Some((a, 1)));
+
+        assert!(reader.next_record_into(&mut record).unwrap());
+        assert_eq!(record.id, b"@b1");
+        assert_eq!(record.seq, b"GG");
+        assert_eq!(reader.current_source(), Some((b, 1)));
+
+        assert!(!reader.next_record_into(&mut record).unwrap());
+    }
+
+    // -- rolling-window quality trimming --------------------------------
+
+    /// The reference the rolling sum replaced: re-sum the whole window at
+    /// every step. Kept here so the optimized loop is pinned to the exact
+    /// cut point the naive one produced, for every input below.
+    fn trim_end_by_resumming(qual: &[u8], min_qual: f64, window_size: usize) -> usize {
+        let mut end_pos = qual.len();
+        if end_pos < window_size {
+            return end_pos;
+        }
+        while end_pos >= window_size {
+            let window = &qual[end_pos - window_size..end_pos];
+            let sum: u64 = window.iter().map(|&q| FastqRecord::phred_score(q) as u64).sum();
+            if sum as f64 / window_size as f64 >= min_qual {
+                break;
+            }
+            end_pos -= 1;
+        }
+        end_pos
+    }
+
+    #[test]
+    fn the_rolling_window_cuts_where_the_resumming_window_cut() {
+        // A deterministic spread of quality strings: all-good, all-bad, a
+        // decaying 3' tail (the real-world shape), and a single dip that a
+        // rolling sum must recover from rather than carry forward.
+        let quals: Vec<Vec<u8>> = vec![
+            b"IIIIIIIIIIIIIIII".to_vec(),
+            b"!!!!!!!!!!!!!!!!".to_vec(),
+            b"IIIIIIIIIIII####".to_vec(),
+            b"IIII####IIIIIIII".to_vec(),
+            b"I".to_vec(),
+            Vec::new(),
+            (0..64u32).map(|i| (33 + (i * 7) % 42) as u8).collect(),
+        ];
+
+        for qual in &quals {
+            for window_size in 1..=8usize {
+                for min_qual in [0.0, 5.0, 20.0, 30.0, 41.0] {
+                    let mut record = FastqRecord {
+                        id: b"@r".to_vec(),
+                        seq: vec![b'A'; qual.len()],
+                        qual: qual.clone(),
+                    };
+                    record.quality_trim_end(min_qual, window_size);
+
+                    let expected = trim_end_by_resumming(qual, min_qual, window_size);
+                    assert_eq!(
+                        record.seq.len(),
+                        expected,
+                        "qual={:?} window={window_size} min={min_qual}",
+                        String::from_utf8_lossy(qual)
+                    );
+                    assert_eq!(record.qual.len(), expected, "seq and qual must stay in step");
+                }
+            }
+        }
     }
 }

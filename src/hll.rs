@@ -31,6 +31,37 @@ fn alpha(m: f64) -> f64 {
     0.7213 / (1.0 + 1.079 / m)
 }
 
+/// `2^-r`, built directly from the IEEE-754 exponent field instead of
+/// calling `f64::powi`.
+///
+/// This is the term `estimate`'s harmonic-mean sum needs once per register,
+/// i.e. `2^precision` times per call -- 16,384 at the default precision.
+/// `2f64.powi(-(r as i32))` has a *runtime* exponent, so it cannot be
+/// constant-folded: it lowers to a `__powidf2` call, which is a
+/// repeated-squaring loop (up to 7 iterations, one `mulsd` each, for an
+/// exponent up to 64) followed by a `divsd` to invert the negative exponent.
+/// This replaces all of that with one integer subtract, one shift and one
+/// register move -- per call to `estimate`, roughly 16,384 function calls,
+/// ~115,000 multiplies and 16,384 divisions removed in exchange for ~49,000
+/// integer operations.
+///
+/// The results are *bit-identical*, not merely close, which is what lets the
+/// substitution be made under an estimator whose output tests compare
+/// numbers. `__powidf2` squares an exact 2.0 at most six times (2, 4, 16,
+/// 256, 65536, 2^32, 2^64 -- every one exactly representable), multiplies a
+/// subset of them (a product of distinct powers of two, so exact), and
+/// divides 1.0 by the result (exact for any power of two down to 2^-1022).
+/// `1023 - r` is this exponent's biased form, so both routes produce the
+/// same bit pattern. Because `r` is a `u8`, `1023 - r` lies in 768..=1023 --
+/// always a normal, finite, positive `f64` -- so the function is total and
+/// needs no range guard, even though registers in practice only ever hold
+/// 0..=64. Verified exhaustively against `powi` over all 256 `u8` values,
+/// and over random register arrays for the summed result.
+#[inline(always)]
+fn two_pow_neg(r: u8) -> f64 {
+    f64::from_bits((1023u64 - r as u64) << 52)
+}
+
 /// Below this precision the register count is too small for the
 /// asymptotic `alpha_m` formula (and the standard error, `~1.04/sqrt(m)`,
 /// would already be a coarse 13% at `m=64`) to be a meaningful estimate.
@@ -109,9 +140,24 @@ impl HyperLogLog {
     /// correction would matter.
     pub fn estimate(&self) -> f64 {
         let m = self.registers.len() as f64;
-        let sum: f64 = self.registers.iter().map(|&r| 2f64.powi(-(r as i32))).sum();
+        // Summation *order* is deliberately unchanged: floating-point
+        // addition is not associative, so grouping the registers (e.g.
+        // histogramming the 65 possible values and summing 65 weighted terms
+        // instead of `m` terms -- far less arithmetic) would round
+        // differently and shift the estimate in the last ULP. That was
+        // considered and rejected: this walks the same registers in the same
+        // sequence and only makes each individual term cheaper, so the sum
+        // is bit-identical.
+        let sum: f64 = self.registers.iter().map(|&r| two_pow_neg(r)).sum();
         let raw = alpha(m) * m * m / sum;
 
+        // The zero-register count stays in its own pass rather than being
+        // folded into the one above. Folding would look like one pass
+        // instead of two, but this branch only runs in the small-range
+        // regime, and for a whole-file cardinality estimate -- the reason
+        // this type exists -- `raw` is normally well above `2.5 * m`, so the
+        // second pass is normally skipped entirely. Merging them would move
+        // `m` comparisons and increments from "sometimes" to "always".
         if raw <= 2.5 * m {
             let zero_registers = self.registers.iter().filter(|&&r| r == 0).count();
             if zero_registers > 0 {

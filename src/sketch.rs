@@ -45,23 +45,89 @@ pub(crate) fn finalize_hash(kmer: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Folds one already-finalized hash into a bottom-`sketch_size` working set,
-/// evicting the current maximum once the set is full. Shared by `from_kmers`
-/// (in-memory) and `from_reader` (streaming) so both construction paths run
-/// through identical selection logic -- see
+/// The bottom-`capacity` working set: the `capacity` smallest *distinct*
+/// hashes seen so far, evicting the current maximum once full. Shared by
+/// `from_kmers` (in-memory) and `from_reader` (streaming) so both
+/// construction paths run through identical selection logic -- see
 /// `streaming_construction_matches_in_memory_path` below, which exists
 /// specifically to prove that sharing pays off.
-#[inline]
-fn insert_bottom_k(min_set: &mut BTreeSet<u64>, sketch_size: usize, hash: u64) {
-    if sketch_size == 0 {
-        return;
+///
+/// The ordered set is not an implementation detail that can be swapped for a
+/// max-heap or an unsorted buffer: bottom-k here is over *distinct* hashes,
+/// and a k-mer stream repeats the same k-mer many times, so the set's
+/// deduplication is load-bearing. A heap holding duplicates would retain
+/// fewer than `capacity` distinct hashes and change the result.
+///
+/// What *is* removable is the per-hash tree work on the rejection path.
+/// `insert` runs once per k-mer -- the hottest line in this file -- and once
+/// the set is full the overwhelming majority of calls are rejections (over a
+/// stream of N hashes only about `capacity * ln(N / capacity)` are ever
+/// accepted; for N = 10^8 and capacity = 1000 that is ~11,500 accepts against
+/// ~10^8 rejects, i.e. 99.99% rejections). The previous version paid, on
+/// *every* rejected hash: a `sketch_size == 0` test, a `len()` test, a
+/// `BTreeSet::iter()` construction (which descends from the root to *both*
+/// the leftmost and the rightmost leaf -- 2 x ~3 node visits at capacity
+/// 1000, each a pointer chase into a cache line that the hot loop otherwise
+/// never touches), and then the comparison. Caching the maximum in a plain
+/// `u64` field reduces the rejected case to one `bool` test and one integer
+/// comparison, both on data already in registers: ~6 pointer-chasing node
+/// visits plus an iterator construction removed per rejected k-mer. The
+/// `capacity == 0` test is hoisted into `new` (it becomes `full = true` with
+/// `max = 0`, which rejects everything, since no `u64` is `< 0`), removing a
+/// third comparison from every call.
+///
+/// The accepted path is unchanged in cost (the same `BTreeSet::insert` plus
+/// `pop_last`, and one tree descent to re-read the new maximum), and the
+/// selected hashes are bit-identical to the old logic's -- the cached value
+/// is always exactly `set.iter().next_back()`, so every branch is taken on
+/// the same condition as before.
+struct BottomK {
+    set: BTreeSet<u64>,
+    capacity: usize,
+    /// Cached copy of `set`'s current maximum. Meaningful only while
+    /// `full`; before that nothing is ever evicted, so it is never read.
+    max: u64,
+    full: bool,
+}
+
+impl BottomK {
+    fn new(capacity: usize) -> Self {
+        // `capacity == 0` starts out "full" with a maximum of 0, so the
+        // `hash < max` test below rejects every hash forever -- the same
+        // no-op the old explicit `sketch_size == 0` guard produced, without
+        // costing a comparison per k-mer.
+        Self { set: BTreeSet::new(), capacity, max: 0, full: capacity == 0 }
     }
-    if min_set.len() < sketch_size {
-        min_set.insert(hash);
-    } else if let Some(&max_val) = min_set.iter().next_back() {
-        if hash < max_val && min_set.insert(hash) {
-            min_set.pop_last();
+
+    #[inline]
+    fn insert(&mut self, hash: u64) {
+        if !self.full {
+            self.set.insert(hash);
+            if self.set.len() >= self.capacity {
+                if let Some(&m) = self.set.iter().next_back() {
+                    self.max = m;
+                }
+                self.full = true;
+            }
+            return;
         }
+        // The hot rejection: one comparison, no tree touched.
+        if hash >= self.max {
+            return;
+        }
+        if self.set.insert(hash) {
+            self.set.pop_last();
+            if let Some(&m) = self.set.iter().next_back() {
+                self.max = m;
+            }
+        }
+    }
+
+    /// Consumes the working set into the ascending, deduplicated hash list
+    /// `GenomeSketch` stores -- `BTreeSet`'s iteration order, so no sort is
+    /// needed here.
+    fn into_hashes(self) -> Vec<u64> {
+        self.set.into_iter().collect()
     }
 }
 
@@ -77,13 +143,13 @@ impl GenomeSketch {
     /// `from_path` for large FASTQ files, where materializing every k-mer
     /// up front would defeat the point of sketching.
     pub fn from_kmers(kmers: &[u64], sketch_size: usize, k: usize) -> Self {
-        let mut min_set: BTreeSet<u64> = BTreeSet::new();
+        let mut bottom_k = BottomK::new(sketch_size);
 
         for &kmer in kmers {
-            insert_bottom_k(&mut min_set, sketch_size, finalize_hash(kmer));
+            bottom_k.insert(finalize_hash(kmer));
         }
 
-        Self { sketch_size, k, hashes: min_set.into_iter().collect() }
+        Self { sketch_size, k, hashes: bottom_k.into_hashes() }
     }
 
     /// Builds a sketch by streaming a FASTQ file record by record,
@@ -127,7 +193,7 @@ impl GenomeSketch {
             });
         }
 
-        let mut min_set: BTreeSet<u64> = BTreeSet::new();
+        let mut bottom_k = BottomK::new(sketch_size);
         let mut record_count: u64 = 0;
 
         loop {
@@ -135,7 +201,7 @@ impl GenomeSketch {
                 Ok(Some(record)) => {
                     record_count += 1;
                     for kmer in kmer::extract_canonical_kmers(&record.seq, k) {
-                        insert_bottom_k(&mut min_set, sketch_size, finalize_hash(kmer));
+                        bottom_k.insert(finalize_hash(kmer));
                     }
                 }
                 Ok(None) => break,
@@ -155,7 +221,7 @@ impl GenomeSketch {
             }
         }
 
-        Ok(Self { sketch_size, k, hashes: min_set.into_iter().collect() })
+        Ok(Self { sketch_size, k, hashes: bottom_k.into_hashes() })
     }
 
     /// Estimates the Jaccard similarity `|A ∩ B| / |A ∪ B|` between the two
@@ -267,23 +333,48 @@ impl GenomeSketch {
             u64::MAX
         };
 
-        let mut resolvable = 0usize;
+        // `self.hashes` is ascending (by construction from a `BTreeSet`, and
+        // enforced on the `load` path by `validate_sketch_invariants`), so
+        // the resolvable hashes are a *prefix*, not a scattered subset: one
+        // `partition_point` finds its length in ceil(log2(n)) comparisons --
+        // 10 at n = 1024 -- replacing n `h > ceiling` comparisons and n
+        // `resolvable += 1` increments in the loop body. It also drops the
+        // whole tail on the common "small query against a large reference"
+        // shape instead of iterating it to `continue`.
+        let resolvable = self.hashes.partition_point(|&h| h <= ceiling);
+        if resolvable == 0 {
+            return Ok(0.0);
+        }
+
+        // Both lists are sorted ascending, and the queries are issued in
+        // ascending order, so each search can start where the previous one
+        // stopped: everything before `lo` is already known to be smaller
+        // than every remaining query. Searching `other.hashes[lo..]` costs
+        // ceil(log2(m - lo)) comparisons, which is <= the ceil(log2(m)) the
+        // full-slice search cost, on *every* call and for every input shape
+        // -- so this is unconditionally fewer comparisons, never a trade.
+        //
+        // A full linear merge walk (O(n + m)) was considered and rejected:
+        // it wins only when n is a large fraction of m (at m = 1024 it needs
+        // n > ~114 to beat n*log2(m)), and loses badly on exactly the shape
+        // `containment` exists to serve -- a small pathogen sketch queried
+        // against a large sample sketch, where n = 1 costs 10 comparisons by
+        // binary search and up to 1024 by merge. Narrowing the search range
+        // captures the merge's win on the balanced shape without its loss on
+        // the skewed one.
         let mut shared = 0usize;
-        for &h in &self.hashes {
-            if h > ceiling {
-                continue;
-            }
-            resolvable += 1;
-            if other.hashes.binary_search(&h).is_ok() {
-                shared += 1;
+        let mut lo = 0usize;
+        for &h in &self.hashes[..resolvable] {
+            match other.hashes[lo..].binary_search(&h) {
+                Ok(offset) => {
+                    shared += 1;
+                    lo += offset + 1;
+                }
+                Err(offset) => lo += offset,
             }
         }
 
-        if resolvable == 0 {
-            Ok(0.0)
-        } else {
-            Ok(shared as f64 / resolvable as f64)
-        }
+        Ok(shared as f64 / resolvable as f64)
     }
 
     /// Estimates the per-base mutation rate implied by `jaccard`, under
@@ -638,6 +729,61 @@ mod tests {
             }
             other => panic!("sketch_size=0 must be InvalidConfig, got {other:?}"),
         }
+    }
+
+    /// `from_kmers` has no `sketch_size` validation of its own (unlike
+    /// `from_reader`), so a zero size must simply select nothing. The old
+    /// `insert_bottom_k` spelled that out as an explicit `sketch_size == 0`
+    /// early return, paid on every k-mer; `BottomK` instead starts a
+    /// zero-capacity set as already-full with a maximum of 0, so the
+    /// `hash < max` test rejects everything (no `u64` is below 0) at no
+    /// per-k-mer cost. That is a subtle enough encoding of the same
+    /// behaviour to be worth pinning, including the `u64::MAX` and `0`
+    /// boundary hashes where an off-by-one in the comparison would show.
+    #[test]
+    fn a_zero_sketch_size_selects_no_hashes_at_all() {
+        for kmers in [
+            vec![],
+            vec![0u64],
+            vec![u64::MAX],
+            vec![0u64, u64::MAX, 7, 7, 1],
+            (0u64..1_000).collect::<Vec<_>>(),
+        ] {
+            let sketch = GenomeSketch::from_kmers(&kmers, 0, 21);
+            assert!(
+                sketch.hashes.is_empty(),
+                "sketch_size 0 must keep nothing, kept {:?} from {} k-mers",
+                sketch.hashes,
+                kmers.len()
+            );
+        }
+    }
+
+    /// The bottom-k discipline is over *distinct* hashes: a k-mer stream
+    /// repeats the same k-mer many times, and the working set deduplicates.
+    /// This pins that a full sketch fed nothing but repeats of hashes it
+    /// already holds neither grows nor evicts -- the property that rules out
+    /// swapping the ordered set for a plain max-heap, which would fill with
+    /// duplicates and retain fewer than `sketch_size` distinct hashes.
+    #[test]
+    fn repeated_kmers_do_not_displace_distinct_ones_from_a_full_sketch() {
+        let distinct: Vec<u64> = (0..64).collect();
+        let baseline = GenomeSketch::from_kmers(&distinct, 8, 21);
+        assert_eq!(baseline.hashes.len(), 8, "the sketch must be full for this test to mean anything");
+
+        // The same k-mers, each repeated 50 times, in a different order.
+        let mut repeated: Vec<u64> = Vec::new();
+        for _ in 0..50 {
+            for &kmer in distinct.iter().rev() {
+                repeated.push(kmer);
+            }
+        }
+        let with_repeats = GenomeSketch::from_kmers(&repeated, 8, 21);
+
+        assert_eq!(
+            with_repeats.hashes, baseline.hashes,
+            "duplicates and input order must not change which hashes bottom-k selects"
+        );
     }
 
     #[test]

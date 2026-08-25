@@ -66,28 +66,42 @@ impl CountMinSketch {
         })
     }
 
-    #[inline(always)]
-    fn hash(&self, row: usize, kmer: u64) -> usize {
-        let h = kmer.wrapping_mul(self.seeds[row]);
-        ((h ^ (h >> 32)) as usize) % self.width
-    }
-
     /// Increments the frequency count for a canonical k-mer.
+    ///
+    /// Iterates `seeds` and `table` as zipped slices rather than indexing
+    /// both by `0..self.depth`. Per row that removes: the `self.seeds[row]`
+    /// bounds check, the `self.table[row]` bounds check, and the address
+    /// arithmetic for both -- 2 compare-and-branch pairs per row, so 8 per
+    /// insert at the default depth of 4, on a path that runs once per
+    /// k-mer. `width` is hoisted out of the loop for the same reason it
+    /// cannot be hoisted automatically: the writes go through `table`'s heap
+    /// buffer, which the optimizer cannot prove does not alias the `width`
+    /// field, so it must otherwise reload it every row.
+    ///
+    /// The column mapping itself is untouched, so the table contents and
+    /// every later `estimate` are bit-identical to before.
     #[inline(always)]
     pub fn insert(&mut self, kmer: u64) {
-        for row in 0..self.depth {
-            let col = self.hash(row, kmer);
-            self.table[row][col] = self.table[row][col].saturating_add(1);
+        debug_assert_eq!(self.seeds.len(), self.depth);
+        debug_assert_eq!(self.table.len(), self.depth);
+        let width = self.width;
+        for (&seed, row) in self.seeds.iter().zip(self.table.iter_mut()) {
+            let col = column(seed, width, kmer);
+            row[col] = row[col].saturating_add(1);
         }
     }
 
     /// Estimates the frequency count for a k-mer (guaranteed to be >= true count).
+    ///
+    /// Same slice-zip treatment as `insert`, for the same per-row saving.
     #[inline(always)]
     pub fn estimate(&self, kmer: u64) -> u32 {
+        debug_assert_eq!(self.seeds.len(), self.depth);
+        debug_assert_eq!(self.table.len(), self.depth);
+        let width = self.width;
         let mut min_count = u32::MAX;
-        for row in 0..self.depth {
-            let col = self.hash(row, kmer);
-            min_count = min_count.min(self.table[row][col]);
+        for (&seed, row) in self.seeds.iter().zip(self.table.iter()) {
+            min_count = min_count.min(row[column(seed, width, kmer)]);
         }
         min_count
     }
@@ -118,13 +132,47 @@ impl CountMinSketch {
             });
         }
 
-        for row in 0..self.depth {
-            for col in 0..self.width {
-                self.table[row][col] = self.table[row][col].saturating_add(other.table[row][col]);
+        // Zipped slice walk instead of `self.table[row][col]` /
+        // `other.table[row][col]` indexing. The dimension guard above
+        // already proved the shapes match, so every one of those bounds
+        // checks was provably redundant -- and there are a lot of them: at
+        // the `default_16mb` shape (4 x 1,048,576) the old loop performed
+        // 4,194,304 compare-and-branch pairs for the two inner indexings
+        // alone. Removing them also leaves a straight-line
+        // `u32::saturating_add` over two contiguous slices, the shape the
+        // vectorizer can actually widen; the indexed form's panic edges
+        // blocked that.
+        debug_assert_eq!(self.table.len(), other.table.len());
+        for (self_row, other_row) in self.table.iter_mut().zip(other.table.iter()) {
+            debug_assert_eq!(self_row.len(), other_row.len());
+            for (a, &b) in self_row.iter_mut().zip(other_row.iter()) {
+                *a = a.saturating_add(b);
             }
         }
         Ok(())
     }
+}
+
+/// The column a k-mer maps to in one row, given that row's seed.
+///
+/// Free-standing rather than a `&self` method so `insert` and `estimate` can
+/// walk `seeds`/`table` as zipped slices while still sharing a single
+/// definition of the mapping. The arithmetic is character-for-character the
+/// one the previous `CountMinSketch::hash` method computed.
+///
+/// The `%` is the expensive part: a 64-bit hardware division, roughly 20-40
+/// cycles of latency, executed `depth` times per `insert` and per
+/// `estimate`. It cannot be removed without changing behaviour, because a
+/// cheaper mapping (a mask, or Lemire's multiply-shift range reduction)
+/// sends k-mers to different columns and so changes every stored count and
+/// every estimate. See this module's note in the performance report: if
+/// `width` were *required* to be a power of two, `% width` would become
+/// `& (width - 1)`, but that is an API restriction on `new`, not a local
+/// rewrite, so it is left to the caller-facing design to decide.
+#[inline(always)]
+fn column(seed: u64, width: usize, kmer: u64) -> usize {
+    let h = kmer.wrapping_mul(seed);
+    ((h ^ (h >> 32)) as usize) % width
 }
 
 #[cfg(test)]
