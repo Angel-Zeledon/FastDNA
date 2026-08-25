@@ -305,8 +305,9 @@ fn pack_codon<const REVERSE: bool>(window: &[u8]) -> Option<u64> {
 /// The windows arrive from `chunks_exact(3)`/`rchunks_exact(3)`, which is
 /// what removes the per-codon `offset + 3 * codon_index` multiply-add and
 /// the three bounds checks the old index-based `pack_codon` paid on every
-/// codon: the iterator does the striding, and the `&[u8; 3]` pattern is one
-/// length test the optimizer can hoist out of the chunked loop.
+/// codon: the iterator does the striding, and the fixed-length slice pattern
+/// in `pack_codon` is a single length test in place of three separate index
+/// checks.
 #[inline]
 fn translate_codons<'a, const REVERSE: bool, I>(
     codons: I,
