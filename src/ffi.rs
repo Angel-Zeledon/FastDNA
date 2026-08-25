@@ -58,7 +58,7 @@ use crate::pipeline::{process_stream_parallel_with_policy, MemoryPolicy, Pipelin
 use crate::preview;
 use crate::progress::Progress;
 use crate::qc::QcSummary;
-use crate::sketch::GenomeSketch;
+use crate::sketch::{FracSketch, GenomeSketch};
 use crate::translate::{self, Frame, StopHandling, TranslationTable};
 use crate::hll;
 use crate::metagenomics;
@@ -82,6 +82,7 @@ impl From<FastDnaError> for PyErr {
             FastDnaError::MalformedFastq { .. }
             | FastDnaError::InvalidK { .. }
             | FastDnaError::MismatchedK { .. }
+            | FastDnaError::MismatchedScale { .. }
             | FastDnaError::InvalidConfig { .. }
             // Not in the spec's table (which predates the cohort engine),
             // but a caller-supplied bad directory is the same kind of
@@ -824,6 +825,84 @@ fn load_sketch(path: String) -> PyResult<PySketch> {
     Ok(PySketch { inner })
 }
 
+/// The Python-visible result of `frac_sketch()` and `load_frac_sketch()`.
+/// Wraps `sketch::FracSketch` -- a FracMinHash ("scaled MinHash")
+/// fingerprint whose size scales with the underlying k-mer set's true
+/// cardinality instead of being clamped to a fixed count the way
+/// `Sketch`'s bottom-k is. Use this instead of `Sketch` for containment
+/// queries where the two sides being compared differ a lot in size (e.g. a
+/// small pathogen sketch against a large metagenomic sample) -- see
+/// `FracSketch`'s own doc comment in `sketch.rs` for why bottom-k is biased
+/// there and this is not.
+#[pyclass(name = "FracSketch", module = "fastdna._core")]
+struct PyFracSketch {
+    inner: FracSketch,
+}
+
+#[pymethods]
+impl PyFracSketch {
+    #[getter]
+    fn k(&self) -> usize {
+        self.inner.k
+    }
+
+    #[getter]
+    fn scale(&self) -> u64 {
+        self.inner.scale
+    }
+
+    /// Asymmetric containment: what fraction of *this* sketch's k-mers also
+    /// appear in `other`. Unlike `Sketch.containment`, the estimate does
+    /// not shrink or lose resolution as `other`'s underlying set grows --
+    /// see `FracSketch::containment`'s doc comment. Raises `ValueError` if
+    /// the two sketches were built with a different `k` or a different
+    /// `scale`.
+    fn containment(&self, other: &PyFracSketch) -> PyResult<f64> {
+        Ok(self.inner.containment(&other.inner)?)
+    }
+
+    /// Symmetric similarity: the fraction of the union of both sketches'
+    /// k-mer sets that is shared. Same `ValueError` behaviour as
+    /// `containment` for a mismatched `k` or `scale`.
+    fn jaccard(&self, other: &PyFracSketch) -> PyResult<f64> {
+        Ok(self.inner.jaccard(&other.inner)?)
+    }
+
+    /// Persists the sketch as JSON, for :func:`load_frac_sketch` later.
+    fn save(&self, path: String) -> PyResult<()> {
+        self.inner.save(path)?;
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("FracSketch(k={}, scale={}, hashes={})", self.inner.k, self.inner.scale, self.inner.hashes.len())
+    }
+}
+
+/// Builds a FracMinHash ("scaled MinHash") sketch of a single FASTQ(.gz)
+/// file by streaming it. Unlike `sketch()`'s bottom-k, memory is bounded by
+/// `~|distinct k-mers| / scale`, not by a fixed constant -- the sketch's
+/// size is allowed to track the file's true k-mer cardinality, which is
+/// what makes its containment estimate unbiased against `sketch()`'s when
+/// comparing sets of very different sizes (see `FracSketch`'s doc comment
+/// in `sketch.rs`).
+///
+/// `scale=1000` by default (a k-mer's hash is kept with probability
+/// 1/1000), the same order of magnitude as sourmash's own common default.
+#[pyfunction]
+#[pyo3(signature = (path, k=21, scale=1000))]
+fn frac_sketch(py: Python<'_>, path: String, k: usize, scale: u64) -> PyResult<PyFracSketch> {
+    let inner = py.allow_threads(|| FracSketch::from_path(path, scale, k))?;
+    Ok(PyFracSketch { inner })
+}
+
+/// Loads a FracSketch previously written by `FracSketch.save`.
+#[pyfunction]
+fn load_frac_sketch(path: String) -> PyResult<PyFracSketch> {
+    let inner = FracSketch::load(path)?;
+    Ok(PyFracSketch { inner })
+}
+
 /// Estimates the number of distinct canonical k-mers across an *entire*
 /// FASTQ(.gz) file using HyperLogLog, in a fixed, small amount of memory
 /// (`2^precision` bytes) regardless of file size -- unlike `peek()`'s
@@ -1459,12 +1538,15 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyKmerCounts>()?;
     m.add_class::<PyPreview>()?;
     m.add_class::<PySketch>()?;
+    m.add_class::<PyFracSketch>()?;
     m.add_class::<PyKmerDatabase>()?;
     m.add_function(wrap_pyfunction!(count, m)?)?;
     m.add_function(wrap_pyfunction!(peek, m)?)?;
     m.add_function(wrap_pyfunction!(build_info, m)?)?;
     m.add_function(wrap_pyfunction!(sketch, m)?)?;
     m.add_function(wrap_pyfunction!(load_sketch, m)?)?;
+    m.add_function(wrap_pyfunction!(frac_sketch, m)?)?;
+    m.add_function(wrap_pyfunction!(load_frac_sketch, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_cardinality, m)?)?;
     m.add_function(wrap_pyfunction!(translate_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(translate_file, m)?)?;

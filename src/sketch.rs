@@ -508,6 +508,324 @@ fn validate_sketch_invariants(sketch: &GenomeSketch) -> std::result::Result<(), 
     Ok(())
 }
 
+/// A FracMinHash ("scaled MinHash") fingerprint of a FASTQ file's canonical
+/// k-mer set (Irber, Brooks, Reiter, Pierce-Ward, Hera, Koslicki & Brown,
+/// "Lightweight compositional analysis of metagenomes with FracMinHash and
+/// minimum metric", *Genome Research* 2022 -- the "scaled sketch"
+/// construction sourmash popularized; implemented here from the published
+/// definition alone, never by reading another tool's source, matching this
+/// project's existing licensing discipline for sketch/hash techniques).
+///
+/// `GenomeSketch`'s bottom-k keeps a *fixed count* of the smallest hashes no
+/// matter how large the underlying k-mer set is. That is exactly what makes
+/// `GenomeSketch::containment` biased when the two compared sets differ a
+/// lot in size: querying a small sketch against a large, *full* bottom-k
+/// sketch means only the hashes below the large sketch's (very low) ceiling
+/// are "resolvable" at all (see that method's doc comment), and that
+/// ceiling can shrink `resolvable` to a single-digit count. At that point
+/// the estimate `shared / resolvable` is not a fine-grained fraction any
+/// more, just a coin flip among a handful of coarse values (0, 1/2, 1, ...)
+/// -- it can land anywhere, including exactly 0.0 or exactly 1.0, with no
+/// relation to the true containment (measured directly: see
+/// `frac_sketch_containment_is_not_biased_by_a_large_size_mismatch_where_bottom_k_is`
+/// below, where this collapses a true containment of 0.5 to a reported
+/// 1.0). `FracSketch` keeps every distinct hash below a fixed *threshold*
+/// instead of a fixed *count*, so its size scales automatically with the
+/// set's true cardinality (`~|set| / scale` entries) and never truncates
+/// based on what the *other* sketch happens to look like.
+///
+/// Construction: a k-mer's hash `h = finalize_hash(kmer)` is kept iff
+/// `h <= u64::MAX / scale`. `finalize_hash` has strong avalanche diffusion
+/// (pinned by `finalize_hash_has_strong_avalanche_bit_diffusion` above), so
+/// each distinct element of the true k-mer set is kept independently with
+/// probability `1/scale`, regardless of how many other elements share that
+/// set or how large a *different* set being compared against happens to be.
+/// That independence from set size is what removes the bottom-k bias:
+/// `self`'s sketch, and therefore `self.containment(other)`'s numerator and
+/// denominator, no longer depend on anything about `other` at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FracSketch {
+    pub scale: u64,
+    pub k: usize,
+    pub hashes: Vec<u64>,
+}
+
+/// `u64::MAX / scale`, the inclusion threshold every hash is compared
+/// against. `scale <= 1` keeps everything (`u64::MAX`, not a division by
+/// zero or by one that would round oddly) -- the degenerate "sample
+/// everything" case, useful mainly as a sanity boundary in tests.
+#[inline(always)]
+fn frac_threshold(scale: u64) -> u64 {
+    if scale <= 1 {
+        u64::MAX
+    } else {
+        u64::MAX / scale
+    }
+}
+
+/// The working set behind `FracSketch` construction: every distinct hash at
+/// or below `threshold`, deduplicated. Unlike `BottomK`, nothing is ever
+/// evicted -- there is no fixed capacity to enforce, since a `FracSketch`'s
+/// size is a property of the input, not a caller-chosen cap. The rejection
+/// path is still just as cheap as `BottomK`'s hot path: one comparison
+/// against a `u64` already in a register, no tree touched, for the
+/// `scale - 1` out of every `scale` hashes (in expectation) that land above
+/// threshold.
+struct FracAccumulator {
+    set: BTreeSet<u64>,
+    threshold: u64,
+}
+
+impl FracAccumulator {
+    fn new(scale: u64) -> Self {
+        Self { set: BTreeSet::new(), threshold: frac_threshold(scale) }
+    }
+
+    #[inline]
+    fn insert(&mut self, hash: u64) {
+        if hash <= self.threshold {
+            self.set.insert(hash);
+        }
+    }
+
+    fn into_hashes(self) -> Vec<u64> {
+        self.set.into_iter().collect()
+    }
+}
+
+impl FracSketch {
+    pub fn new(scale: u64, k: usize) -> Self {
+        Self { scale, k, hashes: Vec::new() }
+    }
+
+    /// Builds a sketch from every k-mer already held in memory as a slice.
+    /// See `GenomeSketch::from_kmers` for the same in-memory-vs-streaming
+    /// trade-off; it applies identically here.
+    pub fn from_kmers(kmers: &[u64], scale: u64, k: usize) -> Self {
+        let mut acc = FracAccumulator::new(scale);
+        for &kmer in kmers {
+            acc.insert(finalize_hash(kmer));
+        }
+        Self { scale, k, hashes: acc.into_hashes() }
+    }
+
+    /// Builds a sketch by streaming a FASTQ file record by record. Unlike
+    /// `GenomeSketch::from_path`, memory is *not* bounded by a caller-chosen
+    /// constant -- it is bounded by `~|distinct k-mers| / scale`, which is
+    /// the whole point: a `FracSketch`'s size is allowed to reflect the
+    /// input's true cardinality rather than being clamped to it.
+    pub fn from_path<P: AsRef<Path>>(path: P, scale: u64, k: usize) -> Result<Self> {
+        let path_ref = path.as_ref();
+        let reader = FastqReader::from_path(path_ref)
+            .map_err(|e| FastDnaError::Io { path: path_ref.to_path_buf(), source: e })?;
+        Self::from_reader(reader, scale, k, path_ref)
+    }
+
+    fn from_reader<R: BufRead>(
+        mut reader: FastqReader<R>,
+        scale: u64,
+        k: usize,
+        source: &Path,
+    ) -> Result<Self> {
+        if k == 0 || k > 32 {
+            return Err(FastDnaError::InvalidK { k });
+        }
+        if scale == 0 {
+            return Err(FastDnaError::InvalidConfig {
+                parameter: "scale",
+                reason: "must be at least 1".to_string(),
+            });
+        }
+
+        let mut acc = FracAccumulator::new(scale);
+        let mut record_count: u64 = 0;
+
+        loop {
+            match reader.next_record() {
+                Ok(Some(record)) => {
+                    record_count += 1;
+                    for kmer in kmer::extract_canonical_kmers(&record.seq, k) {
+                        acc.insert(finalize_hash(kmer));
+                    }
+                }
+                Ok(None) => break,
+                Err(FastqReadError::Io(source_err)) => {
+                    return Err(FastDnaError::Io { path: source.to_path_buf(), source: source_err });
+                }
+                Err(FastqReadError::Malformed(reason)) => {
+                    return Err(FastDnaError::MalformedFastq {
+                        path: source.to_path_buf(),
+                        record: record_count + 1,
+                        reason,
+                    });
+                }
+            }
+        }
+
+        Ok(Self { scale, k, hashes: acc.into_hashes() })
+    }
+
+    /// Estimates containment: what fraction of `self`'s k-mers also appear
+    /// in `other`. Unlike `GenomeSketch::containment`, this has no ceiling
+    /// exclusion step -- every hash `self` kept is, by construction,
+    /// resolvable against `other` (both sketches were filtered by the same
+    /// scale-derived threshold, so a hash `self` kept is exactly as likely
+    /// to have been kept by `other` had it appeared in `other`'s set). The
+    /// estimate is therefore `|self.hashes ∩ other.hashes| / |self.hashes|`
+    /// with no denominator shrinkage, unbiased regardless of how much
+    /// larger or smaller `other`'s true set is than `self`'s.
+    ///
+    /// Requires equal `k` (no biological meaning otherwise, same as
+    /// `GenomeSketch`) and equal `scale` (comparing sketches sampled at
+    /// different rates would silently distort the ratio) -- both fail as
+    /// `Result`s, not panics, for the same FFI-boundary reason as
+    /// `GenomeSketch`'s methods.
+    pub fn containment(&self, other: &FracSketch) -> Result<f64> {
+        if self.k != other.k {
+            return Err(FastDnaError::MismatchedK { left: self.k, right: other.k });
+        }
+        if self.scale != other.scale {
+            return Err(FastDnaError::MismatchedScale { left: self.scale, right: other.scale });
+        }
+        if self.hashes.is_empty() {
+            return Ok(0.0);
+        }
+
+        // Same narrowing-binary-search walk as `GenomeSketch::containment`,
+        // minus the ceiling/`resolvable` step: every one of `self.hashes` is
+        // queried, not just a prefix.
+        let mut shared = 0usize;
+        let mut lo = 0usize;
+        for &h in &self.hashes {
+            match other.hashes[lo..].binary_search(&h) {
+                Ok(offset) => {
+                    shared += 1;
+                    lo += offset + 1;
+                }
+                Err(offset) => lo += offset,
+            }
+        }
+
+        Ok(shared as f64 / self.hashes.len() as f64)
+    }
+
+    /// Estimates the Jaccard similarity `|A ∩ B| / |A ∪ B|`. Both sketches
+    /// hold their complete scale-filtered hash sets (nothing is truncated
+    /// the way bottom-k truncates at `sketch_size`), so a single linear
+    /// merge over both sorted lists computes the exact intersection and
+    /// union of the two *sketches* directly -- unlike
+    /// `GenomeSketch::jaccard`, there is no "is the exhausted side full"
+    /// case to handle, because neither side is ever partially truncated.
+    pub fn jaccard(&self, other: &FracSketch) -> Result<f64> {
+        if self.k != other.k {
+            return Err(FastDnaError::MismatchedK { left: self.k, right: other.k });
+        }
+        if self.scale != other.scale {
+            return Err(FastDnaError::MismatchedScale { left: self.scale, right: other.scale });
+        }
+
+        let mut i = 0;
+        let mut j = 0;
+        let mut intersection = 0usize;
+        let mut union_count = 0usize;
+
+        while i < self.hashes.len() && j < other.hashes.len() {
+            match self.hashes[i].cmp(&other.hashes[j]) {
+                std::cmp::Ordering::Equal => {
+                    intersection += 1;
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+            union_count += 1;
+        }
+        union_count += (self.hashes.len() - i) + (other.hashes.len() - j);
+
+        if union_count == 0 {
+            Ok(0.0)
+        } else {
+            Ok(intersection as f64 / union_count as f64)
+        }
+    }
+
+    /// Persists the sketch as JSON, same write-to-temp-then-rename
+    /// discipline as `GenomeSketch::save`.
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
+
+        let (file, pending) = crate::atomic::AtomicFile::create(path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, self).map_err(|e| {
+            if e.is_io() {
+                FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
+            } else {
+                FastDnaError::Export { path: path.to_path_buf(), reason: e.to_string() }
+            }
+        })?;
+        writer.flush().map_err(to_err)?;
+        drop(writer);
+        pending.commit()?;
+        Ok(())
+    }
+
+    /// Loads a sketch previously written by `save`, validating the same
+    /// class of invariants `GenomeSketch::load` validates (see
+    /// `validate_frac_sketch_invariants`).
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
+        let load_err = |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason };
+
+        let file = File::open(path).map_err(to_err)?;
+        let reader = BufReader::new(file);
+        let sketch: FracSketch = serde_json::from_reader(reader).map_err(|e| {
+            if e.is_io() {
+                FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
+            } else {
+                load_err(e.to_string())
+            }
+        })?;
+
+        validate_frac_sketch_invariants(&sketch).map_err(load_err)?;
+
+        Ok(sketch)
+    }
+}
+
+/// Verifies the invariants `FracSketch::jaccard`'s merge walk and
+/// `FracSketch::containment`'s binary search both silently assume: `hashes`
+/// is sorted strictly ascending, every entry is at or below the
+/// scale-derived threshold, `k` is in range, and `scale` is at least 1.
+/// Mirrors `validate_sketch_invariants` for `GenomeSketch`, minus the
+/// `sketch_size` cap check -- a `FracSketch` has no fixed capacity to
+/// exceed.
+fn validate_frac_sketch_invariants(sketch: &FracSketch) -> std::result::Result<(), String> {
+    if sketch.k == 0 || sketch.k > 32 {
+        return Err(format!(
+            "k is {}, outside the 1..=32 range 2-bit packing supports",
+            sketch.k
+        ));
+    }
+    if sketch.scale == 0 {
+        return Err("scale is 0; a saved FracSketch must use a scale of at least 1".to_string());
+    }
+    if !sketch.hashes.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err("hashes is not sorted in strictly ascending order".to_string());
+    }
+    let threshold = frac_threshold(sketch.scale);
+    if sketch.hashes.last().is_some_and(|&h| h > threshold) {
+        return Err(format!(
+            "hashes contains a value above the scale-{} threshold ({threshold}); \
+             every entry must satisfy h <= u64::MAX / scale",
+            sketch.scale
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 // Matches the established pattern in `preview.rs`/`progress.rs`:
 // `unwrap`/`expect` are denied under `src/` because production code must
@@ -1095,6 +1413,203 @@ mod tests {
             "at least one input bit position diffuses poorly: {min_per_bit_avg} flipped bits/flip \
              on average (want > 20) -- a linear finalizer leaves some input bits (e.g. the top bit) \
              barely affecting the output"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // FracSketch
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn frac_sketch_size_scales_with_input_cardinality_not_a_fixed_cap() {
+        // Unlike GenomeSketch::from_kmers, there is no capacity to hit: a
+        // 10x larger input should keep roughly 10x more hashes (in
+        // expectation ~1/scale of the distinct input), not saturate at a
+        // fixed count the way bottom-k would.
+        let small: Vec<u64> = (0..2_000).collect();
+        let large: Vec<u64> = (0..20_000).collect();
+        let scale = 50;
+
+        let a = FracSketch::from_kmers(&small, scale, 21);
+        let b = FracSketch::from_kmers(&large, scale, 21);
+
+        assert!(
+            b.hashes.len() > a.hashes.len() * 3,
+            "a 10x larger input must keep noticeably more hashes, not saturate at a fixed cap: \
+             small kept {}, large kept {}",
+            a.hashes.len(),
+            b.hashes.len()
+        );
+    }
+
+    #[test]
+    fn frac_sketch_containment_of_identical_inputs_is_one() {
+        let kmers: Vec<u64> = (0..5_000).collect();
+        let a = FracSketch::from_kmers(&kmers, 20, 21);
+        let b = FracSketch::from_kmers(&kmers, 20, 21);
+
+        let c = a.containment(&b).expect("same k and scale must not error");
+        assert_eq!(c, 1.0, "a sketch compared with itself must be exactly 1.0");
+    }
+
+    #[test]
+    fn frac_sketch_containment_of_disjoint_inputs_is_zero() {
+        let a = FracSketch::from_kmers(&(0u64..5_000).collect::<Vec<_>>(), 20, 21);
+        let b = FracSketch::from_kmers(&(1_000_000u64..1_005_000).collect::<Vec<_>>(), 20, 21);
+
+        let c = a.containment(&b).expect("same k and scale must not error");
+        assert_eq!(c, 0.0);
+    }
+
+    #[test]
+    fn frac_sketch_mismatched_k_and_scale_are_errors_not_panics() {
+        let a = FracSketch::from_kmers(&[1, 2, 3], 10, 21);
+        let b_bad_k = FracSketch::from_kmers(&[1, 2, 3], 10, 25);
+        let b_bad_scale = FracSketch::from_kmers(&[1, 2, 3], 20, 21);
+
+        match a.containment(&b_bad_k) {
+            Err(FastDnaError::MismatchedK { left, right }) => assert_eq!((left, right), (21, 25)),
+            other => panic!("expected MismatchedK, got {other:?}"),
+        }
+        match a.jaccard(&b_bad_k) {
+            Err(FastDnaError::MismatchedK { .. }) => {}
+            other => panic!("expected MismatchedK, got {other:?}"),
+        }
+        match a.containment(&b_bad_scale) {
+            Err(FastDnaError::MismatchedScale { left, right }) => assert_eq!((left, right), (10, 20)),
+            other => panic!("expected MismatchedScale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frac_sketch_save_then_load_round_trips_to_an_identical_sketch() {
+        let kmers: Vec<u64> = (0..5_000).collect();
+        let original = FracSketch::from_kmers(&kmers, 20, 21);
+        assert!(!original.hashes.is_empty(), "test data must actually produce kept hashes");
+
+        let dir = tempfile::tempdir().expect("failed to create temp dir for test");
+        let path = dir.path().join("fastdna_frac_sketch_roundtrip_test.sig");
+        original.save(&path).expect("save must succeed");
+        let loaded = FracSketch::load(&path).expect("load must succeed");
+
+        assert_eq!(loaded.scale, original.scale);
+        assert_eq!(loaded.k, original.k);
+        assert_eq!(loaded.hashes, original.hashes);
+    }
+
+    #[test]
+    fn frac_sketch_load_rejects_a_hash_above_the_scale_threshold() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir for test");
+        let path = dir.path().join("fastdna_frac_sketch_bad_threshold_test.sig");
+        // scale=2 -> threshold = u64::MAX/2; u64::MAX itself is above it.
+        let bad = FracSketch { scale: 2, k: 21, hashes: vec![1, u64::MAX] };
+        std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
+
+        match FracSketch::load(&path) {
+            Err(FastDnaError::Load { reason, .. }) => {
+                assert!(reason.contains("threshold"), "reason should explain the violation: {reason}");
+            }
+            other => panic!("expected Err(Load), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frac_sketch_streaming_construction_matches_in_memory_path() {
+        let k = 5;
+        let scale = 4;
+        let reads = ["ACGTACGGTTACAGTCAGTCAGCATCGATCGACTAGCATGGGTTAACCGGTT", "TTGGCCAATTGGCCTAGCTAGCTAGGGCATCGATCGATCG"];
+
+        let mut kmers: Vec<u64> = Vec::new();
+        for seq in &reads {
+            kmers.extend(kmer::extract_canonical_kmers(seq.as_bytes(), k));
+        }
+        let in_memory = FracSketch::from_kmers(&kmers, scale, k);
+
+        let reader = reader_over(&reads);
+        let streamed =
+            FracSketch::from_reader(reader, scale, k, Path::new("<memory>")).expect("streaming build must succeed");
+
+        assert_eq!(streamed.scale, in_memory.scale);
+        assert_eq!(streamed.k, in_memory.k);
+        assert_eq!(
+            streamed.hashes, in_memory.hashes,
+            "streaming and in-memory construction must select identical hashes"
+        );
+    }
+
+    /// The falsifiable claim this whole type exists to satisfy: on a
+    /// deliberately size-mismatched pair (a 500-element set `a` versus a
+    /// 50,000-element set `b`, a 100x ratio, with `a` sharing exactly half
+    /// its content with `b`), `GenomeSketch`'s bottom-k containment
+    /// estimate is measurably biased against the true 0.5 containment,
+    /// while `FracSketch`'s estimate is not.
+    ///
+    /// Measured directly against these exact inputs: bottom-k (sketch_size
+    /// 256, both sketches full) reports containment = 1.0, |diff| = 0.5;
+    /// FracSketch (scale 20) reports containment ~= 0.588, |diff| ~= 0.088.
+    ///
+    /// The mechanism (documented on `GenomeSketch::containment` and
+    /// `FracSketch`'s own doc comment): a bottom-k sketch of `b` at a small
+    /// `sketch_size` becomes "full" and its ceiling collapses to a tiny
+    /// fraction of hash space (sketch_size / |b|, here 256/50,000 ~=
+    /// 0.5%). Only the handful of `a`'s hashes that happen to fall below
+    /// that ceiling are "resolvable" at all -- for this input, `a`'s own
+    /// sketch is *also* full (256 of its 500), so `resolvable` collapses to
+    /// a single-digit count, and the ratio `shared/resolvable` becomes a
+    /// near-coin-flip between a handful of possible values (0.0, 1.0, or a
+    /// coarse fraction between) with no relation to the true 0.5 -- it does
+    /// not fail in one fixed direction, it fails by losing the resolution
+    /// to represent 0.5 at all. `FracSketch` has no such ceiling: every
+    /// hash `a` keeps is resolvable against `b` by construction, so its
+    /// denominator (17 hashes here) stays large enough to actually resolve
+    /// the true ratio instead of collapsing to a handful of coin flips.
+    #[test]
+    fn frac_sketch_containment_is_not_biased_by_a_large_size_mismatch_where_bottom_k_is() {
+        let shared: Vec<u64> = (0..250).collect();
+        let a_only: Vec<u64> = (250..500).collect();
+        let b_only: Vec<u64> = (100_000..149_750).collect();
+
+        let a_kmers: Vec<u64> = shared.iter().chain(a_only.iter()).copied().collect();
+        let b_kmers: Vec<u64> = shared.iter().chain(b_only.iter()).copied().collect();
+
+        assert_eq!(a_kmers.len(), 500);
+        assert_eq!(b_kmers.len(), 50_000);
+        let true_containment = 250.0 / 500.0; // exactly 0.5 by construction
+
+        // Bottom-k, at a sketch_size realistic for this kind of screening
+        // workload (Mash's own default is 1000; 256 here to make the
+        // ceiling-collapse mechanism bite deterministically for this test's
+        // fixed inputs without relying on a much larger, slower universe).
+        let bottom_k_a = GenomeSketch::from_kmers(&a_kmers, 256, 21);
+        let bottom_k_b = GenomeSketch::from_kmers(&b_kmers, 256, 21);
+        assert!(bottom_k_b.hashes.len() >= 256, "b's bottom-k sketch must be full for the ceiling mechanism to apply");
+        let bottom_k_estimate =
+            bottom_k_a.containment(&bottom_k_b).expect("same k must not error");
+
+        // FracSketch at scale=20 (expected sketch size ~500/20=25 for a,
+        // ~2500/20 for b -- both non-trivial, no fixed cap in play).
+        let frac_a = FracSketch::from_kmers(&a_kmers, 20, 21);
+        let frac_b = FracSketch::from_kmers(&b_kmers, 20, 21);
+        let frac_estimate = frac_a.containment(&frac_b).expect("same k and scale must not error");
+
+        assert!(
+            (bottom_k_estimate - true_containment).abs() > 0.3,
+            "expected the bottom-k estimate to be measurably biased away from the true containment \
+             {true_containment}, got {bottom_k_estimate} (|diff| = {})",
+            (bottom_k_estimate - true_containment).abs()
+        );
+        assert!(
+            (frac_estimate - true_containment).abs() < 0.15,
+            "expected the FracSketch estimate to track the true containment {true_containment} \
+             closely, got {frac_estimate} (|diff| = {})",
+            (frac_estimate - true_containment).abs()
+        );
+        assert!(
+            (frac_estimate - true_containment).abs() < (bottom_k_estimate - true_containment).abs(),
+            "FracSketch must land closer to the true containment than bottom-k did: \
+             frac |diff| = {}, bottom-k |diff| = {}",
+            (frac_estimate - true_containment).abs(),
+            (bottom_k_estimate - true_containment).abs()
         );
     }
 }

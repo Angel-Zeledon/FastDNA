@@ -156,3 +156,87 @@ def test_compare_all_rejects_an_unknown_metric(tmp_path):
 
     with pytest.raises(ValueError):
         fastdna.compare_all([str(path), str(path)], metric="not_a_real_metric")
+
+
+# ---------------------------------------------------------------------------
+# fastdna.frac_sketch() / load_frac_sketch() -- FracMinHash (scaled MinHash)
+# ---------------------------------------------------------------------------
+
+
+def test_frac_sketch_identical_files_have_containment_and_jaccard_one(tmp_path):
+    reads = ["ACGTACGTACGTACGTACGTACGT"] * 20
+    a = write_fastq(tmp_path, "a.fastq", reads)
+    b = write_fastq(tmp_path, "b.fastq", reads)
+
+    s1 = fastdna.frac_sketch(str(a), k=5, scale=4)
+    s2 = fastdna.frac_sketch(str(b), k=5, scale=4)
+
+    assert s1.jaccard(s2) == pytest.approx(1.0)
+    assert s1.containment(s2) == pytest.approx(1.0)
+
+
+def test_frac_sketch_disjoint_alphabets_have_containment_and_jaccard_zero(tmp_path):
+    a = write_fastq(tmp_path, "a.fastq", ["AAAAAAAAAAAAAAAAAAAA"] * 20)
+    b = write_fastq(tmp_path, "b.fastq", ["CCCCCCCCCCCCCCCCCCCC"] * 20)
+
+    s1 = fastdna.frac_sketch(str(a), k=5, scale=4)
+    s2 = fastdna.frac_sketch(str(b), k=5, scale=4)
+
+    assert s1.jaccard(s2) == pytest.approx(0.0)
+    assert s1.containment(s2) == pytest.approx(0.0)
+
+
+def test_frac_sketch_mismatched_k_raises_valueerror(tmp_path):
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTACGTACGTACGT"] * 10)
+
+    s1 = fastdna.frac_sketch(str(path), k=5, scale=4)
+    s2 = fastdna.frac_sketch(str(path), k=7, scale=4)
+
+    with pytest.raises(ValueError):
+        s1.jaccard(s2)
+
+
+def test_frac_sketch_mismatched_scale_raises_valueerror(tmp_path):
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTACGTACGTACGT"] * 10)
+
+    s1 = fastdna.frac_sketch(str(path), k=5, scale=4)
+    s2 = fastdna.frac_sketch(str(path), k=5, scale=8)
+
+    with pytest.raises(ValueError):
+        s1.containment(s2)
+
+
+def test_frac_sketch_exposes_k_and_scale(tmp_path):
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTACGTACGTACGT"] * 5)
+
+    s = fastdna.frac_sketch(str(path), k=9, scale=50)
+
+    assert s.k == 9
+    assert s.scale == 50
+
+
+def test_frac_sketch_save_and_load_round_trips(tmp_path):
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTACGTACGTACGT"] * 10)
+    original = fastdna.frac_sketch(str(path), k=5, scale=4)
+
+    out = tmp_path / "sample.frac_sketch.json"
+    original.save(str(out))
+    loaded = fastdna.load_frac_sketch(str(out))
+
+    assert loaded.k == original.k
+    assert loaded.scale == original.scale
+    assert loaded.jaccard(original) == pytest.approx(1.0)
+
+
+def test_frac_sketch_load_of_a_missing_file_is_an_error(tmp_path):
+    with pytest.raises((FileNotFoundError, OSError)):
+        fastdna.load_frac_sketch(str(tmp_path / "nope.frac_sketch.json"))
+
+
+def test_frac_sketch_repr_reports_k_and_scale():
+    class _FakeRaw:
+        k = 21
+        scale = 1000
+
+    sketch = fastdna.FracSketch(_FakeRaw())
+    assert repr(sketch) == "FracSketch(k=21, scale=1000)"

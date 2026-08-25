@@ -335,6 +335,79 @@ def test_gather_rejects_invalid_min_containment(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# scale= -- FracSketch-backed classify()/gather(), unbiased for
+# size-mismatched query/reference pairs (see fastdna.FracSketch's and
+# src/sketch.rs's docstrings for the mechanism this exists to fix).
+# ---------------------------------------------------------------------------
+
+
+def test_build_reference_database_with_scale_builds_frac_sketches(tmp_path):
+    motif = "ACGTGGCATCAGT"
+    ref_path = write_fastq(tmp_path, "ref.fastq", [repeat_motif(motif, 5)] * 5)
+
+    db = build_reference_database({"ref": ref_path}, k=11, scale=4)
+
+    assert isinstance(db["ref"], fastdna.FracSketch)
+    assert db["ref"].k == 11
+    assert db["ref"].scale == 4
+
+
+def test_classify_with_scale_still_ranks_the_matching_reference_first(tmp_path):
+    motif_a = "ACGTGGCATCAGT"
+    motif_b = "TTAGGCCTAAGGC"
+
+    query_path = write_fastq(tmp_path, "query.fastq", [repeat_motif(motif_a, 5)] * 20)
+    ref_a_path = write_fastq(tmp_path, "ref_a.fastq", [repeat_motif(motif_a, 5)] * 20)
+    ref_b_path = write_fastq(tmp_path, "ref_b.fastq", [repeat_motif(motif_b, 5)] * 20)
+
+    reference_db = build_reference_database({"match": ref_a_path, "unrelated": ref_b_path}, k=11, scale=4)
+
+    result = classify(str(query_path), reference_db, k=11, scale=4, metric="containment")
+
+    assert result.column("name").to_pylist()[0] == "match"
+    assert result.column("score").to_pylist()[0] == pytest.approx(1.0)
+
+
+def test_classify_with_scale_accepts_an_already_built_frac_sketch(tmp_path):
+    motif = "ACGTGGCATCAGT"
+    query_path = write_fastq(tmp_path, "query.fastq", [repeat_motif(motif, 5)] * 10)
+    ref_path = write_fastq(tmp_path, "ref.fastq", [repeat_motif(motif, 5)] * 10)
+
+    reference_db = build_reference_database([ref_path], k=11, scale=4)
+    query_sketch = fastdna.frac_sketch(str(query_path), k=11, scale=4)
+
+    result = classify(query_sketch, reference_db, k=11, scale=4)
+
+    assert result.column("name").to_pylist()[0] == "ref"
+    assert result.column("score").to_pylist()[0] == pytest.approx(1.0)
+
+
+def test_gather_with_scale_picks_out_two_distinct_organisms(tmp_path):
+    motif_a = "ACGTGGCATCAGT"
+    motif_b = "TTAGGCCTAAGGC"
+    motif_c = "GATCGATCGGATT"
+
+    query_reads = [repeat_motif(motif_a, 5)] * 20 + [repeat_motif(motif_b, 5)] * 20
+    query_path = write_fastq(tmp_path, "mixed_query.fastq", query_reads)
+
+    ref_a_path = write_fastq(tmp_path, "organism_a.fastq", [repeat_motif(motif_a, 5)] * 20)
+    ref_b_path = write_fastq(tmp_path, "organism_b.fastq", [repeat_motif(motif_b, 5)] * 20)
+    ref_c_path = write_fastq(tmp_path, "organism_c.fastq", [repeat_motif(motif_c, 5)] * 20)
+
+    reference_db = build_reference_database(
+        {"organism_a": ref_a_path, "organism_b": ref_b_path, "organism_c": ref_c_path},
+        k=11,
+        scale=4,
+    )
+
+    result = gather(str(query_path), reference_db, k=11, scale=4, min_containment=0.05)
+
+    picked_names = set(result.column("name").to_pylist())
+    assert {"organism_a", "organism_b"}.issubset(picked_names)
+    assert "organism_c" not in picked_names
+
+
+# ---------------------------------------------------------------------------
 # The score column names its own convention
 # ---------------------------------------------------------------------------
 

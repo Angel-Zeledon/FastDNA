@@ -20,6 +20,11 @@ pub enum FastDnaError {
     VocabTooLarge { estimated_bytes: u64, limit: u64 },
     /// Two sketches built with different `k` cannot be compared.
     MismatchedK { left: usize, right: usize },
+    /// Two `FracSketch`es built with different `scale` cannot be compared:
+    /// each hash is kept independently of set size at probability `1/scale`,
+    /// so comparing sketches built at different scales would compare sets
+    /// sampled at different rates, silently distorting the ratio.
+    MismatchedScale { left: u64, right: u64 },
     /// A worker thread panicked. This indicates a bug in FastDNA.
     Internal { detail: String },
     /// A configuration value supplied by the caller is not usable.
@@ -75,6 +80,10 @@ impl fmt::Display for FastDnaError {
             FastDnaError::MismatchedK { left, right } => {
                 write!(f, "cannot compare sketches built with different k: {left} and {right}")
             }
+            FastDnaError::MismatchedScale { left, right } => write!(
+                f,
+                "cannot compare FracSketches built with different scale: {left} and {right}"
+            ),
             FastDnaError::Internal { detail } => {
                 write!(f, "internal error (this is a bug in FastDNA): {detail}")
             }

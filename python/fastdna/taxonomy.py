@@ -30,7 +30,7 @@ from typing import NamedTuple
 
 import pyarrow as pa
 
-from . import Sketch, sketch as _sketch
+from . import FracSketch, Sketch, frac_sketch as _frac_sketch, sketch as _sketch
 
 __all__ = [
     "build_reference_database",
@@ -56,24 +56,33 @@ def _default_name(path) -> str:
     return pathlib.Path(name).stem
 
 
-def _resolve_sketch(path_or_sketch, *, k, sketch_size) -> Sketch:
-    """Accepts either a file path (sketched here with `k`/`sketch_size`)
-    or an already-built `Sketch` (returned unchanged, `k`/`sketch_size`
-    ignored) -- the "don't rebuild what the caller already has" rule
-    `classify()`'s docstring calls out, factored out since both `classify`
-    and `gather` need it.
+def _resolve_sketch(path_or_sketch, *, k, sketch_size, scale=None):
+    """Accepts either a file path (sketched here with `k`/`sketch_size`, or
+    `k`/`scale` when `scale` is given) or an already-built `Sketch` /
+    `FracSketch` (returned unchanged, sketching parameters ignored) -- the
+    "don't rebuild what the caller already has" rule `classify()`'s
+    docstring calls out, factored out since both `classify` and `gather`
+    need it.
+
+    `scale` selects which sketch construction a freshly-built path uses:
+    `Sketch` (bottom-k, via `sketch_size`) when `scale is None`, or
+    `FracSketch` (via `scale`) otherwise. See `classify()`'s docstring for
+    why `FracSketch` exists and when to reach for it -- containment queries
+    where the two sides can differ a lot in size.
     """
-    if isinstance(path_or_sketch, Sketch):
+    if isinstance(path_or_sketch, (Sketch, FracSketch)):
         return path_or_sketch
+    if scale is not None:
+        return _frac_sketch(str(path_or_sketch), k=k, scale=scale)
     return _sketch(str(path_or_sketch), k=k, sketch_size=sketch_size)
 
 
-def build_reference_database(paths_or_dict, *, k=21, sketch_size=1000):
-    """Builds a `{name: Sketch}` reference database once, up front, so
-    `classify()` (or `gather()`) never re-reads a reference FASTQ file per
-    query -- the same "sketch once, compare many times" principle
-    `compare_all()` already applies to all-pairs comparison, applied here
-    to one-query-vs-many-references.
+def build_reference_database(paths_or_dict, *, k=21, sketch_size=1000, scale=None):
+    """Builds a `{name: Sketch}` (or `{name: FracSketch}`) reference
+    database once, up front, so `classify()` (or `gather()`) never re-reads
+    a reference FASTQ file per query -- the same "sketch once, compare many
+    times" principle `compare_all()` already applies to all-pairs
+    comparison, applied here to one-query-vs-many-references.
 
     `paths_or_dict` accepts either an iterable of paths (names derived
     from each filename, see `_default_name`) or an explicit
@@ -81,12 +90,21 @@ def build_reference_database(paths_or_dict, *, k=21, sketch_size=1000):
     their own (e.g. accession numbers, or several files that would
     otherwise collide on the same derived name).
 
-    Returns a plain `dict[str, Sketch]` -- deliberately not a bespoke
-    index/database type. `Sketch.save()`/`fastdna.load_sketch()` already
-    exist for persisting one sketch; a caller who wants a persisted
-    *database* can save each of this dict's values under its key as a
-    filename and rebuild the same dict later with
-    `{name: load_sketch(path) for name, path in ...}`. Inventing a second,
+    `scale`: when given, builds `FracSketch`es (via `frac_sketch(...,
+    scale=scale)`) instead of the default bottom-k `Sketch`es. Pass this
+    when the database will be queried with `classify(..., metric=
+    "containment")` or `gather()` against references of very different
+    sizes from the query -- see `classify()`'s docstring for why bottom-k
+    containment is biased there and `FracSketch` is not. Leave it `None`
+    (the default) for `metric="jaccard"` use or same-size comparisons,
+    where bottom-k's fixed memory footprint is the simpler choice.
+
+    Returns a plain `dict[str, Sketch]` (or `dict[str, FracSketch]`) --
+    deliberately not a bespoke index/database type. `Sketch.save()`/
+    `fastdna.load_sketch()` (or `FracSketch.save()`/`load_frac_sketch()`)
+    already exist for persisting one sketch; a caller who wants a
+    persisted *database* can save each of this dict's values under its key
+    as a filename and rebuild the same dict later. Inventing a second,
     bespoke multi-sketch file format on top of that would add a format to
     maintain without adding any capability this dict-of-Sketch doesn't
     already have.
@@ -96,6 +114,8 @@ def build_reference_database(paths_or_dict, *, k=21, sketch_size=1000):
     else:
         items = [(_default_name(p), p) for p in paths_or_dict]
 
+    if scale is not None:
+        return {name: _frac_sketch(str(path), k=k, scale=scale) for name, path in items}
     return {name: _sketch(str(path), k=k, sketch_size=sketch_size) for name, path in items}
 
 
@@ -131,6 +151,7 @@ def classify(
     *,
     k=21,
     sketch_size=1000,
+    scale=None,
     top_n=5,
     metric="containment",
     min_score=0.0,
@@ -158,11 +179,32 @@ def classify(
     for callers who want a symmetric similarity instead (e.g. comparing
     two sketches of comparable size/composition).
 
+    On `scale` and why the default bottom-k `Sketch` can still mislead
+    even with `metric="containment"`: bottom-k's containment estimate is
+    itself biased when the query and a reference differ *enough* in size
+    (see `Sketch`/`FracSketch`'s docstrings for the mechanism -- a large
+    reference's bottom-k sketch develops a low ceiling that only a
+    handful of the query's own hashes can ever resolve against, which can
+    collapse a real containment of e.g. 0.5 to a reported 0.0 or 1.0).
+    This matters most exactly in classify's own headline scenario -- a
+    small clinical isolate or amplicon screened against whole reference
+    genomes that can be orders of magnitude larger. Pass `scale` (e.g.
+    `scale=1000`) to sketch both the query and `reference_db` (via
+    `build_reference_database(..., scale=...)`) as `FracSketch` instead,
+    whose containment estimate does not have this failure mode. Leave it
+    `None` (the default, bottom-k `Sketch`) when query and references are
+    comparable in size, or when using `metric="jaccard"`.
+
     `query_path_or_sketch` accepts either a file path (sketched here with
-    `k`/`sketch_size`) or an already-built `Sketch` (used unchanged) --
-    so classifying one query sketch against several different
-    `reference_db`s, or reusing a sketch already built for another
-    purpose, costs one sketch build total rather than one per call.
+    `k`/`sketch_size`, or `k`/`scale` when `scale` is given) or an
+    already-built `Sketch`/`FracSketch` (used unchanged) -- so classifying
+    one query sketch against several different `reference_db`s, or reusing
+    a sketch already built for another purpose, costs one sketch build
+    total rather than one per call. When passing an already-built sketch
+    together with a `reference_db`, both must be the same kind (both
+    `Sketch` or both `FracSketch`) built with matching `k` (and `scale`,
+    for `FracSketch`) -- comparing across kinds raises a `TypeError` from
+    the Rust layer, comparing mismatched `k`/`scale` raises `ValueError`.
 
     `min_score`: references scoring at or below this value are dropped
     from the result entirely, the same "there is a floor below which a
@@ -187,7 +229,7 @@ def classify(
     if not reference_db:
         return _empty_score_table()
 
-    query = _resolve_sketch(query_path_or_sketch, k=k, sketch_size=sketch_size)
+    query = _resolve_sketch(query_path_or_sketch, k=k, sketch_size=sketch_size, scale=scale)
 
     # Resolved once, not once per reference: `metric` cannot change during
     # the loop, so a database of 10,000 references did 10,000 attribute
@@ -351,7 +393,16 @@ def check_sample_identity(path_a, path_b, *, k=21, sketch_size=1000, threshold=0
     )
 
 
-def gather(query_path_or_sketch, reference_db, *, k=21, sketch_size=1000, min_containment=0.1, max_references=None):
+def gather(
+    query_path_or_sketch,
+    reference_db,
+    *,
+    k=21,
+    sketch_size=1000,
+    scale=None,
+    min_containment=0.1,
+    max_references=None,
+):
     """Approximates sourmash's `gather`: iteratively picks the single
     reference that currently best explains the query, records it, and
     repeats against the remaining references -- answering "what *set* of
@@ -361,14 +412,24 @@ def gather(query_path_or_sketch, reference_db, *, k=21, sketch_size=1000, min_co
 
     This is a genuinely approximate, best-effort heuristic, not a port of
     sourmash's algorithm -- said plainly, up front, because that
-    algorithm's core trick does not carry over to `GenomeSketch` as it
-    exists here. sourmash's real `gather` can *subtract* the exact hashes
-    a picked reference explained from the query's FracMinHash sketch
-    before scoring the next round, because it can see and remove
-    individual hash values. `fastdna`'s `Sketch` exposes no such
-    operation -- only `jaccard`/`containment`/`mash_distance` scalar
-    comparisons -- so this function cannot know *which* of the query's
-    k-mers a picked reference explained, only a similarity number.
+    algorithm's core trick does not carry over to `fastdna`'s sketch types
+    as they exist here. sourmash's real `gather` can *subtract* the exact
+    hashes a picked reference explained from the query's FracMinHash
+    sketch before scoring the next round, because it can see and remove
+    individual hash values. Neither `Sketch` nor `FracSketch` exposes such
+    a subtraction operation here -- only `jaccard`/`containment`/(for
+    `Sketch`) `mash_distance` scalar comparisons -- so this function cannot
+    know *which* of the query's k-mers a picked reference explained, only
+    a similarity number.
+
+    On `scale`: `gather` leans on `.containment()` for every round, which
+    makes it exactly as exposed to bottom-k `Sketch`'s size-mismatch bias
+    as `classify()` is (see that function's docstring for the mechanism).
+    A metagenomic query being decomposed against reference genomes of very
+    different sizes is gather's own headline use case, so this bias
+    matters here at least as much. Pass `scale` (e.g. `scale=1000`) to
+    sketch the query and `reference_db` (via `build_reference_database(...,
+    scale=...)`) as `FracSketch` instead.
 
     The approximation used instead: at each round, rank the remaining
     references by `query.containment(reference)` (the same metric
@@ -417,7 +478,7 @@ def gather(query_path_or_sketch, reference_db, *, k=21, sketch_size=1000, min_co
             }
         )
 
-    query = _resolve_sketch(query_path_or_sketch, k=k, sketch_size=sketch_size)
+    query = _resolve_sketch(query_path_or_sketch, k=k, sketch_size=sketch_size, scale=scale)
 
     remaining = dict(reference_db)
 

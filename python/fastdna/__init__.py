@@ -453,6 +453,88 @@ def load_sketch(path):
     return Sketch(_core.load_sketch(str(path)))
 
 
+class FracSketch:
+    """A FracMinHash ("scaled MinHash") fingerprint of a FASTQ file's
+    canonical k-mer set, built by :func:`frac_sketch` or
+    :func:`load_frac_sketch`.
+
+    `Sketch`'s bottom-k keeps a *fixed count* of the smallest hash values
+    no matter how large the underlying k-mer set is -- fine for `.jaccard()`
+    between comparably-sized samples, but biased for `.containment()`
+    between very differently-sized ones (e.g. a small pathogen sketch
+    queried against a large metagenomic sample): the large sketch's ceiling
+    collapses to a tiny fraction of hash space, so only a handful of the
+    small sketch's hashes are ever "resolvable" against it, and the ratio
+    stops being a fine-grained estimate at all (see the Rust-side
+    `FracSketch` doc comment in `src/sketch.rs` for the measured example --
+    a true containment of 0.5 collapsing to a reported 1.0).
+
+    `FracSketch` keeps every hash below a fixed *threshold* instead of a
+    fixed *count*, so its size scales automatically with the set's true
+    cardinality (`~|set| / scale` entries) and never truncates based on
+    what the *other* sketch being compared happens to look like. Prefer
+    this over `Sketch` for `.containment()` queries where the two sides can
+    differ a lot in size -- this is exactly `fastdna.taxonomy.classify()`'s
+    and `fastdna.taxonomy.gather()`'s use case, which is why both accept a
+    `scale` parameter to switch to `FracSketch` internally.
+    """
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    @property
+    def k(self):
+        return self._raw.k
+
+    @property
+    def scale(self):
+        return self._raw.scale
+
+    def containment(self, other):
+        """Asymmetric containment: what fraction of *this* sketch's
+        k-mers also appear in `other`. Unlike `Sketch.containment`, the
+        estimate does not lose resolution as `other`'s underlying set
+        grows relative to this one -- see the class docstring.
+        """
+        return self._raw.containment(other._raw)
+
+    def jaccard(self, other):
+        """Symmetric similarity: the fraction of the union of both
+        sketches' k-mer sets that is shared.
+        """
+        return self._raw.jaccard(other._raw)
+
+    def save(self, path):
+        """Persists this sketch as JSON, for :func:`load_frac_sketch`
+        later.
+        """
+        self._raw.save(str(path))
+
+    def __repr__(self):
+        return f"FracSketch(k={self.k}, scale={self.scale})"
+
+
+def frac_sketch(path, *, k=21, scale=1000):
+    """Builds a FracMinHash ("scaled MinHash") sketch of a single
+    FASTQ(.gz) file by streaming it. Unlike :func:`sketch`, memory is
+    bounded by `~|distinct k-mers| / scale`, not by a fixed constant -- the
+    sketch's size tracks the file's true k-mer cardinality, which is what
+    removes the size-mismatch bias `Sketch.containment` has (see
+    `FracSketch`'s docstring).
+
+    `scale=1000` by default (a k-mer's hash is kept with probability
+    1/1000) -- the same order of magnitude commonly used for scaled
+    sketching in the literature. A smaller `scale` keeps more hashes (finer
+    resolution, more memory); a larger one keeps fewer.
+    """
+    return FracSketch(_core.frac_sketch(str(path), k, scale))
+
+
+def load_frac_sketch(path):
+    """Loads a FracSketch previously written by `FracSketch.save`."""
+    return FracSketch(_core.load_frac_sketch(str(path)))
+
+
 def compare(path_a, path_b, *, k=21, sketch_size=1000):
     """Sugar for building two sketches and comparing them in one call:
     `fastdna.compare(a, b)` is `fastdna.sketch(a).jaccard(fastdna.sketch(b))`.
