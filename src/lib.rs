@@ -1,6 +1,7 @@
 // src/lib.rs
 
 pub mod atomic;
+pub mod binned;
 pub mod cli;
 pub mod cms;
 pub mod cohort;
@@ -15,11 +16,13 @@ pub mod ffi;
 pub mod kmer;
 pub mod mem_estimate;
 pub mod metagenomics;
+pub mod minimizer;
 pub mod pipeline;
 pub mod preview;
 pub mod progress;
 pub mod qc;
 pub mod sketch;
+pub mod superkmer;
 pub mod translate;
 pub mod wasm;
 
