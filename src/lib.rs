@@ -19,6 +19,7 @@ pub mod preview;
 pub mod progress;
 pub mod qc;
 pub mod sketch;
+pub mod translate;
 pub mod wasm;
 
 pub use error::{FastDnaError, Result};
