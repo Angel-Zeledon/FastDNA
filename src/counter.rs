@@ -257,7 +257,7 @@ fn finalize_inner(inner: &mut Inner) {
 /// source into a single growing accumulator (see `MAX_PENDING_RUNS`).
 /// Consumes `sources` rather than borrowing, so `consolidate` does not
 /// need to clone runs it is about to discard.
-fn k_way_merge_sorted_counts(mut sources: Vec<Vec<(u64, u32)>>) -> Vec<(u64, u32)> {
+pub(crate) fn k_way_merge_sorted_counts(mut sources: Vec<Vec<(u64, u32)>>) -> Vec<(u64, u32)> {
     match sources.len() {
         0 => return Vec::new(),
         // A single source is already exactly what a merge of one source
