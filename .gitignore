@@ -19,3 +19,6 @@ __pycache__/
 # Local virtualenvs used for wheel testing
 .venv/
 venv/
+
+# Agent worktrees (full checkouts, never part of the repo)
+.claude/worktrees/
