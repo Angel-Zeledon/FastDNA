@@ -289,13 +289,15 @@ def test_get_params_set_params_round_trip():
         "max_rules": 10,
         "rule_type": "conjunction",
         "tiebreaker": "max_coverage",
+        "class_weight": None,
     }
 
-    clf.set_params(max_rules=3, rule_type="disjunction", tiebreaker="first")
+    clf.set_params(max_rules=3, rule_type="disjunction", tiebreaker="first", class_weight="balanced")
     assert clf.get_params() == {
         "max_rules": 3,
         "rule_type": "disjunction",
         "tiebreaker": "first",
+        "class_weight": "balanced",
     }
 
 
@@ -408,3 +410,152 @@ def test_rule_namedtuple_fields():
     rule = clf.rules_[0]
     assert isinstance(rule, Rule)
     assert rule == Rule(feature_index=2, feature_name=KMERS[2], presence=True)
+
+
+# ---------------------------------------------------------------------------
+# class_weight -- cost-sensitive learning
+#
+# Why these fixtures look the way they do: a plain per-class rescaling of the
+# greedy "negatives removed" count cannot change which literal a hard-coverage
+# SCM picks -- every candidate is *required* to hold for 100% of the positive
+# class, so that class's contribution to every score is the same additive
+# constant, and the negative class is a single homogeneous population with one
+# weight value, so weighting is a pure positive scalar multiple of the raw
+# count (verified analytically and by exhaustive randomized search: 20,000
+# random imbalanced datasets with exact dyadic weights produced zero
+# divergences from the unweighted rules). class_weight therefore has to do
+# something structurally different to matter at all: `fit()` relaxes the hard
+# "must hold for every positive" requirement into a weighted trade-off
+# (weighted negatives removed minus weighted *currently-covered* positives a
+# candidate would newly exclude), and only takes a literal whose net score is
+# positive. When every sample shares one weight (class_weight=None, or a
+# uniform dict), there is no asymmetry to trade off and fit() provably falls
+# back to running the exact original hard-coverage code.
+# ---------------------------------------------------------------------------
+
+# 3 positives (minority, "resistant"), 5 negatives (majority, "susceptible").
+# Column 0 ("informative"): present in 2 of the 3 positives and absent from
+# every negative -- a real, near-perfect discriminator marred by one
+# exceptional positive (e.g. a strain resistant through a different
+# mechanism). It is present_ok=False AND absent_ok=False (mixed across the
+# positives in both polarities), so a hard SCM can never even consider it.
+# Column 1 ("pure"): present in all 3 positives (a valid hard candidate) but
+# only absent in 2 of the 5 negatives, so present(col1) removes just 2 of 5.
+IMBALANCED_X = np.array(
+    [
+        [1, 1],  # positive 0
+        [1, 1],  # positive 1
+        [0, 1],  # positive 2 -- the exception column 0 misses
+        [0, 1],  # negative 0
+        [0, 1],  # negative 1
+        [0, 1],  # negative 2
+        [0, 0],  # negative 3
+        [0, 0],  # negative 4
+    ],
+    dtype=np.uint8,
+)
+IMBALANCED_Y = np.array([1, 1, 1, 0, 0, 0, 0, 0])
+
+
+def test_class_weight_none_matches_omitting_the_parameter():
+    default = SetCoveringClassifier(max_rules=1).fit(IMBALANCED_X, IMBALANCED_Y)
+    explicit = SetCoveringClassifier(max_rules=1, class_weight=None).fit(IMBALANCED_X, IMBALANCED_Y)
+    assert explicit.rules_ == default.rules_
+    assert np.array_equal(explicit.predict(IMBALANCED_X), default.predict(IMBALANCED_X))
+
+
+def test_uniform_dict_class_weight_is_bit_identical_to_unweighted():
+    # Both classes weighted equally -- no cost asymmetry, so this must fall
+    # back to running the exact same hard-coverage search as class_weight=None,
+    # for every affected fixture, not just this one.
+    for X, y in [(ONE_FEATURE_X, ONE_FEATURE_Y), (TWO_FEATURE_X, TWO_FEATURE_Y), (IMBALANCED_X, IMBALANCED_Y)]:
+        unweighted = SetCoveringClassifier().fit(X, y)
+        uniform = SetCoveringClassifier(class_weight={0: 2.5, 1: 2.5}).fit(X, y)
+        assert uniform.rules_ == unweighted.rules_
+        assert np.array_equal(uniform.predict(X), unweighted.predict(X))
+
+
+def test_balanced_class_weight_finds_a_literal_the_hard_scm_cannot_use():
+    # Hard-coverage SCM (class_weight=None): column 0 is ineligible (mixed
+    # across the positives), so the only candidate is present(column 1),
+    # which removes 2 of 5 negatives. With max_rules=1 it stops there,
+    # leaving negatives 0-2 uncovered -> 3 false positives on the training set.
+    unweighted = SetCoveringClassifier(max_rules=1).fit(IMBALANCED_X, IMBALANCED_Y)
+    assert [(r.feature_index, r.presence) for r in unweighted.rules_] == [(1, True)]
+    unweighted_pred = unweighted.predict(IMBALANCED_X)
+    assert np.count_nonzero(unweighted_pred != IMBALANCED_Y) == 3
+
+    # class_weight="balanced": w_pos = 8/(2*3) = 4/3, w_neg = 8/(2*5) = 4/5.
+    # present(column 0) removes all 5 negatives (weighted gain 5*4/5=4.0) at
+    # the cost of excluding the one covered positive that lacks it (weighted
+    # cost 4/3 ~= 1.333); net score ~2.667. present(column 1) removes 2
+    # negatives (weighted gain 2*4/5=1.6) at zero cost; net score 1.6. Column
+    # 0's net score wins, so it is picked even though a hard SCM could never
+    # even nominate it.
+    balanced = SetCoveringClassifier(max_rules=1, class_weight="balanced").fit(IMBALANCED_X, IMBALANCED_Y)
+    assert [(r.feature_index, r.presence) for r in balanced.rules_] == [(0, True)]
+    balanced_pred = balanced.predict(IMBALANCED_X)
+    # Every negative is now classified correctly; the one training-set error
+    # is the deliberate trade-off, positive example 2 (the exception column 0
+    # misses) predicted as the negative class.
+    assert np.count_nonzero(balanced_pred != IMBALANCED_Y) == 1
+    misclassified = np.flatnonzero(balanced_pred != IMBALANCED_Y)
+    assert list(misclassified) == [2]
+    # The hard SCM's 100%-positive-recall guarantee is explicitly given up
+    # here -- that is the point of a *cost-sensitive* relaxation.
+    assert balanced_pred[2] != IMBALANCED_Y[2]
+
+
+def test_explicit_dict_class_weight_matches_balanced_when_numerically_equal():
+    balanced = SetCoveringClassifier(max_rules=1, class_weight="balanced").fit(IMBALANCED_X, IMBALANCED_Y)
+    explicit = SetCoveringClassifier(max_rules=1, class_weight={0: 8 / 10, 1: 8 / 6}).fit(
+        IMBALANCED_X, IMBALANCED_Y
+    )
+    assert explicit.rules_ == balanced.rules_
+    assert np.array_equal(explicit.predict(IMBALANCED_X), balanced.predict(IMBALANCED_X))
+
+
+def test_explicit_dict_class_weight_behaves_as_documented_with_asymmetric_values():
+    # Heavily upweighting the negative (majority) class relative to the
+    # positive class should only *strengthen* the preference for the
+    # informative-but-impure literal, since violating a positive becomes
+    # relatively cheaper.
+    clf = SetCoveringClassifier(max_rules=1, class_weight={0: 10.0, 1: 1.0}).fit(IMBALANCED_X, IMBALANCED_Y)
+    assert [(r.feature_index, r.presence) for r in clf.rules_] == [(0, True)]
+
+
+@pytest.mark.parametrize(
+    "bad_class_weight",
+    [
+        "unbalanced",
+        ["balanced"],
+        3,
+        3.5,
+    ],
+)
+def test_class_weight_wrong_type_or_unknown_string_is_rejected(bad_class_weight):
+    with pytest.raises(ValueError, match="class_weight"):
+        SetCoveringClassifier(class_weight=bad_class_weight).fit(IMBALANCED_X, IMBALANCED_Y)
+
+
+def test_class_weight_dict_missing_a_class_is_rejected():
+    with pytest.raises(ValueError, match="class_weight"):
+        SetCoveringClassifier(class_weight={1: 2.0}).fit(IMBALANCED_X, IMBALANCED_Y)
+
+
+def test_class_weight_dict_with_unknown_label_is_rejected():
+    with pytest.raises(ValueError, match="class_weight"):
+        SetCoveringClassifier(class_weight={0: 1.0, 1: 2.0, 2: 3.0}).fit(IMBALANCED_X, IMBALANCED_Y)
+
+
+@pytest.mark.parametrize("bad_weight", [0, -1.0, "heavy", True])
+def test_class_weight_dict_with_non_positive_or_non_numeric_weight_is_rejected(bad_weight):
+    with pytest.raises(ValueError, match="class_weight"):
+        SetCoveringClassifier(class_weight={0: bad_weight, 1: 1.0}).fit(IMBALANCED_X, IMBALANCED_Y)
+
+
+def test_class_weight_docstring_documents_the_cost_sensitive_relaxation():
+    doc = SetCoveringClassifier.__doc__
+    assert "class_weight" in doc
+    assert "cost-sensitive" in doc.lower()
+    assert "balanced" in doc

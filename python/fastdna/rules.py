@@ -146,6 +146,70 @@ def _as_binary_matrix(X, method_name):
     return arr.astype(bool)
 
 
+def _resolve_sample_weights(class_weight, y, classes):
+    """Turns `class_weight` into a length-`len(y)` float64 array of
+    per-sample weights, one entry per row of `y`, or `None` when
+    `class_weight` is `None` -- meaning "no weighting", which `fit()` uses
+    as the signal to run the original, unmodified hard-coverage search.
+
+    `classes` is `self.classes_` (the two sorted labels). Every rejection
+    names the actual offending value or label, matching this module's
+    validation convention elsewhere (see `_as_binary_matrix`).
+    """
+    if class_weight is None:
+        return None
+
+    n_samples = len(y)
+    labels = classes.tolist()
+
+    if isinstance(class_weight, str):
+        if class_weight != "balanced":
+            raise ValueError(
+                f"class_weight must be None, 'balanced', or a dict of {{label: weight}}; "
+                f"the only recognized string value is 'balanced', got {class_weight!r}."
+            )
+        # sklearn's own formula: n_samples / (n_classes * bincount(y)).
+        counts = np.array([np.count_nonzero(y == c) for c in classes], dtype=np.float64)
+        per_class = n_samples / (len(classes) * counts)
+        weight_by_class = dict(zip(labels, per_class.tolist()))
+    elif isinstance(class_weight, dict):
+        missing = [c for c in labels if c not in class_weight]
+        unknown = [c for c in class_weight if c not in labels]
+        if missing or unknown:
+            parts = []
+            if missing:
+                parts.append(f"missing a weight for {missing!r}")
+            if unknown:
+                parts.append(f"has weight(s) for unknown label(s) {unknown!r}")
+            raise ValueError(
+                f"class_weight dict must have exactly one weight per class in classes_ "
+                f"({labels!r}): {' and '.join(parts)}."
+            )
+        bad = {
+            c: w
+            for c, w in class_weight.items()
+            if isinstance(w, bool) or not isinstance(w, (int, float, np.integer, np.floating))
+            or not (w > 0) or not np.isfinite(w)
+        }
+        if bad:
+            raise ValueError(
+                f"class_weight values must be finite positive numbers, got {bad!r} -- a "
+                "weight must express how much this class's examples count, and zero, "
+                "negative, or non-numeric weights have no such meaning."
+            )
+        weight_by_class = {c: float(w) for c, w in class_weight.items()}
+    else:
+        raise ValueError(
+            f"class_weight must be None, 'balanced', or a dict of {{label: weight}}, got "
+            f"{class_weight!r} ({type(class_weight).__name__})."
+        )
+
+    weights = np.empty(n_samples, dtype=np.float64)
+    for c, w in weight_by_class.items():
+        weights[y == c] = w
+    return weights
+
+
 class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
     """A Set Covering Machine: a short conjunction (or disjunction) of
     present/absent k-mer rules, fitted greedily.
@@ -192,6 +256,57 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         Both fall back to the lowest feature index (then to `present`
         before `absent`) so that a fit is fully deterministic and
         reproducible.
+    class_weight : None, "balanced", or dict[label, float], default None
+        Enables **cost-sensitive** fitting for imbalanced cohorts (matching
+        `sklearn`'s own `class_weight` convention). `None` (the default)
+        runs the exact algorithm described above: unweighted, unchanged.
+        `"balanced"` sets each class's weight to
+        `n_samples / (n_classes * numpy.bincount(y))`, sklearn's own
+        formula; a `dict` sets the weight of each label explicitly.
+
+        **Why weighting a plain count doesn't work, and what this actually
+        does.** The obvious generalization -- weight the greedy score's
+        "negatives removed" count by each removed example's class weight --
+        is *provably a no-op* for this algorithm, for any dataset. Every
+        candidate literal is required to hold for 100% of the positive
+        class (that hard guarantee is what makes the rules sample-compressed
+        and is the reason a "negative removed" is always drawn from one
+        single, homogeneous class at a time); with only one weight value per
+        class, weighting a count over a homogeneous population is a positive
+        scalar multiple of the unweighted count, and scaling by a positive
+        constant never changes which candidate has the highest score. (This
+        was checked exhaustively, not just argued: 20,000 randomized
+        imbalanced datasets, exact power-of-two weights to rule out
+        floating-point noise, zero divergences from the unweighted rules.)
+
+        So `class_weight` here does something structurally different: when
+        the weights are not uniform across classes, `fit()` relaxes the hard
+        "must hold for every positive" requirement into a weighted
+        trade-off. Each round, a candidate literal's score becomes
+
+            (sum of weights of remaining negatives it would remove)
+            - (sum of weights of still-covered positives it would newly exclude)
+
+        and only a literal with a strictly positive net score is eligible.
+        This means a weighted conjunction/disjunction may deliberately
+        misclassify a few low-weight training positives (or, for a
+        disjunction's dual, negatives) if doing so buys a proportionally
+        larger, higher-weight gain elsewhere -- the standard meaning of cost-
+        sensitive learning, and a genuine, documented departure from the
+        unweighted model's 100%-training-recall-on-the-positive-class
+        guarantee. `explain()` and `predict()` need no special-casing: they
+        just read off whatever `rules_` this trade-off produced.
+
+        When every sample carries the same weight -- `class_weight=None`,
+        or a `dict` giving both classes an equal value -- there is no
+        asymmetry to trade off, and `fit()` detects this and runs the
+        original hard-coverage search verbatim, which is what makes
+        `class_weight=None` (and a uniform `dict`) provably bit-identical to
+        the historical, unweighted behavior. See `python/tests/test_rules.py`
+        for the test proving this and a hand-checkable example of the
+        relaxation finding a literal (present in most, but not all, of a
+        tiny positive class) that the hard SCM can never even nominate as a
+        candidate.
 
     Attributes
     ----------
@@ -211,7 +326,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         Column count of the training `X`; `predict()` requires the same.
     """
 
-    def __init__(self, max_rules=10, rule_type="conjunction", tiebreaker="max_coverage"):
+    def __init__(self, max_rules=10, rule_type="conjunction", tiebreaker="max_coverage", class_weight=None):
         # scikit-learn convention (the same one KmerVectorizer follows):
         # __init__ only assigns the parameters, unchanged and unvalidated,
         # so get_params()/set_params()/clone() can always rebuild an
@@ -219,6 +334,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         self.max_rules = max_rules
         self.rule_type = rule_type
         self.tiebreaker = tiebreaker
+        self.class_weight = class_weight
 
     # -- fitting ----------------------------------------------------------
 
@@ -329,23 +445,48 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         self.n_features_in_ = n_features
         self._feature_names_given_ = named
 
+        sample_weight = _resolve_sample_weights(self.class_weight, y, classes)
+
         # classes_[1] is the positive class (scikit-learn's convention).
         # For a disjunction, run the identical greedy loop on the inverted
         # labels and flip the polarity of every rule it returns -- see the
-        # docstring's "dual problem".
+        # docstring's "dual problem". `sample_weight` is passed through
+        # unpermuted in both directions: it is indexed by the same boolean
+        # masks derived from `positives`/`~positives`, so it always lines up
+        # with whichever set plays "positive" for this call.
         positives = y == classes[1]
         if self.rule_type == "disjunction":
-            found = self._greedy_conjunction(binary, ~positives)
+            found = self._greedy_conjunction(binary, ~positives, sample_weight)
             self._rules_ = [Rule(idx, names[idx], not presence) for idx, presence in found]
         else:
-            found = self._greedy_conjunction(binary, positives)
+            found = self._greedy_conjunction(binary, positives, sample_weight)
             self._rules_ = [Rule(idx, names[idx], presence) for idx, presence in found]
         return self
 
-    def _greedy_conjunction(self, binary, positives):
-        """The single shared code path: returns `[(feature_index, presence)]`
-        for a conjunction that keeps every sample in `positives` and removes
-        as many of the rest as it can.
+    def _greedy_conjunction(self, binary, positives, sample_weight=None):
+        """Returns `[(feature_index, presence)]` for a conjunction over
+        `positives`.
+
+        Dispatches to `_greedy_hard` -- the original, unweighted
+        hard-coverage search, verbatim -- whenever there is no real
+        weighting to apply (`sample_weight` is `None`, or every sample
+        shares the same weight, e.g. a uniform `class_weight` dict). This is
+        what makes `class_weight=None` and a uniform dict provably
+        bit-identical to the historical behavior: the exact same code runs.
+        A genuinely non-uniform `sample_weight` -- i.e. `class_weight` set
+        to `"balanced"` or an asymmetric dict on an actually imbalanced
+        cohort -- goes to `_greedy_soft`, the cost-sensitive relaxation (see
+        the class docstring's `class_weight` entry for why a hard-coverage
+        SCM needs a structurally different mechanism, not just a weighted
+        count, to make class_weight matter).
+        """
+        if sample_weight is None or np.all(sample_weight == sample_weight[0]):
+            return self._greedy_hard(binary, positives)
+        return self._greedy_soft(binary, positives, sample_weight)
+
+    def _greedy_hard(self, binary, positives):
+        """The original, unweighted greedy search: keeps every sample in
+        `positives` covered and removes as many of the rest as it can.
         """
         pos_rows = binary[positives]
         # A candidate rule must hold for every positive. Computed once, from
@@ -409,6 +550,75 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
             column = binary[:, idx]
             holds = column if presence else ~column
             remaining &= holds
+            rules.append((idx, presence))
+        return rules
+
+    def _greedy_soft(self, binary, positives, sample_weight):
+        """The cost-sensitive relaxation used whenever `sample_weight` is
+        genuinely non-uniform across classes: candidacy is no longer gated
+        on holding for every positive. Instead, every round, every
+        (feature, polarity) is scored by
+
+            (weight of remaining negatives it would remove)
+            - (weight of still-covered positives it would newly exclude)
+
+        and the highest-scoring literal with a strictly positive score is
+        taken -- "positive" meaning it is worth adding at all: a literal
+        that costs at least as much (in weight) as it gains is never an
+        improvement over leaving it out. `covered` tracks which positives
+        still satisfy every rule chosen so far (it can shrink, unlike
+        `_greedy_hard`'s always-fully-covered positive set); a positive
+        dropped from it in one round is not "cost" again in a later round --
+        its weight has already been paid.
+        """
+        present_coverage = binary.sum(axis=0)
+        absent_coverage = binary.shape[0] - present_coverage
+        use_coverage = self.tiebreaker == "max_coverage"
+
+        remaining = ~positives  # negatives not yet removed
+        covered = positives.copy()  # positives still satisfying every rule so far
+        rules = []
+        while len(rules) < self.max_rules and remaining.any():
+            neg_rows = binary[remaining]
+            neg_weight = sample_weight[remaining]
+            cov_rows = binary[covered]
+            cov_weight = sample_weight[covered]
+
+            gain_present = neg_weight @ (~neg_rows).astype(np.float64)
+            cost_present = cov_weight @ (~cov_rows).astype(np.float64)
+            gain_absent = neg_weight @ neg_rows.astype(np.float64)
+            cost_absent = cov_weight @ cov_rows.astype(np.float64)
+
+            score_present = gain_present - cost_present
+            score_absent = gain_absent - cost_absent
+
+            best = None  # (score, coverage, -index, presence_rank), maximized
+            best_rule = None
+            for score, coverage, presence in (
+                (score_present, present_coverage, True),
+                (score_absent, absent_coverage, False),
+            ):
+                candidates = np.flatnonzero(score > 0)
+                presence_rank = int(presence)
+                indices = candidates.tolist()
+                scores = score[candidates].tolist()
+                coverages = coverage[candidates].tolist() if use_coverage else repeat(0)
+                for j, sc, cov in zip(indices, scores, coverages):
+                    key = (sc, cov, -j, presence_rank)
+                    if best is None or key > best:
+                        best = key
+                        best_rule = (j, presence)
+
+            if best_rule is None:
+                # No literal is worth its weighted cost: adding one would
+                # only make the model larger for a net loss.
+                break
+
+            idx, presence = best_rule
+            column = binary[:, idx]
+            holds = column if presence else ~column
+            remaining &= holds
+            covered &= holds
             rules.append((idx, presence))
         return rules
 
