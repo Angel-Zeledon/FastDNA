@@ -8,6 +8,7 @@ use std::thread;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::prelude::*;
 
+use crate::binned::{BinStore, BinnedConfig};
 use crate::counter::KmerCounter;
 use crate::disk_spill::{self, ScratchDir, SpillWriter};
 use crate::error::{FastDnaError, Result};
@@ -614,19 +615,31 @@ pub fn process_stream_parallel<S: RecordSource>(
     Ok((master_counter, master_qc, total_reads))
 }
 
-/// Which of FastDNA's two counting strategies produced a result.
+/// Which of FastDNA's counting strategies produced a result.
 ///
 /// `InMemory` (`process_stream_parallel`) sorts and compacts entirely in
-/// RAM and is the faster of the two whenever the input fits; `Disk` (see
+/// RAM and is the fastest whenever the input fits; `Disk` (see
 /// `disk_spill.rs`) partitions k-mers into buckets, spills each to scratch
 /// files, and merges bucket by bucket so only one bucket is resident at
 /// once, trading speed for a peak memory footprint that does not scale
 /// with `threads * distinct_kmers` the way the in-memory strategy's does
 /// (see `mem_estimate.rs` for the measured reason that scaling exists).
+///
+/// `Binned` (see `binned.rs`) partitions by canonical minimizer instead,
+/// storing runs of consecutive k-mers that share a bin as 2-bit packed
+/// super-k-mers rather than one `u64` per occurrence, and counting bin by
+/// bin in RAM. It is **opt-in only**: `resolve_strategy`'s automatic
+/// chooser never selects it, and `--strategy binned` /
+/// `FASTDNA_STRATEGY=binned` are the only ways to reach it. That is
+/// deliberate -- `docs/design-minimizer-counting.md` §5 step 6 makes
+/// promoting it to the automatic chooser a separate, later decision, to be
+/// taken only once a real (non-synthetic) sample has been counted correctly
+/// and a per-bin occupancy report examined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountStrategy {
     InMemory,
     Disk,
+    Binned,
 }
 
 impl CountStrategy {
@@ -634,6 +647,7 @@ impl CountStrategy {
         match self {
             CountStrategy::InMemory => "in-memory",
             CountStrategy::Disk => "disk",
+            CountStrategy::Binned => "binned",
         }
     }
 }
@@ -689,7 +703,8 @@ pub struct StrategyDecision {
 /// act on it, with no risk of the two disagreeing.
 ///
 /// Resolution order: an explicit `policy.strategy` wins outright. Failing
-/// that, `FASTDNA_STRATEGY` (`disk`, or `memory`/`in-memory`) is checked --
+/// that, `FASTDNA_STRATEGY` (`disk`, `memory`/`in-memory`, or `binned`) is
+/// checked --
 /// an escape hatch for forcing a strategy through callers that have no
 /// dedicated API surface for it yet, most notably the Python bindings
 /// (`ffi.rs`'s `count()` takes no strategy argument, and adding one is out
@@ -702,6 +717,13 @@ pub struct StrategyDecision {
 /// from and this always resolves to `InMemory` -- the conservative choice
 /// for library callers who have not told this function enough to justify
 /// spilling to disk.
+///
+/// The automatic arm chooses between `InMemory` and `Disk` and **nothing
+/// else**: `CountStrategy::Binned` is reachable only by being named, in
+/// `policy.strategy` or in `FASTDNA_STRATEGY`. `the_automatic_chooser_never_
+/// selects_the_binned_strategy` pins that, because promoting it is §5 step 6
+/// -- a separate decision that is explicitly out of scope until a real
+/// sample has been counted correctly.
 pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> StrategyDecision {
     let env_max_ram = std::env::var("FASTDNA_MAX_RAM_BYTES").ok().and_then(|s| s.trim().parse::<u64>().ok());
     let budget_bytes = policy
@@ -716,6 +738,11 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
     let env_strategy = std::env::var("FASTDNA_STRATEGY").ok().and_then(|s| match s.trim() {
         "disk" => Some(CountStrategy::Disk),
         "memory" | "in-memory" => Some(CountStrategy::InMemory),
+        // Reachable only by asking for it by name, exactly like the two
+        // above -- and unlike them, it is never reachable any other way.
+        // The `auto` arm below deliberately does not know this variant
+        // exists; see `CountStrategy::Binned`.
+        "binned" => Some(CountStrategy::Binned),
         _ => None,
     });
 
@@ -964,8 +991,190 @@ fn process_stream_parallel_disk<S: RecordSource>(
     Ok((counter, master_qc, total_reads))
 }
 
+/// The binned strategy's per-worker outcome. Only a `QcSummary`: the
+/// counting result itself never passes through here, because the whole
+/// point is that a worker writes into the shared `BinStore` instead of
+/// building anything of its own.
+type BinnedWorkerOutcome = std::result::Result<QcSummary, String>;
+
+/// The minimizer-partitioned counting strategy
+/// (`docs/design-minimizer-counting.md`, and see `binned.rs` for the
+/// algorithm).
+///
+/// Structurally a sibling of `process_stream_parallel` and
+/// `process_stream_parallel_disk`, not a variant of either, for the same
+/// reason those two are siblings of each other: this strategy's own bugs
+/// must not be able to reach back into the two already-tested paths. The
+/// producer (`spawn_producer`) is shared, as it is between those two, and
+/// nothing strategy-specific lives in it.
+///
+/// What a worker does per record is deliberately the same shape as the other
+/// two -- `qc.observe_record` before trimming, then `quality_trim_end`, then
+/// the k-mer work -- so `tests/dual_strategy.rs` can require all three to be
+/// indistinguishable from their counts alone. The one difference is the last
+/// step: instead of extracting a `Vec<u64>` of occurrences, the worker cuts
+/// the sequence into super-k-mers and appends each to its bin's open chunk.
+///
+/// `config` must already be valid (`process_stream_parallel_with_policy`
+/// validates it before choosing a strategy).
+fn process_stream_parallel_binned<S: RecordSource>(
+    reader: S,
+    config: PipelineConfig,
+    source: &Path,
+    progress: ProgressFn<'_>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(KmerCounter, QcSummary, u64)> {
+    let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(CHANNEL_DEPTH);
+    let (recycle_tx, recycle_rx): (Sender<RecordBatch>, Receiver<RecordBatch>) =
+        bounded(recycle_depth(config.num_threads));
+
+    let k = config.k;
+    let min_qual = config.min_quality;
+    let qual_win = config.quality_window;
+    let progress_interval = config.progress_interval;
+
+    // The one piece of shared state, and it is shared by design: worker 3's
+    // and worker 5's super-k-mers for bin 17 are disjoint pieces of one
+    // store rather than two private copies of the same summary. See
+    // `binned.rs` for why that is what removes the `threads * occurrences`
+    // term from the memory model.
+    let store = BinStore::new(BinnedConfig::new(k));
+
+    // 1. Producer thread -- the same one the other two strategies use.
+    let reader_handle = spawn_producer(
+        reader,
+        sender,
+        recycle_rx,
+        config.batch_size,
+        source.to_path_buf(),
+        cancel.clone(),
+    );
+
+    let reads_seen = AtomicU64::new(0);
+    // Counted exactly the way `KmerCounter::insert_batch` counts its own --
+    // every instance handed over, before any per-key saturation -- so that
+    // `total_kmers()` matches the other two strategies bit for bit and not
+    // merely the distinct-k-mer table.
+    let total_occurrences = AtomicU64::new(0);
+
+    // 2. Parallel consumer pool.
+    let results: Vec<BinnedWorkerOutcome> = (0..config.num_threads)
+        .into_par_iter()
+        .map(|_| {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let mut writer = store.writer();
+                let mut local_qc = QcSummary::default();
+
+                while let Ok(mut batch) = receiver.recv() {
+                    if let Some(tok) = &cancel {
+                        if tok.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+
+                    let n = batch.len() as u64;
+                    // Accumulated locally and published once per batch, not
+                    // once per record: same reasoning as the disk strategy's
+                    // worker loop.
+                    let mut batch_occurrences: u64 = 0;
+
+                    for record in &mut batch {
+                        local_qc.observe_record(record);
+                        record.quality_trim_end(min_qual, qual_win);
+
+                        // The binned counterpart of
+                        // `extract_canonical_kmers_into` + `insert_batch`.
+                        // The returned occurrence count is exactly
+                        // `extract_canonical_kmers(&record.seq, k).len()` --
+                        // that equality is the multiset invariant
+                        // `superkmer.rs` proves, and it is what keeps
+                        // `total_kmers()` identical across strategies.
+                        batch_occurrences += writer.push_sequence(&store, &record.seq) as u64;
+                    }
+
+                    total_occurrences.fetch_add(batch_occurrences, Ordering::Relaxed);
+
+                    let _ = recycle_tx.try_send(batch);
+
+                    if let Some(emit) = progress {
+                        let prev = reads_seen.fetch_add(n, Ordering::Relaxed);
+                        if prev / progress_interval != (prev + n) / progress_interval {
+                            emit(Progress::ReadsProcessed(prev + n));
+                        }
+                    }
+                }
+
+                // Publishes this worker's partially filled chunks. Skipping
+                // it would silently drop up to `bins * chunk_bytes` of
+                // super-k-mers per worker -- the tail of the input -- which
+                // is exactly the R2 class of failure, so it is not left to
+                // a `Drop` impl that a panic or an early return could make
+                // conditional.
+                writer.finish(&store);
+                local_qc
+            }));
+
+            match outcome {
+                Ok(qc) => {
+                    if cancel.as_ref().is_some_and(|tok| tok.load(Ordering::Relaxed)) {
+                        while receiver.recv().is_ok() {}
+                    }
+                    Ok(qc)
+                }
+                Err(payload) => {
+                    // Drain so the bounded channel never backs up and blocks
+                    // the producer, even if this was the only worker still
+                    // consuming.
+                    while receiver.recv().is_ok() {}
+                    Err(panic_message(payload))
+                }
+            }
+        })
+        .collect();
+
+    let total_reads = reader_handle
+        .join()
+        .map_err(|_| FastDnaError::Internal { detail: "FASTQ reader thread panicked".to_string() })??;
+
+    let mut worker_panic: Option<String> = None;
+    let mut master_qc = QcSummary::default();
+    for outcome in results {
+        match outcome {
+            Ok(qc) => master_qc.merge(&qc),
+            Err(detail) => {
+                if worker_panic.is_none() {
+                    worker_panic = Some(detail);
+                }
+            }
+        }
+    }
+    if let Some(detail) = worker_panic {
+        return Err(FastDnaError::Internal { detail });
+    }
+
+    if cancel.as_ref().is_some_and(|tok| tok.load(Ordering::Relaxed)) {
+        return Err(FastDnaError::Cancelled);
+    }
+
+    master_qc.finalize();
+
+    // 3. Phase 2 plus the cross-bin merge. A bin's chunks are freed as soon
+    // as they have been expanded, and the merge is streaming, so the only
+    // thing that grows here is the final table.
+    let merged = store.finish();
+    let counter = KmerCounter::from_sorted_entries(merged, total_occurrences.load(Ordering::Relaxed));
+
+    if let Some(emit) = progress {
+        if catch_unwind(AssertUnwindSafe(|| emit(Progress::Finished { reads: total_reads }))).is_err() {
+            return Err(FastDnaError::Internal { detail: "progress callback panicked".to_string() });
+        }
+    }
+
+    Ok((counter, master_qc, total_reads))
+}
+
 /// Streams a FASTQ source and returns its canonical k-mer counts, choosing
-/// between FastDNA's two counting strategies automatically (or as forced
+/// between FastDNA's counting strategies automatically (or as forced
 /// by `policy`) and reporting which one ran.
 ///
 /// This is `process_stream_parallel` plus strategy selection, not a
@@ -990,6 +1199,7 @@ pub fn process_stream_parallel_with_policy<S: RecordSource>(
     let (counter, qc, total_reads) = match decision.strategy {
         CountStrategy::InMemory => process_stream_parallel(reader, config, source, progress, cancel)?,
         CountStrategy::Disk => process_stream_parallel_disk(reader, config, source, progress, cancel)?,
+        CountStrategy::Binned => process_stream_parallel_binned(reader, config, source, progress, cancel)?,
     };
 
     Ok((counter, qc, total_reads, decision))
@@ -1079,6 +1289,64 @@ mod tests {
             FastDnaError::Internal { detail } => assert!(detail.contains("index out of bounds")),
             other => panic!("expected Internal, got {other:?}"),
         }
+    }
+
+    /// Every variant must have a distinct, stable name: it is what the CLI
+    /// banner prints and what a report attributes a run to.
+    #[test]
+    fn count_strategy_as_str_names_every_variant_distinctly() {
+        let names = [
+            CountStrategy::InMemory.as_str(),
+            CountStrategy::Disk.as_str(),
+            CountStrategy::Binned.as_str(),
+        ];
+        assert_eq!(names, ["in-memory", "disk", "binned"]);
+        let unique: std::collections::HashSet<&str> = names.into_iter().collect();
+        assert_eq!(unique.len(), names.len(), "two strategies share a name");
+    }
+
+    /// The automatic arm chooses between `InMemory` and `Disk` and nothing
+    /// else. Promoting the binned strategy is §5 step 6 of
+    /// `docs/design-minimizer-counting.md` -- a separate decision, gated on
+    /// a real sample having been counted correctly and a per-bin occupancy
+    /// report examined -- so `auto` must not be able to reach it by any
+    /// combination of estimate and budget.
+    #[test]
+    fn the_automatic_chooser_never_selects_the_binned_strategy() {
+        for input_bytes in [None, Some(0u64), Some(1), Some(4096), Some(2_140_000_000), Some(100 << 30)] {
+            for threads in [1usize, 8, 64] {
+                for max_ram in [None, Some(0u64), Some(1), Some(1 << 40)] {
+                    let policy = MemoryPolicy {
+                        strategy: None,
+                        max_ram_bytes: max_ram,
+                        estimated_input_bytes: input_bytes,
+                    };
+                    let config = PipelineConfig { num_threads: threads, ..PipelineConfig::default() };
+                    let decision = resolve_strategy(&policy, &config);
+                    assert_ne!(
+                        decision.strategy,
+                        CountStrategy::Binned,
+                        "auto reached the opt-in binned strategy at {input_bytes:?} bytes, \
+                         {threads} threads, budget {max_ram:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Forcing the binned strategy through `policy` must be honoured and
+    /// must not be reported as an environment override -- the caller asked
+    /// for it directly.
+    #[test]
+    fn an_explicit_binned_policy_is_honoured_without_claiming_an_env_override() {
+        let policy = MemoryPolicy {
+            strategy: Some(CountStrategy::Binned),
+            max_ram_bytes: Some(1),
+            estimated_input_bytes: Some(100 << 30),
+        };
+        let decision = resolve_strategy(&policy, &PipelineConfig::default());
+        assert_eq!(decision.strategy, CountStrategy::Binned);
+        assert!(!decision.env_override_applied);
     }
 
     /// `env_override_applied` must be false when `--max-ram` shadowed the

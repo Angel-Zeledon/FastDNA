@@ -189,6 +189,7 @@ fn run(args: Cli) -> Result<()> {
             CliStrategy::Auto => None,
             CliStrategy::Memory => Some(CountStrategy::InMemory),
             CliStrategy::Disk => Some(CountStrategy::Disk),
+            CliStrategy::Binned => Some(CountStrategy::Binned),
         },
         max_ram_bytes: args.max_ram,
         estimated_input_bytes,

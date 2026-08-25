@@ -8,11 +8,18 @@ use std::path::PathBuf;
 /// choice to `pipeline::resolve_strategy`'s memory estimate; `Memory` and
 /// `Disk` force one strategy outright, for benchmarking and debugging (see
 /// `pipeline::resolve_strategy`'s doc comment).
+///
+/// `Binned` is the minimizer-partitioned super-k-mer strategy
+/// (`binned.rs`). Unlike the other two it is **not** something `Auto` can
+/// ever pick: naming it here, or setting `FASTDNA_STRATEGY=binned`, is the
+/// only way to run it. Promoting it is a separate, later decision
+/// (`docs/design-minimizer-counting.md` §5 step 6).
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CliStrategy {
     Auto,
     Memory,
     Disk,
+    Binned,
 }
 
 /// User-facing choice of spectrum file format, forwarded into
@@ -146,8 +153,10 @@ pub struct Cli {
 
     /// Force a specific counting strategy instead of letting the memory
     /// estimate choose. "auto" (the default) picks based on the estimated
-    /// peak memory versus --max-ram; "memory" and "disk" force one
-    /// strategy outright, for benchmarking and debugging.
+    /// peak memory versus --max-ram; "memory", "disk" and "binned" force
+    /// one strategy outright, for benchmarking and debugging. "binned" is
+    /// the experimental minimizer-partitioned strategy and "auto" never
+    /// selects it.
     #[arg(long, value_enum, default_value = "auto")]
     pub strategy: CliStrategy,
 }
