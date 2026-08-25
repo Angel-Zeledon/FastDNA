@@ -332,3 +332,56 @@ def test_gather_rejects_invalid_min_containment(tmp_path):
 
     with pytest.raises(ValueError):
         gather(str(path), reference_db, k=11, min_containment=1.5)
+
+
+# ---------------------------------------------------------------------------
+# The score column names its own convention
+# ---------------------------------------------------------------------------
+
+
+class TestScoreColumnNamesItsConvention:
+    """A similarity number whose convention does not travel with it is a
+    trap. `classify(metric="containment")` and `classify(metric="jaccard")`
+    both return a column called `score`, and the two are not comparable:
+    containment is asymmetric and deliberately unpenalized by a size
+    mismatch, Jaccard is neither. Raghava & Barton (BMC Bioinformatics
+    7:415, 2006) measured up to 22 points of spread across percent-identity
+    conventions on one alignment; the lesson generalizes to any similarity
+    a tool emits.
+
+    The metric is recorded in the Arrow schema metadata rather than by
+    renaming the column: metadata survives a Parquet round-trip and breaks
+    no existing consumer, which is the same choice `gwas.py` makes for its
+    screening-only caveat.
+    """
+
+    def _db(self, tmp_path):
+        motif = "ACGTGGCATCAGT"
+        return build_reference_database(
+            {"ref_a": write_fastq(tmp_path, "ref_a.fastq", [repeat_motif(motif, 5)] * 20)},
+            k=11,
+            sketch_size=64,
+        )
+
+    def test_classify_records_which_metric_produced_the_score(self, tmp_path):
+        motif = "ACGTGGCATCAGT"
+        query = write_fastq(tmp_path, "query.fastq", [repeat_motif(motif, 5)] * 20)
+        db = self._db(tmp_path)
+
+        for metric in ("containment", "jaccard"):
+            table = classify(query, db, k=11, sketch_size=64, metric=metric)
+            meta = table.schema.metadata or {}
+            assert meta.get(b"fastdna.metric") == metric.encode(), (
+                f"the score column must say it holds {metric}: {meta}"
+            )
+
+    def test_an_empty_result_still_names_its_metric(self, tmp_path):
+        query = write_fastq(tmp_path, "query.fastq", [repeat_motif("TTAGGCCTAAGGC", 5)] * 20)
+        db = self._db(tmp_path)
+
+        # min_score=1.0 keeps nothing: an empty table is still a typed
+        # result and must carry the same contract as a populated one.
+        table = classify(query, db, k=11, sketch_size=64, metric="jaccard", min_score=1.0)
+        assert table.num_rows == 0
+        meta = table.schema.metadata or {}
+        assert meta.get(b"fastdna.metric") == b"jaccard"

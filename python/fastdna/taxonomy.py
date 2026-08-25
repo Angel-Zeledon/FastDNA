@@ -99,8 +99,30 @@ def build_reference_database(paths_or_dict, *, k=21, sketch_size=1000):
     return {name: _sketch(str(path), k=k, sketch_size=sketch_size) for name, path in items}
 
 
-def _empty_score_table(name_column="name", score_column="score"):
-    return pa.table({name_column: pa.array([], type=pa.string()), score_column: pa.array([], type=pa.float64())})
+def _empty_score_table(name_column="name", score_column="score", metric=None):
+    table = pa.table({name_column: pa.array([], type=pa.string()), score_column: pa.array([], type=pa.float64())})
+    return _stamp_metric(table, metric) if metric is not None else table
+
+
+def _stamp_metric(table, metric):
+    """Records which similarity convention produced the `score` column, in
+    the Arrow schema metadata.
+
+    A bare number called "score" is not self-describing: `containment` is
+    asymmetric and deliberately unpenalized by a size mismatch between
+    query and reference, while `jaccard` is penalized by exactly that, so
+    the two answer different questions and are not comparable to each
+    other. A caller handed a table -- or a Parquet file written from one,
+    months later -- has no way to tell which it is holding.
+
+    Recorded as metadata rather than by renaming the column to `containment`
+    or `jaccard`: metadata survives a Parquet round-trip and breaks no
+    existing consumer, the same trade `gwas.py` makes for its screening-only
+    caveat. Renaming would be more discoverable and is the better shape for
+    a future major version.
+    """
+    existing = table.schema.metadata or {}
+    return table.replace_schema_metadata({**existing, b"fastdna.metric": metric.encode()})
 
 
 def classify(
@@ -177,11 +199,11 @@ def classify(
         scores.append(score)
 
     if not names:
-        return _empty_score_table()
+        return _empty_score_table(metric=metric)
 
     table = pa.table({"name": names, "score": scores})
     table = table.sort_by([("score", "descending")])
-    return table.slice(0, top_n)
+    return _stamp_metric(table.slice(0, top_n), metric)
 
 
 class SampleIdentityResult(NamedTuple):
