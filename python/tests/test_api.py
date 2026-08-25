@@ -45,6 +45,35 @@ def test_count_returns_arrow_table_with_correct_values(tmp_path):
     assert len(r) == 2
 
 
+def test_hpc_absorbs_a_run_internal_indel(tmp_path):
+    # Same fixture as the Rust integration test
+    # (pipeline_hpc_flag_absorbs_a_run_internal_indel_end_to_end): a clean
+    # read with a run of 6 A's, and the same read with one A deleted from
+    # inside that run -- the kind of error long-read platforms make, not
+    # Illumina.
+    clean = "GATCAAAAAATCG"
+    with_deletion = "GATCAAAAATCG"
+    path = write_fastq(tmp_path, [clean, with_deletion])
+
+    without_hpc = fastdna.count(str(path), k=4)
+    # (13-4+1) + (12-4+1) = 19: the raw, uncompressed read lengths.
+    assert without_hpc.total_kmers == 19
+
+    with_hpc = fastdna.count(str(path), k=4, hpc=True)
+    # Both reads collapse to the identical 8-base "GATCATCG", so total
+    # occurrences is exactly double a single compressed read's: (8-4+1)*2.
+    assert with_hpc.total_kmers == 10
+    assert with_hpc.total_kmers != without_hpc.total_kmers
+
+
+def test_hpc_off_by_default_matches_hpc_false_explicitly(tmp_path):
+    path = write_fastq(tmp_path, ["ACGTACGTAC"] * 3)
+    default = fastdna.count(str(path), k=5)
+    explicit = fastdna.count(str(path), k=5, hpc=False)
+    assert default.total_kmers == explicit.total_kmers
+    assert default.distinct_kmers == explicit.distinct_kmers
+
+
 def test_qc_reports_read_and_base_metrics(tmp_path):
     path = write_fastq(tmp_path, ["ACGTACGTAC"] * 3)
     r = fastdna.count(str(path), k=5)

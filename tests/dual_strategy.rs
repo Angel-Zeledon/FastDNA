@@ -1,4 +1,4 @@
-//! Verifies FastDNA's three counting strategies produce bit-identical
+﻿//! Verifies FastDNA's three counting strategies produce bit-identical
 //! results.
 //!
 //! This is the disk-partitioned strategy's acceptance criterion (see
@@ -100,6 +100,7 @@ fn config(k: usize, threads: usize) -> PipelineConfig {
         batch_size: 512,
         num_threads: threads,
         progress_interval: 1_000_000,
+        hpc: false,
     }
 }
 
@@ -241,7 +242,7 @@ fn all_strategies_agree_on_reads_that_yield_no_kmers() {
 
 /// `auto` must never reach the binned strategy, however extreme the
 /// estimate: promoting it is a separate decision
-/// (`docs/design-minimizer-counting.md` §5 step 6, gated on a real sample
+/// (`docs/design-minimizer-counting.md` Â§5 step 6, gated on a real sample
 /// being counted correctly first). Checked here, at the seam a user
 /// actually crosses, as well as in `pipeline.rs`'s own unit tests.
 #[test]

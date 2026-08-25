@@ -166,6 +166,9 @@ fn run(args: Cli) -> Result<()> {
     println!("Output:         {}", args.output.display());
     println!("k-mer Size:     {}", args.kmer_size);
     println!("Quality Cutoff: Q >= {}", args.min_quality);
+    if args.hpc {
+        println!("Homopolymer Compression: on");
+    }
 
     // A single source of truth for the thread-count default: PipelineConfig's
     // own Default impl, not a hardcoded number duplicated here.
@@ -180,6 +183,7 @@ fn run(args: Cli) -> Result<()> {
         batch_size: 10_000,
         num_threads: threads,
         progress_interval: default_config.progress_interval,
+        hpc: args.hpc,
     };
 
     let estimated_input_bytes = estimate_total_input_bytes(&inputs);

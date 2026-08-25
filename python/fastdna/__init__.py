@@ -269,8 +269,21 @@ def count(
     threads=None,
     progress=None,
     progress_interval=100_000,
+    hpc=False,
 ):
     """Count canonical k-mers in a single FASTQ(.gz) file.
+
+    `hpc=True` collapses homopolymer runs (e.g. "AAAAAA" -> "A") before
+    k-mer extraction. Off by default -- output is byte-for-byte identical to
+    `hpc=False`. Turn it on for long-read input (Oxford Nanopore, PacBio),
+    where an insertion or deletion inside a homopolymer run, not a
+    substitution, is the dominant sequencing error; left uncompressed, that
+    single indel shifts and corrupts every k-mer downstream of it. Short-read
+    Illumina data has no need for this. Trades exact base-level positional
+    correspondence with the original read for robustness to those indels:
+    downstream tools that map a k-mer back to a reference coordinate (e.g.
+    `fastdna.annotate`) are working with compressed-sequence offsets, not the
+    original read's.
 
     `threads=None` uses the core's own default thread count. Passing
     `threads=0` explicitly raises `ValueError` rather than hanging -- the
@@ -313,6 +326,7 @@ def count(
         threads=threads,
         progress=adapter,
         progress_interval=progress_interval,
+        hpc=hpc,
     )
     return KmerCounts(raw)
 

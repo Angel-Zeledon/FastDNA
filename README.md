@@ -380,6 +380,7 @@ writes CSV. Every exporter writes the same three columns: `kmer_u64`
 | `--histogram <FILE>` | unset | Optional path to export the frequency spectrum (histogram CSV) |
 | `--strategy <auto\|memory\|disk>` | `auto` | Counting strategy: `auto` picks based on the estimated peak memory versus `--max-ram`; `memory` and `disk` force one strategy outright |
 | `--max-ram <SIZE>` | half of available RAM; 4 GB if undetectable | Memory budget the automatic chooser targets before switching to the disk strategy. Plain byte count or `K`/`M`/`G`/`T` suffix (binary, 1024-based units; `4G`, `4GB`, `4gb` are equivalent) |
+| `--hpc` | off | Collapse homopolymer runs (e.g. `AAAAAA` -> `A`) before k-mer extraction. With the flag absent, output is byte-for-byte identical to today's. Meant for long-read input (Oxford Nanopore, PacBio), where an indel inside a homopolymer run -- not a substitution -- is the dominant sequencing error and, left uncompressed, shifts every k-mer downstream of it; short-read Illumina data has no need for it. Trades exact base-level positional correspondence with the original read for that robustness: a downstream tool mapping a k-mer back to a reference coordinate (e.g. `fastdna.annotate`) is working with compressed-sequence offsets, not the original read's |
 
 At startup the CLI prints the strategy decision it will act on, alongside
 the estimated peak memory and the budget it was compared against:

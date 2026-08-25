@@ -25,6 +25,18 @@ fn min_count_still_defaults_to_one() {
 }
 
 #[test]
+fn hpc_defaults_to_off() {
+    let cli = Cli::parse_from(["fastdna", "--input", "sample.fastq"]);
+    assert!(!cli.hpc, "homopolymer compression must be opt-in");
+}
+
+#[test]
+fn hpc_is_parsed_when_supplied() {
+    let cli = Cli::parse_from(["fastdna", "--input", "sample.fastq", "--hpc"]);
+    assert!(cli.hpc);
+}
+
+#[test]
 fn existing_short_flags_are_unchanged() {
     let cli = Cli::parse_from([
         "fastdna", "--input", "s.fastq", "-k", "21", "-q", "30", "-m", "5",
