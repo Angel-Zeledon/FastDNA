@@ -69,3 +69,23 @@ print_stderr = "deny"
 # here would make a worker panic kill the host Python process with no traceback,
 # and no test would fail, because the suite does not run under this profile.
 panic = "unwind"
+
+# Cross-crate inlining and a single codegen unit. The hot loop calls across
+# module boundaries on every base (base_to_bits, canonical_kmer_u64) and
+# across the arrow/parquet crate boundary on every exported row; without fat
+# LTO those calls survive as calls.
+#
+# Not measured on this project yet, and deliberately not: the only machine
+# available swings a fixed binary between 25 s and 90 s on the same input
+# depending on what Docker and WSL are holding, which cannot resolve a
+# change of this size. This is kept as a reasoned default -- it removes work
+# rather than trading it, and it is hardware-independent, unlike
+# `-C target-cpu=native`, which is deliberately NOT set here: this crate
+# ships wheels, and a binary built for one CPU's instruction set crashes on
+# older machines.
+#
+# The cost is build time, not run time. Revisit with a real measurement when
+# a controlled environment exists (CI, or a machine that is not also running
+# a container runtime).
+lto = "fat"
+codegen-units = 1
