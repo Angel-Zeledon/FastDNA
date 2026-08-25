@@ -5,6 +5,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 use arrow::array::{ArrayRef, StringArray, UInt32Array, UInt64Array};
+use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -49,6 +50,75 @@ pub fn counts_schema() -> Arc<Schema> {
     ]))
 }
 
+/// The column buffers one Parquet chunk is assembled in, held in exactly the
+/// layout Arrow stores those columns as: a `u64` values buffer, a `u32`
+/// values buffer, and -- for the k-mer sequence column -- one contiguous
+/// value buffer plus an `i32` offsets buffer.
+///
+/// This exists to keep the decoded bases from being copied twice. The
+/// straightforward `Vec<String>` version costs, *per exported k-mer*
+/// (53.8 million of them on the benchmark file):
+///
+/// 1. one heap allocation for the `String`,
+/// 2. one `String::from_utf8` scan of `k` bytes that cannot fail, because
+///    every byte came from the `b"ACGT"` literal,
+/// 3. one `memcpy` of those `k` bytes into Arrow's own value buffer inside
+///    `StringArray::from_iter_values`,
+/// 4. one `free` when the chunk is cleared.
+///
+/// Writing the bases straight into `seq_bytes` removes all four: the buffer
+/// *is* Arrow's value buffer (`Buffer::from_vec` takes ownership of the
+/// allocation rather than copying it). Pre-sizing it also removes the
+/// repeated doubling `from_iter_values` does -- it starts its value buffer
+/// at capacity 0 and regrows it to ~4 MB per chunk, copying everything
+/// written so far each time, roughly one extra full-buffer copy in total.
+///
+/// What remains is a single `std::str::from_utf8` over the whole chunk
+/// buffer inside `StringArray::try_new` (the same bytes as before, scanned
+/// contiguously instead of in 53.8 million separate calls) plus one
+/// `is_char_boundary` per row -- a load and a compare, against the
+/// allocate/free pair it replaces.
+struct ChunkBuffers {
+    kmers: Vec<u64>,
+    seq_bytes: Vec<u8>,
+    seq_offsets: Vec<i32>,
+    freqs: Vec<u32>,
+}
+
+impl ChunkBuffers {
+    /// `rows` rows of `k`-base sequences, sized up front so nothing regrows.
+    fn with_capacity(rows: usize, k: usize) -> Self {
+        // An offsets buffer has one more entry than it has values: the
+        // leading 0 that opens the first string.
+        let mut seq_offsets = Vec::with_capacity(rows + 1);
+        seq_offsets.push(0);
+        Self {
+            kmers: Vec::with_capacity(rows),
+            seq_bytes: Vec::with_capacity(rows.saturating_mul(k)),
+            seq_offsets,
+            freqs: Vec::with_capacity(rows),
+        }
+    }
+
+    fn push(&mut self, kmer_bits: u64, k: usize, count: u32) {
+        self.kmers.push(kmer_bits);
+        kmer::decode_kmer_into(kmer_bits, k, &mut self.seq_bytes);
+        // Cast is safe for any chunk Arrow can hold in an i32-offset column;
+        // `export_counts_parquet` caps a chunk at 131 072 rows of at most 32
+        // bases, i.e. 4 MiB, far below `i32::MAX`.
+        self.seq_offsets.push(self.seq_bytes.len() as i32);
+        self.freqs.push(count);
+    }
+
+    fn len(&self) -> usize {
+        self.kmers.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.kmers.is_empty()
+    }
+}
+
 pub fn export_counts_parquet<P: AsRef<Path>>(
     counter: &KmerCounter,
     output_path: P,
@@ -68,29 +138,26 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
     let chunk_size = 131_072;
     let mut total_written = 0;
 
-    let mut u64_chunk = Vec::with_capacity(chunk_size);
-    let mut seq_chunk = Vec::with_capacity(chunk_size);
-    let mut freq_chunk = Vec::with_capacity(chunk_size);
+    let mut chunk = ChunkBuffers::with_capacity(chunk_size, k);
 
     for (kmer_bits, count) in counter.iter() {
         if count >= min_count {
-            u64_chunk.push(kmer_bits);
-            seq_chunk.push(kmer::decode_kmer(kmer_bits, k));
-            freq_chunk.push(count);
+            chunk.push(kmer_bits, k, count);
 
-            if u64_chunk.len() >= chunk_size {
-                write_chunk(&mut writer, &schema, &u64_chunk, &seq_chunk, &freq_chunk, path)?;
-                total_written += u64_chunk.len();
-                u64_chunk.clear();
-                seq_chunk.clear();
-                freq_chunk.clear();
+            if chunk.len() >= chunk_size {
+                total_written += chunk.len();
+                // The buffers are handed to Arrow by move, so a fresh set is
+                // started here: ~410 allocations across the whole benchmark
+                // export, against the 53.8 million this replaces.
+                let full = std::mem::replace(&mut chunk, ChunkBuffers::with_capacity(chunk_size, k));
+                write_chunk(&mut writer, &schema, full, path)?;
             }
         }
     }
 
-    if !u64_chunk.is_empty() {
-        total_written += u64_chunk.len();
-        write_chunk(&mut writer, &schema, &u64_chunk, &seq_chunk, &freq_chunk, path)?;
+    if !chunk.is_empty() {
+        total_written += chunk.len();
+        write_chunk(&mut writer, &schema, chunk, path)?;
     }
 
     // `close` consumes the writer and with it the last handle on the temp
@@ -109,17 +176,27 @@ pub fn export_parquet<P: AsRef<Path>>(
     export_counts_parquet(counter, output_path, k, min_count)
 }
 
+/// Takes the chunk by value so every buffer reaches Arrow as a move.
+/// `UInt64Array::from(Vec<u64>)` and `Buffer::from_vec` both adopt the
+/// existing allocation, so none of the three columns is copied here -- the
+/// previous `&[T]` signature forced a `to_vec()` on each numeric column,
+/// 12 bytes per row (8 for the k-mer, 4 for the count) memcpy'd for nothing,
+/// or ~645 MB across the benchmark's 53.8 million rows.
 fn write_chunk(
     writer: &mut ArrowWriter<File>,
     schema: &Arc<Schema>,
-    u64s: &[u64],
-    seqs: &[String],
-    freqs: &[u32],
+    chunk: ChunkBuffers,
     path: &Path,
 ) -> Result<()> {
-    let u64_arr: ArrayRef = Arc::new(UInt64Array::from(u64s.to_vec()));
-    let seq_arr: ArrayRef = Arc::new(StringArray::from_iter_values(seqs.iter().map(|s| s.as_str())));
-    let freq_arr: ArrayRef = Arc::new(UInt32Array::from(freqs.to_vec()));
+    let ChunkBuffers { kmers, seq_bytes, seq_offsets, freqs } = chunk;
+
+    let u64_arr: ArrayRef = Arc::new(UInt64Array::from(kmers));
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(seq_offsets));
+    let seq_arr: ArrayRef = Arc::new(
+        StringArray::try_new(offsets, Buffer::from_vec(seq_bytes), None)
+            .map_err(|e| export_err(path, e))?,
+    );
+    let freq_arr: ArrayRef = Arc::new(UInt32Array::from(freqs));
 
     let batch = RecordBatch::try_new(schema.clone(), vec![u64_arr, seq_arr, freq_arr])
         .map_err(|e| export_err(path, e))?;
@@ -138,11 +215,22 @@ pub fn export_counts_csv<P: AsRef<Path>>(
     let mut writer = BufWriter::with_capacity(512 * 1024, file);
     writeln!(writer, "kmer_u64,kmer_sequence,frequency").map_err(|e| io_err(path, e))?;
 
+    // Reused across every row. `decode_kmer` would allocate a `String` (and
+    // free it, and re-validate its UTF-8) once per exported k-mer -- 53.8
+    // million times on the benchmark file. The bases are copied into the
+    // `BufWriter` exactly as often as before; only the allocation, the free
+    // and the scan go away.
+    let mut seq_buf: Vec<u8> = Vec::with_capacity(k);
+
     let mut written = 0;
     for (kmer_bits, count) in counter.iter() {
         if count >= min_count {
-            writeln!(writer, "{},{},{}", kmer_bits, kmer::decode_kmer(kmer_bits, k), count)
-                .map_err(|e| io_err(path, e))?;
+            seq_buf.clear();
+            kmer::decode_kmer_into(kmer_bits, k, &mut seq_buf);
+
+            write!(writer, "{kmer_bits},").map_err(|e| io_err(path, e))?;
+            writer.write_all(&seq_buf).map_err(|e| io_err(path, e))?;
+            writeln!(writer, ",{count}").map_err(|e| io_err(path, e))?;
             written += 1;
         }
     }
@@ -278,11 +366,11 @@ mod tests {
         let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
 
         // Mismatched lengths: two u64s but only one sequence/frequency.
-        let u64s = vec![1u64, 2u64];
-        let seqs = vec!["AAAA".to_string()];
-        let freqs = vec![5u32];
+        let mut chunk = ChunkBuffers::with_capacity(2, 4);
+        chunk.push(0, 4, 5);
+        chunk.kmers.push(2);
 
-        let result = write_chunk(&mut writer, &schema, &u64s, &seqs, &freqs, &path);
+        let result = write_chunk(&mut writer, &schema, chunk, &path);
 
         match result {
             Err(FastDnaError::Export { path: p, .. }) => {
@@ -290,6 +378,91 @@ mod tests {
             }
             other => panic!("expected Export, got {other:?}"),
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The CSV row is now emitted as three writes into the `BufWriter`
+    /// (integer, decoded bases from a reused buffer, integer) rather than one
+    /// `writeln!` over a freshly allocated `String`. The bytes on disk must
+    /// be identical, header included -- `train_classifier.py` parses these
+    /// exact column names.
+    #[test]
+    fn csv_rows_keep_their_exact_bytes() {
+        let k = 4;
+        let mut counter = KmerCounter::new();
+        // "AACG" = 00 00 01 10 = 6, canonical already (its reverse
+        // complement "CGTT" = 0b01101111 = 111 is larger).
+        counter.insert_batch(&[6, 6, 0]);
+
+        let dir = std::env::temp_dir().join("fastdna_export_csv_bytes_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("counts.csv");
+
+        let written = export_counts_csv(&counter, &path, k, 1).unwrap();
+        assert_eq!(written, 2);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.remove(0), "kmer_u64,kmer_sequence,frequency");
+        lines.sort_unstable();
+        assert_eq!(lines, vec!["0,AAAA,1", "6,AACG,2"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The `kmer_sequence` column is now assembled as raw Arrow buffers --
+    /// bases written straight into the value buffer, offsets pushed by hand
+    /// -- instead of a `Vec<String>`. Nothing else in the tree reads a
+    /// Parquet file back, so this pins the result: every row's decoded
+    /// sequence must still equal `decode_kmer`, and the offsets must still
+    /// cut the value buffer in the right places.
+    ///
+    /// Deliberately spans a chunk boundary (131 072 rows) so the
+    /// buffers-are-moved-and-replaced path is exercised alongside the
+    /// short final chunk.
+    #[test]
+    fn parquet_sequence_column_round_trips_across_a_chunk_boundary() {
+        use arrow::array::{Array, StringArray as RoundTripStrings, UInt64Array as RoundTripU64s};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let k = 31;
+        let rows = 131_072 + 5;
+
+        let mut counter = KmerCounter::new();
+        // Distinct, spread across the 2-bit space so the decoded bases vary.
+        let kmers: Vec<u64> =
+            (0..rows as u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 2).collect();
+        counter.insert_batch(&kmers);
+
+        let dir = std::env::temp_dir().join("fastdna_export_roundtrip_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("counts.parquet");
+
+        let written = export_counts_parquet(&counter, &path, k, 1).unwrap();
+        assert_eq!(written, counter.distinct_kmers());
+
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+
+        let mut seen = 0usize;
+        for batch in reader {
+            let batch = batch.unwrap();
+            let bits = batch.column(0).as_any().downcast_ref::<RoundTripU64s>().unwrap();
+            let seqs = batch.column(1).as_any().downcast_ref::<RoundTripStrings>().unwrap();
+            assert_eq!(bits.len(), seqs.len());
+
+            for row in 0..bits.len() {
+                assert_eq!(
+                    seqs.value(row),
+                    kmer::decode_kmer(bits.value(row), k),
+                    "sequence column diverges from decode_kmer at row {row}"
+                );
+            }
+            seen += bits.len();
+        }
+
+        assert_eq!(seen, written, "every written row must read back");
 
         let _ = std::fs::remove_file(&path);
     }

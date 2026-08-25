@@ -320,6 +320,15 @@ pub fn process_stream_parallel<S: RecordSource>(
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let mut local_counter = KmerCounter::with_capacity(131_072);
                 let mut local_qc = QcSummary::default();
+                // Worker-owned k-mer scratch, allocated once per worker
+                // instead of once per record. `extract_canonical_kmers`
+                // allocates a fresh `Vec<u64>` on every call, so the
+                // per-record form costs one malloc/free pair per read --
+                // ~7 million of them on a 2.14 GB FASTQ. The `_into`
+                // variant clears and refills this buffer, which reaches its
+                // high-water mark within the first few reads and never
+                // allocates again.
+                let mut canon_kmers: Vec<u64> = Vec::new();
 
                 while let Ok(mut batch) = receiver.recv() {
                     if let Some(tok) = &cancel {
@@ -336,10 +345,10 @@ pub fn process_stream_parallel<S: RecordSource>(
                         local_qc.observe_record(record);
                         record.quality_trim_end(min_qual, qual_win);
 
-                        // Canonical k-mers: 2-bit packed, O(1) rolling window, and
-                        // ambiguous bases ('N') reset the window rather than
-                        // producing corrupt k-mers.
-                        let canon_kmers = kmer::extract_canonical_kmers(&record.seq, k);
+                        // Canonical k-mers: 2-bit packed, O(1) rolling window
+                        // on both strands, and ambiguous bases ('N') reset the
+                        // window rather than producing corrupt k-mers.
+                        kmer::extract_canonical_kmers_into(&record.seq, k, &mut canon_kmers);
                         local_counter.insert_batch(&canon_kmers);
                     }
 
@@ -693,6 +702,10 @@ fn process_stream_parallel_disk<S: RecordSource>(
             let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(Vec<Vec<PathBuf>>, QcSummary)> {
                 let mut spill = SpillWriter::new(&scratch, worker_idx, k, bucket_bits);
                 let mut local_qc = QcSummary::default();
+                // Worker-owned scratch; same reasoning as the in-memory
+                // strategy above -- one allocation per worker instead of one
+                // per record.
+                let mut canon_kmers: Vec<u64> = Vec::new();
 
                 while let Ok(mut batch) = receiver.recv() {
                     if let Some(tok) = &cancel {
@@ -707,7 +720,7 @@ fn process_stream_parallel_disk<S: RecordSource>(
                         local_qc.observe_record(record);
                         record.quality_trim_end(min_qual, qual_win);
 
-                        let canon_kmers = kmer::extract_canonical_kmers(&record.seq, k);
+                        kmer::extract_canonical_kmers_into(&record.seq, k, &mut canon_kmers);
                         total_occurrences.fetch_add(canon_kmers.len() as u64, Ordering::Relaxed);
                         spill.insert_batch(&canon_kmers)?;
                     }
