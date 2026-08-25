@@ -54,7 +54,11 @@ decision reshaped to look like one. `calibration_report` does not raise on
 that input -- see its docstring for why a hard error would be the wrong
 call -- but it warns loudly (`UncalibratedScoresWarning`) and the resulting
 reliability diagram is honestly degenerate (at most two points) rather than
-silently presented as a normal calibration curve.
+silently presented as a normal calibration curve. `fastdna.calibration.
+calibrate` is the fix for that gap -- wrap the fitted model, fit on
+held-out data, and the reliability diagram this function draws from the
+wrapper's output on a further held-out set is how the fix is checked, not
+assumed (`python/tests/test_calibration.py`).
 
 ## Package convention
 
@@ -289,7 +293,7 @@ def calibration_report(y_true, y_prob, *, n_bins=10, strategy="uniform", pos_lab
     an ordinary calibration curve. The intended callers for this function
     are genuinely probabilistic estimators used elsewhere in this ecosystem
     -- logistic regression or a boosted tree over a `KmerVectorizer` matrix,
-    or a future calibration wrapper (Venn-ABERS, referenced in
+    or `fastdna.calibration.calibrate` (Venn-ABERS by default, referenced in
     `SetCoveringClassifier.predict_proba`'s own docstring) fitted on
     held-out, lineage-blocked folds from `fastdna.cv`.
 

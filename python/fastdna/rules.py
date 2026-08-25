@@ -671,8 +671,8 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         log-loss) will therefore be degenerate on this output, and a
         reliability diagram of it is meaningless.
 
-        For real probabilities, wrap a fitted model in the calibration
-        helper planned as `fastdna.cv.calibrate` (roadmap A1: Venn-ABERS,
+        For real probabilities, wrap a fitted model with
+        `fastdna.calibration.calibrate` (roadmap A1: Venn-ABERS by default,
         the variant used in clinical microbiology), fitted on held-out,
         lineage-blocked folds from `fastdna.cv` -- calibrating on the
         training folds would simply relabel the same overfit.
