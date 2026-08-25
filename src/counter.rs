@@ -1,6 +1,7 @@
 // src/counter.rs
 
 use std::cmp::Reverse;
+use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
 use std::sync::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
@@ -160,6 +161,26 @@ const MAX_PENDING_RUNS: usize = 8;
 /// not, on this data size and this hardware, and shipping it anyway on the
 /// strength of the general "radix is O(n)" argument -- without the
 /// measurement -- would have been a real regression.
+/// **Tried and reverted: `raw.drain(..).peekable()` for the compaction
+/// scan.** That is what this loop used to be, and the emitted assembly is
+/// what condemned it. Per *run* it wrote the `Peekable`'s `Option<u64>` slot
+/// and the `Drain`'s cursor back to the stack four times and reloaded the
+/// push cursor immediately after storing it (a store-to-load forward right
+/// in the per-run dependency chain); per *element* it spent 8 instructions,
+/// two of them an `incl` + `cmovel` pair implementing `saturating_add(1)`
+/// that formed a **2-cycle loop-carried dependency** on the count register.
+/// The index walk below reads the same sorted slice with ~5 instructions per
+/// element, carries only `incq` (1 cycle) between iterations, keeps a single
+/// stack store per run, and drops the `Drain` drop glue (its guard branches
+/// and its `memmove` call site) entirely. Against 840 million occurrences on
+/// the benchmark file that is on the order of 2.5e9 fewer instructions and
+/// 840 million fewer `cmov`s in the critical path.
+///
+/// The saturation is preserved exactly rather than dropped: applying
+/// `saturating_add(1)` to a starting count of 1 once per repeat over a run
+/// of length `L` yields `min(L, u32::MAX)`, which is what
+/// `run_len.min(u32::MAX as usize) as u32` computes -- once per *distinct*
+/// k-mer instead of once per *occurrence*.
 fn compact_raw(inner: &mut Inner) {
     if inner.raw.is_empty() {
         return;
@@ -167,20 +188,33 @@ fn compact_raw(inner: &mut Inner) {
 
     inner.raw.sort_unstable();
 
-    let mut new_run: Vec<(u64, u32)> = Vec::with_capacity(inner.raw.len());
-    let mut iter = inner.raw.drain(..).peekable();
-    while let Some(kmer) = iter.next() {
-        let mut count: u32 = 1;
-        while iter.peek() == Some(&kmer) {
-            iter.next();
-            // `saturating_add`, not `+=`: a single k-mer occurring more
-            // than u32::MAX times should not panic or silently wrap, even
-            // though that is not expected to occur in practice.
-            count = count.saturating_add(1);
+    let sorted: &[u64] = inner.raw.as_slice();
+    let len = sorted.len();
+    // Exactly `len` is the smallest capacity that can never need to grow
+    // (one entry per element, in the all-distinct case), so no `push` below
+    // reallocates and no bytes are ever recopied.
+    let mut new_run: Vec<(u64, u32)> = Vec::with_capacity(len);
+
+    let mut i = 0usize;
+    while i < len {
+        let kmer = sorted[i];
+        let run_start = i;
+        i += 1;
+        while i < len && sorted[i] == kmer {
+            i += 1;
         }
-        new_run.push((kmer, count));
+        // `saturating_add` semantics, computed once per run: see the doc
+        // comment above. A single k-mer occurring more than u32::MAX times
+        // must not panic or silently wrap, even though that is not expected
+        // to occur in practice.
+        new_run.push((kmer, (i - run_start).min(u32::MAX as usize) as u32));
     }
 
+    // `clear`, not `drain(..)`: both keep the allocation for the next fill,
+    // but `clear` on a `Vec<u64>` (no `Drop` to run) is a single length
+    // store, where `Drain` is an iterator whose own `Drop` has to re-derive
+    // and restore the length past a tail-move guard.
+    inner.raw.clear();
     inner.pending.push(new_run);
 }
 
@@ -246,28 +280,48 @@ fn k_way_merge_sorted_counts(mut sources: Vec<Vec<(u64, u32)>>) -> Vec<(u64, u32
         }
     }
 
-    while let Some(Reverse((kmer, src_idx, elem_idx))) = heap.pop() {
-        let mut count = sources[src_idx][elem_idx].1;
+    while let Some(&Reverse((kmer, _, _))) = heap.peek() {
+        let mut count: u32 = 0;
 
-        let next_idx = elem_idx + 1;
-        if let Some(&(next_kmer, _)) = sources[src_idx].get(next_idx) {
-            heap.push(Reverse((next_kmer, src_idx, next_idx)));
-        }
-
-        // Fold in every other source currently sitting at the same key --
-        // possible because sources may share keys (that is exactly what
-        // makes this a merge rather than a concatenation), but never
-        // *within* one source (each is already deduplicated on its own).
-        loop {
-            let same_key = matches!(heap.peek(), Some(&Reverse((peek_kmer, _, _))) if peek_kmer == kmer);
-            if !same_key {
+        // Fold in every source currently sitting at this key -- possible
+        // because sources may share keys (that is exactly what makes this a
+        // merge rather than a concatenation), but never *within* one source
+        // (each is already deduplicated on its own). Starting from 0 and
+        // folding the first contributor through the same `saturating_add` as
+        // the rest is identical to seeding `count` with it:
+        // `0.saturating_add(x)` is `x`.
+        while let Some(mut top) = heap.peek_mut() {
+            let Reverse((head_kmer, src_idx, elem_idx)) = *top;
+            if head_kmer != kmer {
                 break;
             }
-            if let Some(Reverse((_, other_src, other_idx))) = heap.pop() {
-                count = count.saturating_add(sources[other_src][other_idx].1);
-                let next = other_idx + 1;
-                if let Some(&(next_kmer, _)) = sources[other_src].get(next) {
-                    heap.push(Reverse((next_kmer, other_src, next)));
+
+            // Hoisted: the previous form indexed `sources[src_idx]` twice
+            // per entry (once to read the count, once to look up the next
+            // element), which is two bounds checks against `sources.len()`
+            // where one suffices -- one compare-and-branch pair removed per
+            // merged entry, over every entry of every source on every
+            // consolidation pass.
+            let src: &[(u64, u32)] = &sources[src_idx];
+            count = count.saturating_add(src[elem_idx].1);
+
+            let next_idx = elem_idx + 1;
+            match src.get(next_idx) {
+                // Overwriting the root through `PeekMut` and letting its
+                // `Drop` re-sift replaces a `pop` (which sifts the hole all
+                // the way down to a leaf and then sifts the moved-in element
+                // back up) *plus* a `push` (another sift up) with a single
+                // sift down -- roughly half the heap element moves and
+                // comparisons, on every one of the tens of millions of
+                // entries a consolidation pass merges. Counted on the
+                // emitted assembly, the whole function shrank from 487 to
+                // 359 instructions, essentially all of it inlined heap
+                // restructuring that no longer happens.
+                Some(&(next_kmer, _)) => *top = Reverse((next_kmer, src_idx, next_idx)),
+                // Source exhausted: this is the one case that still has to
+                // shrink the heap.
+                None => {
+                    PeekMut::pop(top);
                 }
             }
         }
@@ -287,20 +341,40 @@ fn merge_sorted_counts(a: &[(u64, u32)], b: &[(u64, u32)]) -> Vec<(u64, u32)> {
     let mut merged: Vec<(u64, u32)> = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.len() && j < b.len() {
-        match a[i].0.cmp(&b[j].0) {
-            std::cmp::Ordering::Less => {
-                merged.push(a[i]);
-                i += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                merged.push(b[j]);
-                j += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                merged.push((a[i].0, a[i].1.saturating_add(b[j].1)));
-                i += 1;
-                j += 1;
-            }
+        // Two `<` comparisons rather than `match a[i].0.cmp(&b[j].0)`.
+        // Matching on `Ordering` does not lower to a three-way branch: rustc
+        // materializes the discriminant with `seta` + `sbb` and then
+        // re-tests it with `movzbl` + `cmpl`, four extra instructions and a
+        // third conditional branch per merged entry, on top of the compare
+        // it already did. Comparing the keys twice costs one extra `cmp` and
+        // nothing else.
+        //
+        // Reading only the keys up front is the other half of it: the counts
+        // are then loaded on the branch that actually uses them, so the
+        // "take from a" path never loads b's count and vice versa. Loading
+        // the whole pair up front (the obvious way to write this) is what
+        // makes an eager, sometimes-dead load appear in the loop.
+        //
+        // Net per merged entry: 4 fewer ALU instructions and one fewer
+        // conditional branch, with no added load -- over 161 million entries
+        // written by the combine phase at benchmark scale (see `merge_all`
+        // for that count), or 53.8 million once that path is adopted.
+        //
+        // The bounds checks here are already gone: `while i < a.len() && j <
+        // b.len()` proves both indices in range and the emitted code has no
+        // panic edge in this loop, only in the tail slicing below.
+        let a_kmer = a[i].0;
+        let b_kmer = b[j].0;
+        if a_kmer < b_kmer {
+            merged.push(a[i]);
+            i += 1;
+        } else if b_kmer < a_kmer {
+            merged.push(b[j]);
+            j += 1;
+        } else {
+            merged.push((a_kmer, a[i].1.saturating_add(b[j].1)));
+            i += 1;
+            j += 1;
         }
     }
     merged.extend_from_slice(&a[i..]);
@@ -494,6 +568,50 @@ impl KmerCounter {
         self_inner.valid = true;
     }
 
+    /// Combines any number of counters into one, in a single k-way merge.
+    ///
+    /// `merge` folds two counters at a time, so a reduce over `w` workers
+    /// rewrites the whole accumulated table once per level of the reduction
+    /// tree. At benchmark scale (8 workers, 53.8 million distinct k-mers,
+    /// 16 bytes per entry) that is 4 merges producing 13.4M entries, 2
+    /// producing 26.9M and 1 producing 53.8M -- 161 million entries written,
+    /// 2.6 GB of `memcpy`, across 7 separate allocations the largest of
+    /// which is 860 MB. Merging all `w` sources at once writes each of the
+    /// 53.8 million final entries exactly once: 860 MB, one allocation.
+    /// That is ~1.7 GB of copying and 6 large allocations removed, and it
+    /// costs nothing extra per entry -- `k_way_merge_sorted_counts` already
+    /// does `O(entries x log(sources))` with `sources` bounded by the worker
+    /// count either way.
+    ///
+    /// Not yet reachable from `pipeline.rs`, whose combine phase still uses
+    /// rayon's pairwise `reduce`; switching that call site over is what
+    /// turns this into an actual saving.
+    pub fn merge_all(counters: Vec<KmerCounter>) -> KmerCounter {
+        let mut total_kmers: u64 = 0;
+        let mut sources: Vec<Vec<(u64, u32)>> = Vec::with_capacity(counters.len());
+
+        for counter in counters {
+            total_kmers += counter.total_kmers;
+            let mut inner =
+                counter.inner.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+            finalize_inner(&mut inner);
+            // An empty source would only occupy a heap slot and be popped
+            // straight back out; skipping it also lets the one-source fast
+            // path in `k_way_merge_sorted_counts` trigger when every other
+            // worker happened to see nothing.
+            if !inner.finalized.is_empty() {
+                sources.push(std::mem::take(&mut inner.finalized));
+            }
+        }
+
+        // The merge output is sorted ascending and deduplicated by
+        // construction -- that is exactly what a k-way merge of sorted,
+        // deduplicated sources with equal keys folded together produces --
+        // which is the invariant `from_sorted_entries` documents as the
+        // caller's responsibility.
+        Self::from_sorted_entries(k_way_merge_sorted_counts(sources), total_kmers)
+    }
+
     /// Removes k-mers outside the inclusive `[min, max]` frequency band.
     ///
     /// Both bounds are inclusive: a k-mer whose count equals `min` or `max` is
@@ -608,11 +726,17 @@ impl Iterator for Iter<'_> {
     type Item = (u64, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let item = self.guard.finalized.get(self.idx).copied();
-        if item.is_some() {
-            self.idx += 1;
-        }
-        item
+        // `?` on the borrow, rather than `.copied()` followed by
+        // `if item.is_some()`: the previous form tested the same
+        // discriminant twice -- once inside `get` to build the `Option`, and
+        // again to decide whether to advance -- and made the advance itself
+        // conditional. One test and one unconditional increment here, over
+        // every entry of the finalized table on every export pass (53.8
+        // million entries per pass at benchmark scale, and `export.rs` plus
+        // `ffi.rs` walk it once each).
+        let &item = self.guard.finalized.get(self.idx)?;
+        self.idx += 1;
+        Some(item)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -762,6 +886,143 @@ mod tests {
             vec![(1, 111), (2, 11), (3, 1), (4, 1), (10, 1)],
             "kmer 1 must sum contributions from all three sources that carry it"
         );
+    }
+
+    /// A source list containing empty sources must not stall the merge or
+    /// let an empty one occupy a heap slot: nothing is seeded for it, and
+    /// the sources around it still merge normally.
+    #[test]
+    fn k_way_merge_skips_empty_sources() {
+        let sources = vec![
+            Vec::new(),
+            vec![(2u64, 5u32), (4, 1)],
+            Vec::new(),
+            vec![(1, 1), (4, 2)],
+            Vec::new(),
+        ];
+
+        assert_eq!(k_way_merge_sorted_counts(sources), vec![(1, 1), (2, 5), (4, 3)]);
+    }
+
+    /// The merge advances the heap root in place (`PeekMut`) instead of
+    /// popping and pushing, and folds equal keys starting from a count of
+    /// zero rather than seeding with the first contributor. Both are
+    /// behaviour-preserving only if the result is byte-identical to a
+    /// straightforward reference over every shape of input -- sources of
+    /// wildly different lengths, keys shared by any subset of them, sources
+    /// that exhaust long before the others, and duplicate-free runs.
+    #[test]
+    fn k_way_merge_matches_a_reference_implementation_on_pseudorandom_input() {
+        /// Sort-and-group: obviously correct, far too slow to ship.
+        fn reference(sources: &[Vec<(u64, u32)>]) -> Vec<(u64, u32)> {
+            let mut flat: Vec<(u64, u32)> = sources.iter().flatten().copied().collect();
+            flat.sort_by_key(|&(kmer, _)| kmer);
+            let mut out: Vec<(u64, u32)> = Vec::new();
+            for (kmer, count) in flat {
+                match out.last_mut() {
+                    Some(last) if last.0 == kmer => last.1 = last.1.saturating_add(count),
+                    _ => out.push((kmer, count)),
+                }
+            }
+            out
+        }
+
+        // A deterministic LCG, so a failure is reproducible and the test
+        // brings in no dependency.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |bound: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+
+        for case in 0..200 {
+            // 1..=9 sources: `MAX_PENDING_RUNS` runs plus `finalized` is the
+            // widest merge `consolidate` ever asks for.
+            let source_count = 1 + (case % 9);
+            let key_space = 1 + next(40);
+
+            let mut sources: Vec<Vec<(u64, u32)>> = Vec::with_capacity(source_count);
+            for _ in 0..source_count {
+                let mut keys: Vec<u64> = (0..key_space).filter(|_| next(3) != 0).collect();
+                keys.dedup();
+                sources
+                    .push(keys.into_iter().map(|kmer| (kmer, 1 + next(1000) as u32)).collect());
+            }
+
+            assert_eq!(
+                k_way_merge_sorted_counts(sources.clone()),
+                reference(&sources),
+                "case {case}: {sources:?}"
+            );
+        }
+    }
+
+    /// Counts must clamp at `u32::MAX` rather than wrapping. `compact_raw`
+    /// now derives a run's count from its length instead of applying
+    /// `saturating_add` per occurrence, and the merge folds contributions
+    /// with `saturating_add` starting from zero -- both have to saturate.
+    #[test]
+    fn merged_counts_saturate_at_u32_max_instead_of_wrapping() {
+        let sources =
+            vec![vec![(7u64, u32::MAX - 1)], vec![(7, 5)], vec![(7, 10)], vec![(9, 1)]];
+
+        assert_eq!(
+            k_way_merge_sorted_counts(sources),
+            vec![(7, u32::MAX), (9, 1)],
+            "an overflowing sum must clamp, not wrap to a tiny count"
+        );
+    }
+
+    /// `merge_all` must produce exactly what repeated pairwise `merge`
+    /// produces -- it is a drop-in for the combine phase, not a different
+    /// answer that happens to be faster.
+    #[test]
+    fn merge_all_agrees_with_repeated_pairwise_merge() {
+        let build = |kmers: &[u64]| {
+            let mut c = KmerCounter::new();
+            for &k in kmers {
+                c.insert(k);
+            }
+            c
+        };
+        let inputs: Vec<Vec<u64>> =
+            vec![vec![1, 1, 4, 9], vec![4, 4, 5], Vec::new(), vec![1, 5, 9, 9, 9], vec![2]];
+
+        let mut pairwise = KmerCounter::new();
+        for input in &inputs {
+            pairwise.merge(build(input));
+        }
+
+        let all = KmerCounter::merge_all(inputs.iter().map(|i| build(i)).collect());
+
+        assert_eq!(all.total_kmers(), pairwise.total_kmers());
+        assert_eq!(all.distinct_kmers(), pairwise.distinct_kmers());
+        assert_eq!(all.iter().collect::<Vec<_>>(), pairwise.iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn merge_all_of_nothing_is_an_empty_counter() {
+        let c = KmerCounter::merge_all(Vec::new());
+        assert_eq!(c.total_kmers(), 0);
+        assert_eq!(c.distinct_kmers(), 0);
+    }
+
+    /// `merge_all` finalizes each source itself, so counters still holding
+    /// unflushed `raw` insertions must not lose them.
+    #[test]
+    fn merge_all_finalizes_sources_that_were_never_read() {
+        let mut a = KmerCounter::new();
+        a.insert(3);
+        a.insert(3);
+        let mut b = KmerCounter::new();
+        b.insert(3);
+        b.insert(7);
+
+        let all = KmerCounter::merge_all(vec![a, b]);
+
+        assert_eq!(all.total_kmers(), 4);
+        assert_eq!(all.get_count(3), 3);
+        assert_eq!(all.get_count(7), 1);
     }
 
     #[test]
