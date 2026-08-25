@@ -86,7 +86,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from scipy import sparse
 
-from . import _column_as_array, _pair_positions, compare_all as _compare_all, count as _count
+from . import _column_as_array, _core, _pair_positions, compare_all as _compare_all, count as _count
 
 __all__ = [
     "ScreeningOnlyWarning",
@@ -288,6 +288,17 @@ def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers
         For fewer than 2 samples, duplicate sample ids (named), the same
         file listed twice, `min_samples` above the cohort size, or a
         non-positive `min_samples`/`max_kmers`.
+
+    Implementation
+    --------------
+    Counted and built natively in Rust (`_core.cohort_presence_matrix`,
+    `src/cohort/matrix.rs`) when the installed extension provides it: every
+    file is streamed once through the same per-sample pipeline `count()`
+    uses and folded directly into the matrix, without ever building a
+    per-file Arrow `RecordBatch` first. `_cohort_presence_matrix_fallback`
+    below -- the pure-Python/pyarrow implementation this replaced -- is kept
+    as the path for an older compiled extension that predates the native
+    function; both produce the same `(matrix, sample_ids, kmer_sequences)`.
     """
     sample_ids, path_strings = _resolve_cohort(paths, caller="cohort_presence_matrix")
     n_samples = len(sample_ids)
@@ -303,15 +314,89 @@ def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers
             f"Use min_samples <= {n_samples}."
         )
 
-    # Every sample counted once, then stacked end to end so the whole
-    # cohort is tallied, filtered and turned into a matrix by vectorized
-    # passes over one pair of arrays. The version this replaced walked the
-    # concatenation twice in Python -- once building three dicts keyed by
-    # `kmer_u64` (three dict operations per row) and once looking every row
-    # up again to emit a (row, column, value) triple -- so a 200-sample
-    # cohort of a million k-mers each did 4x10^8 Python-level dict
-    # operations. The counting itself, which dominates either way, is
-    # unchanged: one `count()` per sample, exactly as before.
+    if hasattr(_core, "cohort_presence_matrix"):
+        return _cohort_presence_matrix_native(
+            path_strings,
+            sample_ids,
+            k=k,
+            min_count=min_count,
+            min_samples=min_samples,
+            max_kmers=max_kmers,
+            n_samples=n_samples,
+        )
+
+    return _cohort_presence_matrix_fallback(
+        path_strings,
+        sample_ids,
+        k=k,
+        min_count=min_count,
+        min_samples=min_samples,
+        max_kmers=max_kmers,
+        n_samples=n_samples,
+    )
+
+
+def _cohort_presence_matrix_native(path_strings, sample_ids, *, k, min_count, min_samples, max_kmers, n_samples):
+    """Native path for `cohort_presence_matrix`: one call into
+    `_core.cohort_presence_matrix`, which streams every file and folds
+    directly into cohort-matrix triples -- see `src/cohort/matrix.rs`'s
+    module doc comment for exactly what this avoids materializing (every
+    per-file `RecordBatch`'s `kmer_sequence` column, decoded and then
+    concatenated a second time, for k-mers the cohort-level `min_samples`
+    filter was about to throw away anyway).
+
+    `stacklevel=3` on the truncation warning below (rather than the `2` the
+    previous single-function implementation used) accounts for this extra
+    call frame, so the warning still points at `cohort_presence_matrix`'s
+    caller, not at this helper.
+    """
+    result = _core.cohort_presence_matrix(
+        path_strings, k=k, min_count=min_count, min_samples=min_samples, max_kmers=max_kmers
+    )
+    n_kmers = result["n_kmers"]
+    n_candidates = result["n_candidates"]
+
+    if max_kmers is not None and n_candidates > n_kmers:
+        cutoff = result["truncation_cutoff"]
+        warnings.warn(
+            f"max_kmers={max_kmers} truncated the cohort matrix: {n_candidates} k-mers passed "
+            f"min_samples={min_samples}, {n_candidates - n_kmers} of them were dropped. Kept the "
+            f"{max_kmers} with the highest minor-sample-count (min(present, absent) across the "
+            f"{n_samples} samples, the minor-allele-count analogue); every dropped k-mer had a "
+            f"minor-sample-count of {cutoff} or lower. Raise max_kmers, or raise min_count/"
+            f"min_samples to shrink the candidate set on biological grounds instead.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    triples = result["triples"]
+    row = _column_as_array(triples.column("row")).to_numpy(zero_copy_only=False)
+    col = _column_as_array(triples.column("col")).to_numpy(zero_copy_only=False)
+    value = _column_as_array(triples.column("value")).to_numpy(zero_copy_only=False)
+    kmer_sequences = _column_as_array(result["kmers"].column("kmer_sequence")).to_pylist()
+
+    matrix = sparse.csr_matrix(
+        (value.astype(np.uint32), (row, col)),
+        shape=(n_samples, n_kmers),
+        dtype=np.uint32,
+    )
+    return matrix, sample_ids, kmer_sequences
+
+
+def _cohort_presence_matrix_fallback(path_strings, sample_ids, *, k, min_count, min_samples, max_kmers, n_samples):
+    """Pure-Python/pyarrow path for `cohort_presence_matrix`, used only when
+    the installed `_core` extension predates `cohort_presence_matrix`.
+
+    Every sample counted once, then stacked end to end so the whole cohort
+    is tallied, filtered and turned into a matrix by vectorized passes over
+    one pair of arrays. The version this replaced walked the concatenation
+    twice in Python -- once building three dicts keyed by `kmer_u64` (three
+    dict operations per row) and once looking every row up again to emit a
+    (row, column, value) triple -- so a 200-sample cohort of a million
+    k-mers each did 4x10^8 Python-level dict operations. The counting
+    itself, which dominates either way, is unchanged: one `count()` per
+    sample, exactly as before.
+    """
     kmer_arrays, sequence_arrays, frequency_arrays, row_counts = [], [], [], []
     for path in path_strings:
         table = _count(path, k=k, min_count=min_count).table
@@ -366,7 +451,7 @@ def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers
             f"minor-sample-count of {cutoff} or lower. Raise max_kmers, or raise min_count/"
             f"min_samples to shrink the candidate set on biological grounds instead.",
             UserWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
         surviving = kept
 

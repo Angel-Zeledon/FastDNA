@@ -4,5 +4,7 @@
 //! downstream (counting, vectorizing) ever runs.
 
 pub mod discovery;
+pub mod matrix;
 
 pub use discovery::{discover_samples, SampleFiles};
+pub use matrix::{build_cohort_matrix, CohortMatrix};

@@ -48,6 +48,7 @@ use pyo3::exceptions::{
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::cohort;
 use crate::counter::KmerCounter;
 use crate::error::FastDnaError;
 use crate::export;
@@ -1305,6 +1306,149 @@ fn build_database(
     Ok(PyKmerDatabase { inner })
 }
 
+/// The schema of `cohort_presence_matrix`'s `"triples"` batch: one row per
+/// nonzero `(sample, k-mer)` entry, in COO form -- `scipy.sparse.csr_matrix`
+/// accepts `(data, (row, col))` triples in any order, so no particular
+/// ordering is promised here.
+fn cohort_triples_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("row", DataType::UInt32, false),
+        Field::new("col", DataType::UInt32, false),
+        Field::new("value", DataType::UInt32, false),
+    ]))
+}
+
+/// The schema of `cohort_presence_matrix`'s `"kmers"` batch: the decoded
+/// sequence of every surviving column, ascending by k-mer value -- see
+/// `cohort::matrix`'s module doc comment for why that is already the
+/// lexicographic order `gwas.py` promises.
+fn cohort_kmers_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new("kmer_sequence", DataType::Utf8, false)]))
+}
+
+/// Streams every file in `paths` through the same per-sample pipeline
+/// `count()` uses, one at a time, and folds the results directly into a
+/// cohort-wide k-mer presence/count matrix (`cohort::matrix::
+/// build_cohort_matrix`) -- without ever building a per-file Arrow
+/// `RecordBatch` the way `python/fastdna/gwas.py::cohort_presence_matrix`
+/// used to by calling `count()` once per file. See `cohort::matrix`'s module
+/// doc comment for exactly what that saved and why: in short, `count()`'s
+/// `.table` decodes *every* distinct k-mer of *every* sample to an ASCII
+/// string before this module's cohort-level `min_samples` filter ever runs,
+/// and the Python fold that followed it copied that same data a second time
+/// via `pyarrow.concat_arrays`. This function decodes a k-mer's sequence
+/// exactly once, only for k-mers that end up as a column of the returned
+/// matrix.
+///
+/// Returns a `dict` with:
+/// - `"triples"`: a `pyarrow.RecordBatch` under `cohort_triples_schema`
+///   (`row`/`col`/`value`), one row per nonzero matrix entry.
+/// - `"kmers"`: a `pyarrow.RecordBatch` under `cohort_kmers_schema`
+///   (`kmer_sequence`), one row per matrix column, already in the
+///   lexicographic order `gwas.py` promises.
+/// - `"n_samples"`, `"n_kmers"`: the matrix shape.
+/// - `"n_candidates"`: how many k-mers passed `min_samples` before any
+///   `max_kmers` truncation -- equal to `n_kmers` unless truncation
+///   happened.
+/// - `"truncation_cutoff"`: the minor-sample-count of the highest-ranked
+///   k-mer `max_kmers` still dropped, or `None` if nothing was truncated.
+///   `python/fastdna/gwas.py` uses these last two to reproduce its own
+///   truncation `UserWarning` without recomputing anything.
+///
+/// No progress callback and no fine-grained cancellation, unlike `count()`:
+/// this is a new, additive entry point rather than a replacement for
+/// `count()`'s own Ctrl-C/progress ergonomics. `py.check_signals()` is
+/// polled once between files (not mid-file), which is a real cancellation
+/// point, not a decoration -- a large cohort is exactly the shape of call
+/// where a user given no way to interrupt it would notice.
+#[pyfunction]
+#[pyo3(signature = (paths, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, min_samples=2, max_kmers=None))]
+#[allow(clippy::too_many_arguments)]
+fn cohort_presence_matrix(
+    py: Python<'_>,
+    paths: Vec<String>,
+    k: usize,
+    min_count: u32,
+    max_count: Option<u32>,
+    min_quality: f64,
+    threads: Option<usize>,
+    min_samples: u32,
+    max_kmers: Option<usize>,
+) -> PyResult<PyObject> {
+    // Read once: `PipelineConfig::default()` calls
+    // `std::thread::available_parallelism` (see `count()`'s own comment on
+    // this), so it is computed once here rather than once per file.
+    let defaults = PipelineConfig::default();
+    let num_threads = threads.unwrap_or(defaults.num_threads);
+    let quality_window = defaults.quality_window;
+    let batch_size = defaults.batch_size;
+    let progress_interval = defaults.progress_interval;
+
+    let mut counters: Vec<KmerCounter> = Vec::with_capacity(paths.len());
+    for path in &paths {
+        // A real cancellation point: without this, a cohort of hundreds of
+        // files gives a user no way to interrupt the run between files. Not
+        // mid-file -- see this function's own doc comment for why that is a
+        // deliberate, documented simplification rather than an oversight.
+        py.check_signals()?;
+
+        let path_buf = PathBuf::from(path);
+        let reader = open_fastq_reader(&path_buf)?;
+        let config =
+            PipelineConfig { k, min_quality, quality_window, batch_size, num_threads, progress_interval };
+
+        let mut counter = py
+            .allow_threads(|| {
+                process_stream_parallel_with_policy(
+                    reader,
+                    config,
+                    &path_buf,
+                    None,
+                    None,
+                    MemoryPolicy::default(),
+                )
+            })
+            .map(|(counter, _qc, _reads, _decision)| counter)?;
+
+        // Matches `count()`: per-sample frequency filtering happens in RAM,
+        // after the pipeline, before this sample's table is used for
+        // anything else.
+        py.allow_threads(|| counter.prune(min_count, max_count));
+        counters.push(counter);
+    }
+
+    // The merge itself walks every sample's table (already fully in memory,
+    // no further I/O), so it is released the same way the per-file counting
+    // above is.
+    let built = py.allow_threads(|| cohort::build_cohort_matrix(&counters, min_samples, max_kmers, k));
+    drop(counters);
+
+    let triples_batch = in_memory_batch(
+        cohort_triples_schema(),
+        vec![
+            Arc::new(UInt32Array::from(built.row)) as ArrayRef,
+            Arc::new(UInt32Array::from(built.col)) as ArrayRef,
+            Arc::new(UInt32Array::from(built.value)) as ArrayRef,
+        ],
+    )?;
+
+    let mut seq_builder = StringBuilder::with_capacity(built.kmer_sequences.len(), built.kmer_sequences.len() * k);
+    for sequence in &built.kmer_sequences {
+        seq_builder.append_value(sequence);
+    }
+    let kmers_batch =
+        in_memory_batch(cohort_kmers_schema(), vec![Arc::new(seq_builder.finish()) as ArrayRef])?;
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("n_samples", built.n_samples)?;
+    dict.set_item("n_kmers", built.n_kmers)?;
+    dict.set_item("n_candidates", built.n_candidates)?;
+    dict.set_item("truncation_cutoff", built.truncation_cutoff)?;
+    dict.set_item("triples", triples_batch.to_pyarrow(py)?)?;
+    dict.set_item("kmers", kmers_batch.to_pyarrow(py)?)?;
+    Ok(dict.into())
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -1322,5 +1466,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(translate_file, m)?)?;
     m.add_function(wrap_pyfunction!(protein_kmers, m)?)?;
     m.add_function(wrap_pyfunction!(build_database, m)?)?;
+    m.add_function(wrap_pyfunction!(cohort_presence_matrix, m)?)?;
     Ok(())
 }
