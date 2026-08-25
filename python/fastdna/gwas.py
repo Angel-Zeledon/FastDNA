@@ -629,23 +629,147 @@ def _benjamini_hochberg(sorted_pvalues):
     return np.clip(np.minimum.accumulate(raw[::-1])[::-1], 0.0, 1.0)
 
 
+def _present_csr(matrix):
+    """The caller-supplied matrix as a boolean `present` CSR matrix, shared
+    by every screening test: a stored entry means "counted", `.astype(bool)`
+    means "present". A caller-supplied matrix may carry explicitly stored
+    zeros, so those are dropped first -- otherwise `.astype(bool)` would
+    read as "has a stored entry" rather than "present".
+    """
+    csr = (matrix.tocsr() if sparse.issparse(matrix) else sparse.csr_matrix(np.asarray(matrix))).copy()
+    csr.eliminate_zeros()
+    return csr.astype(bool)
+
+
 def _contingency_counts(matrix, case_mask):
     """Per-column `(a, b, c, d)` = (case present, case absent, control
     present, control absent), computed with two sparse row-slice sums
     rather than a Python loop over columns.
     """
-    csr = (matrix.tocsr() if sparse.issparse(matrix) else sparse.csr_matrix(np.asarray(matrix))).copy()
-    # A caller-supplied matrix may carry explicitly stored zeros; dropping
-    # them first is what makes `.astype(bool)` mean "present" rather than
-    # "has a stored entry".
-    csr.eliminate_zeros()
-    present = csr.astype(bool)
+    present = _present_csr(matrix)
 
     n_case = int(case_mask.sum())
     n_control = int(case_mask.size - n_case)
     a = np.asarray(present[case_mask].sum(axis=0)).ravel().astype(np.int64)
     c = np.asarray(present[~case_mask].sum(axis=0)).ravel().astype(np.int64)
     return a, n_case - a, c, n_control - c
+
+
+def _continuous_group_stats(matrix, phenotype_array):
+    """Per-column presence/absence group statistics for a continuous
+    phenotype: `(n_present, n_absent, mean_present, mean_absent,
+    var_present, var_absent)`, each a length-`n_kmers` `float64` array.
+
+    Computed with two sparse matrix-vector products -- `present.T @
+    phenotype` and `present.T @ phenotype**2` -- rather than slicing out
+    each column's two phenotype groups and calling `numpy.mean`/`numpy.var`
+    on them one k-mer at a time. Every downstream statistic (mean,
+    variance, Welch's t, the ANOVA F) is algebraically recovered from those
+    two sums plus the (single, matrix-wide) total sum and sum of squares,
+    so the whole screen touches each stored matrix entry exactly once, in
+    C, regardless of how many k-mers are tested.
+
+    On not also memoizing by presence *pattern*: the `(a, c)` trick in the
+    binary path works because a 2x2 table is fully described by two
+    integers, so scipy is called once per distinct `(a, c)` pair instead of
+    once per k-mer -- a real win because each `fisher_exact`/
+    `chi2_contingency` call is a Python-level round trip. Here there is no
+    equivalent shortcut *worth taking*: computing a per-column dedup key
+    (e.g. a hash of which samples are present) costs one touch of every
+    stored entry, i.e. the same O(nnz) this function already spends on the
+    two matrix-vector products -- and unlike the Fisher path, this
+    function makes no per-k-mer Python calls to amortize away: the t/F
+    statistic and its p-value are computed for every column at once with a
+    handful of vectorized NumPy/SciPy array ops, not a Python loop. Pattern
+    dedup would add a hashing pass and a lookup table without removing any
+    work the vectorized path is still doing, so it was investigated and
+    skipped rather than implemented.
+    """
+    present = _present_csr(matrix)
+    n_samples, n_kmers = present.shape
+    present_f = present.astype(np.float64)
+
+    n_present = np.asarray(present.sum(axis=0)).ravel().astype(np.float64)
+    n_absent = n_samples - n_present
+
+    sum_present = np.asarray(present_f.T @ phenotype_array).ravel()
+    sumsq_present = np.asarray(present_f.T @ (phenotype_array**2)).ravel()
+    sum_total = float(phenotype_array.sum())
+    sumsq_total = float((phenotype_array**2).sum())
+    sum_absent = sum_total - sum_present
+    sumsq_absent = sumsq_total - sumsq_present
+
+    safe_n_present = np.maximum(n_present, 1.0)
+    safe_n_absent = np.maximum(n_absent, 1.0)
+    mean_present = np.where(n_present > 0, sum_present / safe_n_present, np.nan)
+    mean_absent = np.where(n_absent > 0, sum_absent / safe_n_absent, np.nan)
+
+    # Sample variance (ddof=1), guarded against catastrophic-cancellation
+    # undershoot below zero and only defined for n >= 2.
+    var_present = np.where(
+        n_present >= 2,
+        np.maximum(sumsq_present - sum_present**2 / safe_n_present, 0.0) / np.maximum(n_present - 1.0, 1.0),
+        np.nan,
+    )
+    var_absent = np.where(
+        n_absent >= 2,
+        np.maximum(sumsq_absent - sum_absent**2 / safe_n_absent, 0.0) / np.maximum(n_absent - 1.0, 1.0),
+        np.nan,
+    )
+
+    return n_present, n_absent, mean_present, mean_absent, var_present, var_absent
+
+
+def _welch_or_anova(matrix, phenotype_array, test):
+    """Vectorized Welch's t-test (`test="welch"`) or one-way ANOVA F-test
+    (`test="anova"`) of the continuous `phenotype_array` split by each
+    column's presence/absence, for every column of `matrix` at once.
+
+    Returns `(n_present, n_absent, mean_present, mean_absent, statistic,
+    p_value)`. A k-mer present in fewer than 2 samples, or absent in fewer
+    than 2 (including present-in-0/present-in-all), has no within-group
+    variance to estimate on at least one side and is reported with
+    `statistic = nan` and the sentinel `p_value = 1.0` -- the same
+    "untestable, not dropped" convention `prefilter_association` already
+    uses for a binary k-mer with a zero marginal, so a caller filtering on
+    `p_value` treats both the same way without special-casing either mode.
+    """
+    from scipy import stats
+
+    n_present, n_absent, mean_present, mean_absent, var_present, var_absent = _continuous_group_stats(
+        matrix, phenotype_array
+    )
+    testable = (n_present >= 2) & (n_absent >= 2)
+
+    safe_n_present = np.maximum(n_present, 2.0)
+    safe_n_absent = np.maximum(n_absent, 2.0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if test == "welch":
+            se_present = var_present / safe_n_present
+            se_absent = var_absent / safe_n_absent
+            denom = np.sqrt(se_present + se_absent)
+            statistic = (mean_present - mean_absent) / denom
+            df = (se_present + se_absent) ** 2 / (
+                se_present**2 / np.maximum(safe_n_present - 1.0, 1.0)
+                + se_absent**2 / np.maximum(safe_n_absent - 1.0, 1.0)
+            )
+            p_values = 2.0 * stats.t.sf(np.abs(statistic), df)
+        else:  # "anova"
+            grand_mean = (mean_present * n_present + mean_absent * n_absent) / (n_present + n_absent)
+            ssb = n_present * (mean_present - grand_mean) ** 2 + n_absent * (mean_absent - grand_mean) ** 2
+            ssw = var_present * (safe_n_present - 1.0) + var_absent * (safe_n_absent - 1.0)
+            df_within = n_present + n_absent - 2.0
+            statistic = ssb / (ssw / df_within)
+            p_values = stats.f.sf(statistic, 1, df_within)
+
+    statistic = np.where(testable, statistic, np.nan)
+    p_values = np.where(testable, np.clip(p_values, 0.0, 1.0), 1.0)
+    return n_present, n_absent, mean_present, mean_absent, statistic, p_values
+
+
+_BINARY_TESTS = ("fisher", "chi2")
+_CONTINUOUS_TESTS = ("welch", "anova")
 
 
 _SCREENING_METADATA = {
@@ -663,7 +787,8 @@ _SCREENING_METADATA = {
 
 
 def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", top_n=None):
-    """A fast, **unadjusted** per-k-mer screen of a binary phenotype.
+    """A fast, **unadjusted** per-k-mer screen of a binary or continuous
+    phenotype.
 
     This is triage, not inference. Read this paragraph before using the
     output for anything: every k-mer is tested independently against the
@@ -676,21 +801,29 @@ def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", t
     small p-values. That is not a subtle bias; it is the dominant signal in
     an uncorrected k-mer screen. The Bonferroni and Benjamini-Hochberg
     columns do not fix it either: multiple-testing control assumes the
-    tests are exchangeable, which structure-confounded tests are not.
-    Nothing this function returns may be reported as an association until
-    it has been confirmed with pyseer (`--lmm` with a `--similarity` matrix
-    -- see :func:`kinship_matrix`), kmersGWAS, DBGWAS, or an equivalent
-    mixed model.
+    tests are exchangeable, which structure-confounded tests are not. A
+    continuous phenotype (e.g. a minimum inhibitory concentration or a
+    virulence score) is, if anything, *more* exposed to this than a binary
+    one: it is tempting to scan a numeric ranking, eyeball whichever k-mer
+    has the largest mean difference, and call it a hit -- that is p-hacking
+    with extra steps, and multiple-testing correction does not rescue it
+    any more than it rescues population structure. Nothing this function
+    returns may be reported as an association until it has been confirmed
+    with pyseer (`--lmm`/`--continuous` with a `--similarity` matrix -- see
+    :func:`kinship_matrix`), kmersGWAS, DBGWAS, or an equivalent mixed
+    model.
 
     What it is genuinely good for: sanity-checking a cohort before
     committing to a long run ("does *anything* separate cases from
-    controls?"), shortlisting k-mers for a downstream model, and debugging
-    a phenotype file. Every call emits a :class:`ScreeningOnlyWarning`
-    saying so, and the returned table carries the same statement in its
-    Arrow schema metadata (`fastdna.screening_only`,
-    `fastdna.population_structure_correction`, `fastdna.confirm_with`), so
-    the caveat survives being saved to Parquet and read back by someone
-    who never saw this docstring.
+    controls, or track a continuous trait?"), shortlisting k-mers for a
+    downstream model, and debugging a phenotype file. Every call emits a
+    :class:`ScreeningOnlyWarning` saying so, and the returned table carries
+    the same statement in its Arrow schema metadata
+    (`fastdna.screening_only`, `fastdna.population_structure_correction`,
+    `fastdna.confirm_with`), so the caveat survives being saved to Parquet
+    and read back by someone who never saw this docstring. This applies
+    identically to both phenotype modes -- there is no quieter code path
+    for the continuous case.
 
     Parameters
     ----------
@@ -699,23 +832,49 @@ def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", t
         binarized: any non-zero entry is "present". Row order must match
         `phenotype`.
     phenotype : array-like of length n_samples
-        A binary phenotype -- exactly two distinct values (`0`/`1`,
-        `False`/`True`, or any pair of comparable labels). The greater of
-        the two is treated as the case group, so the usual 0/1 and
-        `False`/`True` encodings mean what they look like. Continuous
-        phenotypes are rejected rather than thresholded behind your back;
-        use pyseer's `--continuous` for those.
+        For `test="fisher"`/`"chi2"` (binary mode): exactly two distinct
+        values (`0`/`1`, `False`/`True`, or any pair of comparable labels).
+        The greater of the two is treated as the case group, so the usual
+        0/1 and `False`/`True` encodings mean what they look like.
+        For `test="welch"`/`"anova"` (continuous mode): a numeric array
+        with at least two distinct finite values -- integers are accepted
+        (e.g. a raw MIC titre), `NaN`/`inf` and non-numeric values are not.
     kmer_sequences : sequence of str, length n_kmers
         Column labels, as returned by :func:`cohort_presence_matrix`. They
         are decoded DNA, so a hit is directly BLASTable -- which is most of
         the point of screening at the k-mer level at all.
-    test : {"fisher", "chi2"}, default "fisher"
+    test : {"fisher", "chi2", "welch", "anova"}, default "fisher"
+        Which test to run, and which phenotype mode that implies --
+        `"fisher"`/`"chi2"` mean binary, `"welch"`/`"anova"` mean
+        continuous. There is no separate mode-selection argument: this
+        module already picks behavior by `test=` (`"fisher"` vs `"chi2"`),
+        so phenotype mode follows the same convention rather than adding a
+        second, redundant switch.
+
         `"fisher"` is Fisher's exact test, correct at any cell count and
         the right default for cohorts where a k-mer may appear in a handful
         of samples. `"chi2"` is Pearson's chi-squared without continuity
         correction -- faster, but its asymptotic approximation is
         unreliable when any expected cell count falls below ~5, which for
         rare k-mers is the normal case rather than the exception.
+
+        `"welch"` is Welch's t-test (`scipy.stats.ttest_ind(...,
+        equal_var=False)`) comparing the phenotype of the samples that
+        carry a k-mer against those that do not, **and is the default for
+        continuous mode** because assuming the two groups share a variance
+        is not a claim this screen is in a position to defend: k-mer
+        presence routinely splits a cohort 3-vs-197, and nothing about
+        carrying a k-mer implies its phenotype spread matches the group
+        that does not. `"anova"` is a one-way ANOVA F-test over the same
+        two groups, which for exactly two groups is the pooled-variance
+        (equal-variance-assumed) counterpart of a classic two-sample
+        t-test -- algebraically `F == t**2` under that shared assumption.
+        It agrees with `"welch"` when the two groups' variances happen to
+        be similar and diverges from it when they do not (unequal group
+        sizes make this the normal case, not the exception, for k-mer
+        presence splits). Use `"anova"` only when equal variance is
+        independently defensible for this cohort, not merely because it
+        moves a p-value.
     top_n : int or None, default None
         Return only the `top_n` most significant rows. The multiple-testing
         columns are always computed over *all* k-mers tested, not over the
@@ -726,33 +885,58 @@ def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", t
     -------
     pyarrow.Table
         Sorted by `p_value` ascending (ties broken by `kmer_sequence`, so
-        the order is reproducible), with columns:
-        `kmer_sequence`, `n_case_present`, `n_case_absent`,
-        `n_control_present`, `n_control_absent`, `odds_ratio`, `p_value`,
-        `p_bonferroni`, `q_value_bh`.
-        `odds_ratio` is the sample odds ratio `(a*d)/(b*c)`, `nan` when a
-        zero cell makes it undefined. K-mers present in every sample or in
-        none have no variance to test and are reported with `p_value` 1.0
-        and a `nan` odds ratio rather than being silently dropped -- their
-        presence in the table is itself information about the cohort.
+        the order is reproducible).
+
+        Binary mode (`test="fisher"`/`"chi2"`) columns: `kmer_sequence`,
+        `n_case_present`, `n_case_absent`, `n_control_present`,
+        `n_control_absent`, `odds_ratio`, `p_value`, `p_bonferroni`,
+        `q_value_bh`. `odds_ratio` is the sample odds ratio `(a*d)/(b*c)`,
+        `nan` when a zero cell makes it undefined. K-mers present in every
+        sample or in none have no variance to test and are reported with
+        `p_value` 1.0 and a `nan` odds ratio rather than being silently
+        dropped -- their presence in the table is itself information about
+        the cohort.
+
+        Continuous mode (`test="welch"`/`"anova"`) columns:
+        `kmer_sequence`, `n_present`, `n_absent`, `mean_present`,
+        `mean_absent`, `statistic`, `p_value`, `p_bonferroni`,
+        `q_value_bh`. `statistic` is the t-statistic (`"welch"`) or
+        F-statistic (`"anova"`); `mean_present`/`mean_absent` are the two
+        groups' phenotype means, which is what the test statistic is
+        already built from -- nothing beyond that falls out of a t/F test,
+        so nothing more is reported. A k-mer present in fewer than 2
+        samples, or absent in fewer than 2 (including the k-mer present in
+        every sample or none of them), has no within-group variance to
+        estimate on at least one side; it is reported with `statistic`
+        `nan` and the sentinel `p_value` 1.0 -- the same "untestable, kept
+        rather than dropped" convention the binary mode uses for its own
+        zero-marginal case, so a caller filtering on `p_value` needs no
+        mode-specific handling. `mean_present`/`mean_absent` are still
+        reported whenever that side has at least one sample (`nan` only
+        when a side is completely empty), since a single-sample mean is
+        informative even though no test can be run from it.
 
     Warns
     -----
     ScreeningOnlyWarning
-        On every call, unconditionally.
+        On every call, unconditionally, in both phenotype modes.
 
     Raises
     ------
     ValueError
         If `matrix` has fewer than 2 rows; if `len(phenotype)` does not
         equal the number of rows; if `len(kmer_sequences)` does not equal
-        the number of columns; if the phenotype has a single class or more
-        than two; or if `test` is not one of the two supported names.
+        the number of columns; if `test` is not one of the four supported
+        names; in binary mode, if the phenotype has a single class or more
+        than two; in continuous mode, if the phenotype is not numeric,
+        contains `NaN`/`inf`, or has zero variance (a single distinct
+        value).
     """
     from scipy import stats
 
-    if test not in ("fisher", "chi2"):
-        raise ValueError(f"test must be 'fisher' or 'chi2', got {test!r}")
+    if test not in _BINARY_TESTS + _CONTINUOUS_TESTS:
+        raise ValueError(f"test must be one of {_BINARY_TESTS + _CONTINUOUS_TESTS!r}, got {test!r}")
+    is_continuous = test in _CONTINUOUS_TESTS
     top_n = _positive_int_or_none(top_n, "top_n")
 
     n_samples, n_kmers = matrix.shape
@@ -778,32 +962,101 @@ def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", t
             "a mismatched list would label every result with the wrong k-mer."
         )
 
-    classes = np.unique(phenotype_array)
-    if classes.size < 2:
-        raise ValueError(
-            f"phenotype has a single class ({classes.tolist()!r}): there is nothing to associate against. "
-            "Check that the phenotype column was read correctly and that both cases and controls "
-            "are present in this cohort."
-        )
-    if classes.size > 2:
-        raise ValueError(
-            f"phenotype has {classes.size} distinct values, but prefilter_association() only supports a "
-            "binary phenotype. Encode it as 0/1 (or False/True) yourself if it really is binary; for a "
-            "genuinely continuous phenotype use pyseer's --continuous, which models it properly "
-            "instead of thresholding it arbitrarily."
-        )
+    if is_continuous:
+        # Object/string dtypes (non-numeric values, or a list mixing `None`
+        # into otherwise-numeric values, which numpy can only represent as
+        # `object`) are rejected here rather than left to fail confusingly
+        # inside the variance arithmetic below. `bool_` is deliberately not
+        # `number`-like in numpy, so a `[True, False, ...]` phenotype is
+        # also rejected -- it belongs in binary mode.
+        if not np.issubdtype(phenotype_array.dtype, np.number):
+            raise ValueError(
+                f"phenotype must be numeric for a continuous test (test={test!r}), got dtype "
+                f"{phenotype_array.dtype}. Encode it as int/float, or use test='fisher'/'chi2' for a "
+                "genuinely binary (two-class) phenotype instead."
+            )
+        phenotype_array = phenotype_array.astype(np.float64)
+        finite = np.isfinite(phenotype_array)
+        if not finite.all():
+            raise ValueError(
+                f"phenotype contains {int((~finite).sum())} NaN/inf value(s), which test={test!r} "
+                "cannot use -- a t/F statistic computed against a NaN or infinite phenotype value is "
+                "meaningless for every k-mer, not just the affected sample(s). Drop or impute those "
+                "samples before calling prefilter_association()."
+            )
+        if np.unique(phenotype_array).size < 2:
+            raise ValueError(
+                f"phenotype has zero variance (every value is {float(phenotype_array[0])!r}): there is "
+                "nothing to associate against. Check that the phenotype column was read correctly."
+            )
+    else:
+        classes = np.unique(phenotype_array)
+        if classes.size < 2:
+            raise ValueError(
+                f"phenotype has a single class ({classes.tolist()!r}): there is nothing to associate against. "
+                "Check that the phenotype column was read correctly and that both cases and controls "
+                "are present in this cohort."
+            )
+        if classes.size > 2:
+            raise ValueError(
+                f"phenotype has {classes.size} distinct values, but test={test!r} only supports a "
+                "binary phenotype. Encode it as 0/1 (or False/True) yourself if it really is binary; "
+                "for a genuinely continuous phenotype pass test='welch' (or test='anova') instead of "
+                "thresholding it arbitrarily."
+            )
 
     warnings.warn(
         "prefilter_association() is an UNADJUSTED screen, not inference: no population-structure "
         "correction, no random effect, no relatedness model. In a cohort with any lineage structure "
         "-- i.e. every real one -- a successful clone's whole accessory genome will score as "
         "significant here. The p_bonferroni/q_value_bh columns control multiplicity, not "
-        "confounding. Confirm anything of interest with pyseer (--lmm plus a --similarity matrix, "
+        "confounding."
+        + (
+            " Continuous phenotypes are additionally easy to p-hack by eye -- scanning a numeric "
+            "ranking for the k-mer with the biggest mean difference and calling it a hit is exactly "
+            "the kind of post-hoc cherry-picking multiple-testing correction cannot rescue."
+            if is_continuous
+            else ""
+        )
+        + " Confirm anything of interest with pyseer (--lmm/--continuous plus a --similarity matrix, "
         "see fastdna.gwas.kinship_matrix), kmersGWAS or DBGWAS before calling it an association.",
         ScreeningOnlyWarning,
         stacklevel=2,
     )
 
+    sequences = np.asarray(list(kmer_sequences), dtype=object)
+
+    if is_continuous:
+        n_present, n_absent, mean_present, mean_absent, statistic, p_values = _welch_or_anova(
+            matrix, phenotype_array, test
+        )
+
+        # Primary key is the last argument to lexsort: p ascending, ties
+        # broken by sequence so repeated runs agree row for row.
+        order = np.lexsort((sequences.astype(str), p_values))
+        sorted_p = p_values[order]
+        q_values = _benjamini_hochberg(sorted_p)
+        bonferroni = np.clip(sorted_p * n_kmers, 0.0, 1.0)
+
+        keep = slice(None) if top_n is None else slice(0, top_n)
+        table = pa.table(
+            {
+                "kmer_sequence": pa.array([str(s) for s in sequences[order][keep]], type=pa.string()),
+                "n_present": pa.array(n_present[order][keep].astype(np.int32), type=pa.int32()),
+                "n_absent": pa.array(n_absent[order][keep].astype(np.int32), type=pa.int32()),
+                "mean_present": pa.array(mean_present[order][keep], type=pa.float64()),
+                "mean_absent": pa.array(mean_absent[order][keep], type=pa.float64()),
+                "statistic": pa.array(statistic[order][keep], type=pa.float64()),
+                "p_value": pa.array(sorted_p[keep], type=pa.float64()),
+                "p_bonferroni": pa.array(bonferroni[keep], type=pa.float64()),
+                "q_value_bh": pa.array(q_values[keep], type=pa.float64()),
+            }
+        )
+        return table.replace_schema_metadata(
+            {**_SCREENING_METADATA, "fastdna.n_kmers_tested": str(n_kmers), "fastdna.test": test}
+        )
+
+    classes = np.unique(phenotype_array)
     case_value = classes[1]
     case_mask = np.asarray(phenotype_array == case_value)
     a, b, c, d = _contingency_counts(matrix, case_mask)
@@ -844,7 +1097,6 @@ def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", t
             p_value_of[(aj, cj)] = cached
         p_values[j] = cached
 
-    sequences = np.asarray(list(kmer_sequences), dtype=object)
     # Primary key is the last argument to lexsort: p ascending, ties broken
     # by sequence so repeated runs agree row for row.
     order = np.lexsort((sequences.astype(str), p_values))

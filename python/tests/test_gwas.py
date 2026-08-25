@@ -456,3 +456,311 @@ def test_prefilter_association_rejects_fewer_than_two_samples(case_control_cohor
 
     with pytest.raises(ValueError, match="at least 2 samples"):
         prefilter_association(one_row, [1], kmer_sequences)
+
+
+def test_prefilter_association_binary_rejection_message_points_to_continuous_tests(case_control_cohort):
+    matrix, _, kmer_sequences, _ = case_control_cohort
+
+    with pytest.raises(ValueError) as excinfo:
+        prefilter_association(matrix, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6], kmer_sequences)
+
+    message = str(excinfo.value)
+    assert "welch" in message
+    assert "anova" in message
+
+
+# ---------------------------------------------------------------------------
+# prefilter_association() -- continuous phenotype (Welch's t-test / ANOVA)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def continuous_cohort(tmp_path):
+    """The same six-sample cohort shape as `case_control_cohort` -- three
+    samples carrying the accessory `CCCCC` k-mer, three that do not -- but
+    paired with a continuous phenotype instead of a 0/1 label: the three
+    accessory carriers have a clearly higher phenotype value than the three
+    that lack it, so `CCCCC` should screen as the top hit under a
+    continuous test exactly as it does under Fisher/chi2.
+    """
+    paths = [write_background_plus_accessory(tmp_path, f"high_{i}.fastq") for i in range(3)]
+    paths += [write_background(tmp_path, f"low_{i}.fastq") for i in range(3)]
+    matrix, sample_ids, kmer_sequences = cohort_presence_matrix(paths, k=5, min_count=1, min_samples=1)
+    phenotype = [10.0, 11.0, 9.0, 1.0, 2.0, 0.0]
+    return matrix, phenotype, kmer_sequences, sample_ids
+
+
+def test_case_only_kmer_ranks_first_under_welch(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+
+    with pytest.warns(ScreeningOnlyWarning):
+        table = prefilter_association(matrix, phenotype, kmer_sequences, test="welch")
+
+    rows = table.to_pylist()
+    assert rows[0]["kmer_sequence"] == "CCCCC"
+    assert rows[0]["n_present"] == 3
+    assert rows[0]["n_absent"] == 3
+    assert rows[0]["mean_present"] > rows[0]["mean_absent"]
+    assert rows[0]["p_value"] < 1.0
+    # The background k-mers are in every sample: no absent group at all,
+    # nothing to test, sentinel p == 1.0 rather than a spurious hit.
+    for row in rows[1:]:
+        assert row["p_value"] > rows[0]["p_value"]
+
+
+def test_prefilter_association_welch_is_the_default_continuous_test(continuous_cohort):
+    """`test="welch"` and the bare Welch computation must agree bit for
+    bit -- `"welch"` is not merely *a* supported continuous test, it is
+    what a caller gets by explicitly asking for the continuous mode's
+    documented default.
+    """
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+
+    with pytest.warns(ScreeningOnlyWarning):
+        explicit = prefilter_association(matrix, phenotype, kmer_sequences, test="welch")
+
+    assert explicit.to_pylist()[0]["kmer_sequence"] == "CCCCC"
+
+
+def test_prefilter_association_supports_anova(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+
+    with pytest.warns(ScreeningOnlyWarning):
+        table = prefilter_association(matrix, phenotype, kmer_sequences, test="anova")
+
+    rows = table.to_pylist()
+    assert rows[0]["kmer_sequence"] == "CCCCC"
+    assert rows[0]["p_value"] < 1.0
+
+
+def test_prefilter_association_welch_matches_scipy_ttest_ind(continuous_cohort):
+    """Pins the vectorized closed-form computation in `_welch_or_anova`
+    against a direct, unvectorized `scipy.stats.ttest_ind(...,
+    equal_var=False)` call on the same two groups -- the two must agree to
+    floating-point tolerance, since the vectorized path is doing the same
+    Welch's-t arithmetic scipy does, just for every k-mer column at once.
+    """
+    from scipy import stats
+
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+    phenotype_array = np.asarray(phenotype, dtype=np.float64)
+    dense = matrix.toarray()
+
+    with pytest.warns(ScreeningOnlyWarning):
+        table = prefilter_association(matrix, phenotype, kmer_sequences, test="welch")
+
+    rows = {row["kmer_sequence"]: row for row in table.to_pylist()}
+    column_index = {name: i for i, name in enumerate(kmer_sequences)}
+
+    present_mask = dense[:, column_index["CCCCC"]].astype(bool)
+    expected = stats.ttest_ind(phenotype_array[present_mask], phenotype_array[~present_mask], equal_var=False)
+
+    assert rows["CCCCC"]["statistic"] == pytest.approx(expected.statistic)
+    assert rows["CCCCC"]["p_value"] == pytest.approx(expected.pvalue)
+
+
+def test_prefilter_association_anova_matches_scipy_f_oneway(continuous_cohort):
+    from scipy import stats
+
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+    phenotype_array = np.asarray(phenotype, dtype=np.float64)
+    dense = matrix.toarray()
+
+    with pytest.warns(ScreeningOnlyWarning):
+        table = prefilter_association(matrix, phenotype, kmer_sequences, test="anova")
+
+    rows = {row["kmer_sequence"]: row for row in table.to_pylist()}
+    column_index = {name: i for i, name in enumerate(kmer_sequences)}
+
+    present_mask = dense[:, column_index["CCCCC"]].astype(bool)
+    expected = stats.f_oneway(phenotype_array[present_mask], phenotype_array[~present_mask])
+
+    assert rows["CCCCC"]["statistic"] == pytest.approx(expected.statistic)
+    assert rows["CCCCC"]["p_value"] == pytest.approx(expected.pvalue)
+
+
+def test_prefilter_association_continuous_warns_that_it_is_screening_only(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+
+    with pytest.warns(ScreeningOnlyWarning, match="pyseer"):
+        prefilter_association(matrix, phenotype, kmer_sequences, test="welch")
+
+
+def test_prefilter_association_continuous_warning_names_the_p_hacking_risk(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+
+    with pytest.warns(ScreeningOnlyWarning, match="p-hack"):
+        prefilter_association(matrix, phenotype, kmer_sequences, test="welch")
+
+
+def test_prefilter_association_continuous_result_carries_screening_metadata(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+
+    with pytest.warns(ScreeningOnlyWarning):
+        table = prefilter_association(matrix, phenotype, kmer_sequences, test="welch")
+
+    metadata = {k.decode(): v.decode() for k, v in table.schema.metadata.items()}
+    assert metadata["fastdna.screening_only"] == "true"
+    assert metadata["fastdna.population_structure_correction"] == "none"
+    assert "pyseer" in metadata["fastdna.confirm_with"]
+    assert metadata["fastdna.test"] == "welch"
+
+
+def test_prefilter_association_continuous_reports_multiple_testing_columns(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+
+    with pytest.warns(ScreeningOnlyWarning):
+        table = prefilter_association(matrix, phenotype, kmer_sequences, test="welch")
+
+    assert {"p_bonferroni", "q_value_bh"}.issubset(set(table.column_names))
+    rows = table.to_pylist()
+    n_tested = len(kmer_sequences)
+    for row in rows:
+        assert row["p_bonferroni"] == pytest.approx(min(1.0, row["p_value"] * n_tested))
+        assert 0.0 <= row["q_value_bh"] <= 1.0
+
+
+def test_prefilter_association_continuous_top_n_limits_rows(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+
+    with pytest.warns(ScreeningOnlyWarning):
+        table = prefilter_association(matrix, phenotype, kmer_sequences, test="welch", top_n=1)
+
+    assert table.num_rows == 1
+    assert table.to_pylist()[0]["kmer_sequence"] == "CCCCC"
+
+
+def test_prefilter_association_rejects_a_non_numeric_continuous_phenotype(continuous_cohort):
+    matrix, _, kmer_sequences, _ = continuous_cohort
+
+    with pytest.raises(ValueError) as excinfo:
+        prefilter_association(matrix, ["lo", "hi", "lo", "hi", "lo", "hi"], kmer_sequences, test="welch")
+
+    assert "numeric" in str(excinfo.value)
+
+
+def test_prefilter_association_rejects_nan_in_a_continuous_phenotype(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+    broken = list(phenotype)
+    broken[0] = float("nan")
+
+    with pytest.raises(ValueError) as excinfo:
+        prefilter_association(matrix, broken, kmer_sequences, test="welch")
+
+    assert "NaN" in str(excinfo.value)
+
+
+def test_prefilter_association_rejects_inf_in_a_continuous_phenotype(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+    broken = list(phenotype)
+    broken[0] = float("inf")
+
+    with pytest.raises(ValueError) as excinfo:
+        prefilter_association(matrix, broken, kmer_sequences, test="welch")
+
+    assert "inf" in str(excinfo.value)
+
+
+def test_prefilter_association_rejects_a_zero_variance_continuous_phenotype(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+    constant = [3.5] * len(phenotype)
+
+    with pytest.raises(ValueError) as excinfo:
+        prefilter_association(matrix, constant, kmer_sequences, test="welch")
+
+    assert "zero variance" in str(excinfo.value)
+
+
+def test_prefilter_association_rejects_continuous_phenotype_length_mismatch(continuous_cohort):
+    matrix, phenotype, kmer_sequences, _ = continuous_cohort
+
+    with pytest.raises(ValueError) as excinfo:
+        prefilter_association(matrix, phenotype[:4], kmer_sequences, test="welch")
+
+    message = str(excinfo.value)
+    assert "6 samples" in message
+    assert "4" in message
+
+
+def test_continuous_untestable_kmers_get_a_sentinel_pvalue_not_dropped():
+    """A k-mer present in every sample, present in none, or present in
+    only a single sample has no within-group variance to estimate on at
+    least one side -- the continuous-mode analogue of the binary path's
+    zero-marginal 2x2 table. Each is kept in the output with `statistic
+    = nan` and the sentinel `p_value = 1.0` rather than being dropped, the
+    same convention `prefilter_association` already uses for an
+    all-present/all-absent k-mer in binary mode.
+    """
+    dense = np.array(
+        [
+            [1, 0, 1, 1],
+            [1, 0, 0, 1],
+            [1, 0, 0, 0],
+            [1, 0, 0, 0],
+            [1, 0, 0, 0],
+        ],
+        dtype=np.uint32,
+    )
+    matrix = scipy.sparse.csr_matrix(dense)
+    kmers = ["ALL_PRESENT", "ALL_ABSENT", "ONE_PRESENT", "SPLIT"]
+    phenotype = [10.0, 9.0, 1.0, 0.5, 2.0]
+
+    with pytest.warns(ScreeningOnlyWarning):
+        table = prefilter_association(matrix, phenotype, kmers, test="welch")
+
+    rows = {row["kmer_sequence"]: row for row in table.to_pylist()}
+    assert set(rows) == {"ALL_PRESENT", "ALL_ABSENT", "ONE_PRESENT", "SPLIT"}
+
+    for name in ("ALL_PRESENT", "ALL_ABSENT", "ONE_PRESENT"):
+        assert rows[name]["p_value"] == 1.0
+        assert np.isnan(rows[name]["statistic"])
+
+    # A single-sample mean is still informative even though no test can be
+    # run from it, so it is reported rather than nan'd out.
+    assert not np.isnan(rows["ONE_PRESENT"]["mean_present"])
+    assert np.isnan(rows["ALL_PRESENT"]["mean_absent"])
+    assert np.isnan(rows["ALL_ABSENT"]["mean_present"])
+
+    assert rows["SPLIT"]["n_present"] == 2
+    assert rows["SPLIT"]["n_absent"] == 3
+    assert not np.isnan(rows["SPLIT"]["statistic"])
+    assert rows["SPLIT"]["p_value"] < 1.0
+
+
+def test_continuous_duplicate_presence_patterns_give_identical_results():
+    """Two k-mer columns that happen to share the exact same
+    presence/absence pattern must land on bit-identical statistics --
+    `_continuous_group_stats` deliberately does not memoize by pattern (see
+    its docstring for why that was investigated and skipped), so this is
+    what would break first if the vectorized per-column arithmetic were
+    accidentally column-order-dependent.
+    """
+    dense = np.array(
+        [
+            [1, 1],
+            [1, 1],
+            [0, 0],
+            [0, 0],
+        ],
+        dtype=np.uint32,
+    )
+    matrix = scipy.sparse.csr_matrix(dense)
+    kmers = ["A", "B"]
+    phenotype = [5.0, 6.0, 1.0, 2.0]
+
+    with pytest.warns(ScreeningOnlyWarning):
+        table = prefilter_association(matrix, phenotype, kmers, test="welch")
+
+    rows = {row["kmer_sequence"]: row for row in table.to_pylist()}
+    assert rows["A"]["statistic"] == rows["B"]["statistic"]
+    assert rows["A"]["p_value"] == rows["B"]["p_value"]
+    assert rows["A"]["mean_present"] == rows["B"]["mean_present"]
+    assert rows["A"]["mean_absent"] == rows["B"]["mean_absent"]
+
+
+def test_prefilter_association_rejects_fewer_than_two_samples_continuous(continuous_cohort):
+    _, _, kmer_sequences, _ = continuous_cohort
+    one_row = scipy.sparse.csr_matrix(np.ones((1, len(kmer_sequences)), dtype=np.uint32))
+
+    with pytest.raises(ValueError, match="at least 2 samples"):
+        prefilter_association(one_row, [1.0], kmer_sequences, test="welch")
