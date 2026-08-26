@@ -1,0 +1,1628 @@
+<title>FastDNA Architecture</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --paper: #f4f6f7;
+    --paper-raised: #ffffff;
+    --ink: #161b22;
+    --ink-soft: #3d4650;
+    --ink-faint: #6b7480;
+    --line: #d7dde2;
+    --line-soft: #e6eaed;
+    --accent: #0f7a8c;
+    --accent-ink: #075c6b;
+    --accent-soft: #e2f2f4;
+    --accent-soft-line: #bfe0e5;
+    --warn: #9a5b12;
+    --warn-soft: #fbf0dd;
+    --warn-line: #edd6a8;
+    --code-bg: #eef1f2;
+    --code-ink: #1c333a;
+    --shadow: 0 1px 2px rgba(20, 30, 35, 0.06), 0 6px 20px rgba(20, 30, 35, 0.05);
+    --base-a: #2f7d4f;
+    --base-c: #2461a3;
+    --base-g: #a3781f;
+    --base-t: #a13f37;
+    --radius: 7px;
+  }
+
+  :root:not([data-theme="light"]) {
+    @media (prefers-color-scheme: dark) {
+      --paper: #14181d;
+      --paper-raised: #1b2027;
+      --ink: #e7ebee;
+      --ink-soft: #b7c0c8;
+      --ink-faint: #838d97;
+      --line: #2c333b;
+      --line-soft: #232a31;
+      --accent: #4fc0d1;
+      --accent-ink: #8adce7;
+      --accent-soft: #16292d;
+      --accent-soft-line: #204049;
+      --warn: #e2ac5f;
+      --warn-soft: #2b2416;
+      --warn-line: #4a3b1e;
+      --code-bg: #10161b;
+      --code-ink: #d7e4e7;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+      --base-a: #5bb87f;
+      --base-c: #5b9bd9;
+      --base-g: #d1a441;
+      --base-t: #d97a70;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper: #14181d;
+    --paper-raised: #1b2027;
+    --ink: #e7ebee;
+    --ink-soft: #b7c0c8;
+    --ink-faint: #838d97;
+    --line: #2c333b;
+    --line-soft: #232a31;
+    --accent: #4fc0d1;
+    --accent-ink: #8adce7;
+    --accent-soft: #16292d;
+    --accent-soft-line: #204049;
+    --warn: #e2ac5f;
+    --warn-soft: #2b2416;
+    --warn-line: #4a3b1e;
+    --code-bg: #10161b;
+    --code-ink: #d7e4e7;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+    --base-a: #5bb87f;
+    --base-c: #5b9bd9;
+    --base-g: #d1a441;
+    --base-t: #d97a70;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    font-size: 16.5px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection { background: var(--accent-soft-line); }
+
+  h1, h2, h3, h4 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    color: var(--ink);
+    text-wrap: balance;
+    line-height: 1.22;
+    font-weight: 600;
+  }
+
+  a { color: var(--accent-ink); text-decoration-color: var(--accent-soft-line); text-underline-offset: 2px; }
+  a:hover { text-decoration-color: currentColor; }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  code, pre, .mono, .tabular { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+  .tabular { font-variant-numeric: tabular-nums; }
+
+  code {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    padding: 0.1em 0.38em;
+    border-radius: 4px;
+    font-size: 0.87em;
+    word-break: break-word;
+  }
+
+  pre {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.85em;
+    line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; border-radius: 0; font-size: 1em; }
+
+  /* ---------- shell layout ---------- */
+
+  .shell {
+    display: grid;
+    grid-template-columns: 280px minmax(0, 1fr);
+    max-width: 1360px;
+    margin: 0 auto;
+  }
+
+  nav.toc {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100vh;
+    overflow-y: auto;
+    padding: 28px 20px 40px 28px;
+    border-right: 1px solid var(--line-soft);
+    font-size: 0.86rem;
+  }
+
+  nav.toc .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  nav.toc .brand .mark { font-family: 'Source Serif 4', serif; font-weight: 700; font-size: 1.18rem; }
+  nav.toc .brand .tag {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: var(--ink-faint);
+  }
+  nav.toc .sub { color: var(--ink-faint); font-size: 0.78rem; margin: 0 0 20px; }
+
+  nav.toc ol { list-style: none; margin: 0; padding: 0; counter-reset: sec; }
+  nav.toc > ol > li { counter-increment: sec; margin-bottom: 3px; }
+  nav.toc a {
+    display: block;
+    padding: 5px 8px;
+    border-radius: 5px;
+    color: var(--ink-soft);
+    text-decoration: none;
+  }
+  nav.toc > ol > li > a::before {
+    content: counter(sec) ".  ";
+    color: var(--accent-ink);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.82em;
+  }
+  nav.toc a:hover { background: var(--line-soft); color: var(--ink); }
+  nav.toc ol ol { list-style: none; margin: 2px 0 6px 14px; padding: 0; border-left: 1px solid var(--line-soft); }
+  nav.toc ol ol a { font-size: 0.94em; padding: 3px 8px 3px 12px; color: var(--ink-faint); }
+  nav.toc ol ol a:hover { color: var(--ink); }
+
+  .toc-toggle { display: none; }
+
+  main {
+    min-width: 0;
+    padding: 40px clamp(20px, 4vw, 64px) 120px;
+  }
+
+  header.hero {
+    max-width: 74ch;
+    margin-bottom: 44px;
+    padding-bottom: 28px;
+    border-bottom: 1px solid var(--line);
+  }
+  header.hero .eyebrow {
+    font-size: 0.76rem;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--accent-ink);
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+  header.hero h1 { font-size: clamp(2rem, 4vw, 2.7rem); margin: 0 0 12px; }
+  header.hero p.lede { font-size: 1.1rem; color: var(--ink-soft); margin: 0 0 18px; max-width: 62ch; }
+  .meta-row { display: flex; flex-wrap: wrap; gap: 10px 22px; font-size: 0.84rem; color: var(--ink-faint); }
+  .meta-row strong { color: var(--ink-soft); font-weight: 600; }
+
+  section.doc-section {
+    max-width: 76ch;
+    margin: 0 0 64px;
+    scroll-margin-top: 24px;
+  }
+  section.doc-section.wide { max-width: 100%; }
+
+  .sec-num {
+    font-family: 'IBM Plex Mono', monospace;
+    color: var(--accent-ink);
+    font-size: 0.95rem;
+    font-weight: 600;
+    display: block;
+    margin-bottom: 4px;
+  }
+
+  h2.sec-title { font-size: 1.7rem; margin: 0 0 6px; scroll-margin-top: 20px; }
+  h3 { font-size: 1.28rem; margin: 38px 0 10px; scroll-margin-top: 20px; }
+  h4 { font-size: 1.05rem; margin: 24px 0 8px; color: var(--ink-soft); }
+  p { margin: 0 0 15px; }
+  ul, ol { margin: 0 0 15px; padding-left: 1.3em; }
+  li { margin-bottom: 5px; }
+  strong { font-weight: 600; }
+
+  .lead-rule { height: 1px; background: var(--line); border: 0; margin: 0 0 30px; }
+
+  /* ---------- callouts ---------- */
+
+  .callout {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius);
+    padding: 14px 18px;
+    margin: 18px 0;
+    font-size: 0.94rem;
+    box-shadow: var(--shadow);
+  }
+  .callout.warn { border-left-color: var(--warn); background: var(--warn-soft); border-color: var(--warn-line); }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .label {
+    display: block;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-weight: 700;
+    margin-bottom: 6px;
+    color: var(--accent-ink);
+  }
+  .callout.warn .label { color: var(--warn); }
+
+  /* ---------- tables ---------- */
+
+  .table-wrap { overflow-x: auto; margin: 18px 0; border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.88rem; background: var(--paper-raised); }
+  caption { text-align: left; font-size: 0.82rem; color: var(--ink-faint); padding: 8px 14px 0; caption-side: top; }
+  th, td { padding: 8px 14px; text-align: left; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+  td.wrap, th.wrap { white-space: normal; }
+  thead th {
+    background: var(--line-soft);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-soft);
+    font-weight: 600;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--accent-soft); }
+  td.num, th.num { text-align: right; font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
+
+  /* ---------- formulas ---------- */
+
+  .formula {
+    background: var(--code-bg);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    margin: 16px 0;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.02rem;
+    overflow-x: auto;
+    color: var(--code-ink);
+  }
+  .formula .cap { display: block; font-family: 'IBM Plex Sans', sans-serif; font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 8px; }
+
+  /* ---------- diagram ---------- */
+
+  .flow {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0;
+    margin: 26px 0 10px;
+    align-items: stretch;
+  }
+  .flow-stage { display: flex; flex-direction: column; gap: 10px; position: relative; padding: 0 10px; }
+  .flow-stage:not(:last-child)::after {
+    content: '→';
+    position: absolute;
+    right: -4px;
+    top: 50%;
+    transform: translate(50%, -50%);
+    color: var(--ink-faint);
+    font-size: 1.3rem;
+    z-index: 2;
+  }
+  .flow-label {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: var(--ink-faint);
+    text-align: center;
+    font-weight: 600;
+  }
+  .flow-box {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    font-size: 0.79rem;
+    box-shadow: var(--shadow);
+    text-align: center;
+    color: var(--ink-soft);
+  }
+  .flow-box strong { display: block; color: var(--ink); font-size: 0.87rem; margin-bottom: 2px; }
+  .flow-box.accent { border-color: var(--accent-soft-line); background: var(--accent-soft); }
+  @media (max-width: 880px) {
+    .flow { grid-template-columns: 1fr; }
+    .flow-stage:not(:last-child)::after { content: '↓'; right: 50%; top: auto; bottom: -6px; transform: translate(50%, 50%); }
+    .flow-stage { padding: 0 0 24px; }
+  }
+
+  .base-chip { display: inline-flex; align-items: center; gap: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 0.85em; padding: 1px 7px; border-radius: 999px; border: 1px solid; }
+  .base-chip.a { color: var(--base-a); border-color: var(--base-a); }
+  .base-chip.c { color: var(--base-c); border-color: var(--base-c); }
+  .base-chip.g { color: var(--base-g); border-color: var(--base-g); }
+  .base-chip.t { color: var(--base-t); border-color: var(--base-t); }
+
+  .badge {
+    display: inline-block;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--accent-soft-line);
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    vertical-align: middle;
+  }
+  .badge.stable { border-color: var(--line); color: var(--ink-soft); background: var(--line-soft); }
+  .badge.optin { border-color: var(--warn-line); color: var(--warn); background: var(--warn-soft); }
+
+  .filepath { font-family: 'IBM Plex Mono', monospace; font-size: 0.87em; color: var(--accent-ink); }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 760px) { .grid-2 { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+  }
+  .card h4 { margin-top: 0; }
+
+  footer.doc-footer {
+    max-width: 76ch;
+    padding-top: 24px;
+    border-top: 1px solid var(--line);
+    color: var(--ink-faint);
+    font-size: 0.82rem;
+  }
+
+  @media (max-width: 980px) {
+    .shell { grid-template-columns: 1fr; }
+    nav.toc {
+      position: static;
+      height: auto;
+      border-right: 0;
+      border-bottom: 1px solid var(--line-soft);
+      padding: 18px 20px;
+    }
+    nav.toc[data-collapsed="true"] ol { display: none; }
+    .toc-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--paper-raised);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 0.78rem;
+      color: var(--ink-soft);
+      cursor: pointer;
+      margin-bottom: 14px;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { scroll-behavior: auto !important; }
+  }
+</style>
+
+<div class="shell">
+  <nav class="toc" id="toc" aria-label="Table of contents">
+    <div class="brand"><span class="mark">FastDNA</span><span class="tag">Architecture</span></div>
+    <p class="sub">Technical Architecture &amp; Implementation Guide</p>
+    <button class="toc-toggle" id="tocToggle" type="button" aria-expanded="true" aria-controls="tocList">Sections ▾</button>
+    <ol id="tocList">
+      <li><a href="#sec-1">System Philosophy and Domain Model</a>
+        <ol>
+          <li><a href="#sec-1-1">Purpose and problem</a></li>
+          <li><a href="#sec-1-2">Data flow</a></li>
+          <li><a href="#sec-1-3">Vs. the state of the art</a></li>
+          <li><a href="#sec-1-4">Key design decisions</a></li>
+        </ol>
+      </li>
+      <li><a href="#sec-2">Low-Level Engine and Data Structures</a>
+        <ol>
+          <li><a href="#sec-2-1">2-bit k-mer representation</a></li>
+          <li><a href="#sec-2-2">Ingestion and streaming</a></li>
+          <li><a href="#sec-2-3">Filtering and compression</a></li>
+          <li><a href="#sec-2-4">Probabilistic structures</a></li>
+          <li><a href="#sec-2-5">Partitioning and parallelism</a></li>
+        </ol>
+      </li>
+      <li><a href="#sec-3">Memory Model, FFI, and Interoperability</a>
+        <ol>
+          <li><a href="#sec-3-1">Zero-copy Arrow export</a></li>
+          <li><a href="#sec-3-2">Ecosystem interop</a></li>
+          <li><a href="#sec-3-3">Error and panic policy</a></li>
+          <li><a href="#sec-3-4">Concurrency control</a></li>
+        </ol>
+      </li>
+      <li><a href="#sec-4">Algorithmic, Statistical, and Modeling Layer</a>
+        <ol>
+          <li><a href="#sec-4-1">Leakage-safe partitioning</a></li>
+          <li><a href="#sec-4-2">Statistical screening</a></li>
+          <li><a href="#sec-4-3">Native models</a></li>
+          <li><a href="#sec-4-4">Calibration and metrics</a></li>
+        </ol>
+      </li>
+      <li><a href="#sec-5">API, CLI, and Workflow Specification</a>
+        <ol>
+          <li><a href="#sec-5-1">Rust CLI</a></li>
+          <li><a href="#sec-5-2">Python API reference</a></li>
+          <li><a href="#sec-5-3">Integration examples</a></li>
+        </ol>
+      </li>
+      <li><a href="#sec-6">Empirical Validation and Reproducibility</a>
+        <ol>
+          <li><a href="#sec-6-1">Cross-tool benchmarks</a></li>
+          <li><a href="#sec-6-2">Real-data validation</a></li>
+          <li><a href="#sec-6-3">Test suite coverage</a></li>
+          <li><a href="#sec-6-4">Reproduction</a></li>
+        </ol>
+      </li>
+    </ol>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <div class="eyebrow">Technical Architecture &amp; Implementation Guide</div>
+      <h1>FastDNA: a canonical k-mer engine with an Arrow-native ML surface</h1>
+      <p class="lede">A manual reference for geneticists, software engineers, and bioinformaticians who need to
+      extend, operate, or scientifically evaluate FastDNA — the Rust genomic k-mer counting kernel and its
+      Python package. Every figure below is drawn from the repository's own source, tests, and measured
+      benchmarks as of the current tree.</p>
+      <div class="meta-row">
+        <span><strong>Core</strong> <code>fastdna/src</code> — Rust, pyo3, Arrow</span>
+        <span><strong>Package</strong> <code>fastdna/python/fastdna</code></span>
+        <span><strong>License</strong> MIT OR Apache-2.0</span>
+        <span><strong>Snapshot</strong> repository state, 2026-08-25</span>
+      </div>
+    </header>
+
+    <!-- =================== SECTION 1 =================== -->
+    <section class="doc-section wide" id="sec-1">
+      <span class="sec-num">01</span>
+      <h2 class="sec-title">System Philosophy and Domain Model</h2>
+      <hr class="lead-rule">
+
+      <div style="max-width:76ch">
+      <h3 id="sec-1-1">1.1 &nbsp;Purpose and the problem being solved</h3>
+      <p>FastDNA counts <strong>canonical k-mers</strong> — fixed-length DNA substrings collapsed with their
+      reverse complement — across FASTQ/FASTA input, at the throughput and memory discipline a real
+      sequencing run demands, and hands the result to Python as a zero-copy Arrow table rather than a bespoke
+      binary format. The domain model is small and explicit: a <span class="filepath">FastqRecord</span>
+      (id/seq/qual) is quality-trimmed, reduced to a multiset of 2-bit-packed <code>u64</code> canonical
+      k-mers, and folded into a sorted <code>(kmer, count)</code> table. Everything else in the repository —
+      three counting strategies, MinHash/HyperLogLog sketching, a Kraken2-style classifier, and a substantial
+      Python ML layer — is built on that one primitive.</p>
+
+      <p>The project's stated boundary (<span class="filepath">docs/philosophy-narrow-not-broad.md</span>) is
+      deliberate: FastDNA does not attempt alignment, pangenome graphs, or variant calling. The document cites
+      concrete adoption evidence for staying narrow — SAMtools (one job) carries roughly 10× the citations of
+      Biopython (everything) for about 1% of the scope, and AnnData (one data structure) sees more monthly
+      downloads than pysam or all of scikit-bio combined. Two unsolicited proposals to add pairwise alignment
+      (WFA), pangenome graphs, interval algebra, and a DLPack/PyTorch bridge were reviewed and declined on
+      exactly this basis: each has a decade-plus incumbent (minimap2, vg/pggb, bedtools) and would reuse
+      essentially none of FastDNA's k-mer engine.</p>
+
+      <h3 id="sec-1-2">1.2 &nbsp;End-to-end data flow</h3>
+      <p>A counting run moves through four stages. The producer/worker split and the three counting strategies
+      are detailed in <a href="#sec-2-5">§2.5</a>; this is the shape every one of them shares.</p>
+      </div>
+
+      <div class="flow">
+        <div class="flow-stage">
+          <span class="flow-label">Ingestion</span>
+          <div class="flow-box"><strong>FASTQ / FASTA</strong>plain or multi-member gzip, file(s) or stdin</div>
+          <div class="flow-box"><strong>Format sniff</strong>content-based, not extension-based</div>
+          <div class="flow-box"><strong>Producer thread</strong>bounded channel, batches of records</div>
+        </div>
+        <div class="flow-stage">
+          <span class="flow-label">Processing</span>
+          <div class="flow-box"><strong>QC observe</strong>GC / Q20 / Q30 before trimming</div>
+          <div class="flow-box"><strong>Quality trim</strong>rolling-window 3′ trim</div>
+          <div class="flow-box accent"><strong>Canonical k-mer extraction</strong>2-bit rolling window, min(kmer, revcomp)</div>
+          <div class="flow-box"><strong>Per-worker counting</strong>sort-and-compact, no locks</div>
+        </div>
+        <div class="flow-stage">
+          <span class="flow-label">Interoperability</span>
+          <div class="flow-box"><strong>k-way merge</strong>one global sorted table</div>
+          <div class="flow-box accent"><strong>Arrow RecordBatch</strong>hand-built buffers, zero-copy to pyarrow</div>
+          <div class="flow-box"><strong>pyo3 boundary</strong>GIL released, typed exceptions</div>
+        </div>
+        <div class="flow-stage">
+          <span class="flow-label">Output / modeling</span>
+          <div class="flow-box"><strong>Parquet / CSV</strong>atomic write-then-rename</div>
+          <div class="flow-box"><strong>KmerVectorizer</strong>scikit-learn sparse matrix</div>
+          <div class="flow-box"><strong>GWAS / rules / CV</strong>cohort-level statistics &amp; models</div>
+        </div>
+      </div>
+
+      <div style="max-width:76ch">
+      <h3 id="sec-1-3">1.3 &nbsp;FastDNA vs. the state of the art — an honest comparison</h3>
+      <p>The repository's own re-measurement (<span class="filepath">docs/BENCHMARKS.md</span>,
+      <span class="filepath">docs/design-minimizer-counting.md</span>, 2026-08-25) is unambiguous: FastDNA is
+      slower and heavier than the two purpose-built C k-mer counters it compares against, on a 2.14&nbsp;GB
+      synthetic FASTQ (7,000,000 reads, k=31, 8 threads, all four tools agreeing on
+      <strong>53,776,394</strong> distinct k-mers / 840,000,000 total occurrences):</p>
+
+      <div class="table-wrap">
+        <table>
+          <caption>Same input, WSL2 Ubuntu / ext4, 8 threads (shared environment)</caption>
+          <thead><tr><th>Tool</th><th class="num">Time</th><th class="num">Peak RAM</th></tr></thead>
+          <tbody>
+            <tr><td>FastK</td><td class="num tabular">38.3 s</td><td class="num tabular">2.86 GB</td></tr>
+            <tr><td>KMC3</td><td class="num tabular">110.4 s</td><td class="num tabular">9.06 GB</td></tr>
+            <tr><td>FastDNA — in-memory</td><td class="num tabular">388.2 s</td><td class="num tabular">10.34 GB</td></tr>
+            <tr><td>FastDNA — disk strategy</td><td class="num tabular">553.6 s</td><td class="num tabular">1.21 GB</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <caption>Same 2.14 GB file, native Windows binary (no WSL2 virtualization overhead)</caption>
+          <thead><tr><th>Configuration</th><th class="num">Time</th><th class="num">Peak RAM</th></tr></thead>
+          <tbody>
+            <tr><td>FastDNA — in-memory</td><td class="num tabular">133.1 s</td><td class="num tabular">8.34 GB</td></tr>
+            <tr><td>FastDNA — disk strategy</td><td class="num tabular">281.8 s</td><td class="num tabular">1.10 GB</td></tr>
+            <tr><td>FastDNA — auto (chooses disk)</td><td class="num tabular">284.7 s</td><td class="num tabular">1.09 GB</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>On native Windows, FastDNA's in-memory strategy is roughly <strong>3.5× slower than FastK</strong>
+      and <strong>1.2× slower than KMC3</strong>; in the shared WSL2 environment (a 12 GB VM the 10.34 GB
+      in-memory run partly swapped against) the gap widens to 10× and 3.5× respectively. All four tools'
+      outputs are byte-identical where comparable. The project's own diagnosis
+      (<span class="filepath">docs/design-minimizer-counting.md</span> §1) is structural, not accidental:
+      FastDNA's current strategies materialize <strong>one 8-byte <code>u64</code> per k-mer occurrence</strong>
+      before sorting, where KMC3's minimizer-partitioned super-k-mers reduce the same 840,000,000 occurrences
+      to 70,635,757 super-k-mer records (an 11.9× reduction) before any sort happens. An opt-in
+      minimizer/super-k-mer strategy exists to close that gap (<a href="#sec-2-5">§2.5</a>) but is not yet
+      promoted to the default chooser.</p>
+
+      <div class="callout">
+        <span class="label">What FastDNA is not competing on</span>
+        <p>The repository is explicit that beating FastK on raw throughput is not the goal
+        (<span class="filepath">docs/design-minimizer-counting.md</span> §6, risk R4): "we will probably still
+        be behind FastK … roughly 2× behind FastK" is treated as an acceptable outcome, framed instead as
+        "reach and beat KMC3, cut memory by 3×." FastDNA's differentiation is the second half of the pipeline
+        C/C++ counters do not have at all: a zero-copy Arrow handoff, population-structure-aware
+        cross-validation, calibrated probabilities, and interpretable rule models over the same k-mer tables
+        (<a href="#sec-4">§4</a>).</p>
+      </div>
+
+      <p>Against three pure-Python baselines on a smaller synthetic file (200,000 reads, 30,000,000 bases),
+      FastDNA is unambiguously faster: 4.94 s (1 thread) to 1.99 s (8 threads, median of 5 runs) versus
+      88.13–125.57 s for a <code>collections.Counter</code> loop, Biopython's <code>SeqIO</code>, and a
+      vectorized NumPy implementation — an 18–63× speedup depending on thread count and which baseline is
+      used, with the two implementations agreeing on distinct/total k-mer counts within 0.001%/0.0004%
+      (<span class="filepath">scripts/bench/crosscheck.py</span>).</p>
+
+      <h3 id="sec-1-4">1.4 &nbsp;Key design decisions and why</h3>
+
+      <h4>Sort-and-compact over a hash map</h4>
+      <p><span class="filepath">src/counter.rs</span>'s <code>KmerCounter</code> buffers raw <code>u64</code>
+      occurrences in a plain <code>Vec</code> and periodically sorts and run-length-compacts it, rather than
+      inserting into a <code>HashMap&lt;u64, u32&gt;</code>. The module doc comment states the reasoning
+      directly: counting is dominated by insertion volume, and a hash table's effectively-random bucket
+      placement misses every cache level once the table exceeds a few tens of megabytes — true of any real
+      FASTQ file. This mirrors FastK's approach and the reason KMC3 partitions before sorting. An earlier
+      HashMap-based <code>KmerCounter</code> measured 920.7 s / 6.96 GB on the 2.14 GB benchmark file;
+      switching to sort-and-compact alone brought it to roughly 101 s / 8.02 GB with no hardware change
+      (<span class="filepath">docs/BENCHMARKS.md</span>).</p>
+
+      <h4>A bounded producer/consumer channel</h4>
+      <p>The producer thread pushes batches of <code>FastqRecord</code>s into a
+      <code>crossbeam_channel::bounded(64)</code> (<span class="filepath">src/pipeline.rs</span>,
+      <code>CHANNEL_DEPTH</code>). The bound is what keeps memory flat on multi-gigabyte inputs; the code
+      comment is explicit that this must never become unbounded. A companion recycling channel
+      (<code>recycle_depth = CHANNEL_DEPTH + num_threads + 1</code>) hands drained batches back to the
+      producer so record buffers are refilled in place rather than reallocated — removing roughly 19 million
+      allocate/free pairs on the 7-million-record benchmark file.</p>
+
+      <h4>Three counting strategies, chosen by a calibrated estimate</h4>
+      <p>In-memory (<code>process_stream_parallel</code>), disk-partitioned
+      (<code>process_stream_parallel_disk</code>, high-bit bucketing), and an opt-in minimizer/super-k-mer
+      strategy (<code>process_stream_parallel_binned</code>) share one producer and one per-record
+      preprocessing order, and are proven bit-identical by a differential test suite
+      (<a href="#sec-6-3">§6.3</a>). <code>resolve_strategy</code> picks in-memory vs. disk from a calibrated
+      peak-memory model (<a href="#sec-2-5">§2.5</a>); the binned strategy is reachable only by explicit
+      request, never by the automatic chooser.</p>
+
+      <h4>Atomic writes everywhere</h4>
+      <p>Every exporter (<span class="filepath">export.rs</span>, <span class="filepath">qc.rs</span>,
+      <span class="filepath">sketch.rs</span>, <span class="filepath">metagenomics.rs</span>) writes through
+      <span class="filepath">atomic.rs</span>'s <code>AtomicFile</code>: a sibling temp file in the same
+      directory, committed only by a same-volume rename. A disk-full error, a crash, or Ctrl-C mid-export
+      leaves the previous good file untouched rather than a truncated table a downstream Parquet reader
+      would silently misread.</p>
+      </div>
+    </section>
+
+    <!-- =================== SECTION 2 =================== -->
+    <section class="doc-section wide" id="sec-2">
+      <span class="sec-num">02</span>
+      <h2 class="sec-title">Low-Level Engine and Data Structures</h2>
+      <hr class="lead-rule">
+
+      <div style="max-width:76ch">
+      <h3 id="sec-2-1">2.1 &nbsp;In-memory representation of the elementary unit</h3>
+
+      <p>A base is mapped through a 256-entry lookup table
+      (<span class="filepath">src/kmer.rs::BASE_BITS</span>) rather than a <code>match</code>: the doc comment
+      shows the emitted assembly for both forms and states the reason precisely — the table form trades an
+      unpredictable 4-way indirect branch for one predictable direct branch taken only on an ambiguous base,
+      at the same instruction count. A/a → <span class="base-chip a">00</span>, C/c →
+      <span class="base-chip c">01</span>, G/g → <span class="base-chip g">10</span>, T/t/U/u →
+      <span class="base-chip t">11</span> (RNA's U is read as T bit-for-bit). Any other byte is
+      <code>INVALID_BASE</code> and resets the rolling window.</p>
+
+      <p>A k-mer of length <code>k</code> (constrained to <code>1..=32</code> by construction — 2 bits × 32
+      = 64 bits, the full width of a <code>u64</code>) is packed most-significant-base-first: each new base
+      enters via <code>fwd = (fwd &lt;&lt; 2 | bits) &amp; mask</code>. Canonicalization takes the
+      lexicographic minimum of the k-mer and its reverse complement:</p>
+
+      <div class="formula">
+        <span class="cap">canonical k-mer</span>
+        canon(x) = min( x, revcomp(x) )
+      </div>
+
+      <p>The reverse complement itself is a closed-form bit trick — invert every bit (complement, since
+      A↔T and C↔G are exactly <code>0b11 XOR</code>), reverse the 2-bit groups via a byte-swap-and-mask
+      cascade, then shift down to <code>k</code> bases:</p>
+      <div class="formula">
+        <span class="cap">src/kmer.rs::reverse_complement_u64</span>
+v = !kmer
+v = ((v >> 2) &amp; 0x3333333333333333) | ((v &amp; 0x3333333333333333) &lt;&lt; 2)
+v = ((v >> 4) &amp; 0x0F0F0F0F0F0F0F0F) | ((v &amp; 0x0F0F0F0F0F0F0F0F) &lt;&lt; 4)
+v = v.swap_bytes()
+v >> (64 − 2k)
+      </div>
+
+      <p>The extraction hot path (<code>extract_canonical_kmers_into</code>) does not call this per k-mer.
+      Both strands are rolled side by side in the same loop — <code>rev = (rev &gt;&gt; 2) | (complement(bits)
+      &lt;&lt; top_shift)</code> — so <code>rev</code> is always already <code>revcomp(fwd, k)</code> and
+      canonicalization is a single <code>fwd.min(rev)</code>. The doc comment quantifies the saving: 4 ALU
+      operations per base replace 13 per k-mer, a net ~9 operations/k-mer saved — about 7.6×10⁹ operations on
+      the 840-million-occurrence benchmark file. An ambiguous base resets both accumulators to zero rather
+      than emitting a corrupted window.</p>
+
+      <p>Odd choices of <code>k</code> matter downstream but are not enforced by the packing itself: an
+      even-length k-mer can equal its own reverse complement, which is why <code>peek()</code>'s
+      <code>suggest_k()</code> always returns an odd value, and why the minimizer scheme's default
+      <code>m = 7</code> is odd for the same reason (<a href="#sec-2-5">§2.5</a>).</p>
+
+      <h3 id="sec-2-2">2.2 &nbsp;Ingestion, parsing, and streaming</h3>
+
+      <p><span class="filepath">src/fastq.rs</span> sniffs FASTQ vs. FASTA from the stream's own first
+      non-blank byte (<code>&gt;</code> → FASTA, anything else → FASTQ), never from a file extension — a
+      <code>.fastq</code> file holding FASTA content is read correctly, and a pipe with no filename at all
+      (<code>fastdna -i -</code>) works the same way. Gzip is detected the same way: the two magic bytes
+      <code>0x1f 0x8b</code>, checked via a non-consuming <code>fill_buf</code> peek, decide whether the
+      stream is wrapped in <code>flate2::MultiGzDecoder</code>. <strong>Multi-member</strong> gzip decoding is
+      load-bearing, not incidental: real SRA/ENA downloads are multi-member gzip files, and a single-member
+      decoder would silently stop at the first member boundary. A FASTA record carries no per-base quality, so
+      the reader synthesizes a Phred+33 <code>'I'</code> (Q40) quality string for every base — high enough
+      that the default <code>-q 20</code> trim is a no-op, so an assembly is never silently truncated from
+      its 3′ end.</p>
+
+      <p><code>MultiSourceReader</code> chains any number of <code>--input</code> files (R1/R2 lanes, extra
+      lanes) into one record stream, opening each lazily so a 200-lane run holds one file handle, and
+      attributes a parse failure to the specific file and its own 1-based record number, not a running count
+      across the whole run.</p>
+
+      <h4>Validation philosophy</h4>
+      <p>Per <span class="filepath">CLAUDE.md</span>'s stated convention — "silent empty output is a bug
+      class, not a behavior" — malformed input fails loudly before or during the read, never silently: a
+      missing <code>@</code>/<code>+</code> marker, a sequence/quality length mismatch, or a file truncated
+      mid-record all raise <code>FastDnaError::MalformedFastq</code> naming the exact file and record. An
+      I/O failure (a corrupt gzip member, a transport error) is kept distinct from a data problem — it never
+      gets attributed a bogus record number.</p>
+
+      <h3 id="sec-2-3">2.3 &nbsp;Filtering and compression algorithms</h3>
+
+      <h4>Quality trimming</h4>
+      <p><code>FastqRecord::quality_trim_end</code> trims the 3′ end until a trailing window of
+      <code>window_size</code> bases (CLI default 4) averages at least <code>min_qual</code> Phred (CLI
+      default 20). The window sum is carried between steps — one subtraction and one addition per step
+      instead of re-summing the whole window — so a 150 bp read needing a full trim at the CLI defaults costs
+      4 + 2×146 = 296 phred lookups instead of 147×4 = 588, and a read needing no trimming (the common case)
+      costs exactly what it always did.</p>
+
+      <h4>Homopolymer compression (<code>--hpc</code>)</h4>
+      <p><code>homopolymer_compress_into</code> collapses runs of the identical base to one occurrence
+      (<code>"AAAAAA"</code> → <code>"A"</code>), matched case-insensitively via the same
+      <code>base_to_bits</code> table k-mer extraction uses, and never merging an ambiguous byte into a
+      neighboring run. It is off by default — output is byte-for-byte unchanged unless the flag is set — and
+      exists for long-read (Oxford Nanopore/PacBio) input, where an indel inside a homopolymer run, not a
+      substitution, is the dominant sequencing error. A hand-built test constructs exactly this case: a clean
+      6-A run versus the same read with one A deleted produce <em>different</em> raw canonical k-mer sets but
+      <em>identical</em> k-mer sets after compression. The cost is stated honestly: compressed-sequence byte
+      offsets no longer correspond 1:1 with the original read, which matters to anything doing
+      reference-coordinate mapping (<span class="filepath">python/fastdna/annotate.py</span>).</p>
+
+      <h3 id="sec-2-4">2.4 &nbsp;Probabilistic and sketching structures</h3>
+
+      <h4>MinHash — <code>GenomeSketch</code> (bottom-k)</h4>
+      <p>Keeps the <code>sketch_size</code> smallest <em>distinct</em> hashes of every canonical k-mer seen,
+      via a <code>BTreeSet</code> capped at capacity with a cached maximum (so a rejected hash — the
+      overwhelming majority once the sketch is full — costs one comparison, no tree touch). The hash itself is
+      <code>finalize_hash</code>, splitmix64's output mixer (two multiplies, three xorshifts); the module doc
+      comment reports a measured discrimination test: on a true Jaccard of 1/3 (100,000/512-sized sketches),
+      the current mixer estimates 0.298828125 (error 0.0345) while the bare-<code>wrapping_mul</code> mixer it
+      replaced estimates 0.275390625 (error 0.0579) — the tolerance in the regression test (0.05) is chosen
+      specifically to catch that regression, not merely to bound a probabilistic estimator loosely.</p>
+      <ul>
+        <li><strong>Jaccard</strong> — symmetric, penalized by a size mismatch between the two k-mer sets. The
+        union-side walk was fixed to count a non-full sketch's remaining tail as genuine union-only members
+        rather than stopping at the shorter list's end, which had been a systematic upward bias reaching
+        33× on small-vs-large comparisons.</li>
+        <li><strong>Containment</strong> — asymmetric; <code>self.containment(other)</code> answers "what
+        fraction of my k-mers are in <code>other</code>," resolvable only up to <code>other</code>'s own
+        bottom-k ceiling (the standard Mash-Screen-style bounded estimator).</li>
+        <li><strong>Mash distance</strong> — <code>D = −(1/k)·ln(2J/(1+J))</code>, the Poisson mutation model
+        from Ondov et al. 2016, clamped to <code>[0, 1]</code>.</li>
+      </ul>
+
+      <h4>FracMinHash — <code>FracSketch</code> (scaled sketch)</h4>
+      <p>Keeps every hash at or below a fixed threshold (<code>u64::MAX / scale</code>) rather than a fixed
+      count, so its size scales with the set's true cardinality (<code>~|set| / scale</code>) instead of
+      being clamped by whichever sketch it is later compared against. Implemented from the published
+      definition (Irber, Brooks, Reiter, Pierce-Ward, Hera, Koslicki &amp; Brown, <em>Genome Research</em>
+      2022) rather than from another tool's source, per the project's stated licensing discipline. The module
+      doc comment gives the concrete failure this fixes: a true containment of 0.5 collapsing to a reported
+      1.0 under bottom-k <code>GenomeSketch</code> when the two compared sets differ enough in size.</p>
+
+      <h4>HyperLogLog — <code>estimate_cardinality</code></h4>
+      <p>Flajolet, Fusy, Gandouet &amp; Meunier (2007), <code>2^precision</code> single-byte registers
+      (16,384 bytes at the default <code>precision = 14</code>, ~0.8% standard error), with small-range
+      linear-counting correction. A real, fixed bug is documented in the source: register-index bits and
+      leading-zero-count bits must come from disjoint ranges of the same hash — the fix shifts the remainder
+      left by <code>precision</code> bits before counting zeros; before the fix, `insert`'s own leftover
+      shift inflated every ρ value and the whole estimate by roughly 70×.</p>
+
+      <h4>Count-Min Sketch — <code>src/cms.rs</code></h4>
+      <p>A depth×width table of saturating <code>u32</code> counters with odd per-row multiplicative hash
+      seeds (an even seed would zero low bits of the product, degrading that row's hash). Per CLAUDE.md, this
+      module is <strong>not yet wired to any CLI or FFI surface</strong> — it exists and is unit-tested, but
+      no counting path or Python binding constructs one today.</p>
+
+      <h3 id="sec-2-5">2.5 &nbsp;Partitioning, binning, and the parallelization strategy</h3>
+
+      <p>All three strategies share <code>spawn_producer</code> (one producer thread, unchanged across all
+      three since it must behave identically for the differential tests in <a href="#sec-6-3">§6.3</a>) and
+      the same per-record order: <code>qc.observe_record</code> (before trimming) → <code>quality_trim_end</code>
+      → k-mer/super-k-mer extraction. Each rayon worker owns fully private state — no shared hash map, no
+      lock on the hot path.</p>
+
+      <div class="grid-2">
+        <div class="card">
+          <h4>In-memory <span class="badge stable">default</span></h4>
+          <p style="margin-bottom:0">Each worker builds a private <code>KmerCounter</code>
+          (sort-and-compact). The combine phase does one k-way merge over every worker's table
+          (<code>KmerCounter::merge_all</code>) instead of a pairwise reduction tree — at benchmark scale
+          this removes ~1.7 GB of redundant <code>memcpy</code> and 6 large allocations versus the tree it
+          replaced.</p>
+        </div>
+        <div class="card">
+          <h4>Disk-partitioned <span class="badge stable">default fallback</span></h4>
+          <p style="margin-bottom:0">Buckets k-mers by their <em>high bits</em> (<code>DEFAULT_BUCKET_BITS =
+          5</code>, 32 buckets), spills sorted runs per worker per bucket, and merges bucket-by-bucket so
+          only one bucket's data is ever resident. High-bit bucketing is chosen over a minimizer specifically
+          because ascending bucket order already equals ascending k-mer order — concatenating each merged
+          bucket in order <em>is</em> the final sorted table, with no extra sort pass. A cascade merge caps
+          simultaneously open file handles at <code>MAX_OPEN_RUNS = 64</code> to stay under OS descriptor
+          limits.</p>
+        </div>
+      </div>
+
+      <p>The chooser, <code>resolve_strategy</code>, picks between these two from a calibrated peak-memory
+      model (<span class="filepath">src/mem_estimate.rs</span>):</p>
+      <div class="formula">
+        <span class="cap">calibrated peak-RSS model (mem_estimate.rs)</span>
+peak_bytes ≈ 777 MiB + threads × 48 MiB + 1.168 × threads × occurrences
+      </div>
+      <p>The <code>1.168</code> bytes/occurrence/thread constant is empirical, fit by least squares over five
+      real calibration runs (392 MB and 2.14 GB inputs, 1/4/8 threads); the model lands within 2–8% of
+      measured peak at realistic (large-file) scale and within ~1% of the 2.14 GB/8-thread anchor point
+      specifically (8.43 GiB predicted vs. 8.34 GB measured). <code>occurrences</code> is itself estimated
+      from raw byte size via a fixed ratio, <code>0.366</code> occurrences/byte, measured directly on two
+      real FASTQ files that agreed within 0.5% despite a 6× size difference. The chooser defaults to a
+      budget of half of currently-available system memory (<code>default_max_ram_bytes</code>), or a fixed
+      4 GB fallback where the OS query is unavailable — Linux via <code>/proc/meminfo</code>, Windows via a
+      hand-written <code>GlobalMemoryStatusEx</code> binding, no new runtime dependency either way.</p>
+
+      <h4>Minimizer/super-k-mer partitioning — <code>binned</code> <span class="badge optin">opt-in only</span></h4>
+      <p>Implements the design in <span class="filepath">docs/design-minimizer-counting.md</span>: a
+      canonical-minimizer <em>signature</em> per k-mer window (<span class="filepath">src/minimizer.rs</span>),
+      maximal runs of consecutive k-mers sharing a signature stored as 2-bit-packed
+      <strong>super-k-mers</strong> (<span class="filepath">src/superkmer.rs</span>) instead of one
+      <code>u64</code> per occurrence, and a final k-way merge across <code>NUM_BINS</code> (default 512)
+      bin tables. The signature is <code>sig(x) = min</code> over every canonical m-mer's <code>mix64</code>
+      hash inside the k-mer's window (default <code>m = 7</code>), which is provably strand-invariant
+      (<code>sig(x) == sig(revcomp(x))</code>) because it is built entirely from canonical m-mers — the one
+      property the whole partition depends on, executable as
+      <code>signature_is_invariant_under_reverse_complement</code>. An eligibility rule excludes homopolymer
+      and <code>AAA</code>-prefixed m-mers from being a minimizer at all, routing an all-ineligible window
+      (a poly-A stretch) to a dedicated overflow bin 0 rather than concentrating it under a hash coincidence.</p>
+
+      <p>The measured compression this buys: on the benchmark shape (150 bp reads, k=31, m=7), storing
+      super-k-mers costs <strong>1.035 bytes per k-mer occurrence</strong> versus the current path's 8 —
+      roughly a <strong>7.7× reduction</strong> — with the multiset-equivalence invariant (expanding every
+      super-k-mer must reproduce <code>extract_canonical_kmers</code>'s exact multiset) checked across
+      hundreds of synthetic (read, k, m) combinations including N runs, homopolymers, and the 255-base
+      super-k-mer cap.</p>
+
+      <div class="callout warn">
+        <span class="label">A real bin-skew finding, and its fix</span>
+        <p>The strategy's own real-data validation gate (<span class="filepath">docs/design-minimizer-counting.md</span>
+        §6, ENA accessions run 2026-08-25) found the static hash-to-bin map badly skewed on low-diversity
+        input: a bacterial WGS shotgun sample (<strong>ENA DRR002015</strong>, 2,343,637 reads) showed a
+        tolerable <strong>5.64×</strong> max/mean bin skew, but a 16S amplicon sample
+        (<strong>ENA DRR021372</strong>, 18,497 reads of one near-identical conserved region) showed
+        <strong>59.20× max/mean</strong> and <strong>1,515.89× max/p50</strong> skew — 11.6% of the entire
+        super-k-mer store landed in one of 512 bins. Correctness held throughout (the auto and binned
+        strategies produced SHA-256-identical Parquet on both samples); only load balance suffered. The fix,
+        <span class="filepath">src/adaptive_bins.rs</span>, samples the first 20,000 records
+        (<code>ADAPTIVE_SAMPLE_RECORDS</code>), builds an exact per-signature weight histogram, and runs a
+        greedy longest-processing-time-first bin-packing (a textbook 4/3-approximation to optimal makespan) to
+        override the static map for heavy signatures only. It is validated against synthetic reproductions of
+        the DRR021372 shape but — for lack of network access in the implementing environment — has
+        <strong>not been re-run against the original real ENA samples that exposed the skew</strong>; treat it
+        as implemented and differentially correct, not yet re-confirmed on that real data. The
+        <code>binned</code> strategy remains reachable only via <code>--strategy binned</code> /
+        <code>FASTDNA_STRATEGY=binned</code> — the automatic chooser never selects it
+        (<code>the_automatic_chooser_never_selects_the_binned_strategy</code> pins this directly).</p>
+      </div>
+      </div>
+    </section>
+
+    <!-- =================== SECTION 3 =================== -->
+    <section class="doc-section wide" id="sec-3">
+      <span class="sec-num">03</span>
+      <h2 class="sec-title">Memory Model, FFI, and Interoperability</h2>
+      <hr class="lead-rule">
+
+      <div style="max-width:76ch">
+      <h3 id="sec-3-1">3.1 &nbsp;Zero-copy Arrow export</h3>
+
+      <p>The shared schema, defined once in <span class="filepath">src/export.rs::counts_schema</span> and
+      used identically by the Parquet/CSV writers and the pyo3 in-memory path, is the single source of truth
+      the whole ML layer is built against:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Column</th><th>Arrow type</th><th>Nullable</th></tr></thead>
+          <tbody>
+            <tr><td><code>kmer_u64</code></td><td>UInt64</td><td>no</td></tr>
+            <tr><td><code>kmer_sequence</code></td><td>Utf8</td><td>no</td></tr>
+            <tr><td><code>frequency</code></td><td>UInt32</td><td>no</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><code>PyKmerCounts.table</code> builds this <code>RecordBatch</code> by hand — a <code>Vec&lt;u64&gt;</code>
+      values buffer, a <code>Vec&lt;u32&gt;</code> values buffer, and a raw value buffer plus <code>i32</code>
+      offsets for the <code>Utf8</code> column — each handed to Arrow by <em>move</em>
+      (<code>UInt64Array::from(Vec)</code>, <code>Buffer::from_vec</code>), so building the batch itself
+      copies each decoded byte exactly once rather than the allocate/validate/copy/free cycle a
+      <code>Vec&lt;String&gt;</code> + <code>StringArray::from_iter_values</code> approach would pay per row
+      (53.8 million times, at benchmark scale). The actual Rust→Python crossing is Arrow's C Data Interface
+      via <code>arrow::pyarrow::ToPyArrow</code>:</p>
+      <div class="formula">
+        <span class="cap">src/ffi.rs — the one Rust→pyarrow bridge, used at every Arrow-returning call</span>
+batch.to_pyarrow(py)  // shares batch's existing buffers; no data copy at this step
+      </div>
+      <p>The built batch is cached in a <code>OnceLock&lt;RecordBatch&gt;</code>, so repeated <code>.table</code>
+      access clones only <code>Arc</code>-backed buffer handles, not bytes. Every other Arrow-producing
+      surface — <code>translate_sequences</code>/<code>translate_file</code> (a <code>proteins_schema</code>
+      batch: <code>sequence_id</code>, <code>frame</code>, <code>protein</code>), <code>protein_kmers</code>
+      (<code>aa_kmers_schema</code>), <code>KmerDatabase.classify</code>/<code>.abundance</code>, and
+      <code>cohort_presence_matrix</code>'s COO triples — crosses through the identical
+      <code>.to_pyarrow(py)</code> call.</p>
+
+      <p><code>cohort_presence_matrix</code> (<span class="filepath">src/cohort/matrix.rs</span>,
+      exposed both natively via <code>_core.cohort_presence_matrix</code> and as a pure-Python fallback in
+      <span class="filepath">python/fastdna/gwas.py</span>) goes further: it never materializes a per-sample
+      Arrow table at all. Every sample's already-sorted <code>KmerCounter</code> is scanned directly, and a
+      k-mer is only ever decoded to an ASCII string once it has survived both the <code>min_samples</code>
+      filter and any <code>max_kmers</code> truncation — i.e. exactly the k-mers that end up as columns,
+      not every k-mer of every sample.</p>
+
+      <h3 id="sec-3-2">3.2 &nbsp;Integration with the standard data-analysis ecosystem</h3>
+
+      <p><code>fastdna.sklearn.KmerVectorizer</code> is the primary bridge into scikit-learn: it projects
+      FASTQ paths onto a learned vocabulary and returns a <code>scipy.sparse.csr_matrix</code> of
+      <code>float64</code>, matching what <code>TfidfVectorizer</code> returns and what
+      <code>LogisticRegression</code>/XGBoost accept without a densify step. Vocabulary selection happens
+      <em>only</em> inside <code>fit()</code> — <code>transform()</code> never sees or is influenced by
+      <code>y</code> — which is what makes the class safe to drop straight into
+      <code>sklearn.model_selection.cross_val_score</code>/<code>GridSearchCV</code> without hand-auditing for
+      feature-selection leakage. <code>fastdna.gwas.cohort_presence_matrix</code> returns the same sparse
+      family for cohort-scale GWAS work; both are consumed downstream by <code>scipy.sparse</code>-aware
+      code throughout the statistical layer (<a href="#sec-4">§4</a>).</p>
+
+      <h3 id="sec-3-3">3.3 &nbsp;Error-handling and stability policy</h3>
+
+      <p>Every <code>FastDnaError</code> variant is mapped to a Python exception in one place,
+      <code>impl From&lt;FastDnaError&gt; for PyErr</code> (<span class="filepath">src/ffi.rs</span>) — the
+      module doc comment states plainly that no other call site is allowed to construct a <code>PyErr</code>
+      from a <code>FastDnaError</code> directly, so no call site can diverge from this table. The
+      <code>match</code> enumerates every variant explicitly, with no wildcard arm:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th><code>FastDnaError</code> variant</th><th>Python exception</th></tr></thead>
+          <tbody>
+            <tr><td><code>Io</code> (source kind <code>NotFound</code>)</td><td><code>FileNotFoundError</code></td></tr>
+            <tr><td><code>Io</code> (any other kind)</td><td><code>OSError</code></td></tr>
+            <tr><td><code>MalformedFastq</code></td><td><code>ValueError</code></td></tr>
+            <tr><td><code>InvalidK</code></td><td><code>ValueError</code></td></tr>
+            <tr><td><code>MismatchedK</code></td><td><code>ValueError</code></td></tr>
+            <tr><td><code>MismatchedScale</code></td><td><code>ValueError</code></td></tr>
+            <tr><td><code>InvalidConfig</code></td><td><code>ValueError</code></td></tr>
+            <tr><td><code>NoSamplesFound</code></td><td><code>ValueError</code></td></tr>
+            <tr><td><code>Load</code></td><td><code>ValueError</code></td></tr>
+            <tr><td><code>MatrixTooLarge</code></td><td><code>MemoryError</code></td></tr>
+            <tr><td><code>VocabTooLarge</code></td><td><code>MemoryError</code></td></tr>
+            <tr><td><code>Export</code></td><td><code>RuntimeError</code></td></tr>
+            <tr><td><code>Cancelled</code></td><td><code>KeyboardInterrupt</code></td></tr>
+            <tr><td><code>Internal</code></td><td><code>RuntimeError</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><strong>Panic safety.</strong> <code>catch_unwind</code> lives in
+      <span class="filepath">src/pipeline.rs</span>, wrapping every rayon worker's body: a panic there
+      (a corrupt record reaching an unguarded index, a caller-supplied progress callback panicking) becomes
+      <code>Err(FastDnaError::Internal)</code> instead of unwinding across the FFI boundary, which is
+      undefined behaviour once a PyO3 binding exists. This is why the release profile pins
+      <code>panic = "unwind"</code> (<span class="filepath">Cargo.toml</span>) with an explicit comment that
+      changing it to <code>"abort"</code> would make <code>catch_unwind</code> a no-op and kill the host
+      Python process with no traceback on any worker panic. A panicked worker still drains and discards its
+      remaining channel input so the producer thread — and any surviving workers — never block on a full
+      channel with nobody left consuming it.</p>
+
+      <p><code>ffi.rs</code> layers a second mechanism on top for exactly one case <code>catch_unwind</code>
+      handles awkwardly: a Python exception raised <em>inside</em> a progress callback. Routing that through
+      <code>panic!</code> works, but Rust's default panic hook writes to stderr before <code>catch_unwind</code>
+      gets a chance to swallow it, and a process-global custom hook would also silence unrelated panics in the
+      host application's other threads. Instead the callback's error is captured into a
+      <code>Mutex&lt;Option&lt;PyErr&gt;&gt;</code> side channel (<code>Mutex</code>, not <code>OnceLock</code>,
+      because <code>PyErr</code> is <code>Send</code> but not guaranteed <code>Sync</code>), checked once the
+      worker thread rejoins.</p>
+
+      <h3 id="sec-3-4">3.4 &nbsp;Concurrency control</h3>
+
+      <p><code>count(threads=None, ...)</code> defaults to <code>PipelineConfig::default().num_threads</code>
+      (<code>std::thread::available_parallelism()</code>); an explicit <code>threads=0</code> is passed
+      through unmodified rather than silently folded into the default, so it is rejected downstream by
+      <code>validate_config</code> as <code>InvalidConfig</code> — closing off the zero-worker-tasks deadlock
+      class (a channel with nobody left to drain it) at the one door the FFI layer could otherwise reopen.</p>
+
+      <p><strong>GIL release.</strong> <code>count()</code>'s actual pipeline call runs on a dedicated worker
+      thread; the thread that entered <code>count()</code> polls that worker with a 50&nbsp;ms
+      <code>recv_timeout</code> loop inside <code>py.allow_threads</code>, re-acquiring the GIL each timeout
+      tick only to call <code>Python::with_gil(|py| py.check_signals())</code> — the standard
+      <code>PyErr_CheckSignals</code> mechanism. The doc comment records that this split was empirically
+      required: an earlier single-thread design (block on the pipeline directly, poll signals from a second
+      watcher thread) did not catch Ctrl-C until the run finished on its own, confirmed with an instrumented
+      build. Every other blocking call (<code>peek</code>, <code>sketch</code>, <code>frac_sketch</code>,
+      <code>estimate_cardinality</code>, translation, <code>KmerDatabase</code> methods,
+      <code>cohort_presence_matrix</code>) releases the GIL the same way via <code>py.allow_threads</code>.</p>
+
+      <p><strong>Progress callbacks</strong> cross the boundary as an owned <code>PyObject</code> moved into
+      the worker thread (required because <code>ProgressFn&lt;'_&gt;</code> borrows, but
+      <code>thread::spawn</code> needs <code>'static</code>); each invocation re-acquires the GIL
+      independently via <code>Python::with_gil</code>, since it is called concurrently and re-entrantly from
+      several rayon workers at once. <code>Progress::ReadsProcessed(n)</code> crosses as a plain Python
+      <code>int</code>; <code>Finished</code>/<code>SampleStarted</code>/<code>SampleFinished</code> cross as
+      tagged dicts. A cancellation request (Ctrl-C, or a callback that raised) sets one shared
+      <code>Arc&lt;AtomicBool&gt;</code> that the pipeline checks once per batch dispatch — not per record, a
+      deliberate cost/latency trade the pipeline doc comments state explicitly.</p>
+      </div>
+    </section>
+
+    <!-- =================== SECTION 4 =================== -->
+    <section class="doc-section wide" id="sec-4">
+      <span class="sec-num">04</span>
+      <h2 class="sec-title">Algorithmic, Statistical, and Modeling Layer</h2>
+      <hr class="lead-rule">
+
+      <div style="max-width:76ch">
+      <h3 id="sec-4-1">4.1 &nbsp;Partitioning and cross-validation that mitigate population-structure bias</h3>
+
+      <p>Bacterial and viral cohorts are clonal, not independent samples — <span class="filepath">python/fastdna/cv.py</span>'s
+      module doc comment cites a PLOS Biology 2025 analysis over 24,000+ genomes showing random
+      cross-validation splits scatter clonal relatives across the train/test boundary and inflate published
+      AMR-prediction accuracy, and a Briefings in Bioinformatics 2024 benchmark (78 datasets) that evaluated
+      exactly this sensitivity. <code>fastdna.cv.lineage_groups(paths, k=21, sketch_size=1000,
+      distance_threshold=0.01)</code> derives lineage labels without a phylogeny: it builds an all-pairs Mash
+      distance matrix via <code>compare_all</code>, then runs <strong>single-linkage</strong> agglomerative
+      clustering at the given threshold. Single linkage is chosen deliberately — it merges on the
+      <em>closest</em> pair, so a chain of near-identical isolates never splits even when its extremes exceed
+      the threshold; the failure this guards against (splitting one clone across folds) is asymmetric, and the
+      chaining failure mode it accepts instead (over-merging distinct lineages) is the safe direction: fewer,
+      larger groups, a more pessimistic but never leaky evaluation.</p>
+
+      <p><code>LineageKFold(n_splits=5, paths=...)</code> wraps <code>sklearn.model_selection.GroupKFold</code>
+      over those labels, refuses <code>groups=</code> passed at <code>split()</code>-time (accepted only for
+      scikit-learn API compatibility, never honoured — the whole point is using the lineages it derived
+      itself), and raises before any fitting happens if <code>n_splits</code> exceeds the number of distinct
+      lineages, naming the fix (lower <code>n_splits</code>, or raise <code>distance_threshold</code>).</p>
+
+      <p><code>permutation_importance_pvalues(model, X, y, feature_names, n_permutations=100, groups=None)</code>
+      refits a cloned, unfitted model on <code>n_permutations</code> relabeled datasets and reports an
+      empirical p-value per feature using the add-one estimator (Phipson &amp; Smyth 2010):</p>
+      <div class="formula">
+        <span class="cap">permutation p-value, never reports an impossible p = 0</span>
+p = (1 + #{permuted importance ≥ observed}) / (1 + n_permutations)
+      </div>
+      <p>When <code>groups</code> is given, each null draw shuffles labels <em>within</em> a lineage only,
+      never across lineages — preserving the lineage/phenotype association in every null so the resulting
+      p-value tests whether a feature explains the phenotype <em>beyond</em> population structure. A cohort
+      where every lineage carries one uniform label is perfectly confounded: every within-lineage permutation
+      reproduces the same labels, and every p-value correctly comes back at 1.0 — "the data cannot distinguish
+      phenotype from lineage" is treated as the correct finding, not a bug to work around.</p>
+
+      <h3 id="sec-4-2">4.2 &nbsp;Statistical filtering, multiple-testing correction, and dimensionality</h3>
+
+      <p><code>fastdna.gwas.prefilter_association(matrix, phenotype, kmer_sequences, test=..., top_n=None)</code>
+      is an explicit <strong>unadjusted screen</strong> — it unconditionally raises
+      <code>ScreeningOnlyWarning</code> on every call and stamps the returned table's Arrow schema metadata
+      with the same caveat so it survives a Parquet round-trip. Binary phenotypes use <strong>Fisher's exact
+      test</strong> (default) or Pearson's <strong>χ²</strong> (no continuity correction); continuous
+      phenotypes (e.g. a raw MIC titre) use <strong>Welch's t-test</strong> (default, unequal-variance) or a
+      one-way <strong>ANOVA F-test</strong> (pooled-variance; for two groups, algebraically <code>F = t²</code>
+      under the shared-variance assumption Welch's test does not make). A binary k-mer's 2×2 table is fully
+      determined by <code>(a, c)</code> — the other two cells follow from the fixed case/control marginals —
+      so <code>scipy.stats.fisher_exact</code>/<code>chi2_contingency</code> is called once per
+      <em>distinct</em> table and the result cached, turning a 10-million-k-mer screen on a 200-sample cohort
+      into ~10⁴ scipy calls instead of 10⁷.</p>
+
+      <p>Multiple-testing correction is Bonferroni (<code>p × n</code>, clamped to 1.0) and
+      <strong>Benjamini–Hochberg</strong>, implemented directly rather than via a dependency:</p>
+      <div class="formula">
+        <span class="cap">python/fastdna/gwas.py::_benjamini_hochberg — BH q-values from ascending p-values</span>
+raw[i]  = p[i] · m / (i + 1)                for i = 0 .. m−1  (p ascending)
+q       = reverse( cummin( reverse(raw) ) ), clipped to [0, 1]
+      </div>
+      <p>The docstring is explicit that neither correction addresses the actual risk: "multiple-testing
+      control assumes the tests are exchangeable, which structure-confounded tests are not." Confirmation is
+      required via pyseer (<code>--lmm</code>/<code>--continuous</code> with a <code>--similarity</code>
+      matrix), kmersGWAS, or DBGWAS — FastDNA does not reimplement mixed-model association statistics by
+      design. <code>fastdna.gwas.kinship_matrix(paths)</code> supplies exactly that <code>--similarity</code>
+      input: a Mash-distance-derived <code>1 − mash_distance</code> matrix, explicitly documented as a
+      sequence-similarity proxy for kinship, not a phylogeny-estimated one.</p>
+
+      <h3 id="sec-4-3">4.3 &nbsp;Native modeling and classification algorithms</h3>
+
+      <h4><code>SetCoveringClassifier</code> — a Set Covering Machine over k-mer presence/absence</h4>
+      <p>Implements Marchand &amp; Shawe-Taylor's Set Covering Machine (JMLR 3, 2002) applied to k-mer
+      matrices as in Drouin et al. (BMC Genomics 17, 2016; Kover). The model is literally a short boolean
+      formula — a conjunction (AND) or disjunction (OR) of <code>present(k-mer)</code>/<code>absent(k-mer)</code>
+      literals, each one a real DNA sequence a biologist can BLAST directly.</p>
+      <p><strong>Objective and decision rule (unweighted case).</strong> With <code>P</code> the positive and
+      <code>N</code> the negative training samples, a candidate literal is only eligible if it holds for every
+      sample in <code>P</code> (a conjunction can never re-admit an excluded positive); the greedy loop
+      repeatedly picks whichever eligible literal removes the most <em>still-covered</em> negatives, ties
+      broken by whole-training-set coverage then feature index, until no negatives remain or
+      <code>max_rules</code> is reached. The disjunction case is the identical loop on the label-inverted dual
+      problem, with each resulting rule's polarity flipped — not a second implementation.</p>
+      <p><strong>Cost-sensitive relaxation (<code>class_weight</code>).</strong> Weighting a plain
+      negatives-removed <em>count</em> is proven a structural no-op for this algorithm (every candidate is
+      still required to hold for 100% of one homogeneous class, so a positive scalar multiple never changes
+      the arg-max) — checked exhaustively over 20,000 randomized imbalanced datasets with exact power-of-two
+      weights, zero divergences. Instead, non-uniform weights relax the hard 100%-positive-coverage
+      requirement into a weighted trade-off, scoring each candidate literal by:</p>
+      <div class="formula">
+        <span class="cap">python/fastdna/rules.py::_greedy_soft — cost-sensitive literal score</span>
+score(literal) = Σ weight(remaining negatives it removes)
+               − Σ weight(still-covered positives it would newly exclude)
+</div>
+      <p>only a strictly positive score is eligible. <code>predict_proba()</code> is explicitly documented as
+      <strong>not calibrated</strong> — a fitted SCM has no notion of confidence and returns exactly
+      <code>[1., 0.]</code> or <code>[0., 1.]</code>; it stays on the class (rather than raising) purely so
+      scikit-learn's duck-typed <code>hasattr</code> checks keep working. <code>fastdna.calibration.calibrate</code>
+      is the documented fix.</p>
+
+      <h4><code>MicRegressor</code> — log2(MIC) regression for antimicrobial resistance</h4>
+      <p>Minimum inhibitory concentration is read off a two-fold dilution series, so raw-MIC regression lets
+      the largest concentrations dominate a squared/absolute-error loss purely by scale. <code>log2_mic()</code>
+      transforms to evenly spaced integers (standard practice in the PATRIC/BV-BRC and CRyPTIC AMR-ML
+      literature) and validates strict positivity/finiteness before transforming:</p>
+      <div class="formula">
+        <span class="cap">python/fastdna/mic.py — the regression target and the un-transform</span>
+target      = log₂(MIC)                     (MIC strictly positive, finite)
+prediction  = 2^( model.predict(X) )        (MicRegressor.predict, un-transforms back to MIC units)
+      </div>
+      <p><code>MicRegressor(estimator=None)</code> wraps any scikit-learn regressor (default
+      <code>sklearn.linear_model.Ridge()</code>), fitting it on <code>log2_mic(y)</code> and exponentiating
+      predictions back on <code>.predict()</code> so the transform cannot be forgotten on one side only.
+      <code>mic_regression_report(mic_true, mic_pred, tolerance_log2=1.0)</code> reports R² and MAE in log2
+      space, plus the field's own accuracy standard, <strong>essential agreement (EA)</strong> — the
+      CLSI/FDA-style fraction of predictions within a stated number of two-fold dilution steps:</p>
+      <div class="formula">
+        <span class="cap">essential agreement — the CLSI/FDA-style AST-device accuracy criterion</span>
+EA(τ) = mean( | log₂(MIC_pred) − log₂(MIC_true) | ≤ τ )     (τ = tolerance_log2, default 1.0)
+      </div>
+
+      <h4>SHAP-based interpretation — <code>fastdna.interpret</code></h4>
+      <p><code>top_features(importances, feature_names, n=20)</code> and
+      <code>export_top_features_fasta(...)</code> turn any fitted model's per-column importances (linear
+      <code>.coef_</code>, tree <code>.feature_importances_</code>, or a reduced SHAP array) back into a
+      ranked list — or a FASTA file — of literal k-mer sequences, closing the loop
+      <code>KmerVectorizer.get_feature_names_out()</code> opened. <code>explain_with_shap(model,
+      X_transformed, feature_names, n=20)</code> wraps the <code>shap</code> package for the same purpose
+      over a genuine SHAP-value matrix.</p>
+
+      <h3 id="sec-4-4">4.4 &nbsp;Probability calibration, uncertainty, and performance metrics</h3>
+
+      <h4>Calibration — Venn-ABERS and Platt scaling</h4>
+      <p><code>fastdna.calibration.calibrate(estimator, X_calib, y_calib, method="venn_abers")</code> wraps a
+      fitted, score-producing estimator so <code>.predict_proba()</code> returns genuine, checkable
+      probabilities from a held-out calibration set.</p>
+      <ul>
+        <li><strong>Venn-ABERS (default)</strong> — Vovk &amp; Petej, UAI 2014. An Inductive Venn-ABERS
+        Predictor fits two isotonic regressions per query score (the calibration set augmented with the query
+        hypothetically labelled 0, then 1), producing a distribution-free interval <code>[p0, p1]</code>; the
+        point estimate is <code>p1 / (1 − p0 + p1)</code>. Chosen as the default specifically because it
+        carries no linear-log-odds assumption and stays honest on the small calibration sets (tens to low
+        hundreds of isolates) typical of clinical-microbiology cohorts — grouping by distinct query score
+        turns what would be <code>2n</code> isotonic fits into at most <code>2</code>×(distinct scores), which
+        for a hard classifier's two-valued output is exactly 4 fits regardless of dataset size.</li>
+        <li><strong>Platt scaling</strong> — a single 1-D logistic regression of label on score, cheaper and
+        appropriate once the calibration set is large enough that its sigmoid-shape assumption is no longer
+        the risk.</li>
+      </ul>
+      <p><code>CalibratedEstimator.predict_interval(X)</code> exposes the raw Venn-ABERS
+      <code>(p0, p1)</code> interval directly (Venn-ABERS only): its width is itself informative, widening
+      exactly where the calibration data gives the method the least to go on.</p>
+
+      <h4>Evaluation under class imbalance — <code>fastdna.evaluation</code></h4>
+      <p><code>precision_recall_report(y_true, y_score)</code> returns the full precision/recall/threshold
+      curve plus average precision (area under it) — the metric to trust over ROC-AUC under severe class
+      imbalance, per Saito &amp; Rehmsmeier (PLOS ONE 10(3), 2015): ROC's false-positive rate is normalized by
+      a majority class that can make two visibly different precision-recall curves look identical in ROC
+      space. <code>calibration_report(y_true, y_prob, n_bins=10, strategy="uniform")</code> returns the
+      reliability diagram plus the Brier score (Brier, 1950). Neither function picks a decision threshold —
+      that trade-off is treated as an operational judgment call the library cannot make on the caller's
+      behalf. Called on <code>SetCoveringClassifier</code>'s hard 0/1 output specifically, it does not raise;
+      it emits <code>UncalibratedScoresWarning</code> and returns the honestly degenerate result (a
+      reliability diagram of at most two points).</p>
+      </div>
+    </section>
+
+    <!-- =================== SECTION 5 =================== -->
+    <section class="doc-section wide" id="sec-5">
+      <span class="sec-num">05</span>
+      <h2 class="sec-title">API, CLI, and Workflow Specification</h2>
+      <hr class="lead-rule">
+
+      <div style="max-width:76ch">
+      <h3 id="sec-5-1">5.1 &nbsp;Rust CLI (<code>fastdna</code> binary)</h3>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <caption>Flags defined in <span class="filepath">src/cli.rs</span></caption>
+          <thead><tr><th>Flag</th><th>Default</th><th class="wrap">Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>-i, --input</code></td><td><em>required or</em> <code>--paired-dir</code></td><td class="wrap">One or more FASTQ/FASTA paths (gzip auto-detected by content), or <code>-</code> for stdin (must be the sole input).</td></tr>
+            <tr><td><code>-o, --output</code></td><td><code>kmer_counts.parquet</code></td><td class="wrap">Output path; format chosen by extension, case-insensitive (<code>.parquet</code> → Arrow/Snappy, else CSV).</td></tr>
+            <tr><td><code>-k, --kmer-size</code></td><td><code>31</code></td><td class="wrap">1–32 inclusive.</td></tr>
+            <tr><td><code>-q, --min-quality</code></td><td><code>20.0</code></td><td class="wrap">Phred+33 cutoff, validated to the printable range 0–93.</td></tr>
+            <tr><td><code>-m, --min-count</code></td><td><code>1</code></td><td class="wrap">≥ 1.</td></tr>
+            <tr><td><code>-M, --max-count</code></td><td>unset</td><td class="wrap">Must not be below <code>--min-count</code>.</td></tr>
+            <tr><td><code>-t, --threads</code></td><td>all logical CPUs</td><td></td></tr>
+            <tr><td><code>--qc</code></td><td><code>qc_report.json</code></td><td></td></tr>
+            <tr><td><code>--histogram</code></td><td>unset</td><td class="wrap">Optional k-mer frequency spectrum export.</td></tr>
+            <tr><td><code>--histogram-format</code></td><td><code>csv</code></td><td class="wrap"><code>csv</code> (named columns) or <code>genomescope</code> (headerless <code>depth count</code>, byte-identical to <code>jellyfish histo</code>/GenomeScope 2.0 input).</td></tr>
+            <tr><td><code>--histogram-max</code></td><td>unset</td><td class="wrap">KMC's <code>-cx</code> convention: depths above the cap are summed into it, not dropped.</td></tr>
+            <tr><td><code>--max-ram</code></td><td>½ available RAM, else 4 GB</td><td class="wrap">Accepts <code>4096</code>, <code>512M</code>, <code>4G</code>, <code>4GB</code> (binary units).</td></tr>
+            <tr><td><code>--strategy</code></td><td><code>auto</code></td><td class="wrap"><code>auto | memory | disk | binned</code> — <code>auto</code> never selects <code>binned</code>.</td></tr>
+            <tr><td><code>--hpc</code></td><td>off</td><td class="wrap">Homopolymer compression (§2.3); byte-identical output when unset.</td></tr>
+            <tr><td><code>--paired-dir</code></td><td>unset</td><td class="wrap">Discover-and-count a directory of samples via R1/R2 pairing instead of naming files by hand. Mutually exclusive with <code>--input</code>; an orphaned mate is a hard error, not a fallback to single-end.</td></tr>
+            <tr><td><code>--paired-output</code></td><td>required with <code>--paired-dir</code></td><td class="wrap">Output directory; one <code>&lt;sample_id&gt;.&lt;ext&gt;</code> file per discovered sample.</td></tr>
+            <tr><td><code>--paired-format</code></td><td><code>parquet</code></td><td class="wrap"><code>parquet | csv</code>; ignored without <code>--paired-dir</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div style="max-width:76ch">
+      <p>Environment-variable equivalents: <code>FASTDNA_STRATEGY</code>, <code>FASTDNA_MAX_RAM_BYTES</code>,
+      <code>FASTDNA_SPILL_DIR</code> (redirects disk-strategy scratch space off a small system drive). Two
+      guards run before any counting starts: <code>guard_against_input_overwrite</code> refuses an output
+      path that resolves to one of the inputs, and <code>preflight_outputs</code> probes every output path's
+      writability, so a typo'd output directory fails in milliseconds rather than after hours of counting.</p>
+
+      <h3 id="sec-5-2">5.2 &nbsp;Python API reference</h3>
+
+      <h4>Core module — <code>fastdna</code></h4>
+      <div class="formula">
+def count(path, *, k=31, min_count=1, max_count=None, min_quality=20.0,
+          threads=None, progress=None, progress_interval=100_000, hpc=False) -> KmerCounts
+
+def peek(path, *, n_reads=10_000) -> PreviewStats-like object (.suggest_k(), .gc_content, .read_length)
+
+def build_info() -> dict           # version, max_k, AVX2-on-this-CPU
+
+def sketch(path, *, k=21, sketch_size=1000) -> Sketch
+def frac_sketch(path, *, k=21, scale=1000) -> FracSketch
+def load_sketch(path) -> Sketch;  def load_frac_sketch(path) -> FracSketch
+def compare(path_a, path_b, *, k=21, sketch_size=1000) -> float          # Jaccard
+def compare_all(paths, *, k=21, sketch_size=1000, metric="jaccard") -> pyarrow.Table
+def estimate_cardinality(path, *, k=31, precision=14) -> float          # HyperLogLog
+      </div>
+      <p><code>KmerCounts</code> is chainable — <code>.filter(min_count=, max_count=)</code>,
+      <code>.sort_by(column, descending=True)</code>, <code>.top(n)</code> each return a new view over the
+      same underlying counted data; <code>.table</code> (zero-copy <code>pyarrow.Table</code>),
+      <code>.qc</code>, <code>.total_kmers</code> (always the <em>original</em> sample total, the
+      normalization basis), <code>.spectrum()</code>, and <code>.suggest_min_count()</code> (locates the
+      valley between the sequencing-error peak and the true coverage peak in the sample's own frequency
+      spectrum) round out the surface.</p>
+
+      <h4><code>fastdna.sklearn.KmerVectorizer</code></h4>
+      <div class="formula">
+class KmerVectorizer(BaseEstimator, TransformerMixin):
+    def __init__(self, k=31, min_count=1, top_features=10_000, threads=None): ...
+    def fit(self, X, y=None) -> self                       # vocabulary_ decided from X alone, y never read
+    def fit_transform(self, X, y=None) -> scipy.sparse.csr_matrix   # one counting pass, not two
+    def transform(self, X) -> scipy.sparse.csr_matrix       # shape (len(X), len(vocabulary_))
+    def get_feature_names_out(self) -> np.ndarray[object]   # decoded k-mer sequences, column order
+      </div>
+      <p>Vocabulary ranking key: descending prevalence (fraction of training samples carrying the k-mer at
+      all) first, then descending total frequency, then ascending <code>kmer_u64</code> for determinism —
+      prevalence, not raw depth, is primary specifically so a k-mer at enormous depth in one sample (a PCR
+      duplicate, a contaminant) cannot dominate the vocabulary over one moderately deep in every sample.</p>
+
+      <h4>Cohort / GWAS surface — <code>fastdna.gwas</code></h4>
+      <div class="formula">
+def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers=None)
+    -> (scipy.sparse.csr_matrix[uint32], sample_ids: list[str], kmer_sequences: list[str])
+
+def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2) -> PyseerExport
+def kinship_matrix(paths, *, k=21, sketch_size=10_000) -> (np.ndarray[n,n], sample_ids: list[str])
+def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", top_n=None) -> pyarrow.Table
+      </div>
+
+      <h4>Statistical / modeling surface</h4>
+      <div class="formula">
+class LineageKFold:  # fastdna.cv
+    def __init__(self, n_splits=5, *, paths=None, groups=None, k=21, sketch_size=1000, distance_threshold=0.01): ...
+def lineage_groups(paths, *, k=21, sketch_size=1000, distance_threshold=0.01) -> np.ndarray[int]
+def permutation_importance_pvalues(model, X, y, feature_names, *, n_permutations=100,
+                                    random_state=None, groups=None) -> pyarrow.Table
+
+class SetCoveringClassifier(BaseEstimator, ClassifierMixin):  # fastdna.rules
+    def __init__(self, max_rules=10, rule_type="conjunction", tiebreaker="max_coverage", class_weight=None): ...
+    def fit(self, X, y, feature_names=None) -> self
+    def predict(self, X);  def predict_proba(self, X);  def explain(self) -> str
+    def export_rules_fasta(self, path) -> list[Rule]
+
+class MicRegressor:  # fastdna.mic
+    def __init__(self, estimator=None): ...          # default sklearn.linear_model.Ridge()
+    def fit(self, X, y);  def predict(self, X);  def predict_log2(self, X)
+def mic_regression_report(mic_true, mic_pred, *, tolerance_log2=1.0) -> MicRegressionReport
+
+def calibrate(estimator, X_calib, y_calib, *, method="venn_abers") -> CalibratedEstimator   # fastdna.calibration
+def precision_recall_report(y_true, y_score, *, pos_label=None) -> PrecisionRecallReport    # fastdna.evaluation
+def calibration_report(y_true, y_prob, *, n_bins=10, strategy="uniform") -> CalibrationReport
+      </div>
+
+      <h4>Composition layer — <code>fastdna.workflow.AssociationWorkflow</code></h4>
+      <p>One entry point chaining the above for the canonical cohort question ("I have FASTQ files and a
+      phenotype, tell me what predicts it"): <code>cohort_presence_matrix</code> →
+      <code>equivalence.collapse_equivalence_classes</code> (skippable) → <code>cv.lineage_groups</code>
+      (or precomputed <code>groups=</code>) → fit a classifier (default <code>SetCoveringClassifier()</code>)
+      both on the full cohort and via <code>cross_val_predict</code> under <code>LineageKFold</code> →
+      <code>precision_recall_report</code>/<code>calibration_report</code> on the held-out predictions →
+      <code>prefilter_association</code> (its <code>ScreeningOnlyWarning</code> is never suppressed) →
+      optional gene annotation of every learned rule (<code>fastdna.annotate</code>) → optional
+      <code>permutation_importance_pvalues</code>. Every stage is individually skippable or replaceable, and
+      <code>AssociationResult.to_report(path)</code> hands the whole result to
+      <code>fastdna.report.to_report</code> for a self-contained, offline-safe HTML summary.</p>
+
+      <h4>Remaining Python modules, briefly</h4>
+      <ul>
+        <li><code>fastdna.embed.embed_cohort(paths, method="umap"|"tsne"|"pcoa")</code> — turns
+        <code>compare_all</code>'s pairwise distances into 2D/3D coordinates for a PCoA-style cohort plot;
+        <code>umap-learn</code>/<code>scikit-learn</code> imported lazily per method.</li>
+        <li><code>fastdna.taxonomy.classify</code>/<code>gather</code>/<code>check_sample_identity</code> —
+        sourmash/Mash-style reference screening and a lab sample-swap QC check, built entirely on the stable
+        sketch API.</li>
+        <li><code>fastdna.metagenomics.build_database</code>/<code>KmerDatabase.classify</code> — thin Python
+        surface over <span class="filepath">src/metagenomics.rs</span>'s Kraken2-style LCA classifier
+        (12 bytes/distinct k-mer, exact 64-bit keys, no minimizers/spaced seeds — validated in
+        <a href="#sec-6-2">§6.2</a>).</li>
+        <li><code>fastdna.genomescope.profile_genome(source, ploidy=2)</code> — GenomeScope 2.0-style
+        negative-binomial mixture fit to a k-mer spectrum for genome size/heterozygosity/coverage/error rate;
+        diploid only, refuses (<code>NotImplementedError</code>) rather than mislabel a polyploid fit.</li>
+        <li><code>fastdna.annotate.load_annotation</code>/<code>annotate_rule</code>/<code>locate_kmer</code>
+        — maps a rule's literal k-mer back to an annotated gene in a user-supplied reference (GFF3/GenBank),
+        substitutions only, no indel tolerance, by design (a k-mer is fixed-length).</li>
+        <li><code>fastdna.interpret</code>, <code>fastdna.report</code>, <code>fastdna.active_learning</code>,
+        <code>fastdna.multiomics</code>, <code>fastdna.plotting</code> — SHAP/importance-to-DNA reporting,
+        offline HTML report bundling, generic margin/entropy uncertainty sampling over ranked classifier
+        output, sample-ID-matched joins across omics layers, and matplotlib helpers for significance/
+        population-structure/spectrum-fit plots, respectively.</li>
+      </ul>
+
+      <h3 id="sec-5-3">5.3 &nbsp;Minimal integration example</h3>
+      <div class="formula">
+from fastdna.sklearn import KmerVectorizer
+from fastdna.cv import LineageKFold
+from fastdna.rules import SetCoveringClassifier
+from fastdna.calibration import calibrate
+from fastdna.evaluation import calibration_report
+from sklearn.model_selection import cross_val_predict
+
+vec = KmerVectorizer(k=31, min_count=2, top_features=10_000)
+X_train = vec.fit_transform(train_paths)                 # vocabulary decided from train_paths ONLY
+
+cv = LineageKFold(n_splits=5, paths=train_paths)          # Mash-distance lineage-blocked folds
+clf = SetCoveringClassifier(max_rules=10)
+proba = cross_val_predict(clf, X_train, y, cv=cv, method="predict_proba")
+
+report = calibration_report(y, proba[:, 1])               # honest, held-out reliability diagram
+clf.fit(X_train, y, feature_names=vec.get_feature_names_out())
+print(clf.explain())                                      # resistant IF present(ACGT...) AND absent(...)
+      </div>
+      </div>
+    </section>
+
+    <!-- =================== SECTION 6 =================== -->
+    <section class="doc-section wide" id="sec-6">
+      <span class="sec-num">06</span>
+      <h2 class="sec-title">Empirical Validation Protocol, Reproducibility, and Benchmarks</h2>
+      <hr class="lead-rule">
+
+      <div style="max-width:76ch">
+      <h3 id="sec-6-1">6.1 &nbsp;Cross-tool benchmark protocol</h3>
+      <p>Methodology and all figures are documented in <span class="filepath">docs/BENCHMARKS.md</span> and
+      <span class="filepath">docs/design-minimizer-counting.md</span>, both re-measured 2026-08-25; the full
+      cross-tool table already appears in <a href="#sec-1-3">§1.3</a>. Two smaller, machine-specific results
+      worth restating here for reproducibility: on a 16 GB test machine, the forced in-memory strategy
+      exhausted memory somewhere between a 2.14 GB and a 3.98 GB input; and <code>RAW_FINALIZE_THRESHOLD</code>
+      (the 2,000,000-instance eager-flush bound in <span class="filepath">src/counter.rs</span>) measurably
+      <em>helps</em> on high-redundancy input (a 127,996,608-occurrence, 1,175,574-distinct file: 1.02 GB
+      unbounded peak RSS vs. 353.4 MB bounded) and measurably <em>hurts</em> on the large diverse benchmark
+      file (every bounded run slower than its unbounded counterpart, by design: repeated eager compaction
+      re-merges the whole growing table on that shape) — reported honestly in both directions rather than
+      only where the bound wins.</p>
+
+      <div class="callout warn">
+        <span class="label">A discrepancy the reader should know about</span>
+        <p><span class="filepath">README.md</span>'s own benchmark table still reports an older measurement
+        (FastDNA in-memory ~101 s / 8.02 GB, calling it "the fastest of the three") that predates the
+        2026-08-25 re-measurement documented in <span class="filepath">docs/BENCHMARKS.md</span> and the
+        design doc (388.2 s WSL2 / 133.1 s native Windows, both slower than FastK and KMC3). The two have not
+        been reconciled in the README text as of this snapshot; the figures in <a href="#sec-1-3">§1.3</a>
+        above are the corrected, more recent ones.</p>
+      </div>
+
+      <h3 id="sec-6-2">6.2 &nbsp;Real-data validation</h3>
+      <p><span class="filepath">docs/validation-real-data.md</span> (2026-08-25) is the first run of
+      <code>fastdna.rules</code>, <code>fastdna.cv</code>, <code>fastdna.gwas</code>, and
+      <code>fastdna.metagenomics</code> against genuine sequence data rather than synthetic fixtures.</p>
+
+      <h4>Track A — AMR genotype-to-phenotype (real assemblies)</h4>
+      <p>50 real <em>S. aureus</em> assemblies from BV-BRC (25 oxacillin-resistant, 25 susceptible, first 25
+      of each class by genome id — no cherry-picking) were counted (<code>k=31</code>), clustered into
+      <strong>6 distinct lineages</strong> (sizes 11/31/2/2/3/1) via <code>lineage_groups</code>, and evaluated
+      under <code>LineageKFold(n_splits=5)</code> with <code>SetCoveringClassifier(max_rules=10)</code>:
+      pooled accuracy <strong>100% (50/50)</strong>, average precision 1.0, Brier score 0.0, every fold
+      converging to the identical single rule <code>present(AAAAAAAGAAAATGGACTCGTTACAGTGTCA)</code>. The
+      report states the honest caveat directly: random (non-lineage-blocked) CV gave the identical 100%, so
+      this particular dataset — a near-monogenic resistance mechanism — does not demonstrate the accuracy
+      <em>drop</em> that correcting for leakage is expected to produce elsewhere. The rule's k-mer was located
+      148 bp from the annotated boundary of the <em>mecA</em> gene (methicillin-resistance transpeptidase) in
+      BV-BRC genome 1280.10000, consistent with Bradley et al. (<em>Nat Commun</em> 6:10063, 2015)'s ~99%
+      concordance between mecA-panel and phenotypic oxacillin testing.</p>
+
+      <h4>Track B — Metagenomic classification (real reads)</h4>
+      <p>A 5-species reference database (<em>E. coli, S. aureus, K. pneumoniae, P. aeruginosa, S. enterica</em>,
+      <code>k=31</code>) built to <strong>24,856,216 distinct k-mers, 298 MB resident</strong> — consistent
+      with the documented ~12 bytes/k-mer model. Classifying real reads from
+      <strong>ENA accession DRR002015</strong> (<em>E. coli</em> 2W14, R1 only, ~97 MB) against it:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>tax_id</th><th>Organism</th><th class="num">Reads</th><th class="num">Relative abundance</th></tr></thead>
+          <tbody>
+            <tr><td>562</td><td>E. coli</td><td class="num tabular">1,657,184</td><td class="num tabular">70.71%</td></tr>
+            <tr><td>0</td><td>unclassified</td><td class="num tabular">635,159</td><td class="num tabular">27.10%</td></tr>
+            <tr><td>1</td><td>root (ambiguous)</td><td class="num tabular">37,286</td><td class="num tabular">1.59%</td></tr>
+            <tr><td>28901</td><td>S. enterica</td><td class="num tabular">7,558</td><td class="num tabular">0.322%</td></tr>
+            <tr><td>573</td><td>K. pneumoniae</td><td class="num tabular">6,186</td><td class="num tabular">0.264%</td></tr>
+            <tr><td>287</td><td>P. aeruginosa</td><td class="num tabular">262</td><td class="num tabular">0.0112%</td></tr>
+            <tr><td>1280</td><td>S. aureus</td><td class="num tabular">2</td><td class="num tabular">0.0001%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Of the 1,671,192 reads called to one specific species, 99.16% were correctly <em>E. coli</em>;
+      cross-reactions with the other Enterobacteriaceae (S. enterica, K. pneumoniae) were an order of
+      magnitude lower again, and near-zero for the unrelated genera. The 27.10% unclassified rate is
+      attributed candidly to the database's exact-match-only k-mers (no spaced seeds, unlike Kraken 2) — "a
+      ~27% sensitivity cost for a ~30× smaller, exact-match, no-tolerance database." Kraken 2 itself was not
+      installed in the validating environment, so no direct concordance number against it is claimed.</p>
+
+      <h3 id="sec-6-3">6.3 &nbsp;Test suite: what is actually covered</h3>
+      <p>252 <code>#[test]</code> functions in the Rust crate as of 2026-08-25
+      (<span class="filepath">docs/design-minimizer-counting.md</span>), plus the Python suite. Selected,
+      representative coverage by area — every example below is a real, named test in the repository:</p>
+
+      <div class="grid-2">
+        <div class="card">
+          <h4>Dual/multi-strategy agreement</h4>
+          <p><span class="filepath">tests/dual_strategy.rs</span> and per-module differential tests
+          (e.g. <code>binned.rs::binned_counts_match_kmer_counter_exactly_across_many_synthetic_inputs</code>,
+          <code>adaptive_counts_match_kmer_counter_exactly_across_many_synthetic_inputs</code>) assert
+          bit-for-bit equality of the <code>(kmer, count)</code> table and total occurrence count across the
+          in-memory, disk, and binned/adaptive-binned strategies over a deterministic fixed-seed xorshift64
+          synthetic FASTQ generator, swept across many <code>(k, m, num_bins, chunk_bytes)</code>
+          combinations.</p>
+        </div>
+        <div class="card">
+          <h4>Structural invariants, proven not just checked</h4>
+          <p><code>signature_is_invariant_under_reverse_complement</code>,
+          <code>bin_of_is_monotonic_in_kmer_value_for_a_fixed_k</code>,
+          <code>bins_hold_disjoint_kmer_sets</code>, and
+          <code>expanding_super_kmers_reproduces_the_reference_multiset_exactly</code> (described in its own
+          comment as "the single most important test in the project") each pin a correctness invariant the
+          whole partitioning design depends on, independent of the aggregate count.</p>
+        </div>
+        <div class="card">
+          <h4>Resilience and robustness</h4>
+          <p><span class="filepath">tests/resilience_hardening.rs</span>,
+          <span class="filepath">tests/fastq_robustness.rs</span>,
+          <span class="filepath">tests/error_handling.rs</span>,
+          <span class="filepath">tests/export_errors.rs</span>,
+          <span class="filepath">tests/qc_export_errors.rs</span> cover corrupt/truncated FASTQ, mismatched
+          seq/qual lengths, I/O failures kept distinct from data errors, and export-path atomic-write
+          failure modes.</p>
+        </div>
+        <div class="card">
+          <h4>Input-format edge cases</h4>
+          <p><span class="filepath">tests/fasta_input.rs</span>, <span class="filepath">tests/multi_input.rs</span>,
+          <span class="filepath">tests/stdin_input.rs</span>, and <span class="filepath">src/cohort/batch.rs</span>'s
+          own test module cover FASTA-as-FASTQ synthetic quality, multi-file/mixed-compression input lists,
+          stdin-with-no-filename gzip sniffing, and the R1/R2 discover-and-count <code>--paired-dir</code> CLI
+          mode (including the hard-error-on-orphan behaviour distinguishing it from
+          <code>discover_samples</code>'s advisory warning).</p>
+        </div>
+      </div>
+
+      <p>Further Rust coverage: <span class="filepath">tests/cli_args.rs</span> /
+      <span class="filepath">cli_max_count_wiring.rs</span> (flag validation, min/max-count band checks),
+      <span class="filepath">tests/histogram_format.rs</span> (CSV vs. GenomeScope spectrum byte-format),
+      <span class="filepath">tests/metagenomics.rs</span> and <span class="filepath">tests/translate.rs</span>
+      (integration tests for the LCA classifier and the six-frame translation module), and
+      <span class="filepath">tests/pipeline_integration.rs</span> (end-to-end producer/worker/export runs).
+      Edge cases pinned directly in unit tests include: <code>k</code> at both boundaries of <code>1..=32</code>,
+      an all-<code>N</code> read, a read shorter than <code>k</code>, the 255-base super-k-mer cap, the
+      <code>u32::MAX</code> count-saturation boundary, zero-threads (rejected as a deadlock guard, not merely
+      slow), and a zero-length homopolymer/quality-window configuration.</p>
+
+      <p>On the Python side (<span class="filepath">python/tests/</span>), the suite exercises the sklearn
+      vectorizer's leakage-safety contract (<code>test_sklearn.py</code>'s
+      <code>test_leakage_guarantee_check_actually_catches_a_leaky_transform</code> is itself a mutation test
+      proving the guard would fail if the guarantee were broken), the GWAS statistical paths, calibration and
+      evaluation reports, <code>LineageKFold</code>'s <code>n_splits</code>-exceeds-lineages guard, and
+      Arrow/pandas/polars interoperability, across 35 test files. A distinctive, real practice throughout the
+      Python suite is the paired "audit" file (<code>test_active_learning_audit.py</code>,
+      <code>test_assembly_qc_audit.py</code>, <code>test_taxonomy_audit.py</code>, and <code>xfail</code>-marked
+      cases inside <code>test_multiomics.py</code>/<code>test_interpret.py</code>): a handful of tests are
+      deliberately marked <code>xfail</code> to pin a <em>known, not-yet-fixed</em> defect precisely — for
+      example, <code>test_qv_is_not_fabricated_by_ordinary_read_quality_decay</code> documents that
+      <code>evaluate_assembly</code> silently inherits <code>min_quality=20.0</code> and reports a
+      confident-looking QV of 25.0 from ordinary 3′ quality decay on an otherwise perfect assembly, and
+      <code>test_identity_threshold_means_the_same_thing_for_both_metrics</code> documents that a
+      <code>check_sample_identity</code> threshold means roughly 14× different strictness depending on
+      whether <code>metric="mash_distance"</code> or <code>"jaccard"</code> is used.</p>
+
+      <div class="callout warn">
+        <span class="label">Test-count discrepancy across two independent counting methods</span>
+        <p>The exact Python test count is itself unsettled between two direct measurements taken during the
+        preparation of this document. A live <code>grep -c "def test_"</code> across
+        <span class="filepath">python/tests/</span> in this checkout counts <strong>650</strong> test
+        functions across the same 35 files; a separate pass reported <strong>375</strong> collected tests
+        (plus 1 skipped, 1 xfailed). Both cannot be a static function count of the identical tree unless a
+        large share of test functions are being filtered out of collection somewhere (missing optional
+        dependencies per <span class="filepath">pyproject.toml</span>'s <code>[project.optional-dependencies]</code>
+        <code>test</code> group — <code>biopython</code>, <code>duckdb</code>, <code>umap-learn</code>,
+        <code>shap</code> — are the likely candidates, since several modules import them lazily and would
+        <code>importorskip</code> whole files rather than fail loudly). This repository's own
+        <span class="filepath">CLAUDE.md</span> separately states "244-test suite," a third figure, which is
+        lower than both direct measurements above and does not resolve the discrepancy. Treat all three
+        numbers as approximate until a single <code>pytest --collect-only -q</code> run inside the project's
+        own <code>.venv</code> is used as the tiebreaker; do not repeat any one of them as a settled fact.</p>
+      </div>
+
+      <div class="callout warn">
+        <span class="label">A second discrepancy the reader should know about</span>
+        <p><span class="filepath">CLAUDE.md</span>'s "known non-obvious facts" section states that
+        <code>python/tests/test_anomaly.py</code> is skipped because <code>anomaly.py</code> was deleted
+        (commit <code>c8870e3</code>). A direct read of the current test file shows this is
+        <strong>no longer accurate</strong>: <code>test_anomaly.py</code> now contains a full, real
+        <code>CohortOutlierFlagger</code>/<code>flag_cohort</code> test suite (robust z-score by default,
+        an opt-in isolation-forest path gated by <code>pytest.importorskip("sklearn")</code>, not a
+        whole-file skip). The module appears to have been rebuilt as the "planned cohort-QC-outlier
+        flagging" replacement CLAUDE.md itself anticipates — but CLAUDE.md's own text has not been updated
+        to say so. Treat the CLAUDE.md note as stale on this specific point.</p>
+      </div>
+
+      <h3 id="sec-6-4">6.4 &nbsp;Exact reproduction commands</h3>
+      <div class="formula">
+<span class="cap">Rust unit + integration tests</span>
+cd fastdna &amp;&amp; cargo test
+
+<span class="cap">Rust lints (unwrap/expect/print denied crate-wide)</span>
+cd fastdna &amp;&amp; cargo clippy --all-targets
+
+<span class="cap">Python package test suite (count under active discrepancy — see §6.3)</span>
+cd fastdna &amp;&amp; python -m pytest python/tests -q
+
+<span class="cap">Rebuild the compiled extension after any Rust change</span>
+cd fastdna &amp;&amp; .venv/Scripts/maturin develop --release
+
+<span class="cap">Cross-tool benchmark (WSL2: KMC 3.2.4 prebuilt, FastK from source)</span>
+bash scripts/bench/kmc3_fastk_comparison.sh
+
+<span class="cap">Deterministic large synthetic dataset (fixed seed 9001)</span>
+python scripts/bench/generate_reads_large.py
+      </div>
+      <p><span class="filepath">scripts/bench/generate_reads_large.py</span> is the vectorized NumPy
+      generator behind the 2.14 GB cross-tool benchmark file (signature:
+      <code>generate_reads_large.py &lt;genome_size&gt; &lt;coverage&gt; &lt;read_len&gt; &lt;out_path&gt;
+      &lt;seed&gt; [chunk_reads]</code>, Illumina-like quality-decay curve, Phred-derived substitution rate,
+      both strands sampled, chunked to bound peak RAM). Its own default seed is <code>1337</code>; the
+      documented benchmark run invokes it explicitly with <code>seed=9001</code>
+      (<span class="filepath">docs/BENCHMARKS.md</span>), and that explicit seed — not a hardcoded constant
+      in the script — is what makes the FastK/KMC3/FastDNA-in-memory/FastDNA-disk agreement on exactly
+      53,776,394 distinct k-mers reproducible rather than a one-time coincidence. A known environment gotcha
+      recorded in
+      <span class="filepath">docs/CHECKPOINT-2026-08-25.md</span>: <span class="filepath">scripts/bench/kmc3_fastk_comparison.sh</span>
+      passes FastK's <code>-P</code> scratch-directory flag with a space, which breaks FastK's argument
+      parser — it must be attached (<code>-Pdir</code>), and on Linux the disk-partitioned strategy's default
+      scratch location can itself be a small RAM-backed <code>tmpfs</code>, in which case
+      <code>FASTDNA_SPILL_DIR</code> must point somewhere with real disk space.</p>
+      </div>
+    </section>
+
+    <footer class="doc-footer">
+      <p>Compiled from the FastDNA repository's own source, doc comments, tests, and dated benchmark/validation
+      documents (2026-08-25 snapshot). Real file paths and identifiers are used throughout as citations, not
+      illustrations — every quoted constant, formula, and figure traces to a specific file in
+      <code>fastdna/</code>. This edition merges two independently produced drafts of this same document,
+      cross-verified against each other and against the repository's source rather than taken on either
+      draft's say-so alone; the §6.3 test-count discrepancy callout above is the one place that
+      cross-verification surfaced a genuine, unresolved disagreement between direct measurements.</p>
+    </footer>
+  </main>
+</div>
+
+<script>
+  (function () {
+    var toggle = document.getElementById('tocToggle');
+    var toc = document.getElementById('toc');
+    if (!toggle || !toc) return;
+    toc.setAttribute('data-collapsed', 'true');
+    toggle.addEventListener('click', function () {
+      var collapsed = toc.getAttribute('data-collapsed') === 'true';
+      toc.setAttribute('data-collapsed', collapsed ? 'false' : 'true');
+      toggle.setAttribute('aria-expanded', collapsed ? 'true' : 'false');
+    });
+  })();
+</script>
