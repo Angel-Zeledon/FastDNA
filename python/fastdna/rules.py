@@ -68,7 +68,6 @@ imported here.
 
 from __future__ import annotations
 
-import os
 from itertools import repeat
 from typing import Any, Dict, NamedTuple, Optional, Sequence, Union
 
@@ -76,7 +75,7 @@ import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
 
-from . import _core
+from . import _core, _PathLike
 
 __all__ = ["Rule", "SetCoveringClassifier"]
 
@@ -674,6 +673,17 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
     def predict(self, X: Any) -> np.ndarray:  # X: same duck-typed dense/sparse matrix as fit()
         """The predicted label per sample, taken from `classes_` so the
         caller's own label dtype (strings included) round-trips.
+
+        Parameters
+        ----------
+        X : array-like or scipy sparse matrix of shape (n_samples, n_features)
+            Binary k-mer presence matrix, same convention as `fit()`'s `X`.
+
+        Returns
+        -------
+        numpy.ndarray of shape (n_samples,)
+            One entry per row of `X`, each equal to `classes_[0]` or
+            `classes_[1]`.
         """
         # _rule_mask() first, deliberately: it is what runs check_is_fitted,
         # and Python evaluates `self.classes_` before the subscript, so
@@ -708,6 +718,18 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         attribute. Returning the honest hard decision, loudly documented,
         keeps `Pipeline`/`OneVsRestClassifier` working and puts the caveat
         where it can be read.
+
+        Parameters
+        ----------
+        X : array-like or scipy sparse matrix of shape (n_samples, n_features)
+            Binary k-mer presence matrix, same convention as `fit()`'s `X`.
+
+        Returns
+        -------
+        numpy.ndarray of shape (n_samples, 2)
+            Columns ordered as `classes_`; every row is `[1., 0.]` or
+            `[0., 1.]` -- see the caveat above before using this as a
+            score.
         """
         fired = self._rule_mask(X, "predict_proba").astype(np.float64)
         return np.column_stack((1.0 - fired, fired))
@@ -721,6 +743,10 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
 
         A `list` copy is returned, not the internal list, so that mutating
         the result cannot silently change what `predict()` does.
+
+        Returns
+        -------
+        list of Rule
         """
         check_is_fitted(self, "classes_")
         return list(self._rules_)
@@ -735,6 +761,16 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         `fit()` received `feature_names`, each literal is the actual k-mer
         sequence -- which is the whole point of the model: the explanation
         *is* the biology, not a proxy for it.
+
+        Naming note: this method predates, and collides in name with, the
+        top-level `fastdna.explain()` function -- both exist, both are
+        public, and nothing here renames either (see the review that added
+        this note for the reasoning: renaming a public method name is a
+        breaking change to flag for a human, not to decide unilaterally).
+
+        Returns
+        -------
+        str
         """
         check_is_fitted(self, "classes_")
         label = self.classes_[1]
@@ -745,7 +781,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         connective = " AND " if self.rule_type == "conjunction" else " OR "
         return f"{label} IF " + connective.join(str(rule) for rule in self._rules_)
 
-    def export_rules_fasta(self, path: Union[str, os.PathLike]) -> list[Rule]:
+    def export_rules_fasta(self, path: _PathLike) -> list[Rule]:
         """Writes the rule k-mers to `path` as FASTA, ready for BLAST.
 
         Each record is two lines, matching `fastdna.interpret`'s exporter:
@@ -760,7 +796,22 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         `feature_2` is not a sequence file, it is a trap for whoever opens
         it next.
 
-        Returns the list of `Rule`s written.
+        Parameters
+        ----------
+        path : str or os.PathLike
+            Destination FASTA file. Required: writing it is this method's
+            entire purpose, so there is no in-memory-only form to fall
+            back to.
+
+        Returns
+        -------
+        list of Rule
+            The rules written, in the same order as `rules_`.
+
+        Raises
+        ------
+        ValueError
+            If `fit()` was called without `feature_names`.
         """
         check_is_fitted(self, "classes_")
         if not self._feature_names_given_:

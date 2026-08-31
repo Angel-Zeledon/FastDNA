@@ -86,11 +86,13 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from scipy import sparse
 
-from . import _column_as_array, _core, _pair_positions, compare_all as _compare_all, count as _count
+from . import _PathLike, _column_as_array, _core, _pair_positions, compare_all as _compare_all, count as _count
 
 __all__ = [
     "ScreeningOnlyWarning",
+    "CohortPresenceMatrix",
     "PyseerExport",
+    "KinshipMatrix",
     "cohort_presence_matrix",
     "export_pyseer_kmers",
     "kinship_matrix",
@@ -223,6 +225,33 @@ def _positive_int_or_none(value, name):
     return int(value)
 
 
+class CohortPresenceMatrix(NamedTuple):
+    """What :func:`cohort_presence_matrix` returns -- a plain, named tuple
+    so `result.matrix`/`result.sample_ids`/`result.kmer_sequences` read as
+    clearly as unpacking (`matrix, sample_ids, kmer_sequences = ...`, still
+    supported since this is a `NamedTuple`).
+
+    Attributes
+    ----------
+    matrix : scipy.sparse.csr_matrix
+        `uint32`, shape `(len(sample_ids), len(kmer_sequences))`. Despite
+        the function's name the stored values are *counts*, not booleans --
+        presence is `matrix > 0` (or `matrix.astype(bool)`), which is the
+        variant model k-mer GWAS actually uses, while the counts are kept
+        because they are free here and cost a re-count to recover.
+        "Presence" is in the name because presence/absence is the question
+        the matrix exists to answer.
+    sample_ids : list of str
+        In the caller's order, indexing rows.
+    kmer_sequences : list of str
+        Decoded canonical k-mers, indexing columns, sorted lexicographically.
+    """
+
+    matrix: object
+    sample_ids: list
+    kmer_sequences: list
+
+
 def cohort_presence_matrix(
     paths: _CohortPaths,
     *,
@@ -230,7 +259,7 @@ def cohort_presence_matrix(
     min_count: int = 2,
     min_samples: int = 2,
     max_kmers: Optional[int] = None,
-) -> tuple[sparse.csr_matrix, list[str], list[str]]:
+) -> CohortPresenceMatrix:
     """Counts every sample once and returns the cohort as one sparse matrix.
 
     This is the substrate a k-mer GWAS (and any other cohort-level model)
@@ -266,18 +295,9 @@ def cohort_presence_matrix(
 
     Returns
     -------
-    (matrix, sample_ids, kmer_sequences)
-        `matrix` : `scipy.sparse.csr_matrix` of `uint32`, shape
-        `(len(sample_ids), len(kmer_sequences))`. Despite the function's
-        name the stored values are *counts*, not booleans -- presence is
-        `matrix > 0` (or `matrix.astype(bool)`), which is the variant model
-        k-mer GWAS actually uses, while the counts are kept because they
-        are free here and cost a re-count to recover. "Presence" is in the
-        name because presence/absence is the question the matrix exists to
-        answer.
-        `sample_ids` : `list[str]`, in the caller's order, indexing rows.
-        `kmer_sequences` : `list[str]` of decoded canonical k-mers,
-        indexing columns, sorted lexicographically.
+    CohortPresenceMatrix
+        `(matrix, sample_ids, kmer_sequences)` -- see that class for what
+        each field holds.
 
     Column selection and `max_kmers`
     --------------------------------
@@ -323,7 +343,7 @@ def cohort_presence_matrix(
     per-file Arrow `RecordBatch` first. `_cohort_presence_matrix_fallback`
     below -- the pure-Python/pyarrow implementation this replaced -- is kept
     as the path for an older compiled extension that predates the native
-    function; both produce the same `(matrix, sample_ids, kmer_sequences)`.
+    function; both produce the same `CohortPresenceMatrix`.
     """
     sample_ids, path_strings = _resolve_cohort(paths, caller="cohort_presence_matrix")
     n_samples = len(sample_ids)
@@ -405,7 +425,7 @@ def _cohort_presence_matrix_native(path_strings, sample_ids, *, k, min_count, mi
         shape=(n_samples, n_kmers),
         dtype=np.uint32,
     )
-    return matrix, sample_ids, kmer_sequences
+    return CohortPresenceMatrix(matrix, sample_ids, kmer_sequences)
 
 
 def _cohort_presence_matrix_fallback(path_strings, sample_ids, *, k, min_count, min_samples, max_kmers, n_samples):
@@ -518,7 +538,7 @@ def _cohort_presence_matrix_fallback(path_strings, sample_ids, *, k, min_count, 
         shape=(n_samples, selected.size),
         dtype=np.uint32,
     )
-    return matrix, sample_ids, kmer_sequences
+    return CohortPresenceMatrix(matrix, sample_ids, kmer_sequences)
 
 
 class PyseerExport(NamedTuple):
@@ -535,7 +555,7 @@ class PyseerExport(NamedTuple):
 
 def export_pyseer_kmers(
     paths: _CohortPaths,
-    out_path: _PathLike,
+    output: _PathLike,
     *,
     k: int = 31,
     min_count: int = 2,
@@ -570,8 +590,8 @@ def export_pyseer_kmers(
 
     Compression
     -----------
-    pyseer assumes this file is gzipped (`--uncompressed` opts out), so a
-    `out_path` ending in `.gz` (case-insensitive) is gzip-compressed and
+    pyseer assumes this file is gzipped (`--uncompressed` opts out), so an
+    `output` path ending in `.gz` (case-insensitive) is gzip-compressed and
     anything else is written as plain text. Prefer the `.gz` form: it is
     both pyseer's default and, for a real cohort, several-fold smaller.
 
@@ -583,6 +603,11 @@ def export_pyseer_kmers(
         sample names in the phenotype file passed to pyseer's
         `--phenotypes` -- pyseer intersects the two and will report an
         empty overlap rather than guessing.
+    output : str or os.PathLike
+        Where to write the pyseer `--kmers` file. Required: this function's
+        entire purpose is the write, so there is no in-memory-only form to
+        fall back to (contrast an `output: Optional[...] = None` parameter
+        elsewhere in the package, which does have one).
     k, min_count, min_samples
         Forwarded to :func:`cohort_presence_matrix`; see there. `max_kmers`
         is deliberately not exposed: a truncated k-mer file handed to
@@ -593,7 +618,8 @@ def export_pyseer_kmers(
     Returns
     -------
     PyseerExport
-        `(path, n_kmers, n_samples, sample_ids, gzipped)`.
+        `(path, n_kmers, n_samples, sample_ids, gzipped)` -- `path` is
+        `output`, resolved to a `pathlib.Path`.
 
     Raises
     ------
@@ -620,14 +646,14 @@ def export_pyseer_kmers(
                 "Rename it by passing an explicit {sample_id: path} mapping."
             )
 
-    out_path = pathlib.Path(str(out_path))
-    gzipped = out_path.name.lower().endswith(".gz")
+    output = pathlib.Path(str(output))
+    gzipped = output.name.lower().endswith(".gz")
 
     # Binary mode throughout, not text mode: on Windows a text-mode write
     # would translate every '\n' into '\r\n', and pyseer's parser would
     # then carry a trailing '\r' into the last sample id of every line.
     csc = matrix.tocsc()
-    opener = (lambda: gzip.open(out_path, "wb")) if gzipped else (lambda: open(out_path, "wb"))
+    opener = (lambda: gzip.open(output, "wb")) if gzipped else (lambda: open(output, "wb"))
     with opener() as handle:
         for column, sequence in enumerate(kmer_sequences):
             start, end = csc.indptr[column], csc.indptr[column + 1]
@@ -638,7 +664,7 @@ def export_pyseer_kmers(
             handle.write(f"{sequence} | {entries}\n".encode("ascii"))
 
     return PyseerExport(
-        path=out_path,
+        path=output,
         n_kmers=len(kmer_sequences),
         n_samples=len(sample_ids),
         sample_ids=sample_ids,
@@ -646,9 +672,26 @@ def export_pyseer_kmers(
     )
 
 
-def kinship_matrix(
-    paths: _CohortPaths, *, k: int = 21, sketch_size: int = 10_000
-) -> tuple[np.ndarray, list[str]]:
+class KinshipMatrix(NamedTuple):
+    """What :func:`kinship_matrix` returns -- a plain, named tuple so
+    `result.matrix`/`result.sample_ids` read as clearly as unpacking
+    (`matrix, sample_ids = ...`, still supported since this is a
+    `NamedTuple`).
+
+    Attributes
+    ----------
+    matrix : numpy.ndarray
+        Shape `(n, n)`, symmetric, with an exact 1.0 diagonal (a sample is
+        identical to itself by definition; it is not estimated).
+    sample_ids : list of str
+        Indexes both axes, in the caller's order.
+    """
+
+    matrix: object
+    sample_ids: list
+
+
+def kinship_matrix(paths: _CohortPaths, *, k: int = 21, sketch_size: int = 10_000) -> KinshipMatrix:
     """A sample-by-sample similarity matrix derived from FastDNA's Mash
     distances -- the population-structure covariance a mixed-model GWAS
     needs as its random effect.
@@ -678,11 +721,8 @@ def kinship_matrix(
 
     Returns
     -------
-    (matrix, sample_ids)
-        `matrix` : `numpy.ndarray` of shape `(n, n)`, symmetric, with an
-        exact 1.0 diagonal (a sample is identical to itself by definition;
-        it is not estimated). `sample_ids` : `list[str]` indexing both
-        axes, in the caller's order.
+    KinshipMatrix
+        `(matrix, sample_ids)` -- see that class for what each field holds.
 
     Feeding it to pyseer
     --------------------
@@ -730,7 +770,7 @@ def kinship_matrix(
     similarity[i, j] = value
     similarity[j, i] = value
 
-    return similarity, sample_ids
+    return KinshipMatrix(similarity, sample_ids)
 
 
 def _benjamini_hochberg(sorted_pvalues):

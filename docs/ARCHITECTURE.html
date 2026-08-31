@@ -1291,10 +1291,10 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
       <h4>Cohort / GWAS surface — <code>fastdna.gwas</code></h4>
       <div class="formula">
 def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers=None)
-    -> (scipy.sparse.csr_matrix[uint32], sample_ids: list[str], kmer_sequences: list[str])
+    -> CohortPresenceMatrix(matrix: scipy.sparse.csr_matrix[uint32], sample_ids: list[str], kmer_sequences: list[str])
 
-def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2) -> PyseerExport
-def kinship_matrix(paths, *, k=21, sketch_size=10_000) -> (np.ndarray[n,n], sample_ids: list[str])
+def export_pyseer_kmers(paths, output, *, k=31, min_count=2, min_samples=2) -> PyseerExport
+def kinship_matrix(paths, *, k=21, sketch_size=10_000) -> KinshipMatrix(matrix: np.ndarray[n,n], sample_ids: list[str])
 def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", top_n=None) -> pyarrow.Table
       </div>
 

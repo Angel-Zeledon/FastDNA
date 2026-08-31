@@ -50,10 +50,13 @@ __all__ = [
     "explain",
 ]
 
-# A path accepted anywhere in this module: a `str`, or anything implementing
-# `os.PathLike` (e.g. `pathlib.Path`) -- every such parameter is converted
-# with `str(path)` before crossing into the Rust core, which only accepts
-# `str`.
+# The path type accepted anywhere in the package: a `str`, or anything
+# implementing `os.PathLike` (e.g. `pathlib.Path`). Every submodule that
+# takes a single-sample path imports this rather than redefining its own
+# `Union[str, os.PathLike]` alias, so `path: _PathLike` means the same thing
+# everywhere in the public API -- see each submodule's own `_PathLike`
+# import for the "one sample" half of the package-wide path convention
+# (`paths: Sequence[_PathLike]` is the cohort half).
 _PathLike = Union[str, os.PathLike]
 
 
