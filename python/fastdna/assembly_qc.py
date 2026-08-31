@@ -423,27 +423,35 @@ def evaluate_kmers(
     k-mer multiset against an already-computed `fastdna.KmerCounts` for
     the reads, without touching any file itself.
 
-    `assembly_kmers` is either a `Mapping[str, int]` from canonical k-mer
-    string to how many times it occurs in the assembly (as produced by
-    `_assembly_kmer_counts`/`evaluate_assembly`'s own internals, or by the
-    pure-Python `_count_fasta_kmers` for a caller building one by hand from
-    e.g. an in-memory sequence with no file on disk), or any
-    iterable of canonical k-mer strings (each occurrence listed
-    separately -- e.g. `["ACGT", "ACGT", "CCGA"]` for a k-mer occurring
-    twice), which is turned into a `collections.Counter` first. Every
-    k-mer must already be in the same canonical form `fastdna` itself
-    uses (see `_canonical`/`KmerCounts.table`'s `kmer_sequence` column) --
-    this function does not re-canonicalize.
+    Parameters
+    ----------
+    assembly_kmers : mapping of str to int, or iterable of str
+        Either a `Mapping[str, int]` from canonical k-mer string to how
+        many times it occurs in the assembly (as produced by
+        `_assembly_kmer_counts`/`evaluate_assembly`'s own internals, or by
+        the pure-Python `_count_fasta_kmers` for a caller building one by
+        hand from e.g. an in-memory sequence with no file on disk), or any
+        iterable of canonical k-mer strings (each occurrence listed
+        separately -- e.g. `["ACGT", "ACGT", "CCGA"]` for a k-mer
+        occurring twice), which is turned into a `collections.Counter`
+        first. Every k-mer must already be in the same canonical form
+        `fastdna` itself uses (see `_canonical`/`KmerCounts.table`'s
+        `kmer_sequence` column) -- this function does not re-canonicalize.
+    reads_counts : fastdna.KmerCounts
+        The reads' own k-mer counts, built with the *same* `k` (mismatched
+        `k` values make the comparison meaningless -- two k-mer sets built
+        at different `k` share almost nothing by construction, not because
+        of any real assembly/read discrepancy).
+    k : int
+        K-mer size both `assembly_kmers` and `reads_counts` were built
+        with.
+    min_count : int, optional
+        See `evaluate_assembly`.
 
-    `reads_counts` is a `fastdna.KmerCounts` for the reads, built with the
-    *same* `k` (mismatched `k` values make the comparison meaningless --
-    two k-mer sets built at different `k` share almost nothing by
-    construction, not because of any real assembly/read discrepancy).
-
-    `min_count`: see `evaluate_assembly`.
-
-    See `AssemblyQC` for the returned fields, and the module docstring for
-    the QV formula and its provenance.
+    Returns
+    -------
+    AssemblyQC
+        See its own docstring for every field's exact meaning and units.
     """
     if not isinstance(assembly_kmers, Mapping):
         assembly_kmers = Counter(assembly_kmers)
@@ -537,67 +545,76 @@ def evaluate_assembly(
     al. 2020 -- see this module's own docstring for the full citation and
     the FASTA-handling discussion).
 
-    `assembly_path`: the assembly to grade. Normally a FASTA file
-    (`.fasta`/`.fa`/`.fna`, optionally `.gz`), counted through
-    `fastdna.count()`'s native FASTA-capable Rust pipeline (see the module
-    docstring's "FASTA/FASTQ mismatch" section for the full story,
-    including a measured caveat: this is a correctness/maintenance win
-    confirmed over the old pure-Python extractor, not an unconditional
-    wall-clock one at every input size). The Rust core content-sniffs
-    FASTA vs. FASTQ from the file's own first non-blank byte rather than
-    its extension, so no dispatch or caller-side conversion is needed
-    here. A FASTQ-like extension (`.fastq`/`.fq`(`.gz`)) -- e.g. an
-    assembly a caller already converted to FASTQ with a dummy quality
-    string, formerly the only way to reach `fastdna.count()` at all for
-    this side -- works exactly the same way and is no longer a special
-    case.
+    Parameters
+    ----------
+    assembly_path : path-like
+        The assembly to grade. Normally a FASTA file (`.fasta`/`.fa`/
+        `.fna`, optionally `.gz`), counted through `fastdna.count()`'s
+        native FASTA-capable Rust pipeline (see the module docstring's
+        "FASTA/FASTQ mismatch" section for the full story, including a
+        measured caveat: this is a correctness/maintenance win confirmed
+        over the old pure-Python extractor, not an unconditional
+        wall-clock one at every input size). The Rust core content-sniffs
+        FASTA vs. FASTQ from the file's own first non-blank byte rather
+        than its extension, so no dispatch or caller-side conversion is
+        needed here. A FASTQ-like extension (`.fastq`/`.fq`(`.gz`)) --
+        e.g. an assembly a caller already converted to FASTQ with a dummy
+        quality string, formerly the only way to reach `fastdna.count()`
+        at all for this side -- works exactly the same way and is no
+        longer a special case.
+    reads_path : path-like
+        The raw FASTQ(.gz) reads the assembly was built from -- genuinely
+        FASTQ, so this side always goes through `fastdna.count()` at full
+        speed. These reads are the ground truth this function grades the
+        assembly against; an assembly built from a *different* read set
+        than the one passed here is not a meaningful comparison.
+    k : int, default 21
+        K-mer size for both sides. Defaults to `21` (not `fastdna.count`'s
+        own `k=31` default), matching Merqury's own recommendation and
+        this package's `fastdna.sketch`'s default -- `k=21` keeps the
+        chance of two *unrelated* k-mers colliding by chance low while
+        staying short enough that ordinary sequencing-error rates do not
+        make every read k-mer unique. Both sides are always counted at
+        the same `k`; there is no way to compare k-mer sets built at
+        different `k` meaningfully.
+    min_count : int, optional
+        Which read k-mers count as "reliable" ground truth for
+        `completeness`, versus likely sequencing errors, expressed as a
+        minimum observed frequency. If `None` (the default), uses the
+        reads' own `KmerCounts.suggest_min_count()` -- the valley between
+        the error peak and the true-coverage peak in *this* sample's own
+        frequency spectrum -- rather than a hardcoded constant, per this
+        package's own design position (see
+        `fastdna.spectrum.suggest_min_count`'s docstring) that there is
+        no single correct universal `min_count`.
+    min_quality : float, default 0.0
+        The minimum per-base Phred quality `reads_path` is counted at,
+        passed straight through to `fastdna.count`. Defaults to `0.0`
+        here -- **not** `fastdna.count`'s own default of `20.0` -- which
+        is a deliberate divergence, not an oversight: `fastdna.count(...,
+        min_quality=20.0)` 3'-end-trims every read before counting, so
+        any read k-mer that existed only in a trimmed tail silently
+        vanishes from the ground truth this function grades the assembly
+        against, and every assembly k-mer that depended on it is then
+        scored as a *consensus error* that was never really there.
+        Merqury itself builds its read k-mer database from the reads
+        exactly as given (`meryl count` on the raw FASTQ, no quality
+        trimming) -- this default matches that, and keeps an assembly's
+        QV a property of the assembly, not of how sharply the caller's
+        sequencer's quality happened to decay toward the read's 3' end
+        (ordinary, harmless decay on an otherwise-correct read dropped
+        this module's own worked example's QV from `inf` to `25.00` with
+        zero real assembly errors). Pass `min_quality=20.0` (or any other
+        value) explicitly to opt back into `fastdna.count`'s own trimming
+        behavior if that is genuinely wanted.
 
-    `reads_path`: the raw FASTQ(.gz) reads the assembly was built from --
-    genuinely FASTQ, so this side always goes through `fastdna.count()`
-    at full speed. These reads are the ground truth this function grades
-    the assembly against; an assembly built from a *different* read set
-    than the one passed here is not a meaningful comparison.
-
-    `k`: k-mer size for both sides. Defaults to `21` (not `fastdna.count`'s
-    own `k=31` default), matching Merqury's own recommendation and this
-    package's `fastdna.sketch`'s default -- `k=21` keeps the chance of two
-    *unrelated* k-mers colliding by chance low while staying short enough
-    that ordinary sequencing-error rates do not make every read k-mer
-    unique. Both sides are always counted at the same `k`; there is no way
-    to compare k-mer sets built at different `k` meaningfully.
-
-    `min_count`: which read k-mers count as "reliable" ground truth for
-    `completeness`, versus likely sequencing errors, expressed as a
-    minimum observed frequency. If `None` (the default), uses the reads'
-    own `KmerCounts.suggest_min_count()` -- the valley between the error
-    peak and the true-coverage peak in *this* sample's own frequency
-    spectrum -- rather than a hardcoded constant, per this package's own
-    design position (see `fastdna.spectrum.suggest_min_count`'s docstring)
-    that there is no single correct universal `min_count`.
-
-    `min_quality`: the minimum per-base Phred quality `reads_path` is
-    counted at, passed straight through to `fastdna.count`. Defaults to
-    `0.0` here -- **not** `fastdna.count`'s own default of `20.0` -- which
-    is a deliberate divergence, not an oversight: `fastdna.count(...,
-    min_quality=20.0)` 3'-end-trims every read before counting, so any
-    read k-mer that existed only in a trimmed tail silently vanishes from
-    the ground truth this function grades the assembly against, and every
-    assembly k-mer that depended on it is then scored as a *consensus
-    error* that was never really there. Merqury itself builds its read
-    k-mer database from the reads exactly as given (`meryl count` on the
-    raw FASTQ, no quality trimming) -- this default matches that, and
-    keeps an assembly's QV a property of the assembly, not of how sharply
-    the caller's sequencer's quality happened to decay toward the read's
-    3' end (ordinary, harmless decay on an otherwise-correct read
-    dropped this module's own worked example's QV from `inf` to `25.00`
-    with zero real assembly errors). Pass `min_quality=20.0` (or any other
-    value) explicitly to opt back into `fastdna.count`'s own trimming
-    behavior if that is genuinely wanted.
-
-    Returns an `AssemblyQC` (see its own docstring for every field's exact
-    meaning and units): `qv` (float, Phred-like, higher is better),
-    `completeness` (float in `[0, 1]`, higher is better), and `spectra` (a
-    `pyarrow.Table` a caller can plot).
+    Returns
+    -------
+    AssemblyQC
+        See its own docstring for every field's exact meaning and units:
+        `qv` (float, Phred-like, higher is better), `completeness` (float
+        in `[0, 1]`, higher is better), and `spectra` (a `pyarrow.Table` a
+        caller can plot).
     """
     reads_counts = fastdna.count(reads_path, k=k, min_quality=min_quality)
     assembly_kmers = _assembly_kmer_counts(assembly_path, k)

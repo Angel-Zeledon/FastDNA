@@ -156,24 +156,39 @@ def count_from_sequences(
     """`fastdna.count()` for an in-memory iterable of sequences instead of
     a file already on disk.
 
-    `sequences` may be:
-
-    - an iterable of plain strings (each auto-numbered `seq0`, `seq1`, ...);
-    - an iterable of `(id, sequence_string)` pairs;
-    - an iterable of Biopython `SeqRecord`-like objects (duck-typed via a
-      `.seq` attribute -- Biopython itself is never imported by this
-      module, so it stays an optional dependency), e.g. the output of
-      `Bio.SeqIO.parse(path, "fastq")` or `Bio.SeqIO.parse(path, "fasta")`.
-
     Writes `sequences` to a temporary FASTQ file (synthesizing uniform
     Q40 quality scores for any record that doesn't already carry real
     ones -- see this module's docstring) and calls `fastdna.count()` on
-    it, deleting the temp file afterward. `k` and any other keyword
-    accepted by `fastdna.count()` (`min_count`, `max_count`,
-    `min_quality`, `threads`, `progress`, `progress_interval`) pass
-    through unchanged.
+    it, deleting the temp file afterward.
 
-    Raises `ValueError` if `sequences` contains no non-empty records.
+    Parameters
+    ----------
+    sequences : iterable
+        One of:
+
+        - an iterable of plain strings (each auto-numbered `seq0`,
+          `seq1`, ...);
+        - an iterable of `(id, sequence_string)` pairs;
+        - an iterable of Biopython `SeqRecord`-like objects (duck-typed
+          via a `.seq` attribute -- Biopython itself is never imported by
+          this module, so it stays an optional dependency), e.g. the
+          output of `Bio.SeqIO.parse(path, "fastq")` or
+          `Bio.SeqIO.parse(path, "fasta")`.
+    k : int, default 31
+        K-mer size, forwarded to `fastdna.count()`.
+    **count_kwargs
+        Any other keyword accepted by `fastdna.count()` (`min_count`,
+        `max_count`, `min_quality`, `threads`, `progress`,
+        `progress_interval`), passed through unchanged.
+
+    Returns
+    -------
+    KmerCounts
+
+    Raises
+    ------
+    ValueError
+        `sequences` contains no non-empty records.
     """
     return _with_temp_fastq(sequences, lambda path: _count(path, k=k, **count_kwargs))
 
@@ -188,5 +203,24 @@ def sketch_from_sequences(
     of a file already on disk. See `count_from_sequences` for what
     `sequences` may contain and the same "synthesized quality, temp file"
     caveats -- they apply identically here.
+
+    Parameters
+    ----------
+    sequences : iterable
+        As in `count_from_sequences`: plain strings, `(id, sequence)`
+        pairs, or Biopython `SeqRecord`-like objects.
+    k : int, default 21
+        K-mer size, forwarded to `fastdna.sketch()`.
+    sketch_size : int, default 1000
+        Bottom-k sketch size, forwarded to `fastdna.sketch()`.
+
+    Returns
+    -------
+    Sketch
+
+    Raises
+    ------
+    ValueError
+        `sequences` contains no non-empty records.
     """
     return _with_temp_fastq(sequences, lambda path: _sketch(path, k=k, sketch_size=sketch_size))

@@ -94,18 +94,6 @@ def build_database(
     """Builds a k-mer -> lowest-common-ancestor database and returns it as
     a :class:`KmerDatabase`.
 
-    `reference` is a FASTA (or FASTQ, gzipped or not) file of reference
-    sequences. `taxonomy` is a tab-separated file carrying both the
-    taxonomy tree and the sequence-to-taxon mapping, with a header naming
-    at least `tax_id`, `parent_tax_id`, `rank` and `name`, plus an
-    optional `sequence_ids` column listing the reference sequence ids
-    belonging to each taxon, separated by `;` or `,`::
-
-        tax_id  parent_tax_id  rank     name              sequence_ids
-        1       1              no rank  root
-        561     1              genus    Escherichia
-        562     561            species  Escherichia coli  NC_000913.3
-
     A sequence id is the first whitespace-delimited token of a FASTA
     header without the `>`, the same convention `samtools faidx` uses.
     The root names either `0` or itself as its parent, following NCBI.
@@ -125,10 +113,39 @@ def build_database(
     about still classifies every read -- to the wrong node, at full
     confidence, with nothing anywhere saying so.
 
-    `k` must be in 1..=32 (the 2-bit packing limit) or `ValueError` is
-    raised. `output`, if given, saves the database to that path; the
-    database is returned either way, so building and classifying in one
-    session never pays a save and a reload.
+    Parameters
+    ----------
+    reference : path-like
+        A FASTA (or FASTQ, gzipped or not) file of reference sequences.
+    taxonomy : path-like
+        A tab-separated file carrying both the taxonomy tree and the
+        sequence-to-taxon mapping, with a header naming at least
+        `tax_id`, `parent_tax_id`, `rank` and `name`, plus an optional
+        `sequence_ids` column listing the reference sequence ids
+        belonging to each taxon, separated by `;` or `,`::
+
+            tax_id  parent_tax_id  rank     name              sequence_ids
+            1       1              no rank  root
+            561     1              genus    Escherichia
+            562     561            species  Escherichia coli  NC_000913.3
+
+    k : int, default 31
+        K-mer size, must be in 1..=32 (the 2-bit packing limit).
+    output : path-like, optional
+        When given, saves the database to that path. The database is
+        returned either way, so building and classifying in one session
+        never pays a save and a reload.
+
+    Returns
+    -------
+    KmerDatabase
+
+    Raises
+    ------
+    ValueError
+        `k` is outside 1..=32, or `taxonomy`/`reference` has a structural
+        problem (see above) -- the message names the offending 1-based
+        line.
     """
     return KmerDatabase(
         _core.build_database(
@@ -163,11 +180,35 @@ class KmerDatabase:
         so. That check is not a formality: the table is searched by
         binary search, and an out-of-order table does not crash it -- it
         makes it return confident nonsense.
+
+        Parameters
+        ----------
+        path : path-like
+            The database file to load.
+
+        Returns
+        -------
+        KmerDatabase
+
+        Raises
+        ------
+        ValueError
+            `path` is truncated, corrupt, or not a database file.
         """
         return cls(_core.KmerDatabase.load(str(path)))
 
     def save(self, path: _PathLike) -> None:
-        """Persists the database, replacing `path` atomically."""
+        """Persists the database, replacing `path` atomically.
+
+        Parameters
+        ----------
+        path : path-like
+            Output file path.
+
+        Returns
+        -------
+        None
+        """
         self._raw.save(str(path))
 
     @property
@@ -213,8 +254,7 @@ class KmerDatabase:
         clade can only be larger. If it passes the root without ever
         meeting the bar the read is unclassified (`tax_id` 0). Raising
         the threshold therefore makes calls less specific or drops them;
-        it never moves a call to a different branch. Must be in
-        [0.0, 1.0] or `ValueError` is raised.
+        it never moves a call to a different branch.
 
         Reads shorter than `k`, reads whose every window contains an
         ambiguous base, and reads matching nothing all appear as
@@ -228,6 +268,28 @@ class KmerDatabase:
         The whole result is materialized: roughly 48 bytes plus the read
         name per read, so a 100-million-read file needs about 5 GB. Split
         such inputs into chunks.
+
+        Parameters
+        ----------
+        reads : path-like
+            A FASTA/FASTQ(.gz) file of reads to classify.
+        confidence_threshold : float, default 0.0
+            The minimum fraction of a read's k-mers that must fall in the
+            clade rooted at the assigned taxon (see above). Must be in
+            `[0.0, 1.0]`.
+
+        Returns
+        -------
+        pyarrow.Table
+            One row per read, in input order, with columns `read_id`
+            (utf8), `tax_id` (uint32, 0 = unclassified), `confidence`
+            (float64), `n_kmers` (uint32) and `n_classified_kmers`
+            (uint32) -- see the table above for exactly what each means.
+
+        Raises
+        ------
+        ValueError
+            `confidence_threshold` is outside `[0.0, 1.0]`.
         """
         batch = self._raw.classify(str(reads), confidence_threshold)
         return pa.Table.from_batches([batch])
@@ -261,8 +323,18 @@ class KmerDatabase:
         not also under each of its species. Kraken's own report format
         gives clade-cumulative totals as well; this does not.
 
-        `classification` may be the `pyarrow.Table` :meth:`classify`
-        returned, or any sequence of taxon ids.
+        Parameters
+        ----------
+        classification : pyarrow.Table, pyarrow.RecordBatch, or sequence of int
+            The table :meth:`classify` returned (its `tax_id` column is
+            used), or any sequence of taxon ids directly.
+
+        Returns
+        -------
+        pyarrow.Table
+            Columns `tax_id`, `name`, `rank`, `reads`,
+            `relative_abundance`, most reads first with ties broken by
+            `tax_id`.
         """
         if isinstance(classification, (pa.Table, pa.RecordBatch)):
             tax_ids = classification.column("tax_id").to_pylist()

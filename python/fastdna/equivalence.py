@@ -217,9 +217,9 @@ class EquivalenceClasses(NamedTuple):
         representative is always the first row of its group).
     """
 
-    matrix: object  # scipy.sparse.csr_matrix
-    representative: list
-    members: object  # pyarrow.Table
+    matrix: sparse.csr_matrix
+    representative: list[str]
+    members: pa.Table
 
 
 def collapse_equivalence_classes(matrix: sparse.spmatrix, kmer_sequences: Sequence[str]) -> EquivalenceClasses:

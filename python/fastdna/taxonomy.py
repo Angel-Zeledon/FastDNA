@@ -106,30 +106,43 @@ def build_reference_database(
     times" principle `compare_all()` already applies to all-pairs
     comparison, applied here to one-query-vs-many-references.
 
-    `paths_or_dict` accepts either an iterable of paths (names derived
-    from each filename, see `_default_name`) or an explicit
-    `{name: path}` dict, for when filenames aren't distinctive names on
-    their own (e.g. accession numbers, or several files that would
-    otherwise collide on the same derived name).
+    Deliberately returns a plain `dict[str, Sketch]` (or
+    `dict[str, FracSketch]`), not a bespoke index/database type.
+    `Sketch.save()`/`fastdna.load_sketch()` (or `FracSketch.save()`/
+    `load_frac_sketch()`) already exist for persisting one sketch; a
+    caller who wants a persisted *database* can save each of this dict's
+    values under its key as a filename and rebuild the same dict later.
+    Inventing a second, bespoke multi-sketch file format on top of that
+    would add a format to maintain without adding any capability this
+    dict-of-Sketch doesn't already have.
 
-    `scale`: when given, builds `FracSketch`es (via `frac_sketch(...,
-    scale=scale)`) instead of the default bottom-k `Sketch`es. Pass this
-    when the database will be queried with `classify(..., metric=
-    "containment")` or `gather()` against references of very different
-    sizes from the query -- see `classify()`'s docstring for why bottom-k
-    containment is biased there and `FracSketch` is not. Leave it `None`
-    (the default) for `metric="jaccard"` use or same-size comparisons,
-    where bottom-k's fixed memory footprint is the simpler choice.
+    Parameters
+    ----------
+    paths_or_dict : iterable of path-like, or dict of str to path-like
+        Either an iterable of paths (names derived from each filename, see
+        `_default_name`) or an explicit `{name: path}` dict, for when
+        filenames aren't distinctive names on their own (e.g. accession
+        numbers, or several files that would otherwise collide on the same
+        derived name).
+    k : int, default 21
+        K-mer size every reference is sketched with.
+    sketch_size : int, default 1000
+        Bottom-k sketch size used when `scale` is `None`.
+    scale : int, optional
+        When given, builds `FracSketch`es (via `frac_sketch(...,
+        scale=scale)`) instead of the default bottom-k `Sketch`es. Pass
+        this when the database will be queried with `classify(..., metric=
+        "containment")` or `gather()` against references of very different
+        sizes from the query -- see `classify()`'s docstring for why
+        bottom-k containment is biased there and `FracSketch` is not.
+        Leave it `None` (the default) for `metric="jaccard"` use or
+        same-size comparisons, where bottom-k's fixed memory footprint is
+        the simpler choice.
 
-    Returns a plain `dict[str, Sketch]` (or `dict[str, FracSketch]`) --
-    deliberately not a bespoke index/database type. `Sketch.save()`/
-    `fastdna.load_sketch()` (or `FracSketch.save()`/`load_frac_sketch()`)
-    already exist for persisting one sketch; a caller who wants a
-    persisted *database* can save each of this dict's values under its key
-    as a filename and rebuild the same dict later. Inventing a second,
-    bespoke multi-sketch file format on top of that would add a format to
-    maintain without adding any capability this dict-of-Sketch doesn't
-    already have.
+    Returns
+    -------
+    dict of str to Sketch, or dict of str to FracSketch
+        One sketch per input reference, keyed by name.
     """
     if isinstance(paths_or_dict, dict):
         items = list(paths_or_dict.items())
@@ -168,7 +181,7 @@ def _stamp_metric(table, metric):
 
 
 def classify(
-    query_path_or_sketch: _SketchOrPath,
+    path: _SketchOrPath,
     reference_db: _ReferenceDb,
     *,
     k: int = 21,
@@ -178,13 +191,11 @@ def classify(
     metric: str = "containment",
     min_score: float = 0.0,
 ) -> pa.Table:
-    """Ranks the references in `reference_db` (a `{name: Sketch}` mapping,
-    as returned by `build_reference_database`, or any raw dict of the same
-    shape) by how well each one explains the query. Returns the `top_n`
-    matches as a `pyarrow.Table` with columns `("name", "score")`, sorted
-    by score descending -- the same "return a small, composable Arrow
-    table rather than a bespoke result class" convention `compare_all()`
-    already uses.
+    """Ranks the references in `reference_db` by how well each one explains
+    the query. Returns the `top_n` matches as a `pyarrow.Table` with columns
+    `("name", "score")`, sorted by score descending -- the same "return a
+    small, composable Arrow table rather than a bespoke result class"
+    convention `compare_all()` already uses.
 
     Why `metric="containment"` is the default -- and the metric this
     function exists to make easy to use correctly: classification/
@@ -217,33 +228,74 @@ def classify(
     `None` (the default, bottom-k `Sketch`) when query and references are
     comparable in size, or when using `metric="jaccard"`.
 
-    `query_path_or_sketch` accepts either a file path (sketched here with
-    `k`/`sketch_size`, or `k`/`scale` when `scale` is given) or an
-    already-built `Sketch`/`FracSketch` (used unchanged) -- so classifying
-    one query sketch against several different `reference_db`s, or reusing
-    a sketch already built for another purpose, costs one sketch build
-    total rather than one per call. When passing an already-built sketch
-    together with a `reference_db`, both must be the same kind (both
-    `Sketch` or both `FracSketch`) built with matching `k` (and `scale`,
-    for `FracSketch`) -- comparing across kinds raises a `TypeError` from
-    the Rust layer, comparing mismatched `k`/`scale` raises `ValueError`.
+    Parameters
+    ----------
+    path : path-like, Sketch or FracSketch
+        The query, as a file path (sketched here with `k`/`sketch_size`,
+        or `k`/`scale` when `scale` is given) or an already-built
+        `Sketch`/`FracSketch` (used unchanged) -- so classifying one query
+        sketch against several different `reference_db`s, or reusing a
+        sketch already built for another purpose, costs one sketch build
+        total rather than one per call. When passing an already-built
+        sketch together with a `reference_db`, both must be the same kind
+        (both `Sketch` or both `FracSketch`) built with matching `k` (and
+        `scale`, for `FracSketch`) -- comparing across kinds raises a
+        `TypeError` from the Rust layer, comparing mismatched `k`/`scale`
+        raises `ValueError`.
+    reference_db : mapping of str to Sketch or FracSketch
+        As returned by `build_reference_database`, or any raw dict of the
+        same shape.
+    k : int, default 21
+        K-mer size used when `path` is a file path. Ignored when `path` is
+        an already-built sketch.
+    sketch_size : int, default 1000
+        Bottom-k sketch size used when `path` is a file path and `scale`
+        is `None`. Ignored otherwise.
+    scale : int, optional
+        When given, sketches `path` (if it is a file path) as a
+        `FracSketch` via `frac_sketch(..., scale=scale)` instead of the
+        default bottom-k `Sketch`. Pass this when `reference_db` was also
+        built with `build_reference_database(..., scale=...)`, and when
+        the query and references differ a lot in size -- see above for why
+        bottom-k containment is biased there and `FracSketch` is not.
+    top_n : int, default 5
+        Maximum number of ranked references to return.
+    metric : {"containment", "jaccard"}, default "containment"
+        Which `Sketch`/`FracSketch` similarity method to score references
+        with. See above for why `"containment"` is the default.
+    min_score : float, default 0.0
+        References scoring at or below this value are dropped from the
+        result entirely, the same "there is a floor below which a ranked
+        position is not a finding" idea `gather`'s `min_containment`
+        already applies. Without it, a query sharing literally zero
+        k-mers with *every* reference in `reference_db` still produced a
+        full, confidently-sorted `top_n` table -- `result.column("name")
+        [0]` handed back a named reference backed by no evidence at all,
+        which is exactly the kind of silent-wrong-answer this package's
+        docstrings elsewhere (`gather`, `check_sample_identity`) go out of
+        their way to avoid. The default `min_score=0.0` is deliberately
+        the weakest possible floor -- both `containment` and `jaccard` are
+        bounded below by 0, so this only ever drops a reference with
+        *zero* real overlap with the query, never a low-but-real one; a
+        caller who wants a stronger bar (analogous to `gather`'s
+        `min_containment=0.1`, chosen there for a different, iterative
+        algorithm and not reused here as a default) can pass a higher
+        `min_score` explicitly.
 
-    `min_score`: references scoring at or below this value are dropped
-    from the result entirely, the same "there is a floor below which a
-    ranked position is not a finding" idea `gather`'s `min_containment`
-    already applies. Without it, a query sharing literally zero k-mers
-    with *every* reference in `reference_db` still produced a full,
-    confidently-sorted `top_n` table -- `result.column("name")[0]` handed
-    back a named reference backed by no evidence at all, which is exactly
-    the kind of silent-wrong-answer this package's docstrings elsewhere
-    (`gather`, `check_sample_identity`) go out of their way to avoid. The
-    default `min_score=0.0` is deliberately the weakest possible floor --
-    both `containment` and `jaccard` are bounded below by 0, so this only
-    ever drops a reference with *zero* real overlap with the query, never
-    a low-but-real one; a caller who wants a stronger bar (analogous to
-    `gather`'s `min_containment=0.1`, chosen there for a different,
-    iterative algorithm and not reused here as a default) can pass a
-    higher `min_score` explicitly.
+    Returns
+    -------
+    pyarrow.Table
+        Columns `("name", "score")`, at most `top_n` rows, sorted by score
+        descending.
+
+    Raises
+    ------
+    ValueError
+        `metric` is not `"containment"` or `"jaccard"`, or `path` is an
+        already-built sketch whose `k`/`scale` mismatches `reference_db`'s.
+    TypeError
+        `path` is an already-built sketch of a different kind (`Sketch`
+        vs. `FracSketch`) than `reference_db`'s entries.
     """
     if metric not in _CLASSIFY_METRICS:
         raise _core.InvalidConfigError(f"metric must be one of {_CLASSIFY_METRICS!r}, got {metric!r}")
@@ -251,7 +303,7 @@ def classify(
     if not reference_db:
         return _empty_score_table()
 
-    query = _resolve_sketch(query_path_or_sketch, k=k, sketch_size=sketch_size, scale=scale)
+    query = _resolve_sketch(path, k=k, sketch_size=sketch_size, scale=scale)
 
     # Resolved once, not once per reference: `metric` cannot change during
     # the loop, so a database of 10,000 references did 10,000 attribute
@@ -396,11 +448,37 @@ def check_sample_identity(
     loosen it if the two runs are known to differ a lot in depth or
     library prep and some slack is expected.
 
-    Returns a `SampleIdentityResult` (not just a bool): `.score` is the
-    raw metric value actually computed (so a caller can see, e.g., "this
-    was mash_distance=0.11, just over the line" rather than a bare
-    `False`), and `.metric`/`.threshold` record what produced the
-    decision.
+    Parameters
+    ----------
+    path_a, path_b : path-like
+        The two FASTQ(.gz) files to compare -- two distinct single
+        samples, sketched independently with the same `k`/`sketch_size`.
+    k : int, default 21
+        K-mer size both files are sketched with.
+    sketch_size : int, default 1000
+        Bottom-k sketch size both files are sketched with.
+    threshold : float, default 0.9
+        The Jaccard-equivalent similarity `path_a` and `path_b` must meet
+        or exceed to be called the same sample. See above for the
+        derivation and why it is compared on a Jaccard-equivalent scale
+        for both metrics.
+    metric : {"mash_distance", "jaccard"}, default "mash_distance"
+        Which `Sketch` similarity method computes `.score`. See above for
+        why `"mash_distance"` is the default.
+
+    Returns
+    -------
+    SampleIdentityResult
+        Not just a bool: `.score` is the raw metric value actually
+        computed (so a caller can see, e.g., "this was
+        mash_distance=0.11, just over the line" rather than a bare
+        `False`), and `.metric`/`.threshold` record what produced the
+        decision.
+
+    Raises
+    ------
+    ValueError
+        `metric` is not `"mash_distance"` or `"jaccard"`.
     """
     if metric not in _IDENTITY_METRICS:
         raise _core.InvalidConfigError(f"metric must be one of {_IDENTITY_METRICS!r}, got {metric!r}")
@@ -424,7 +502,7 @@ def check_sample_identity(
 
 
 def gather(
-    query_path_or_sketch: _SketchOrPath,
+    path: _SketchOrPath,
     reference_db: _ReferenceDb,
     *,
     k: int = 21,
@@ -489,12 +567,48 @@ def gather(
     output as an approximate, order-and-magnitude guide to composition,
     not exact abundance fractions.
 
-    Returns a `pyarrow.Table` with columns `("name", "containment",
-    "adjusted_score")`, in the order references were picked (i.e. best
-    first): `containment` is the raw, undiscounted `query.containment
-    (reference)` at the round it was picked; `adjusted_score` is that
-    value after the redundancy discount described above, which is what
-    `min_containment` is actually compared against.
+    Parameters
+    ----------
+    path : path-like, Sketch or FracSketch
+        The query, as a file path (sketched here with `k`/`sketch_size`,
+        or `k`/`scale` when `scale` is given) or an already-built
+        `Sketch`/`FracSketch` (used unchanged).
+    reference_db : mapping of str to Sketch or FracSketch
+        As returned by `build_reference_database`, or any raw dict of the
+        same shape.
+    k : int, default 21
+        K-mer size used when `path` is a file path. Ignored when `path` is
+        an already-built sketch.
+    sketch_size : int, default 1000
+        Bottom-k sketch size used when `path` is a file path and `scale`
+        is `None`. Ignored otherwise.
+    scale : int, optional
+        When given, sketches `path` (if it is a file path) as a
+        `FracSketch` via `frac_sketch(..., scale=scale)` instead of the
+        default bottom-k `Sketch`. See above for why this matters for
+        `gather`'s own headline use case.
+    min_containment : float, default 0.1
+        The redundancy-discounted containment score a candidate reference
+        must clear to be picked. Picking stops once no remaining
+        reference clears this bar. Must be in `[0.0, 1.0]`.
+    max_references : int, optional
+        Maximum number of references to pick. `None` (the default) picks
+        until `min_containment` or `reference_db` itself is exhausted.
+
+    Returns
+    -------
+    pyarrow.Table
+        Columns `("name", "containment", "adjusted_score")`, in the order
+        references were picked (i.e. best first): `containment` is the
+        raw, undiscounted `query.containment(reference)` at the round it
+        was picked; `adjusted_score` is that value after the redundancy
+        discount described above, which is what `min_containment` is
+        actually compared against.
+
+    Raises
+    ------
+    ValueError
+        `min_containment` is not in `[0.0, 1.0]`.
     """
     if not 0.0 <= min_containment <= 1.0:
         raise _core.InvalidConfigError(f"min_containment must be in [0.0, 1.0], got {min_containment!r}")
@@ -508,7 +622,7 @@ def gather(
             }
         )
 
-    query = _resolve_sketch(query_path_or_sketch, k=k, sketch_size=sketch_size, scale=scale)
+    query = _resolve_sketch(path, k=k, sketch_size=sketch_size, scale=scale)
 
     remaining = dict(reference_db)
 

@@ -164,10 +164,10 @@ def plot_significance(
         `"position"`; `x="position"` without `positions`; `positions` given
         with `x="index"`; or `positions` does not have one entry per row of
         `table`.
-
-    `matplotlib` is imported lazily here and is not a dependency of
-    `fastdna`; a missing install raises an `ImportError` naming the package
-    and the install command.
+    ImportError
+        `matplotlib` is not installed. Named explicitly, with the install
+        command, rather than a raw `ModuleNotFoundError` -- `matplotlib`
+        is imported lazily here and is not a dependency of `fastdna`.
     """
     plt = _matplotlib_pyplot()
     np = _numpy()
@@ -328,10 +328,11 @@ def plot_population_structure(
         Non-square `distance_matrix`; `sample_ids` length does not match
         it; the matrix is not symmetric; `groups` length does not match it;
         `kind` is not `"dendrogram"` or `"heatmap"`.
-
-    `matplotlib` and `scipy` are imported lazily here and are not
-    dependencies of `fastdna`; a missing install raises an `ImportError`
-    naming the package and the install command.
+    ImportError
+        `matplotlib` or `scipy` is not installed. Named explicitly, with
+        the install command, rather than a raw `ModuleNotFoundError` --
+        neither is a dependency of `fastdna`; both are imported lazily
+        here.
     """
     plt = _matplotlib_pyplot()
     np = _numpy()
