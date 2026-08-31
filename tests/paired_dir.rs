@@ -140,6 +140,7 @@ fn a_paired_directory_is_discovered_and_counted_into_one_output_per_sample() {
         &config(5),
         1,
         None,
+        false,
     )
     .expect("a cleanly paired two-sample directory must succeed");
 
@@ -172,6 +173,7 @@ fn an_unpaired_file_alongside_a_paired_sample_fails_the_whole_run() {
         &config(5),
         1,
         None,
+        false,
     );
 
     match result {
@@ -202,6 +204,7 @@ fn an_empty_directory_is_rejected_rather_than_producing_an_empty_cohort() {
         &config(5),
         1,
         None,
+        false,
     );
 
     assert!(

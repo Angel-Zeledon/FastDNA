@@ -15,10 +15,17 @@ dependencies, and `fastdna`'s core package must stay importable without
 them (docs/ml-genomics-roadmap.md, item 5).
 """
 
+from __future__ import annotations
+
+import os
+from typing import Any, Iterable, Union
+
 import numpy as np
 import pyarrow as pa
 
 import fastdna
+
+__all__ = ["embed_cohort"]
 
 
 def _distance_matrix(table, paths, metric):
@@ -126,15 +133,15 @@ def _reduce(distance_matrix, method, n_components, method_kwargs):
 
 
 def embed_cohort(
-    paths,
+    paths: Iterable[Union[str, os.PathLike]],
     *,
-    k=21,
-    sketch_size=1000,
-    metric="mash_distance",
-    method="umap",
-    n_components=2,
-    **method_kwargs,
-):
+    k: int = 21,
+    sketch_size: int = 1000,
+    metric: str = "mash_distance",
+    method: str = "umap",
+    n_components: int = 2,
+    **method_kwargs: Any,  # forwarded verbatim to the underlying UMAP/TSNE/MDS constructor
+) -> pa.Table:
     """Embeds a cohort of FASTQ(.gz) files into `n_components`-dimensional
     coordinates based on pairwise genomic (dis)similarity, for plotting
     "where does each sample sit relative to the others" -- the operation

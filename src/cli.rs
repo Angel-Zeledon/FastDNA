@@ -99,8 +99,20 @@ fn parse_min_quality(raw: &str) -> Result<f64, String> {
     Ok(value)
 }
 
+// `version` comes from Cargo.toml, not a literal. `pyproject.toml` already
+// documents that the version lives in one place -- "the version stays
+// sourced from Cargo.toml's [package] version alone ... rather than
+// duplicating it" -- and this line was exactly the duplication that
+// paragraph considered already avoided: `ffi.rs` uses
+// env!("CARGO_PKG_VERSION") in both of its own sites while the CLI carried
+// "0.1.0" written by hand, so the first version bump would have made
+// `fastdna --version` and `fastdna.__version__` disagree.
+//
+// `author` is removed rather than fixed: Cargo.toml declares no `authors`,
+// so there is nothing to read it from, and "FastDNA Team" is not an entity
+// that exists. clap omits the field when it is not given.
 #[derive(Parser, Debug)]
-#[command(name = "fastdna", version = "0.1.0", author = "FastDNA Team")]
+#[command(name = "fastdna", version = env!("CARGO_PKG_VERSION"))]
 pub struct Cli {
     /// Input FASTQ/FASTA file(s), optionally gzipped, or "-" for stdin.
     /// Several may be given (R1/R2, extra lanes); their counts and QC are
@@ -178,6 +190,21 @@ pub struct Cli {
     /// selects it.
     #[arg(long, value_enum, default_value = "auto")]
     pub strategy: CliStrategy,
+
+    /// Include the decoded `kmer_sequence` column in the output.
+    ///
+    /// Off by default: that column is entirely derivable from `kmer_u64`
+    /// plus `--kmer-size` (it is exactly what `kmer::decode_kmer_into`
+    /// computes), and on the benchmark file it is 1,667 MB against 430 MB
+    /// for `kmer_u64` and 215 MB for `frequency` -- 2.6x the other two
+    /// columns combined, and the majority of the ~17% of a run's wall
+    /// time the export step costs. Every ML-facing consumer this crate
+    /// ships (`fastdna.sklearn`, `.cv`, `.gwas`) works in `u64` space and
+    /// never reads it. Pass this flag to get it back, or reconstruct it
+    /// from `kmer_u64` in Python via `KmerCounts.with_sequence()` without
+    /// rereading the FASTQ.
+    #[arg(long)]
+    pub with_sequence: bool,
 
     /// Collapse homopolymer runs (e.g. "AAAAAA" -> "A") before extracting
     /// k-mers. Off by default: with the flag absent, output is byte-for-byte

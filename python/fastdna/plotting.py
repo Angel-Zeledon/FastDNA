@@ -31,7 +31,18 @@ what that process actually decided.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any, Optional, Sequence
+
 from . import _column_as_array
+
+if TYPE_CHECKING:
+    # matplotlib, numpy and scipy are soft dependencies of this module (imported
+    # lazily, inside the functions that need them); pyarrow is a hard dependency
+    # of the fastdna package but this module never needs the module itself, only
+    # Table instances passed in as arguments. Both imports here only run for
+    # static type checkers, so neither forces an eager import at module load time.
+    import matplotlib.axes
+    import pyarrow as pa
 
 __all__ = ["plot_significance", "plot_population_structure"]
 
@@ -80,7 +91,14 @@ def _scipy_hierarchy():
     return dendrogram, linkage, squareform
 
 
-def plot_significance(table, *, x="index", positions=None, threshold_lines=True, ax=None):
+def plot_significance(
+    table: "pa.Table",
+    *,
+    x: str = "index",
+    positions: Optional[Sequence[float]] = None,
+    threshold_lines: bool = True,
+    ax: Optional["matplotlib.axes.Axes"] = None,
+) -> "matplotlib.axes.Axes":
     """Plots a significance scatter, in the visual style of a Manhattan
     plot, over `table` -- the `pyarrow.Table` :func:`fastdna.gwas.
     prefilter_association` returns (or any table with the same
@@ -243,7 +261,14 @@ def _group_color_map(groups, cmap):
     return {label: cmap(i % cmap.N) for i, label in enumerate(seen)}
 
 
-def plot_population_structure(distance_matrix, sample_ids, *, groups=None, kind="dendrogram", ax=None):
+def plot_population_structure(
+    distance_matrix: Any,  # array-like (numpy.ndarray or nested sequence); numpy is a lazy/soft dependency here
+    sample_ids: Sequence[str],
+    *,
+    groups: Optional[Sequence[Any]] = None,
+    kind: str = "dendrogram",
+    ax: Optional["matplotlib.axes.Axes"] = None,
+) -> "matplotlib.axes.Axes":
     """Plots the cohort's Mash-distance population structure -- a
     dendrogram or a heatmap -- optionally colored by group labels so a
     caller can see which samples a leakage-safe CV split (or any other

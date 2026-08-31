@@ -160,7 +160,9 @@ def test_core_api_still_functions_with_no_optional_packages_installed():
         }}))
         """,
     )
-    assert result["columns"] == ["kmer_u64", "kmer_sequence", "frequency"]
+    # kmer_sequence is off by default (see count()'s own docstring); this
+    # test's own subprocess script above calls count() without asking for it.
+    assert result["columns"] == ["kmer_u64", "frequency"]
     assert result["distinct"] > 0
     assert result["total"] > 0
     assert result["html_has_table"], "_repr_html_ must fall back to hand-built HTML without pandas"

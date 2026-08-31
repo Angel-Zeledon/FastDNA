@@ -54,6 +54,10 @@ inside `LineageKFold`/`permutation_importance_pvalues()`, in the same
 optional-dependency pattern `fastdna.embed` uses: importing this module
 never requires either package, only calling into it does.
 """
+from __future__ import annotations
+
+import os
+from typing import Any, Iterable, Iterator, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -138,7 +142,13 @@ def _relabel_by_first_appearance(labels):
     return out
 
 
-def lineage_groups(paths, *, k=21, sketch_size=1000, distance_threshold=0.01):
+def lineage_groups(
+    paths: Iterable[Union[str, os.PathLike]],
+    *,
+    k: int = 21,
+    sketch_size: int = 1000,
+    distance_threshold: float = 0.01,
+) -> np.ndarray:
     """Assigns each of `paths` an integer lineage label, by single-linkage
     agglomerative clustering of the cohort's all-pairs Mash distances at
     `distance_threshold`.
@@ -268,7 +278,16 @@ class LineageKFold:
         once.
     """
 
-    def __init__(self, n_splits=5, *, paths=None, groups=None, k=21, sketch_size=1000, distance_threshold=0.01):
+    def __init__(
+        self,
+        n_splits: int = 5,
+        *,
+        paths: Optional[Iterable[Union[str, os.PathLike]]] = None,
+        groups: Optional[np.ndarray] = None,  # array-like of int, one lineage label per sample
+        k: int = 21,
+        sketch_size: int = 1000,
+        distance_threshold: float = 0.01,
+    ) -> None:
         if (paths is None) == (groups is None):
             raise ValueError(
                 "LineageKFold requires exactly one of paths= or groups=: pass paths= to "
@@ -310,7 +329,7 @@ class LineageKFold:
             )
 
     @property
-    def groups_(self):
+    def groups_(self) -> np.ndarray:
         if self._groups is None:
             self._groups = lineage_groups(
                 self.paths,
@@ -321,7 +340,12 @@ class LineageKFold:
             self._check_n_splits(self._groups)
         return self._groups
 
-    def get_n_splits(self, X=None, y=None, groups=None):
+    def get_n_splits(
+        self,
+        X: Any = None,  # array-like, sparse matrix, or list; accepted and ignored (scikit-learn splitter API)
+        y: Any = None,  # ignored; accepted for scikit-learn API compatibility
+        groups: Any = None,  # ignored; accepted for scikit-learn API compatibility
+    ) -> int:
         """The number of folds `split()` will produce -- `self.n_splits`.
 
         `X`/`y`/`groups` are accepted and ignored, matching scikit-learn's
@@ -330,7 +354,12 @@ class LineageKFold:
         """
         return self.n_splits
 
-    def split(self, X, y=None, groups=None):
+    def split(
+        self,
+        X: Any,  # array-like, sparse matrix, or list; only its length is used
+        y: Any = None,  # ignored; accepted for scikit-learn API compatibility
+        groups: Any = None,  # ignored; accepted for scikit-learn API compatibility
+    ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         """Yields `(train_indices, test_indices)` pairs, `n_splits` of them.
 
         Parameters
@@ -370,7 +399,7 @@ class LineageKFold:
         placeholder = np.zeros((n, 1))
         yield from GroupKFold(n_splits=self.n_splits).split(placeholder, y, lineages)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         source = "paths" if self.paths is not None else "groups"
         return f"LineageKFold(n_splits={self.n_splits}, from={source!r})"
 
@@ -437,8 +466,15 @@ def _permute(y, groups, rng):
 
 
 def permutation_importance_pvalues(
-    model, X, y, feature_names, *, n_permutations=100, random_state=None, groups=None
-):
+    model: Any,  # unfitted scikit-learn estimator exposing coef_ or feature_importances_ once fitted
+    X: Any,  # array-like or sparse matrix, shape (n_samples, n_features)
+    y: np.ndarray,  # array-like, shape (n_samples,)
+    feature_names: Iterable[str],
+    *,
+    n_permutations: int = 100,
+    random_state: Optional[int] = None,
+    groups: Optional[np.ndarray] = None,  # array-like, lineage labels; see _permute
+) -> pa.Table:
     """Attaches an empirical p-value to each feature's importance, by
     refitting `model` on repeatedly permuted labels.
 

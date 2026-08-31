@@ -1,5 +1,12 @@
 """fastdna.mic -- log2(MIC) regression for antimicrobial resistance.
 
+## Status: frozen
+
+Per `docs/audit/PLAN.md` §2 ("Qué se poda"), this module is frozen: stable,
+not accepting new features, and a candidate for extraction into a separate
+`fastdna-contrib` package in a future release. Freezing is not deleting --
+see that section for the full reasoning behind the boundary.
+
 ## Why this module exists
 
 Minimum inhibitory concentration (MIC) is the standard antimicrobial
@@ -110,7 +117,7 @@ never requires scikit-learn to be installed.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Any, NamedTuple, Optional
 
 import numpy as np
 import pyarrow as pa
@@ -123,7 +130,7 @@ __all__ = [
 ]
 
 
-def log2_mic(mic_values):
+def log2_mic(mic_values: np.ndarray) -> np.ndarray:  # mic_values is array-like, coerced via np.asarray
     """Validates raw MIC values and returns their log2 transform.
 
     MIC values come from a two-fold dilution series, so log2 turns them
@@ -209,13 +216,20 @@ class MicRegressor:
         `X.shape[1]` at fit time, scikit-learn's own convention.
     """
 
-    def __init__(self, estimator=None):
+    def __init__(
+        self,
+        estimator: Optional[Any] = None,  # scikit-learn-compatible regressor; sklearn is imported lazily
+    ) -> None:
         # scikit-learn convention: __init__ only assigns parameters, no
         # validation and no side effects, matching fastdna.sklearn.KmerVectorizer
         # and fastdna.calibration.calibrate's own estimator-parameter handling.
         self.estimator = estimator
 
-    def fit(self, X, y):
+    def fit(
+        self,
+        X: Any,  # array-like or scipy sparse matrix, shape (n_samples, n_features)
+        y: np.ndarray,  # array-like of shape (n_samples,), raw MIC values; coerced via log2_mic()
+    ) -> MicRegressor:
         """Fits `estimator` (or the default `Ridge()`) on `(X, log2_mic(y))`.
 
         Parameters
@@ -263,7 +277,7 @@ class MicRegressor:
                 "predict_log2()."
             )
 
-    def predict_log2(self, X):
+    def predict_log2(self, X: Any) -> np.ndarray:  # X is array-like or scipy sparse matrix
         """Predicted `log2(MIC)`, i.e. the wrapped estimator's raw output --
         the space the model was actually fit in, and the one
         `mean_absolute_error` and R^2 are conventionally reported in for
@@ -276,7 +290,7 @@ class MicRegressor:
         self._check_fitted()
         return np.asarray(self.estimator_.predict(X), dtype=np.float64).reshape(-1)
 
-    def predict(self, X):
+    def predict(self, X: Any) -> np.ndarray:  # X is array-like or scipy sparse matrix
         """Predicted MIC in original (linear) units: `2 ** predict_log2(X)`.
 
         Returns
@@ -324,7 +338,12 @@ class MicRegressionReport(NamedTuple):
     essential_agreement: float
 
 
-def mic_regression_report(mic_true, mic_pred, *, tolerance_log2=1.0):
+def mic_regression_report(
+    mic_true: np.ndarray,  # array-like of shape (n_samples,), coerced via log2_mic()
+    mic_pred: np.ndarray,  # array-like of shape (n_samples,), coerced via log2_mic()
+    *,
+    tolerance_log2: float = 1.0,
+) -> MicRegressionReport:
     """R^2, MAE and essential agreement for predicted vs. true MIC values.
 
     Does no fitting -- like `fastdna.evaluation.precision_recall_report`

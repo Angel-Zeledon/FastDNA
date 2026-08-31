@@ -92,15 +92,22 @@ from __future__ import annotations
 
 import gzip
 import math
+import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping, Optional, Union
 
 import pyarrow as pa
 
 import fastdna
+
+__all__ = [
+    "AssemblyQC",
+    "evaluate_kmers",
+    "evaluate_assembly",
+]
 
 #: File extensions recognized as "already FASTQ" (see module docstring,
 #: path 2): routed through the real `fastdna.count()` path instead of the
@@ -252,7 +259,11 @@ def _assembly_kmer_counts(assembly_path, k: int) -> Counter:
         # caller happened to pick rather than on anything real -- disabled
         # here to keep this path's behavior equivalent to the pure-FASTA
         # path, which has no quality signal to trim on at all.
-        counted = fastdna.count(assembly_path, k=k, min_count=1, min_quality=0.0)
+        # `with_sequence=True`: this function's whole job is building a
+        # {sequence: count} mapping, so the decoded column is not overhead
+        # to avoid here the way it is in the ML-facing paths -- it is the
+        # thing being asked for.
+        counted = fastdna.count(assembly_path, k=k, min_count=1, min_quality=0.0, with_sequence=True)
         table = counted.table
         return Counter(
             dict(zip(table.column("kmer_sequence").to_pylist(), table.column("frequency").to_pylist()))
@@ -374,18 +385,18 @@ class AssemblyQC:
     #: This is data for a caller to plot, not a plot itself.
     spectra: pa.Table = field(repr=False)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         qv_str = "inf" if math.isinf(self.qv) else f"{self.qv:.2f}"
         comp_str = "nan" if isinstance(self.completeness, float) and math.isnan(self.completeness) else f"{self.completeness:.4f}"
         return f"AssemblyQC(k={self.k}, qv={qv_str}, completeness={comp_str}, min_count_used={self.min_count_used})"
 
 
 def evaluate_kmers(
-    assembly_kmers,
-    reads_counts,
+    assembly_kmers: Union[Mapping[str, int], Iterable[str]],
+    reads_counts: fastdna.KmerCounts,
     *,
     k: int,
-    min_count: int | None = None,
+    min_count: Optional[int] = None,
 ) -> AssemblyQC:
     """Lower-level entry point: compares an already-computed assembly
     k-mer multiset against an already-computed `fastdna.KmerCounts` for
@@ -414,7 +425,14 @@ def evaluate_kmers(
     if not isinstance(assembly_kmers, Mapping):
         assembly_kmers = Counter(assembly_kmers)
 
-    reads_table = reads_counts.table
+    # `.with_sequence()` rather than `.table` directly: `kmer_sequence` is
+    # off by default in `fastdna.count()` since it costs ~17% of a run's
+    # wall time and is derivable from `kmer_u64` alone. This function's own
+    # `reads_counts` comes from the caller, who may or may not have asked
+    # for it explicitly -- reconstructing it here (a no-op if it is already
+    # present) makes this function work either way instead of failing with
+    # a missing-column error depending on how the caller built its input.
+    reads_table = reads_counts.with_sequence().table
     all_seqs = reads_table.column("kmer_sequence").to_pylist()
     all_freqs = reads_table.column("frequency").to_pylist()
 
@@ -485,11 +503,11 @@ def evaluate_kmers(
 
 
 def evaluate_assembly(
-    assembly_path,
-    reads_path,
+    assembly_path: Union[str, os.PathLike],
+    reads_path: Union[str, os.PathLike],
     *,
     k: int = 21,
-    min_count: int | None = None,
+    min_count: Optional[int] = None,
     min_quality: float = 0.0,
 ) -> AssemblyQC:
     """Merqury-style reference-free assembly quality assessment (Rhie et

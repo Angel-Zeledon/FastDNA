@@ -31,7 +31,9 @@ EXPECTED_CANONICAL_COUNTS = {"ACGTA": 9, "CGTAC": 9}
 
 def test_count_returns_arrow_table_with_correct_values(tmp_path):
     path = write_fastq(tmp_path, ["ACGTACGTAC"] * 3)
-    r = fastdna.count(str(path), k=5)
+    # with_sequence=True: this test asserts on the decoded kmer_sequence
+    # column, which is off by default (see count()'s own docstring).
+    r = fastdna.count(str(path), k=5, with_sequence=True)
     tbl = r.table
 
     assert tbl.num_rows == 2

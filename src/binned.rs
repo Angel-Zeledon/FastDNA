@@ -1062,4 +1062,85 @@ mod tests {
         assert!(!chunk.try_push(b"ACGT"), "a full chunk must refuse rather than overflow");
         assert_eq!(chunk.filled().len(), MIN_CHUNK_BYTES);
     }
+
+    /// Manual diagnostic: per-bin occupancy report for the binned
+    /// strategy, ported from the deleted `examples/binned_occupancy_report.rs`
+    /// (H-08: `binned` became `pub(crate)`, so this could no longer be a
+    /// public example). It drives the exact production types
+    /// (`FastqReader`, `BinStore`, `BinWriter::push_sequence`) that
+    /// `pipeline.rs`'s worker loop drives, single-threaded, so the
+    /// occupancy numbers are what a real run would actually produce -- not
+    /// a reimplementation of the bin function. This is the R3 mitigation
+    /// `docs/design-minimizer-counting.md` §6 and §7 call for: report
+    /// per-bin occupancy behind a debug flag, and benchmark on at least one
+    /// real SRA sample before step 6.
+    ///
+    /// Runs by default against a synthetic FASTQ built in-process by
+    /// [`synthetic_fastq`]; point it at a real file instead by setting
+    /// `FASTDNA_OCCUPANCY_FASTQ` to its path (`.gz` allowed).
+    ///
+    /// `cargo test --lib -- --ignored per_bin_occupancy_report -- --nocapture`
+    #[test]
+    #[ignore = "manual diagnostic, not a correctness check -- run with --ignored --nocapture"]
+    fn per_bin_occupancy_report() {
+        let k: usize = 31;
+        let min_qual = 20.0;
+        let quality_window = 1usize;
+
+        let (mut reader, source): (FastqReader<Box<dyn std::io::BufRead + Send>>, String) =
+            match std::env::var("FASTDNA_OCCUPANCY_FASTQ") {
+                Ok(path) => {
+                    let reader = FastqReader::from_path(&path)
+                        .unwrap_or_else(|e| panic!("failed to open {path}: {e}"));
+                    (reader, path)
+                }
+                Err(_) => {
+                    let bytes = synthetic_fastq(200_000, 150, 2_000_000, 0x5EED_5EED_5EED_5EED);
+                    let reader =
+                        FastqReader::new(Box::new(Cursor::new(bytes)) as Box<dyn std::io::BufRead + Send>);
+                    (reader, "<synthetic: 200_000 reads x 150bp, genome 2_000_000bp>".to_string())
+                }
+            };
+
+        let config = BinnedConfig::new(k);
+        let store = BinStore::new(config);
+        let mut writer = store.writer();
+
+        let mut records_seen: u64 = 0;
+        while let Some(mut record) = reader.next_record().expect("read error") {
+            record.quality_trim_end(min_qual, quality_window);
+            writer.push_sequence(&store, &record.seq);
+            records_seen += 1;
+        }
+
+        let total_occurrences = writer.occurrences();
+        writer.finish(&store);
+
+        let occupancy = store.occupancy();
+        let total_bytes: usize = occupancy.iter().sum();
+        let nonempty = occupancy.iter().filter(|&&b| b > 0).count();
+        let mean = total_bytes as f64 / occupancy.len() as f64;
+        let max = occupancy.iter().copied().max().unwrap_or(0);
+        let min_nonzero = occupancy.iter().copied().filter(|&b| b > 0).min().unwrap_or(0);
+
+        let mut sorted = occupancy.clone();
+        sorted.sort_unstable();
+        let p50 = sorted[sorted.len() / 2];
+        let p90 = sorted[(sorted.len() * 9) / 10];
+        let p99 = sorted[(sorted.len() * 99) / 100];
+
+        println!("source: {source}");
+        println!("k = {k}, m = {}, num_bins = {}", config.m, config.num_bins);
+        println!("records: {records_seen}, k-mer occurrences: {total_occurrences}");
+        println!(
+            "super-k-mer store: {total_bytes} bytes ({:.3} MiB)",
+            total_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!("bins occupied: {nonempty}/{}", occupancy.len());
+        println!(
+            "bin bytes -- mean: {mean:.0}, min(nonzero): {min_nonzero}, p50: {p50}, p90: {p90}, p99: {p99}, max: {max}"
+        );
+        println!("skew (max / mean): {:.2}x", max as f64 / mean);
+        println!("skew (max / p50): {:.2}x", max as f64 / p50.max(1) as f64);
+    }
 }

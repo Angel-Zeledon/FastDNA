@@ -25,8 +25,9 @@ necessarily heuristic given what a MinHash sketch can and cannot expose.
 from __future__ import annotations
 
 import math
+import os
 import pathlib
-from typing import NamedTuple
+from typing import Dict, Iterable, Mapping, NamedTuple, Optional, Union
 
 import pyarrow as pa
 
@@ -42,6 +43,21 @@ __all__ = [
 
 _CLASSIFY_METRICS = ("containment", "jaccard")
 _IDENTITY_METRICS = ("mash_distance", "jaccard")
+
+# A path accepted anywhere in this module: a `str`, or anything implementing
+# `os.PathLike` (e.g. `pathlib.Path`) -- every such parameter is converted
+# with `str(path)` before use, matching `fastdna/__init__.py`'s own
+# `_PathLike` convention.
+_PathLike = Union[str, os.PathLike]
+
+# A query or reference sketch accepted throughout this module: either an
+# already-built sketch, or a path sketched on the fly -- see
+# `_resolve_sketch`.
+_SketchOrPath = Union[_PathLike, Sketch, FracSketch]
+
+# A `{name: Sketch}` (or `{name: FracSketch}`) reference database, as
+# returned by `build_reference_database` -- see `classify`/`gather`.
+_ReferenceDb = Mapping[str, Union[Sketch, FracSketch]]
 
 
 def _default_name(path) -> str:
@@ -77,7 +93,13 @@ def _resolve_sketch(path_or_sketch, *, k, sketch_size, scale=None):
     return _sketch(str(path_or_sketch), k=k, sketch_size=sketch_size)
 
 
-def build_reference_database(paths_or_dict, *, k=21, sketch_size=1000, scale=None):
+def build_reference_database(
+    paths_or_dict: Union[Iterable[_PathLike], Dict[str, _PathLike]],
+    *,
+    k: int = 21,
+    sketch_size: int = 1000,
+    scale: Optional[int] = None,
+) -> Union[Dict[str, Sketch], Dict[str, FracSketch]]:
     """Builds a `{name: Sketch}` (or `{name: FracSketch}`) reference
     database once, up front, so `classify()` (or `gather()`) never re-reads
     a reference FASTQ file per query -- the same "sketch once, compare many
@@ -146,16 +168,16 @@ def _stamp_metric(table, metric):
 
 
 def classify(
-    query_path_or_sketch,
-    reference_db,
+    query_path_or_sketch: _SketchOrPath,
+    reference_db: _ReferenceDb,
     *,
-    k=21,
-    sketch_size=1000,
-    scale=None,
-    top_n=5,
-    metric="containment",
-    min_score=0.0,
-):
+    k: int = 21,
+    sketch_size: int = 1000,
+    scale: Optional[int] = None,
+    top_n: int = 5,
+    metric: str = "containment",
+    min_score: float = 0.0,
+) -> pa.Table:
     """Ranks the references in `reference_db` (a `{name: Sketch}` mapping,
     as returned by `build_reference_database`, or any raw dict of the same
     shape) by how well each one explains the query. Returns the `top_n`
@@ -304,7 +326,15 @@ def _implied_jaccard_from_mash_distance(mash_distance: float, k: int) -> float:
     return e / (2.0 - e)
 
 
-def check_sample_identity(path_a, path_b, *, k=21, sketch_size=1000, threshold=0.9, metric="mash_distance"):
+def check_sample_identity(
+    path_a: _PathLike,
+    path_b: _PathLike,
+    *,
+    k: int = 21,
+    sketch_size: int = 1000,
+    threshold: float = 0.9,
+    metric: str = "mash_distance",
+) -> SampleIdentityResult:
     """Answers "are these two FASTQ files plausibly the same underlying
     biological sample" -- e.g. two sequencing runs of one specimen -- for
     a lab QC / sample-swap-detection workflow, where a "no" is a real,
@@ -394,15 +424,15 @@ def check_sample_identity(path_a, path_b, *, k=21, sketch_size=1000, threshold=0
 
 
 def gather(
-    query_path_or_sketch,
-    reference_db,
+    query_path_or_sketch: _SketchOrPath,
+    reference_db: _ReferenceDb,
     *,
-    k=21,
-    sketch_size=1000,
-    scale=None,
-    min_containment=0.1,
-    max_references=None,
-):
+    k: int = 21,
+    sketch_size: int = 1000,
+    scale: Optional[int] = None,
+    min_containment: float = 0.1,
+    max_references: Optional[int] = None,
+) -> pa.Table:
     """Approximates sourmash's `gather`: iteratively picks the single
     reference that currently best explains the query, records it, and
     repeats against the remaining references -- answering "what *set* of

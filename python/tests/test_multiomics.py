@@ -86,7 +86,9 @@ def test_kmer_feature_table_row_matches_direct_count(tmp_path):
     table = kmer_feature_table([str(a), str(b)], k=4)
 
     # Cross-check against calling fastdna.count() directly on sample a.
-    direct = fastdna.count(str(a), k=4)
+    # with_sequence=True: this test compares by decoded k-mer sequence,
+    # which is off by default (see count()'s docstring).
+    direct = fastdna.count(str(a), k=4, with_sequence=True)
     direct_counts = dict(
         zip(direct.table.column("kmer_sequence").to_pylist(), direct.table.column("frequency").to_pylist())
     )
@@ -114,7 +116,7 @@ def test_kmer_feature_table_row_matches_direct_count(tmp_path):
 
     # A k-mer present only in sample b's reads must be 0 in sample a's row
     # (missing k-mers become 0, not absent/NaN).
-    direct_b = fastdna.count(str(b), k=4)
+    direct_b = fastdna.count(str(b), k=4, with_sequence=True)
     b_counts = dict(
         zip(direct_b.table.column("kmer_sequence").to_pylist(), direct_b.table.column("frequency").to_pylist())
     )

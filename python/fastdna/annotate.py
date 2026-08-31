@@ -101,9 +101,10 @@ annotation file is one of:
 """
 from __future__ import annotations
 
+import os
 import pathlib
 from collections import defaultdict
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional, Union
 
 import pyarrow as pa
 
@@ -338,7 +339,7 @@ class Annotation:
     structure, at this scale, is the right tradeoff.
     """
 
-    def __init__(self, sequences: dict, features: list):
+    def __init__(self, sequences: dict[str, str], features: list[Feature]) -> None:
         self.sequences = sequences
         self.features = list(features)
         self._exact_index_cache: dict[int, dict] = {}
@@ -357,7 +358,7 @@ class Annotation:
         self._exact_index_cache[k] = index
         return index
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         total_length = sum(len(s) for s in self.sequences.values())
         return (
             f"Annotation(sequences={len(self.sequences)}, "
@@ -365,7 +366,9 @@ class Annotation:
         )
 
 
-def load_annotation(reference_fasta_path, annotation_path) -> Annotation:
+def load_annotation(
+    reference_fasta_path: Union[str, os.PathLike], annotation_path: Union[str, os.PathLike]
+) -> Annotation:
     """Loads a reference FASTA plus its GFF3 or GenBank annotation into an
     `Annotation`, ready for repeated `locate_kmer()`/`annotate_rule()` calls.
 
@@ -493,7 +496,7 @@ def _approximate_hits(
     return raw
 
 
-def locate_kmer(annotation: Annotation, kmer_sequence: str, *, max_mismatches: int = 0) -> list:
+def locate_kmer(annotation: Annotation, kmer_sequence: str, *, max_mismatches: int = 0) -> list[Hit]:
     """Every occurrence of `kmer_sequence` (or its reverse complement) in
     `annotation`'s reference sequence(s), exactly or within
     `max_mismatches` substitutions, with the annotated feature(s) each
@@ -563,7 +566,12 @@ def locate_kmer(annotation: Annotation, kmer_sequence: str, *, max_mismatches: i
     return hits
 
 
-def annotate_rule(rule, annotation: Annotation, *, max_mismatches: int = 0) -> pa.Table:
+def annotate_rule(
+    rule: Any,  # fastdna.rules.Rule (duck-typed, not imported here) or a plain k-mer sequence str
+    annotation: Annotation,
+    *,
+    max_mismatches: int = 0,
+) -> pa.Table:
     """Convenience wrapper: `locate_kmer()` for a `fastdna.rules.Rule` (or a
     plain k-mer sequence string), returned as a `pyarrow.Table` -- one row
     per `Hit`, ready to attach to `SetCoveringClassifier.explain()` output
@@ -637,7 +645,9 @@ def annotate_rule(rule, annotation: Annotation, *, max_mismatches: int = 0) -> p
     )
 
 
-def export_bed(table: pa.Table, path, *, name_column: str = "kmer_sequence") -> None:
+def export_bed(
+    table: pa.Table, path: Union[str, os.PathLike], *, name_column: str = "kmer_sequence"
+) -> None:
     """Writes `table` -- `annotate_rule()`'s output, or `pa.concat_tables()`
     of several such tables -- as a standard BED6 file, for loading a rule's
     genomic hit positions into IGV, the UCSC Genome Browser, or any other

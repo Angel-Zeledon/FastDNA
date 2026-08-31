@@ -35,12 +35,18 @@ and clean the file up afterward.
   module.
 """
 
+from __future__ import annotations
+
 import os
 import tempfile
 import warnings
+from typing import Any, Iterable
 
+from . import KmerCounts, Sketch
 from . import count as _count
 from . import sketch as _sketch
+
+__all__ = ["count_from_sequences", "sketch_from_sequences"]
 
 #: Uniform per-base quality used when a sequence carries no real quality
 #: scores (plain strings, `(id, seq)` pairs, or a `SeqRecord` with no
@@ -141,7 +147,12 @@ def _with_temp_fastq(sequences, fn):
             pass  # already gone, or never fully created -- nothing left to clean up
 
 
-def count_from_sequences(sequences, *, k=31, **count_kwargs):
+def count_from_sequences(
+    sequences: Iterable[Any],  # plain strings, (id, sequence) pairs, or Biopython SeqRecord-like objects -- see below
+    *,
+    k: int = 31,
+    **count_kwargs: Any,  # forwarded to fastdna.count(), e.g. min_count, max_count, min_quality, threads, progress
+) -> KmerCounts:
     """`fastdna.count()` for an in-memory iterable of sequences instead of
     a file already on disk.
 
@@ -167,7 +178,12 @@ def count_from_sequences(sequences, *, k=31, **count_kwargs):
     return _with_temp_fastq(sequences, lambda path: _count(path, k=k, **count_kwargs))
 
 
-def sketch_from_sequences(sequences, *, k=21, sketch_size=1000):
+def sketch_from_sequences(
+    sequences: Iterable[Any],  # plain strings, (id, sequence) pairs, or Biopython SeqRecord-like objects -- see count_from_sequences
+    *,
+    k: int = 21,
+    sketch_size: int = 1000,
+) -> Sketch:
     """`fastdna.sketch()` for an in-memory iterable of sequences instead
     of a file already on disk. See `count_from_sequences` for what
     `sequences` may contain and the same "synthesized quality, temp file"

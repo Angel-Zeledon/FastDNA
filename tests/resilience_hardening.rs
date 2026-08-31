@@ -153,7 +153,7 @@ fn counter_with_data() -> KmerCounter {
 fn csv_export_leaves_no_temp_sibling_on_success() {
     let dir = TempDir::new().unwrap();
     let dest = dir.path().join("counts.csv");
-    export::export_counts_csv(&counter_with_data(), &dest, 4, 1).unwrap();
+    export::export_counts_csv(&counter_with_data(), &dest, 4, 1, false).unwrap();
     assert!(dest.exists());
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 }
@@ -162,7 +162,7 @@ fn csv_export_leaves_no_temp_sibling_on_success() {
 fn parquet_export_leaves_no_temp_sibling_on_success() {
     let dir = TempDir::new().unwrap();
     let dest = dir.path().join("counts.parquet");
-    export::export_counts_parquet(&counter_with_data(), &dest, 4, 1).unwrap();
+    export::export_counts_parquet(&counter_with_data(), &dest, 4, 1, false).unwrap();
     assert!(dest.exists());
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 }
@@ -171,7 +171,7 @@ fn parquet_export_leaves_no_temp_sibling_on_success() {
 fn failed_csv_export_to_a_missing_directory_creates_nothing() {
     let dir = TempDir::new().unwrap();
     let dest = dir.path().join("ghost").join("counts.csv");
-    let err = export::export_counts_csv(&counter_with_data(), &dest, 4, 1).unwrap_err();
+    let err = export::export_counts_csv(&counter_with_data(), &dest, 4, 1, false).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("counts.csv"), "error must name the destination: {msg}");
     assert!(!dest.exists());

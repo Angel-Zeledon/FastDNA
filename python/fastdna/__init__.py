@@ -7,6 +7,9 @@ the Rust/Python boundary, per the packaging design (docs/superpowers/specs/
 2026-08-22-fastdna-python-design.md, §9).
 """
 
+import os
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Sequence, Union
+
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -14,7 +17,40 @@ from . import _core
 from ._progress import make_progress_adapter
 from .spectrum import suggest_min_count as _suggest_min_count
 
+if TYPE_CHECKING:
+    # `pandas`/`polars` are soft dependencies (see `KmerCounts.to_pandas`/
+    # `.to_polars`) never imported at module load time; this import only
+    # runs for static type checkers, so their return-type annotations can
+    # name the real classes without requiring either package at runtime.
+    import pandas
+    import polars
+
 __version__ = _core.__version__
+
+__all__ = [
+    "count",
+    "peek",
+    "build_info",
+    "KmerCounts",
+    "Sketch",
+    "sketch",
+    "load_sketch",
+    "FracSketch",
+    "frac_sketch",
+    "load_frac_sketch",
+    "compare",
+    "compare_all",
+    "estimate_cardinality",
+    # Re-exported at the bottom of this module (see the comment there).
+    "CohortCounts",
+    "count_cohort",
+]
+
+# A path accepted anywhere in this module: a `str`, or anything implementing
+# `os.PathLike` (e.g. `pathlib.Path`) -- every such parameter is converted
+# with `str(path)` before crossing into the Rust core, which only accepts
+# `str`.
+_PathLike = Union[str, os.PathLike]
 
 
 def _column_as_array(column):
@@ -36,6 +72,43 @@ def _column_as_array(column):
             return pa.array([], type=column.type)
         return pa.concat_arrays(chunks)
     return column
+
+
+def _decode_kmers(bits, k):
+    """Decodes packed 2-bit-per-base k-mers (`kmer_u64` values) into their
+    ASCII sequence strings, vectorized over every value in `bits` at once.
+
+    `bits` is anything `numpy.asarray` accepts -- a `pyarrow.Array`/
+    `ChunkedArray` (via its own `to_numpy`), a plain Python sequence of
+    ints, or an existing numpy array.
+
+    Shared by `KmerCounts.with_sequence()` (decodes every row of a table)
+    and `fastdna.sklearn.KmerVectorizer` (decodes only the k-mers that
+    survive vocabulary selection -- typically `top_features`, several
+    orders of magnitude fewer than a cohort's row count): both need the
+    same bit layout, and `kmer::decode_kmer` is the only other place that
+    layout is implemented, Rust-side, so this is the one Python copy of it
+    rather than a second one drifting from the first.
+
+    Position `k-1-i` (from the right) comes from bits `2*i`/`2*i+1` of the
+    packed k-mer -- the same layout `kmer::decode_kmer_into` unpacks in
+    Rust, most significant bits first.
+    """
+    import numpy as np
+
+    # `pyarrow.Array`/`ChunkedArray` -> numpy via their own `to_numpy()`
+    # (uniform across the pyarrow>=14 versions this package supports,
+    # unlike relying on `np.asarray`'s buffer-protocol auto-detection to
+    # do the same thing); anything else (a plain sequence, an existing
+    # numpy array) goes through `np.asarray` directly.
+    if isinstance(bits, (pa.Array, pa.ChunkedArray)):
+        bits = bits.to_numpy(zero_copy_only=False)
+    bits = np.asarray(bits, dtype=np.uint64)
+    alphabet = np.frombuffer(b"ACGT", dtype=np.uint8)
+    codes = np.empty((len(bits), k), dtype=np.uint8)
+    for i in range(k):
+        codes[:, k - 1 - i] = alphabet[(bits >> np.uint64(2 * i)) & np.uint64(0b11)]
+    return [row.tobytes().decode("ascii") for row in codes]
 
 
 def _pair_positions(table, paths):
@@ -114,7 +187,7 @@ class KmerCounts:
     contains.
     """
 
-    def __init__(self, raw, _table=None):
+    def __init__(self, raw: "_core.KmerCounts", _table: Optional[pa.Table] = None):
         self._raw = raw
         # `None` means "no view derived yet -- use the Rust side's own
         # table verbatim"; set once `.filter()`/`.sort_by()`/`.top()` (or
@@ -125,28 +198,30 @@ class KmerCounts:
         self._table = _table
 
     @property
-    def table(self):
+    def table(self) -> pa.Table:
         if self._table is not None:
             return self._table
         return pa.Table.from_batches([self._raw.table])
 
     @property
-    def qc(self):
+    def qc(self) -> Dict[str, Any]:
         return self._raw.qc
 
     @property
-    def total_kmers(self):
+    def total_kmers(self) -> int:
         return self._raw.total_kmers
 
     @property
-    def distinct_kmers(self):
+    def distinct_kmers(self) -> int:
         return self.table.num_rows
 
     @property
-    def k(self):
+    def k(self) -> int:
         return self._raw.k
 
-    def filter(self, min_count=None, max_count=None):
+    def filter(
+        self, min_count: Optional[int] = None, max_count: Optional[int] = None
+    ) -> "KmerCounts":
         """Returns a new `KmerCounts` restricted to k-mers whose frequency
         falls in `[min_count, max_count]` (either bound optional, both
         inclusive) -- applied on top of whatever view this one already
@@ -158,7 +233,31 @@ class KmerCounts:
         already dropped during counting. Use it to explore a single
         `count()` result at several thresholds without re-reading the
         FASTQ file for each one.
+
+        A negative bound is rejected rather than applied. Frequencies are
+        `uint32`, so no negative threshold can exclude anything and
+        `filter(min_count=-3)` silently returned the whole table -- a
+        `min_count` that went negative through arithmetic looked like a
+        filter that ran and kept everything. The CLI already rejects this
+        (`--min-count` is `value_parser!(u32).range(1..)`); this brings the
+        Python path in line.
+
+        An *inverted* band (`min_count > max_count`) is deliberately NOT
+        rejected here, unlike in the CLI. On a command line that
+        combination can only be a typo; in Python both bounds are commonly
+        computed from the data, and an empty view is the correct answer to
+        "no k-mer falls in this band".
         """
+        for name, value in (("min_count", min_count), ("max_count", max_count)):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    f"{name} must be an int or None, got {type(value).__name__}: {value!r}"
+                )
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+
         if min_count is None and max_count is None:
             return KmerCounts(self._raw, self.table)
 
@@ -171,35 +270,95 @@ class KmerCounts:
             mask = upper if mask is None else pc.and_(mask, upper)
         return KmerCounts(self._raw, self.table.filter(mask))
 
-    def sort_by(self, column="frequency", *, descending=True):
+    def sort_by(self, column: str = "frequency", *, descending: bool = True) -> "KmerCounts":
         """Returns a new `KmerCounts` with the current view sorted by
         `column` (any of `table.column_names`; `frequency` by default,
         matching what "the most/least common k-mers" means in practice).
+
+        The name is checked here rather than left to pyarrow, whose own
+        message for an unknown key talks about `FieldRef` -- an Arrow
+        concept a FastDNA caller has no reason to know -- and buries the
+        valid column names inside a dump of the table's first rows.
         """
+        available = self.table.column_names
+        if column not in available:
+            raise ValueError(
+                f"unknown column {column!r}; sort_by accepts one of {available}"
+            )
         order = "descending" if descending else "ascending"
         return KmerCounts(self._raw, self.table.sort_by([(column, order)]))
 
-    def top(self, n):
+    def top(self, n: int) -> "KmerCounts":
         """The `n` most frequent k-mers in the current view, as a new
         `KmerCounts` -- sugar for `.sort_by("frequency").table.slice(0, n)`
         that stays chainable, e.g. `counts.filter(min_count=5).top(20)`.
+
+        `n` must be a non-negative `int`. The validation below is not
+        defensive boilerplate: `pyarrow.Table.slice()` accepts all three of
+        the values it rejects and answers each of them plausibly rather
+        than raising. `slice(0, None)` means "to the end", so `top(None)`
+        used to return the *entire* table -- the exact opposite of what the
+        name promises, and a config key that resolved to `None` would
+        silently hand back 53 million rows. `slice(0, -5)` returns an empty
+        table, so an `n` that went negative through arithmetic looked like
+        the biological result "no k-mer passed the filter" instead of a
+        bug. A float was truncated silently. `bool` is rejected ahead of
+        `int` on purpose: `isinstance(True, int)` is `True` in Python, so
+        `top(True)` would otherwise slip through as `n = 1`.
         """
+        if isinstance(n, bool) or not isinstance(n, int):
+            raise TypeError(
+                f"top(n) needs a non-negative int, got {type(n).__name__}: {n!r}"
+            )
+        if n < 0:
+            raise ValueError(f"top(n) needs n >= 0, got {n}")
         return self.sort_by("frequency", descending=True)._head(n)
 
     def _head(self, n):
         return KmerCounts(self._raw, self.table.slice(0, n))
 
-    def to_pandas(self):
+    def with_sequence(self) -> "KmerCounts":
+        """The current view with a `kmer_sequence` column added, decoded
+        from `kmer_u64`.
+
+        `count(with_sequence=False)` (the default) skips building this
+        column: it is entirely derivable from `kmer_u64` plus `k`, and
+        skipping it saves ~17% of a run's wall time and roughly half its
+        output size on the benchmark file (see `count()`'s own docstring).
+        This method exists so turning it off by default does not take the
+        capability away from anyone -- only the cost from callers who never
+        read it. It does not reread the FASTQ: decoding a `u64` back into
+        its `k` bases is a pure function of the integer, done here once per
+        row already in the table.
+
+        A no-op if `kmer_sequence` is already present (e.g. this view came
+        from `count(with_sequence=True)`).
+        """
+        if "kmer_sequence" in self.table.column_names:
+            return self
+
+        bits = self.table.column("kmer_u64")
+        decoded = _decode_kmers(bits, self.k)
+        sequences = pa.array(decoded, type=pa.string())
+
+        table = self.table.append_column("kmer_sequence", sequences)
+        # `kmer_u64, kmer_sequence, frequency` -- the same column order
+        # `count(with_sequence=True)` produces, so a caller cannot tell
+        # which path built a given table from its shape alone.
+        table = table.select(["kmer_u64", "kmer_sequence", "frequency"])
+        return KmerCounts(self._raw, table)
+
+    def to_pandas(self) -> "pandas.DataFrame":
         """The current view as a `pandas.DataFrame` (requires `pandas`)."""
         return self.table.to_pandas()
 
-    def to_polars(self):
+    def to_polars(self) -> "polars.DataFrame":
         """The current view as a `polars.DataFrame` (requires `polars`)."""
         import polars as pl
 
         return pl.from_arrow(self.table)
 
-    def spectrum(self):
+    def spectrum(self) -> Dict[int, int]:
         """`{depth: number of distinct k-mers observed at that depth}`.
 
         Exposes the Rust core's `KmerCounter::generate_histogram` so
@@ -212,7 +371,7 @@ class KmerCounts:
         """
         return dict(self._raw.spectrum())
 
-    def suggest_min_count(self):
+    def suggest_min_count(self) -> int:
         """The `min_count` detected from this sample's own frequency
         spectrum: the valley between the error peak (frequency 1-2) and the
         true coverage peak. See `fastdna.spectrum.suggest_min_count` for why
@@ -221,10 +380,10 @@ class KmerCounts:
         """
         return _suggest_min_count(self.spectrum())
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.distinct_kmers
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"KmerCounts(k={self.k}, distinct={self.distinct_kmers}, total={self.total_kmers})"
 
     def _repr_html_(self):
@@ -260,17 +419,18 @@ class KmerCounts:
 
 
 def count(
-    path,
+    path: _PathLike,
     *,
-    k=31,
-    min_count=1,
-    max_count=None,
-    min_quality=20.0,
-    threads=None,
-    progress=None,
-    progress_interval=100_000,
-    hpc=False,
-):
+    k: int = 31,
+    min_count: int = 1,
+    max_count: Optional[int] = None,
+    min_quality: float = 20.0,
+    threads: Optional[int] = None,
+    progress: Optional[Union[bool, Callable[[Any], None]]] = None,
+    progress_interval: int = 100_000,
+    hpc: bool = False,
+    with_sequence: bool = False,
+) -> KmerCounts:
     """Count canonical k-mers in a single FASTQ(.gz) file.
 
     `hpc=True` collapses homopolymer runs (e.g. "AAAAAA" -> "A") before
@@ -315,6 +475,19 @@ def count(
     called from the interpreter's main thread; `PyErr_CheckSignals` is a
     no-op anywhere else, so calling this from a `threading.Thread` makes
     Ctrl-C do nothing until the run finishes on its own.
+
+    `with_sequence=False` by default: `.table` does not include the decoded
+    `kmer_sequence` column. That column is entirely derivable from
+    `kmer_u64` plus `k` -- it is exactly what the Rust core's
+    `decode_kmer_into` computes -- and on the benchmark file it is 1,667 MB
+    against 430 MB for `kmer_u64` and 215 MB for `frequency`, 2.6x the
+    other two columns combined; decoding it is also the majority of the
+    ~17% of a run's wall time the export/table-build step costs. Every
+    ML-facing module this package ships (`fastdna.sklearn`, `.cv`, `.gwas`)
+    works in `u64` space and never reads it. Pass `with_sequence=True` to
+    get it back from the count itself, or call `.with_sequence()` on an
+    already-built `KmerCounts` to reconstruct it locally without rereading
+    the FASTQ.
     """
     adapter = make_progress_adapter(progress)
     raw = _core.count(
@@ -327,11 +500,12 @@ def count(
         progress=adapter,
         progress_interval=progress_interval,
         hpc=hpc,
+        with_sequence=with_sequence,
     )
     return KmerCounts(raw)
 
 
-def peek(path, *, n_reads=10_000):
+def peek(path: _PathLike, *, n_reads: int = 10_000) -> "_core.Preview":
     """Samples the first `n_reads` records of a FASTQ(.gz) file and reports
     read-length geometry, GC content, and a suggested `k` -- in
     milliseconds, without reading the rest of the file.
@@ -344,7 +518,7 @@ def peek(path, *, n_reads=10_000):
     return _core.peek(path=str(path), n_reads=n_reads)
 
 
-def build_info():
+def build_info() -> Dict[str, Any]:
     """Reports the installed version, the maximum supported k, and whether
     AVX2 is live on *this* CPU -- without which "it's slow on my Mac" is
     undiagnosable remotely.
@@ -369,18 +543,18 @@ class Sketch:
     and every later comparison loads two small files instead.
     """
 
-    def __init__(self, raw):
+    def __init__(self, raw: "_core.Sketch"):
         self._raw = raw
 
     @property
-    def k(self):
+    def k(self) -> int:
         return self._raw.k
 
     @property
-    def sketch_size(self):
+    def sketch_size(self) -> int:
         return self._raw.sketch_size
 
-    def jaccard(self, other):
+    def jaccard(self, other: "Sketch") -> float:
         """Symmetric similarity: the fraction of the union of both
         sketches' k-mer sets that is shared. Penalizes genome-size
         differences -- two sketches from genomes of very different sizes
@@ -391,7 +565,7 @@ class Sketch:
         """
         return self._raw.jaccard(other._raw)
 
-    def containment(self, other):
+    def containment(self, other: "Sketch") -> float:
         """Asymmetric containment: what fraction of *this* sketch's
         k-mers also appear in `other`. `a.containment(b)` and
         `b.containment(a)` are different questions -- the one that matters
@@ -402,7 +576,7 @@ class Sketch:
         """
         return self._raw.containment(other._raw)
 
-    def mash_distance(self, other):
+    def mash_distance(self, other: "Sketch") -> float:
         """Estimates the per-base mutation rate implied by `.jaccard()`,
         under the Poisson mutation model Mash itself uses (Ondov et al.,
         2016) -- the same k-mer overlap turned into an evolutionary-
@@ -418,11 +592,11 @@ class Sketch:
         """
         return self._raw.mash_distance(other._raw)
 
-    def save(self, path):
+    def save(self, path: _PathLike) -> None:
         """Persists this sketch as JSON, for :func:`load_sketch` later."""
         self._raw.save(str(path))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Sketch(k={self.k}, sketch_size={self.sketch_size})"
 
     def _repr_html_(self):
@@ -450,7 +624,7 @@ class Sketch:
         )
 
 
-def sketch(path, *, k=21, sketch_size=1000):
+def sketch(path: _PathLike, *, k: int = 21, sketch_size: int = 1000) -> Sketch:
     """Builds a MinHash sketch of a single FASTQ(.gz) file by streaming it
     -- memory stays bounded by `sketch_size` regardless of file size,
     unlike `count()`, which must hold every distinct k-mer at once.
@@ -462,7 +636,7 @@ def sketch(path, *, k=21, sketch_size=1000):
     return Sketch(_core.sketch(str(path), k, sketch_size))
 
 
-def load_sketch(path):
+def load_sketch(path: _PathLike) -> Sketch:
     """Loads a sketch previously written by `Sketch.save`."""
     return Sketch(_core.load_sketch(str(path)))
 
@@ -493,18 +667,18 @@ class FracSketch:
     `scale` parameter to switch to `FracSketch` internally.
     """
 
-    def __init__(self, raw):
+    def __init__(self, raw: "_core.FracSketch"):
         self._raw = raw
 
     @property
-    def k(self):
+    def k(self) -> int:
         return self._raw.k
 
     @property
-    def scale(self):
+    def scale(self) -> int:
         return self._raw.scale
 
-    def containment(self, other):
+    def containment(self, other: "FracSketch") -> float:
         """Asymmetric containment: what fraction of *this* sketch's
         k-mers also appear in `other`. Unlike `Sketch.containment`, the
         estimate does not lose resolution as `other`'s underlying set
@@ -512,23 +686,23 @@ class FracSketch:
         """
         return self._raw.containment(other._raw)
 
-    def jaccard(self, other):
+    def jaccard(self, other: "FracSketch") -> float:
         """Symmetric similarity: the fraction of the union of both
         sketches' k-mer sets that is shared.
         """
         return self._raw.jaccard(other._raw)
 
-    def save(self, path):
+    def save(self, path: _PathLike) -> None:
         """Persists this sketch as JSON, for :func:`load_frac_sketch`
         later.
         """
         self._raw.save(str(path))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"FracSketch(k={self.k}, scale={self.scale})"
 
 
-def frac_sketch(path, *, k=21, scale=1000):
+def frac_sketch(path: _PathLike, *, k: int = 21, scale: int = 1000) -> FracSketch:
     """Builds a FracMinHash ("scaled MinHash") sketch of a single
     FASTQ(.gz) file by streaming it. Unlike :func:`sketch`, memory is
     bounded by `~|distinct k-mers| / scale`, not by a fixed constant -- the
@@ -544,12 +718,12 @@ def frac_sketch(path, *, k=21, scale=1000):
     return FracSketch(_core.frac_sketch(str(path), k, scale))
 
 
-def load_frac_sketch(path):
+def load_frac_sketch(path: _PathLike) -> FracSketch:
     """Loads a FracSketch previously written by `FracSketch.save`."""
     return FracSketch(_core.load_frac_sketch(str(path)))
 
 
-def compare(path_a, path_b, *, k=21, sketch_size=1000):
+def compare(path_a: _PathLike, path_b: _PathLike, *, k: int = 21, sketch_size: int = 1000) -> float:
     """Sugar for building two sketches and comparing them in one call:
     `fastdna.compare(a, b)` is `fastdna.sketch(a).jaccard(fastdna.sketch(b))`.
 
@@ -561,7 +735,9 @@ def compare(path_a, path_b, *, k=21, sketch_size=1000):
     return sketch(path_a, k=k, sketch_size=sketch_size).jaccard(sketch(path_b, k=k, sketch_size=sketch_size))
 
 
-def compare_all(paths, *, k=21, sketch_size=1000, metric="jaccard"):
+def compare_all(
+    paths: Sequence[_PathLike], *, k: int = 21, sketch_size: int = 1000, metric: str = "jaccard"
+) -> pa.Table:
     """Builds a sketch for each of `paths` once, then compares every pair,
     returning a `pyarrow.Table` in long format (`sample_a`, `sample_b`,
     the metric column) -- one row per unordered pair (`n*(n-1)/2` rows for
@@ -611,7 +787,7 @@ def compare_all(paths, *, k=21, sketch_size=1000, metric="jaccard"):
     return pa.table({"sample_a": sample_a, "sample_b": sample_b, metric: values})
 
 
-def estimate_cardinality(path, *, k=31, precision=14):
+def estimate_cardinality(path: _PathLike, *, k: int = 31, precision: int = 14) -> float:
     """Estimates the number of *distinct* canonical k-mers across an
     entire FASTQ(.gz) file using HyperLogLog, in a fixed, small amount of
     memory (`2**precision` bytes, 16 KB at the default) regardless of
@@ -626,3 +802,12 @@ def estimate_cardinality(path, *, k=31, precision=14):
     "roughly how many distinct k-mers" is enough to plan around.
     """
     return _core.estimate_cardinality(str(path), k, precision)
+
+
+# Imported at the end of the module, deliberately: `cohort_counts.py` does
+# `from fastdna import _column_as_array` at its own import time, which
+# needs that name to already be bound on this module. Everything
+# `cohort_counts.count_cohort()` calls at runtime (`fastdna.count`) is
+# resolved when it is actually called, not at import time, so only the
+# early binding matters here.
+from .cohort_counts import CohortCounts, count_cohort  # noqa: E402

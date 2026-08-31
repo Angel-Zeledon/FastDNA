@@ -26,6 +26,23 @@ convenience layer drops straight back to the underlying modules; every
 parameter they accept remains reachable here through this module's own
 `*_kwargs` dicts or explicit overrides.
 
+**One deliberate exception.** When `cv=` replaces the default
+`cv.LineageKFold` with a splitter that is not an instance of it, `run()`
+emits `NaiveCrossValidationWarning` and records which splitter actually
+produced `cv_predictions` in that table's own Arrow schema metadata. No
+single one of the six composed modules can make this particular check by
+itself: `sklearn.model_selection.cross_val_predict` has no notion of
+lineage at all, and `cv.LineageKFold` only knows about itself, not about
+whatever a caller substituted in its place. A hand-written script stitching
+the same six modules together would therefore not get this warning for
+free -- it is the one validation rule this convenience layer adds rather
+than merely forwards, and it exists because population-structure-inflated
+CV is precisely the risk the rest of this project is built around (see
+`fastdna.cv`'s own module docstring, and `fastdna.audit`, which quantifies
+the resulting gap directly for a given estimator and cohort). A caller who
+overrides `cv=` still gets exactly the number they asked for -- it is never
+withheld -- just never silently alone.
+
 ## The default pipeline
 
     from fastdna.workflow import AssociationWorkflow
@@ -54,7 +71,8 @@ parameter they accept remains reachable here through this module's own
    `.rules_`) and evaluated honestly via `sklearn.model_selection.
    cross_val_predict` under a `cv.LineageKFold` built from the lineage
    groups (skippable via `cv=False`, or replaceable with any other
-   scikit-learn splitter via `cv=<splitter>`).
+   scikit-learn splitter via `cv=<splitter>` -- doing so emits
+   `NaiveCrossValidationWarning`, see "One deliberate exception" above).
 5. `evaluation.precision_recall_report` and `evaluation.calibration_report`
    over those held-out predictions (only computed alongside step 4).
 6. `gwas.prefilter_association` (skippable via `screen=False`) -- a fast,
@@ -80,11 +98,14 @@ missing rather than failing deep inside a plotting call.
 
 ## What this module does not do
 
-It does not add any statistics, plotting style, or validation rule that its
-six composed modules do not already have -- see each of their own module
-docstrings for the honesty caveats that still apply unchanged here
-(unadjusted screening, hard-decision `predict_proba`, Mash-derived rather
-than phylogeny-derived kinship, and so on). It also does not pick a
+It does not add any statistics or plotting style beyond what its six
+composed modules already have -- see each of their own module docstrings
+for the honesty caveats that still apply unchanged here (unadjusted
+screening, hard-decision `predict_proba`, Mash-derived rather than
+phylogeny-derived kinship, and so on). The one validation rule it does add
+beyond forwarding theirs -- `NaiveCrossValidationWarning` when `cv=`
+overrides the default `cv.LineageKFold` -- is described above, under "One
+deliberate exception", precisely because it is the only one. It also does not pick a
 phenotype-encoding, threshold, or "best" model for you: `classifier=` and
 every `*_kwargs` dict stay fully overridable, and the result is every
 intermediate artifact, not a single verdict.
@@ -93,8 +114,10 @@ intermediate artifact, not a single verdict.
 from __future__ import annotations
 
 import inspect
-from collections.abc import Mapping
-from typing import NamedTuple, Optional
+import os
+import warnings
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Sequence, Union
 
 import numpy as np
 import pyarrow as pa
@@ -108,7 +131,41 @@ from .evaluation import CalibrationReport, PrecisionRecallReport, calibration_re
 from .gwas import _resolve_cohort, cohort_presence_matrix, kinship_matrix, prefilter_association
 from .rules import SetCoveringClassifier
 
-__all__ = ["AssociationWorkflow", "AssociationResult"]
+if TYPE_CHECKING:
+    # matplotlib is a soft dependency, imported lazily by fastdna.plotting itself;
+    # this import only runs for static type checkers.
+    import matplotlib.axes
+
+__all__ = ["AssociationWorkflow", "AssociationResult", "NaiveCrossValidationWarning"]
+
+
+class NaiveCrossValidationWarning(UserWarning):
+    """Raised by `AssociationWorkflow.run()` when `cv=` replaces the
+    default `cv.LineageKFold` with a splitter that is not an instance of
+    it, so this run's `cv_predictions`/`precision_recall`/`calibration`
+    were **not** evaluated under this project's leakage-safe default.
+
+    This is not a claim that the resulting score is wrong -- only that it
+    is unprotected. `fastdna.cv`'s own module docstring lays out exactly
+    why that matters for a clonal cohort: a random split scatters
+    near-copies of the same lineage across the train/test boundary, so a
+    held-out fold is not really held out, and the model can score highly
+    by recognizing the lineage rather than the phenotype. `fastdna.audit`
+    exists specifically to quantify that gap for a given estimator and
+    cohort (its own `score_random` is, deliberately, exactly this same
+    kind of naive score) -- run it alongside this workflow before treating
+    the number this warning is attached to as a performance estimate on
+    genomes this cohort did not contain.
+
+    A distinct category (rather than a bare `UserWarning`), matching
+    `gwas.ScreeningOnlyWarning`'s own reasoning, so a caller who has
+    deliberately chosen a different splitter -- to reproduce a known
+    random-CV baseline, say, or because an independent check already ruled
+    out lineage structure in this cohort -- can silence *this* warning
+    specifically (`warnings.filterwarnings("ignore",
+    category=NaiveCrossValidationWarning)`) without silencing every other
+    warning FastDNA might legitimately need to raise.
+    """
 
 
 class AssociationResult(NamedTuple):
@@ -140,6 +197,15 @@ class AssociationResult(NamedTuple):
         Columns `sample_id`, `y_true`, `cv_score` -- one row per sample,
         `cv_score` its held-out `predict_proba` positive-class score from
         `sklearn.model_selection.cross_val_predict`. `None` when `cv=False`.
+        Its Arrow schema metadata always records `fastdna.
+        cv_lineage_blocked` (`"true"`/`"false"`) and `fastdna.cv_splitter`
+        (the splitter's own `repr()`), plus `fastdna.leakage_risk` when it
+        is `"false"` -- so whether this table came from the leakage-safe
+        default survives a save-to-Parquet-and-reload, the same
+        survives-serialization convention `gwas.prefilter_association` uses
+        for its own screening-only caveat. See `AssociationWorkflow`'s `cv`
+        parameter and `NaiveCrossValidationWarning` for what sets it to
+        `"false"`.
     precision_recall : fastdna.evaluation.PrecisionRecallReport or None
         Computed from `cv_predictions`; `None` when `cv=False`.
     calibration : fastdna.evaluation.CalibrationReport or None
@@ -169,7 +235,14 @@ class AssociationResult(NamedTuple):
     importance: Optional[pa.Table]
     annotations: Optional[pa.Table]
 
-    def to_report(self, path, *, calibration_interval=None, metadata=None, **kwargs):
+    def to_report(
+        self,
+        path: Union[str, os.PathLike],
+        *,
+        calibration_interval: Optional[tuple[float, float]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,  # forwarded to fastdna.report.to_report(), e.g. title=
+    ) -> None:
         """`fastdna.report.to_report()`, populated from this result's own
         `classifier` and `calibration` (`None` when `run()` was called with
         `cv=False` -- the report then shows "no calibration report was
@@ -268,6 +341,38 @@ def _new_classifier(classifier):
     return clone(classifier) if classifier is not None else SetCoveringClassifier()
 
 
+def _cv_provenance_metadata(cv_splitter: Any) -> Dict[str, str]:
+    """Arrow schema metadata for `AssociationResult.cv_predictions`
+    recording whether `cv_splitter` is this project's leakage-safe default
+    -- so the answer survives being saved to Parquet and read back
+    separately from `NaiveCrossValidationWarning`, the same
+    "the caveat lives in the data, not only in a transient warning"
+    convention `gwas.prefilter_association`'s own screening-only metadata
+    already established (see its `_SCREENING_METADATA`).
+
+    Only `cv_splitter`'s *type* is inspected, matching the check `run()`
+    itself makes before emitting `NaiveCrossValidationWarning`: an
+    explicitly-constructed `cv.LineageKFold` (custom `k=`, `sketch_size=`,
+    or a precomputed `groups=`) is still recorded as lineage-blocked, since
+    it still carries the same "never splits a lineage across train/test"
+    guarantee, whatever its parameters.
+    """
+    is_lineage_blocked = isinstance(cv_splitter, LineageKFold)
+    metadata = {
+        "fastdna.cv_lineage_blocked": "true" if is_lineage_blocked else "false",
+        "fastdna.cv_splitter": repr(cv_splitter),
+    }
+    if not is_lineage_blocked:
+        metadata["fastdna.leakage_risk"] = (
+            "this cv_score was not evaluated under cv.LineageKFold -- a random split on a clonal "
+            "cohort can let the model score highly by recognizing lineage rather than phenotype "
+            "(see fastdna.cv's own module docstring). Compare against fastdna.audit()'s "
+            "score_lineage/gap for the same cohort and estimator before treating this as a "
+            "performance estimate on genomes this cohort did not contain."
+        )
+    return metadata
+
+
 class AssociationWorkflow:
     """Orchestrates a full k-mer-cohort-to-phenotype association study from
     FASTQ files, chaining `fastdna.gwas`, `fastdna.equivalence`,
@@ -310,6 +415,15 @@ class AssociationWorkflow:
         splitter to use it instead (the resolved `groups` are still
         computed, e.g. for the `n_permutations` stage, but this workflow's
         own leakage-safe splitter is then not what evaluates the model).
+        Doing so emits `NaiveCrossValidationWarning`, not suppressed, and
+        marks `AssociationResult.cv_predictions` accordingly in that
+        table's own Arrow schema metadata -- see that warning's and that
+        field's own docstrings for exactly what each records. Passing an
+        actual `cv.LineageKFold` instance here (e.g. one built with a
+        custom `k=`/`sketch_size=`/`distance_threshold=`, or from a
+        precomputed `groups=` of your own) is a non-default but still
+        leakage-safe choice and triggers neither -- only the splitter's
+        *type* is checked, never its parameters.
         Pass `False` to skip cross-validated evaluation entirely --
         `cv_predictions`, `precision_recall` and `calibration` all come
         back `None`, and the classifier is still fitted on the full cohort.
@@ -355,24 +469,24 @@ class AssociationWorkflow:
 
     def __init__(
         self,
-        paths,
-        phenotype,
+        paths: Union[Iterable[Union[str, os.PathLike]], Mapping[str, Union[str, os.PathLike]]],
+        phenotype: Union[Mapping[str, Any], Sequence[Any], np.ndarray],
         *,
-        collapse_equivalence=True,
-        matrix_kwargs=None,
-        groups=None,
-        lineage_kwargs=None,
-        n_splits=5,
-        cv=None,
-        classifier=None,
-        screen=True,
-        screen_kwargs=None,
-        n_permutations=None,
-        permutation_random_state=None,
-        reference_fasta=None,
-        annotation_path=None,
-        annotate_kwargs=None,
-    ):
+        collapse_equivalence: bool = True,
+        matrix_kwargs: Optional[Dict[str, Any]] = None,
+        groups: Optional[Union[Sequence[Any], np.ndarray]] = None,
+        lineage_kwargs: Optional[Dict[str, Any]] = None,
+        n_splits: int = 5,
+        cv: Any = None,  # None (default), False (skip CV), or a scikit-learn-compatible splitter instance
+        classifier: Any = None,  # unfitted scikit-learn-compatible estimator; sklearn estimator types have no precise common annotation
+        screen: bool = True,
+        screen_kwargs: Optional[Dict[str, Any]] = None,
+        n_permutations: Optional[int] = None,
+        permutation_random_state: Optional[int] = None,
+        reference_fasta: Optional[Union[str, os.PathLike]] = None,
+        annotation_path: Optional[Union[str, os.PathLike]] = None,
+        annotate_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if (reference_fasta is None) != (annotation_path is None):
             raise ValueError(
                 "reference_fasta and annotation_path must be given together, or not at all -- "
@@ -451,12 +565,35 @@ class AssociationWorkflow:
         cv_predictions = precision_recall = calibration = None
         if self.cv is not False:
             cv_splitter = self.cv if self.cv is not None else LineageKFold(n_splits=self.n_splits, groups=groups)
+            if not isinstance(cv_splitter, LineageKFold):
+                # See the module docstring's "One deliberate exception": no
+                # one of the six composed modules can make this check by
+                # itself, since none of them ever sees both "the
+                # leakage-safe default this workflow would have built" and
+                # "the splitter actually passed" at once.
+                warnings.warn(
+                    f"cv={cv_splitter!r} replaces this workflow's default cv.LineageKFold, so this "
+                    "run's cv_predictions/precision_recall/calibration were NOT evaluated under a "
+                    "leakage-safe split. fastdna.cv's own module docstring explains why that matters: "
+                    "a random split on a clonal cohort -- every real bacterial or viral one -- "
+                    "scatters near-copies of the same lineage across the train/test boundary, so the "
+                    "held-out score this produces can reflect the model recognizing lineage rather "
+                    "than phenotype, not a performance estimate on genomes this cohort did not "
+                    "contain. This result is not withheld -- only reported without the corroboration "
+                    "this workflow gives it by default, and the same caveat is recorded in "
+                    "cv_predictions' own Arrow schema metadata so it survives being saved and "
+                    "reloaded. Compare it against fastdna.audit()'s score_lineage/gap for the "
+                    "same cohort and estimator, or drop cv= (or pass cv=None) to use cv.LineageKFold "
+                    "instead.",
+                    NaiveCrossValidationWarning,
+                    stacklevel=2,
+                )
             cv_estimator = _new_classifier(self.classifier)
             proba = cross_val_predict(cv_estimator, matrix, y, cv=cv_splitter, method="predict_proba")
             cv_score = proba[:, 1]
             cv_predictions = pa.table(
                 {"sample_id": sample_ids, "y_true": list(y), "cv_score": cv_score.tolist()}
-            )
+            ).replace_schema_metadata(_cv_provenance_metadata(cv_splitter))
             precision_recall = precision_recall_report(y, cv_score)
             calibration = calibration_report(y, cv_score)
 
@@ -510,7 +647,7 @@ class AssociationWorkflow:
         self.result_ = result
         return result
 
-    def plot_significance(self, **kwargs):
+    def plot_significance(self, **kwargs: Any) -> "matplotlib.axes.Axes":
         """`fastdna.plotting.plot_significance` over this workflow's own
         `result_.screening`. Needs `run()` (with `screen=True`, the
         default) to have been called first. `**kwargs` are forwarded to
@@ -528,7 +665,7 @@ class AssociationWorkflow:
 
         return plotting.plot_significance(self.result_.screening, **kwargs)
 
-    def plot_population_structure(self, **kwargs):
+    def plot_population_structure(self, **kwargs: Any) -> "matplotlib.axes.Axes":
         """`fastdna.plotting.plot_population_structure` over this cohort's
         Mash-distance matrix, colored by the lineage groups `run()` already
         resolved. Needs `run()` to have been called first.

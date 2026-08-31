@@ -22,3 +22,6 @@ venv/
 
 # Agent worktrees (full checkouts, never part of the repo)
 .claude/worktrees/
+
+# Stray atomic-write temp files from interrupted agent runs
+*.py.tmp.*

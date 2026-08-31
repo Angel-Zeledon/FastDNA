@@ -12,6 +12,10 @@ computes the histogram (`KmerCounter::generate_histogram`, exposed as
 not FFI-boundary work.
 """
 
+from typing import Mapping
+
+__all__ = ["suggest_min_count", "DEFAULT_MIN_COUNT", "RISE_FACTOR"]
+
 #: Used when the spectrum carries too little signal to locate a valley (see
 #: `suggest_min_count`). Not a recommendation in its own right -- callers
 #: relying on it routinely are exactly the "eyeball a universal 5" problem
@@ -31,7 +35,7 @@ DEFAULT_MIN_COUNT = 2
 RISE_FACTOR = 2.0
 
 
-def suggest_min_count(spectrum, default=DEFAULT_MIN_COUNT):
+def suggest_min_count(spectrum: Mapping[int, int], default: int = DEFAULT_MIN_COUNT) -> int:
     """Finds the valley floor between the error peak and the coverage peak.
 
     `spectrum` maps depth (an int >= 1) to the number of distinct k-mers

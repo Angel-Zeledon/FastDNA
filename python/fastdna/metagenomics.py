@@ -72,14 +72,25 @@ composition table, or a host-removal decision per read.
 """
 from __future__ import annotations
 
+import os
+from typing import Optional, Sequence, Union
+
 import pyarrow as pa
 
 from . import _core
 
 __all__ = ["build_database", "KmerDatabase"]
 
+# A path accepted anywhere in this module: a `str`, or anything implementing
+# `os.PathLike` (e.g. `pathlib.Path`) -- every such parameter is converted
+# with `str(path)` before use, matching `fastdna/__init__.py`'s own
+# `_PathLike` convention.
+_PathLike = Union[str, os.PathLike]
 
-def build_database(reference, taxonomy, *, k=31, output=None):
+
+def build_database(
+    reference: _PathLike, taxonomy: _PathLike, *, k: int = 31, output: Optional[_PathLike] = None
+) -> "KmerDatabase":
     """Builds a k-mer -> lowest-common-ancestor database and returns it as
     a :class:`KmerDatabase`.
 
@@ -140,11 +151,11 @@ class KmerDatabase:
     discovered by running out of memory.
     """
 
-    def __init__(self, raw):
+    def __init__(self, raw: "_core.KmerDatabase") -> None:
         self._raw = raw
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path: _PathLike) -> "KmerDatabase":
         """Loads a database written by :meth:`save` or by
         `build_database(..., output=...)`.
 
@@ -155,25 +166,25 @@ class KmerDatabase:
         """
         return cls(_core.KmerDatabase.load(str(path)))
 
-    def save(self, path):
+    def save(self, path: _PathLike) -> None:
         """Persists the database, replacing `path` atomically."""
         self._raw.save(str(path))
 
     @property
-    def k(self):
+    def k(self) -> int:
         return self._raw.k
 
     @property
-    def n_kmers(self):
+    def n_kmers(self) -> int:
         """The number of distinct canonical k-mers in the lookup table."""
         return self._raw.n_kmers
 
     @property
-    def memory_bytes(self):
+    def memory_bytes(self) -> int:
         """Resident bytes: `12 * n_kmers` plus the taxonomy."""
         return self._raw.memory_bytes
 
-    def classify(self, reads, *, confidence_threshold=0.0):
+    def classify(self, reads: _PathLike, *, confidence_threshold: float = 0.0) -> pa.Table:
         """Classifies every read of a FASTA/FASTQ(.gz) file, returning a
         `pyarrow.Table` with one row per read, in input order:
 
@@ -221,7 +232,7 @@ class KmerDatabase:
         batch = self._raw.classify(str(reads), confidence_threshold)
         return pa.Table.from_batches([batch])
 
-    def abundance(self, classification):
+    def abundance(self, classification: Union[pa.Table, pa.RecordBatch, Sequence[int]]) -> pa.Table:
         """Aggregates a table from :meth:`classify` into a composition
         report: `tax_id`, `name`, `rank`, `reads`, `relative_abundance`,
         most reads first with ties broken by `tax_id` so two runs over the
@@ -259,7 +270,7 @@ class KmerDatabase:
             tax_ids = [int(tax_id) for tax_id in classification]
         return pa.Table.from_batches([self._raw.abundance(tax_ids)])
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"KmerDatabase(k={self.k}, n_kmers={self.n_kmers:,}, memory_bytes={self.memory_bytes:,})"
 
     def _repr_html_(self):

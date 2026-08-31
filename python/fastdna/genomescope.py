@@ -42,6 +42,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from .spectrum import suggest_min_count
 
@@ -450,7 +451,13 @@ class GenomeProfile:
 # ---------------------------------------------------------------------------
 
 
-def profile_genome(source, *, k=None, ploidy=2, max_coverage=None):
+def profile_genome(
+    source: Any,  # KmerCounts, a {depth: distinct k-mers} mapping, or a path to a FASTQ(.gz) file
+    *,
+    k: Optional[int] = None,
+    ploidy: int = 2,
+    max_coverage: Optional[int] = None,
+) -> GenomeProfile:
     """Fits a GenomeScope-style negative-binomial mixture to a k-mer
     frequency spectrum and reports what the fit implies about the genome:
     size, heterozygosity, repeat content, haploid coverage and sequencing
@@ -650,7 +657,11 @@ def profile_genome(source, *, k=None, ploidy=2, max_coverage=None):
     )
 
 
-def plot_spectrum_fit(profile, spectrum, ax=None):
+def plot_spectrum_fit(
+    profile: GenomeProfile,
+    spectrum: Any,  # {depth: distinct k-mers} mapping or KmerCounts
+    ax: Any = None,  # matplotlib.axes.Axes; matplotlib is an optional, lazily imported dependency
+) -> Any:  # matplotlib.axes.Axes; matplotlib is optional and lazily imported, not a module-level dependency
     """Plots an observed spectrum against the model :func:`profile_genome`
     fitted to it -- the standard GenomeScope figure, and the fastest way to
     see whether a profile is trustworthy.

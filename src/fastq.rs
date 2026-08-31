@@ -242,6 +242,70 @@ pub type BoxedStream = Box<dyn BufRead + Send + 'static>;
 /// The size of the read buffer every input stream gets, gzip or plain.
 const STREAM_BUFFER_BYTES: usize = 128 * 1024;
 
+// This crate's gzip handling -- sniffing (`looks_gzipped`), stream-wrapping
+// (`decode_sniffing_gzip`), and the two call sites below that build a
+// `MultiGzDecoder` directly (`from_path`, `InputSpec::open`) -- all go
+// through `flate2`. `Cargo.toml` pins `flate2 = "1.0"` with no backend
+// feature enabled by default, so `flate2` uses its default backend,
+// `miniz_oxide`: pure Rust, no C toolchain needed to build this crate, and
+// measurably slower at inflate than the C implementations `flate2` can
+// also use.
+//
+// Decompression happens on the pipeline's producer thread, in series with
+// reading -- see the comment inside `from_path` below -- so for real gzip
+// input this is on the critical path of every run. It does not show up in
+// `docs/BENCHMARKS.md` because that file's reference input is plain FASTQ;
+// real SRA/ENA downloads are gzip, so a real user pays this cost on every
+// run that number does not.
+//
+// `docs/audit/performance-v2.md` (G-4) proposed making flate2's `zlib-ng`
+// feature unconditional, citing a claimed 2-3x inflate speedup, but said
+// in its own words to measure before shipping it ("hay que medirlo antes
+// de darlo por bueno"). Measured, not assumed: built this crate twice in
+// the same `rust:1-slim-bookworm` container this project's Docker-only
+// verification already uses (there is no local Rust toolchain to measure
+// natively), once with default features and once with `--features
+// zlib-ng`, and ran a harness that calls `FastqReader::from_path` and
+// drains every record via `next_record_into` -- this crate's actual read
+// path, not a synthetic zlib microbenchmark -- against a realistic 348 MB
+// synthetic `.fastq.gz` (1,066,666 reads, 160M bases, generated with
+// `scripts/bench/generate_reads_large.py`, gzip level 6, ~75 MB
+// compressed). Three runs each, same container, same file, wall clock end
+// to end:
+//
+//                run 1     run 2     run 3    median
+//   miniz_oxide  8.24 s    8.25 s    6.64 s    8.24 s
+//   zlib-ng      2.05 s    2.16 s    4.38 s    2.16 s
+//
+// zlib-ng wins every single pairing, including the most adversarial one
+// (its slowest run, 4.38 s, against miniz_oxide's fastest, 6.64 s: still
+// 1.5x faster). Median-to-median is 3.8x; mean-to-mean, which does not
+// discard either backend's one noisy run, is 2.7x. Either way this clears
+// the plan's claimed 2-3x, on this machine, on this file.
+//
+// The cost the plan flagged is real: `flate2/zlib-ng` pulls in
+// `libz-ng-sys`, which needs a C compiler and `cmake` at build time --
+// both had to be `apt-get install`ed into the container above; neither is
+// there by default. Today this crate needs neither. `compile.bat`, the
+// documented native-Windows build path, is a bare `cargo build --release`
+// with no toolchain setup of its own, and this session has no way to
+// confirm a C toolchain and cmake are present wherever that script
+// actually gets run, nor to test the macOS legs of
+// `.github/workflows/wheels.yml` at all -- only Linux x86_64, in Docker,
+// was verified here. Making zlib-ng unconditional would trade a measured,
+// real speedup for an unmeasured, real risk of breaking a build this
+// session cannot see.
+//
+// So: opt-in, not default. `[features] zlib-ng = ["flate2/zlib-ng"]` in
+// `Cargo.toml` turns it on (`cargo build --release --features zlib-ng`,
+// or for the Python wheel `maturin build --release --features
+// python,zlib-ng`) on a machine known to have a C toolchain and cmake --
+// true of the manylinux containers and Bioconda that
+// `docs/audit/performance-v2.md` itself names. `default = []` leaves
+// every build that does not opt in -- `compile.bat`, plain `cargo
+// build`/`test`/`clippy`, and every leg of `wheels.yml` as it stands
+// today -- on miniz_oxide, unchanged.
+
 /// Whether a stream's first bytes are the gzip magic number (`1f 8b`).
 ///
 /// Extension-based detection is fine for a named file and impossible for a
@@ -259,7 +323,10 @@ pub fn looks_gzipped(prefix: &[u8]) -> bool {
 /// of it.
 ///
 /// `MultiGzDecoder`, not `GzDecoder`: see `FastqReader::from_path` for why
-/// multi-member support is required rather than merely nice.
+/// multi-member support is required rather than merely nice. Which
+/// *backend* flate2 uses to inflate (miniz_oxide vs zlib-ng) is a separate,
+/// build-time choice -- see the comment above `STREAM_BUFFER_BYTES` in this
+/// file for the G-4 measurement and decision.
 pub fn decode_sniffing_gzip(mut stream: BoxedStream) -> io::Result<BoxedStream> {
     let gzipped = looks_gzipped(stream.fill_buf()?);
     if gzipped {
@@ -307,6 +374,10 @@ impl InputSpec {
     /// Opens the stream, decompressing gzip. A named file is decided by
     /// extension (unchanged from `FastqReader::from_path`); stdin has no
     /// extension to consult, so it is decided by magic bytes.
+    ///
+    /// The gzip backend compiled in (miniz_oxide by default, zlib-ng if
+    /// built with `--features zlib-ng`) is the same for every branch here;
+    /// see the comment above `STREAM_BUFFER_BYTES` in this file.
     fn open(&self) -> io::Result<BoxedStream> {
         match self {
             InputSpec::File(path) => {
@@ -369,6 +440,10 @@ impl FastqReader<Box<dyn BufRead + Send>> {
         // `ffi.rs`) already decodes all members, and `preview`/`sketch`/
         // `hll` reading a truncated prefix of the same file must not
         // disagree with it.
+        //
+        // Which *backend* flate2 uses to inflate (miniz_oxide vs zlib-ng)
+        // is a build-time choice, not a call here -- see the comment above
+        // `STREAM_BUFFER_BYTES` for the G-4 measurement and decision.
         let reader: Box<dyn BufRead + Send> = if is_gzipped {
             Box::new(BufReader::with_capacity(128 * 1024, MultiGzDecoder::new(file)))
         } else {

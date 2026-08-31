@@ -7,6 +7,12 @@ match a query against any known class/reference, that low-confidence result
 is exactly the signal that a query needs expert review and, once labeled, is
 a strong candidate for the reference set/training data.
 
+**Status: frozen.** Per `docs/audit/PLAN.md` §2 ("Qué se poda"), this
+module is frozen: stable, not accepting new features, and a candidate for
+extraction into a separate `fastdna-contrib` package in a future release.
+Freezing is not deleting -- see that section for the full reasoning behind
+the boundary.
+
 Deliberately generic: this module does not import or assume the existence
 of `fastdna.taxonomy` or `fastdna.sklearn`. It accepts two plain,
 documented input shapes instead, so it works with output from either (or
@@ -39,8 +45,10 @@ Literature Survey", 2009):
 Convention used consistently by both methods: **larger return value means
 more uncertain.**
 """
+from __future__ import annotations
 
 import math
+from typing import Any, Optional
 
 __all__ = [
     "uncertainty_score",
@@ -219,7 +227,11 @@ def _entropy_uncertainty(scores):
     return entropy
 
 
-def uncertainty_score(ranked_results_or_probs, *, method="margin"):
+def uncertainty_score(
+    ranked_results_or_probs: Any,  # ranked-tuples list or (probs, labels) pair; see docstring
+    *,
+    method: str = "margin",
+) -> float:
     """Computes a single uncertainty score for ONE query's classification
     result. Larger return value = more uncertain (consistent convention
     across both methods).
@@ -279,7 +291,12 @@ def _iter_batch(batch_of_results):
     return list(batch_of_results)
 
 
-def prioritize_for_review(batch_of_results, *, method="margin", top_n=None):
+def prioritize_for_review(
+    batch_of_results: Any,  # list of (query_id, result) tuples, or {query_id: result} dict
+    *,
+    method: str = "margin",
+    top_n: Optional[int] = None,
+) -> list[tuple[Any, float, Any]]:
     """Turns a batch of per-query classification results into a review
     queue, most-uncertain-first.
 
@@ -328,7 +345,11 @@ def prioritize_for_review(batch_of_results, *, method="margin", top_n=None):
     return scored
 
 
-def suggest_reference_additions(prioritized_queue, *, uncertainty_threshold):
+def suggest_reference_additions(
+    prioritized_queue: list[tuple[Any, float, Any]],
+    *,
+    uncertainty_threshold: float,
+) -> list[tuple[Any, float, Any]]:
     """Convenience filter over `prioritize_for_review`'s output: returns
     just the entries at or above `uncertainty_threshold`.
 

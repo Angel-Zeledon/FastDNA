@@ -22,6 +22,16 @@
 // `#[pyfunction]`/`#[pymethods]` items that all share this pattern.
 #![allow(clippy::useless_conversion)]
 
+// `pyo3::create_exception!` (used below for `FastDnaErrorBase`) expands to
+// code that checks `cfg(feature = "gil-refs")` -- a cfg pyo3 declares for
+// *itself*, not one this crate's own Cargo.toml lists, so Cargo's
+// check-cfg linting reports it as unexpected. A per-item `#[allow(...)]`
+// placed directly on the macro invocation does not suppress this (rustc
+// says so explicitly: the attribute is "ignored, since it's applied to the
+// macro invocation" rather than to what it expands into) -- module-level
+// is the only scope that reaches generated code here too.
+#![allow(unexpected_cfgs)]
+
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -42,11 +52,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use flate2::read::MultiGzDecoder;
-use pyo3::exceptions::{
-    PyFileNotFoundError, PyKeyboardInterrupt, PyMemoryError, PyOSError, PyRuntimeError, PyValueError,
-};
+use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::collections::HashMap;
 
 use crate::cohort;
 use crate::counter::KmerCounter;
@@ -63,44 +72,233 @@ use crate::translate::{self, Frame, StopHandling, TranslationTable};
 use crate::hll;
 use crate::metagenomics;
 
+// The base every FastDNA-specific exception inherits from, alongside
+// whichever ordinary Python builtin it already behaved as before this
+// hierarchy existed (see the per-variant mapping in `From<FastDnaError> for
+// PyErr` below). Catching `FastDnaError` catches any FastDNA-specific
+// error; catching `ValueError`/`OSError`/`MemoryError`/`RuntimeError`/
+// `FileNotFoundError` keeps working exactly as before, because every leaf
+// class genuinely inherits from both.
+//
+// H-10: `pyo3::create_exception!` only supports a single base class, so the
+// leaves below (which must inherit from *two* classes) cannot be declared
+// with it. This was tried the other way first: a `create_exception!` per
+// leaf naming `FastDnaError` as its one base, with a comment claiming it
+// "also" behaved as the matching builtin -- that compiled clean but only
+// ever produced single inheritance, silently breaking every existing
+// `pytest.raises(ValueError)` / `except OSError:` call site (30 test
+// failures, caught in this session before landing; see CHANGELOG.md). Real
+// multiple inheritance needs actual Python multiple inheritance, which
+// means an actual Python `class` statement -- `register_exception_hierarchy`
+// below builds the thirteen leaves with a short embedded-Python snippet,
+// run once at import time, inside `_core`'s own `#[pymodule]` function.
+// This is a documented, ordinary way to work around
+// `create_exception!`'s single-base limitation, not a hack.
+//
+// Named `FastDnaErrorBase`, not `FastDnaError`, purely to avoid shadowing
+// `crate::error::FastDnaError` (this file's `use crate::error::FastDnaError;`
+// above) inside this module's namespace -- the macro below defines a new
+// Rust item named exactly what its second argument says, and a same-named
+// local item wins over the `use` import, which broke every other use of
+// `error::FastDnaError` in this file the first time this was tried (54
+// compile errors, from `?` no longer finding a matching `From` impl). The
+// PYTHON-visible name is still plain `FastDnaError` -- that's the string
+// key `register_exception_hierarchy` registers it under below, independent
+// of this Rust identifier.
+//
+// (Both comment blocks above use `//`, not `///`: a doc comment on a macro
+// invocation itself is a no-op -- rustdoc has nothing to attach it to and
+// warns `unused_doc_comment` -- so this follows the plain-`//` convention
+// this file already used for the block this replaces.)
+//
+// The `cfg(feature = "gil-refs")` warning this macro's expansion would
+// otherwise print here (pyo3's own internal cfg, not this crate's -- see
+// the module-level `#![allow(unexpected_cfgs)]` near the top of this file
+// for why the allow has to live there instead of on this invocation) is
+// suppressed at the module level, not here.
+pyo3::create_exception!(
+    _core,
+    FastDnaErrorBase,
+    pyo3::exceptions::PyException,
+    "Base class for every exception FastDNA's Rust core raises. Catching \
+     this catches any FastDNA-specific error, regardless of which ordinary \
+     Python exception type (ValueError, OSError, ...) it also is."
+);
+
+/// One `class Leaf(FastDnaError, Builtin): pass` per error kind that needs
+/// its own catchable identity. `FastDnaError` is injected into the exec
+/// globals by `register_exception_hierarchy`; the builtins (`ValueError`,
+/// `OSError`, `FileNotFoundError`, `MemoryError`, `RuntimeError`) come from
+/// Python's own `__builtins__`, which `Python::run_bound` supplies to exec'd
+/// code automatically, the same as a plain `exec()` call would.
+///
+/// Order matches `EXCEPTION_LEAF_NAMES` below and the match arms in
+/// `From<FastDnaError> for PyErr`; keep all three in step when adding a
+/// variant.
+const EXCEPTION_HIERARCHY_SOURCE: &str = "\
+class MalformedFastqError(FastDnaError, ValueError):
+    '''A FASTQ record that could not be parsed.'''
+class InvalidKError(FastDnaError, ValueError):
+    '''k is outside the 1..=32 range 2-bit packing allows.'''
+class MismatchedKError(FastDnaError, ValueError):
+    '''Two sketches built with different k cannot be compared.'''
+class MismatchedScaleError(FastDnaError, ValueError):
+    '''Two FracSketches built with different scale cannot be compared.'''
+class InvalidConfigError(FastDnaError, ValueError):
+    '''A configuration value supplied by the caller is not usable.'''
+class NoSamplesFoundError(FastDnaError, ValueError):
+    '''A cohort directory contains no recognizable FASTQ files.'''
+class LoadError(FastDnaError, ValueError):
+    '''A previously-saved artifact (e.g. a GenomeSketch) could not be read back.'''
+class IoNotFoundError(FastDnaError, FileNotFoundError):
+    '''The path FastDNA was asked to read does not exist.'''
+class IoError(FastDnaError, OSError):
+    '''An I/O failure other than the path simply not existing.'''
+class MatrixTooLargeError(FastDnaError, MemoryError):
+    '''The requested dense matrix would exceed the configured byte limit.'''
+class VocabTooLargeError(FastDnaError, MemoryError):
+    '''The requested vocabulary table would exceed the configured byte limit.'''
+class ExportError(FastDnaError, RuntimeError):
+    '''Serialization or writer failure while exporting results.'''
+class InternalError(FastDnaError, RuntimeError):
+    '''A worker thread panicked. This indicates a bug in FastDNA.'''
+";
+
+/// Every leaf name declared in `EXCEPTION_HIERARCHY_SOURCE`, in the same
+/// order, so `register_exception_hierarchy` can pull each one out of the
+/// exec globals afterward.
+const EXCEPTION_LEAF_NAMES: &[&str] = &[
+    "MalformedFastqError",
+    "InvalidKError",
+    "MismatchedKError",
+    "MismatchedScaleError",
+    "InvalidConfigError",
+    "NoSamplesFoundError",
+    "LoadError",
+    "IoNotFoundError",
+    "IoError",
+    "MatrixTooLargeError",
+    "VocabTooLargeError",
+    "ExportError",
+    "InternalError",
+];
+
+/// Populated once, from inside `_core`'s `#[pymodule]` function, before any
+/// `#[pyfunction]` becomes callable. Python guarantees a module's own
+/// top-level init code finishes before its functions can be invoked from
+/// the importing side, so every read from `From<FastDnaError> for PyErr`
+/// sees this already filled in -- there is no ordering race to guard here.
+static EXCEPTION_CLASSES: OnceLock<HashMap<&'static str, Py<PyAny>>> = OnceLock::new();
+
+/// Builds the thirteen dual-inheriting leaf classes from
+/// `EXCEPTION_HIERARCHY_SOURCE` and registers all fourteen names (the base
+/// plus the thirteen leaves) on `m`, so Python can also
+/// `from fastdna._core import InvalidKError` directly.
+fn register_exception_hierarchy(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("FastDnaError", py.get_type_bound::<FastDnaErrorBase>())?;
+
+    let globals = PyDict::new_bound(py);
+    globals.set_item("FastDnaError", py.get_type_bound::<FastDnaErrorBase>())?;
+    py.run_bound(EXCEPTION_HIERARCHY_SOURCE, Some(&globals), None)?;
+
+    let mut classes = HashMap::with_capacity(EXCEPTION_LEAF_NAMES.len());
+    for &name in EXCEPTION_LEAF_NAMES {
+        let cls = globals.get_item(name)?.unwrap_or_else(|| {
+            panic!(
+                "{name} is declared in EXCEPTION_HIERARCHY_SOURCE but missing from \
+                 the exec globals afterward -- EXCEPTION_LEAF_NAMES has drifted out \
+                 of step with the source"
+            )
+        });
+        m.add(name, cls.clone())?;
+        classes.insert(name, cls.unbind());
+    }
+    EXCEPTION_CLASSES
+        .set(classes)
+        .map_err(|_| PyRuntimeError::new_err("fastdna._core was initialized more than once"))?;
+    Ok(())
+}
+
+/// Builds a `PyErr` for one of the thirteen leaf classes registered by
+/// `register_exception_hierarchy`, by calling the class the way Python
+/// itself would (`SomeError(message)`) rather than constructing an
+/// instance by hand.
+fn leaf_exception(py: Python<'_>, name: &'static str, message: String) -> PyErr {
+    let classes = EXCEPTION_CLASSES.get().unwrap_or_else(|| {
+        panic!("fastdna._core must finish importing before any FastDnaError can convert to PyErr")
+    });
+    let cls = classes
+        .get(name)
+        .unwrap_or_else(|| panic!("{name} is not a registered exception leaf"))
+        .bind(py);
+    match cls.call1((message,)) {
+        Ok(instance) => PyErr::from_value_bound(instance),
+        // Constructing the exception instance itself failed -- surface
+        // that failure rather than the original error it was standing in
+        // for, since it is the more actionable problem at this point.
+        Err(err) => err,
+    }
+}
+
 /// The single place the spec's error-to-exception table (design doc §12) is
 /// implemented. No call site maps a `FastDnaError` to a `PyErr` directly, so
 /// no call site can diverge from this table.
 impl From<FastDnaError> for PyErr {
     fn from(err: FastDnaError) -> PyErr {
-        match &err {
+        // `Cancelled` deliberately does not join the hierarchy above:
+        // Python's own `KeyboardInterrupt` inherits from `BaseException`,
+        // not `Exception`, specifically so a broad `except Exception:` does
+        // not swallow it. Folding it into `FastDnaError` (an `Exception`
+        // subclass) would defeat that on purpose, so it stays a plain,
+        // undecorated `KeyboardInterrupt`.
+        if matches!(err, FastDnaError::Cancelled) {
+            return PyKeyboardInterrupt::new_err(err.to_string());
+        }
+
+        let message = err.to_string();
+        let name: &'static str = match &err {
             // `NotFound` gets the more specific exception; every other kind
             // of I/O failure (permission denied, a bad gzip stream, ...) is
             // a generic OSError.
             FastDnaError::Io { source, .. } => {
                 if source.kind() == std::io::ErrorKind::NotFound {
-                    PyFileNotFoundError::new_err(err.to_string())
+                    "IoNotFoundError"
                 } else {
-                    PyOSError::new_err(err.to_string())
+                    "IoError"
                 }
             }
-            FastDnaError::MalformedFastq { .. }
-            | FastDnaError::InvalidK { .. }
-            | FastDnaError::MismatchedK { .. }
-            | FastDnaError::MismatchedScale { .. }
-            | FastDnaError::InvalidConfig { .. }
+            FastDnaError::MalformedFastq { .. } => "MalformedFastqError",
+            FastDnaError::InvalidK { .. } => "InvalidKError",
+            FastDnaError::MismatchedK { .. } => "MismatchedKError",
+            FastDnaError::MismatchedScale { .. } => "MismatchedScaleError",
+            FastDnaError::InvalidConfig { .. } => "InvalidConfigError",
             // Not in the spec's table (which predates the cohort engine),
             // but a caller-supplied bad directory is the same kind of
             // mistake as InvalidConfig, so it gets the same treatment
-            // rather than being left an unclassified RuntimeError.
-            | FastDnaError::NoSamplesFound { .. }
+            // rather than being left unclassified.
+            FastDnaError::NoSamplesFound { .. } => "NoSamplesFoundError",
             // Also not in the spec's table (predates GenomeSketch
             // persistence). A corrupt/foreign sketch file is bad input
             // data, the same kind of mistake as a malformed FASTQ record,
-            // not an internal failure -- ValueError, not RuntimeError.
-            | FastDnaError::Load { .. } => PyValueError::new_err(err.to_string()),
-            FastDnaError::MatrixTooLarge { .. } | FastDnaError::VocabTooLarge { .. } => {
-                PyMemoryError::new_err(err.to_string())
-            }
-            FastDnaError::Export { .. } => PyRuntimeError::new_err(err.to_string()),
-            FastDnaError::Cancelled => PyKeyboardInterrupt::new_err(err.to_string()),
-            FastDnaError::Internal { .. } => PyRuntimeError::new_err(err.to_string()),
-        }
+            // not an internal failure -- ValueError-family, not RuntimeError.
+            FastDnaError::Load { .. } => "LoadError",
+            FastDnaError::MatrixTooLarge { .. } => "MatrixTooLargeError",
+            FastDnaError::VocabTooLarge { .. } => "VocabTooLargeError",
+            FastDnaError::Export { .. } => "ExportError",
+            FastDnaError::Internal { .. } => "InternalError",
+            FastDnaError::Cancelled => unreachable!("handled above, before the message is built"),
+            // No wildcard arm: `FastDnaError` (src/error.rs) is
+            // `#[non_exhaustive]` for callers *outside* this crate only --
+            // inside it, matching stays genuinely exhaustive (see
+            // error.rs's own `non_exhaustive_does_not_block_construction_
+            // inside_the_crate` test), so a `_ =>` arm here would be dead
+            // code today (confirmed by `unreachable_patterns` when this was
+            // tried) and would silently swallow a real classification
+            // decision the next time a variant is added. Adding a variant
+            // to `FastDnaError` must be a compile error here until someone
+            // decides which leaf class it maps to.
+        };
+        Python::with_gil(|py| leaf_exception(py, name, message))
     }
 }
 
@@ -116,6 +314,9 @@ fn in_memory_export_err<E: std::fmt::Display>(err: E) -> FastDnaError {
     FastDnaError::Export {
         path: PathBuf::from("<in-memory Arrow table>"),
         reason: err.to_string(),
+        // No typed cause: this function's only caller builds the message
+        // with `format!`, not from a real error object.
+        source: None,
     }
 }
 
@@ -157,8 +358,18 @@ fn in_memory_export_err<E: std::fmt::Display>(err: E) -> FastDnaError {
 /// the exact final buffer length and bounding it up front bounds every
 /// intermediate offset. That also turns an unwind at the FFI boundary into an
 /// ordinary `Export` error.
-fn build_record_batch(counter: &KmerCounter, k: usize) -> Result<RecordBatch, FastDnaError> {
-    let schema = export::counts_schema();
+/// `with_sequence` mirrors `export::counts_schema`'s own flag: the decoded
+/// `kmer_sequence` column costs one `decode_kmer_into` call and one offset
+/// push per row, on top of everything else this function already does, and
+/// the majority of this crate's own Python-side ML surface never reads it.
+/// Off by default (see `count()`'s `with_sequence=false`), reconstructible
+/// without rereading the FASTQ via `KmerCounts.with_sequence()`.
+fn build_record_batch(
+    counter: &KmerCounter,
+    k: usize,
+    with_sequence: bool,
+) -> Result<RecordBatch, FastDnaError> {
+    let schema = export::counts_schema(with_sequence);
 
     // One lock acquisition on the counter rather than two: `Iter` reports its
     // own exact remaining length, so the row count comes from the same guard
@@ -169,44 +380,59 @@ fn build_record_batch(counter: &KmerCounter, k: usize) -> Result<RecordBatch, Fa
     let rows = counter.iter();
     let n = rows.size_hint().0;
 
-    // Exact, not an estimate: `decode_kmer_into` appends exactly `k` bytes per
-    // k-mer. `checked_mul` because `usize` is 32 bits on some wheel targets;
-    // the `i32::MAX` bound is Arrow's, for the offsets of a `Utf8` column.
-    let total_seq_bytes = n
-        .checked_mul(k)
-        .filter(|&bytes| bytes <= i32::MAX as usize)
-        .ok_or_else(|| {
-            in_memory_export_err(format!(
-                "{n} k-mers of {k} bases exceed the {} byte limit of an Arrow Utf8 column",
-                i32::MAX
-            ))
-        })?;
-
     let mut kmers: Vec<u64> = Vec::with_capacity(n);
-    let mut seq_bytes: Vec<u8> = Vec::with_capacity(total_seq_bytes);
-    // An offsets buffer has one more entry than it has values: the leading 0
-    // that opens the first string.
-    let mut seq_offsets: Vec<i32> = Vec::with_capacity(n + 1);
-    seq_offsets.push(0);
     let mut freqs: Vec<u32> = Vec::with_capacity(n);
 
-    for (kmer_bits, count) in rows {
-        kmers.push(kmer_bits);
-        kmer::decode_kmer_into(kmer_bits, k, &mut seq_bytes);
-        // Bounded by `total_seq_bytes <= i32::MAX` above, so this cast is
-        // value-preserving for every row.
-        seq_offsets.push(seq_bytes.len() as i32);
-        freqs.push(count);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(3);
+
+    if with_sequence {
+        // Exact, not an estimate: `decode_kmer_into` appends exactly `k`
+        // bytes per k-mer. `checked_mul` because `usize` is 32 bits on some
+        // wheel targets; the `i32::MAX` bound is Arrow's, for the offsets
+        // of a `Utf8` column.
+        let total_seq_bytes = n
+            .checked_mul(k)
+            .filter(|&bytes| bytes <= i32::MAX as usize)
+            .ok_or_else(|| {
+                in_memory_export_err(format!(
+                    "{n} k-mers of {k} bases exceed the {} byte limit of an Arrow Utf8 column",
+                    i32::MAX
+                ))
+            })?;
+
+        let mut seq_bytes: Vec<u8> = Vec::with_capacity(total_seq_bytes);
+        // An offsets buffer has one more entry than it has values: the
+        // leading 0 that opens the first string.
+        let mut seq_offsets: Vec<i32> = Vec::with_capacity(n + 1);
+        seq_offsets.push(0);
+
+        for (kmer_bits, count) in rows {
+            kmers.push(kmer_bits);
+            kmer::decode_kmer_into(kmer_bits, k, &mut seq_bytes);
+            // Bounded by `total_seq_bytes <= i32::MAX` above, so this cast
+            // is value-preserving for every row.
+            seq_offsets.push(seq_bytes.len() as i32);
+            freqs.push(count);
+        }
+
+        columns.push(Arc::new(UInt64Array::from(kmers)));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(seq_offsets));
+        let seq_arr: ArrayRef = Arc::new(
+            StringArray::try_new(offsets, Buffer::from_vec(seq_bytes), None)
+                .map_err(in_memory_export_err)?,
+        );
+        columns.push(seq_arr);
+    } else {
+        for (kmer_bits, count) in rows {
+            kmers.push(kmer_bits);
+            freqs.push(count);
+        }
+        columns.push(Arc::new(UInt64Array::from(kmers)));
     }
 
-    let u64_arr: ArrayRef = Arc::new(UInt64Array::from(kmers));
-    let offsets = OffsetBuffer::new(ScalarBuffer::from(seq_offsets));
-    let seq_arr: ArrayRef = Arc::new(
-        StringArray::try_new(offsets, Buffer::from_vec(seq_bytes), None).map_err(in_memory_export_err)?,
-    );
-    let freq_arr: ArrayRef = Arc::new(UInt32Array::from(freqs));
+    columns.push(Arc::new(UInt32Array::from(freqs)));
 
-    RecordBatch::try_new(schema, vec![u64_arr, seq_arr, freq_arr]).map_err(in_memory_export_err)
+    RecordBatch::try_new(schema, columns).map_err(in_memory_export_err)
 }
 
 /// The Python-visible result of `count()`. Holds the counter and QC summary
@@ -218,6 +444,10 @@ struct PyKmerCounts {
     counter: KmerCounter,
     qc: QcSummary,
     k: usize,
+    // Whether `.table` includes `kmer_sequence`. Fixed at construction time
+    // by `count(with_sequence=...)`: the cache below holds at most one
+    // batch, so this cannot be a per-call choice without invalidating it.
+    with_sequence: bool,
     table_cache: OnceLock<RecordBatch>,
 }
 
@@ -245,7 +475,9 @@ impl PyKmerCounts {
         let batch = match self.table_cache.get() {
             Some(cached) => cached.clone(),
             None => {
-                let built = py.allow_threads(|| build_record_batch(&self.counter, self.k))?;
+                let built = py.allow_threads(|| {
+                    build_record_batch(&self.counter, self.k, self.with_sequence)
+                })?;
                 // `OnceLock::set` can in general lose a race to a
                 // concurrent initializer, and that race is real here, not
                 // hypothetical: `py.allow_threads` above releases the GIL
@@ -407,7 +639,7 @@ fn open_fastq_reader(path: &PathBuf) -> Result<FastqReader<Box<dyn BufRead + Sen
 /// returns `FastDnaError::Cancelled`, which `impl From<..> for PyErr`
 /// above maps to `KeyboardInterrupt`.
 #[pyfunction]
-#[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=None, hpc=false))]
+#[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=None, hpc=false, with_sequence=false))]
 #[allow(clippy::too_many_arguments)]
 fn count(
     py: Python<'_>,
@@ -425,6 +657,12 @@ fn count(
     // for long-read (Nanopore/PacBio) input where indels inside homopolymer
     // runs, not substitutions, are the dominant sequencing error.
     hpc: bool,
+    // Include the decoded `kmer_sequence` column in `.table`. Off by
+    // default -- see `export::counts_schema`'s doc comment for the full
+    // rationale (it is derivable from `kmer_u64` and costs ~17% of a run's
+    // wall time on the benchmark file). `KmerCounts.with_sequence()`
+    // reconstructs it locally when this was left off.
+    with_sequence: bool,
 ) -> PyResult<PyKmerCounts> {
     let path_buf = PathBuf::from(path);
     let reader = open_fastq_reader(&path_buf)?;
@@ -640,7 +878,7 @@ fn count(
 
     let (counter, qc, _total_reads) = outcome?;
 
-    Ok(PyKmerCounts { counter, qc, k, table_cache: OnceLock::new() })
+    Ok(PyKmerCounts { counter, qc, k, with_sequence, table_cache: OnceLock::new() })
 }
 
 /// The Python-visible result of `peek()`. Wraps `preview::PreviewStats`
@@ -991,6 +1229,7 @@ fn in_memory_batch(schema: Arc<Schema>, columns: Vec<ArrayRef>) -> Result<Record
     RecordBatch::try_new(schema, columns).map_err(|e| FastDnaError::Export {
         path: PathBuf::from("<in-memory Arrow table>"),
         reason: e.to_string(),
+        source: Some(Box::new(e)),
     })
 }
 
@@ -1547,7 +1786,9 @@ fn cohort_presence_matrix(
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = m.py();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    register_exception_hierarchy(py, m)?;
     m.add_class::<PyKmerCounts>()?;
     m.add_class::<PyPreview>()?;
     m.add_class::<PySketch>()?;

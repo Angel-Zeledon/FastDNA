@@ -85,7 +85,7 @@ existing is genomic population structure.
 from __future__ import annotations
 
 import warnings
-from typing import NamedTuple
+from typing import Any, NamedTuple, Optional, Sequence, Union
 
 import numpy as np
 import pyarrow as pa
@@ -187,7 +187,12 @@ def _validate_matching_length(y_true, scores, score_name, caller):
     return scores
 
 
-def precision_recall_report(y_true, y_score, *, pos_label=None):
+def precision_recall_report(
+    y_true: Union[Sequence[Any], np.ndarray],
+    y_score: Union[Sequence[Any], np.ndarray],
+    *,
+    pos_label: Optional[Any] = None,
+) -> PrecisionRecallReport:
     """Precision-recall curve and average precision -- the metric to trust
     over ROC-AUC when the classes are imbalanced.
 
@@ -257,7 +262,14 @@ def precision_recall_report(y_true, y_score, *, pos_label=None):
     return PrecisionRecallReport(curve=curve, average_precision=float(average_precision))
 
 
-def calibration_report(y_true, y_prob, *, n_bins=10, strategy="uniform", pos_label=None):
+def calibration_report(
+    y_true: Union[Sequence[Any], np.ndarray],
+    y_prob: Union[Sequence[Any], np.ndarray],
+    *,
+    n_bins: int = 10,
+    strategy: str = "uniform",
+    pos_label: Optional[Any] = None,
+) -> CalibrationReport:
     """Reliability diagram and Brier score for probability estimates.
 
     A model can rank cases well (good average precision) while its

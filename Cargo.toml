@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Fast canonical k-mer counting from FASTQ, with a zero-copy Arrow bridge to Python"
-repository = "https://github.com/anzeledon/fastdna"
+repository = "https://github.com/Angel-Zeledon/FastDNA"
 readme = "README.md"
 keywords = ["bioinformatics", "genomics", "kmer", "fastq", "arrow"]
 categories = ["science", "command-line-utilities"]
@@ -30,6 +30,22 @@ crossbeam-channel = "0.5"
 rustc-hash = "2.0"
 
 # File processing and ML
+#
+# Default backend for gzip decompression: `miniz_oxide` (pure Rust, no C
+# toolchain needed to build this crate). `docs/audit/performance-v2.md`
+# (G-4) proposed switching unconditionally to flate2's `zlib-ng` backend
+# for faster inflate; measured instead of assumed -- see the comment above
+# `STREAM_BUFFER_BYTES` in `src/fastq.rs` for the full methodology and
+# numbers. Short version: zlib-ng won by 2.7-3.8x decompressing a
+# realistic `.fastq.gz` through this crate's own read path, in this
+# project's Docker verification container. The win is real, but so is the
+# cost: zlib-ng needs a C compiler and cmake at build time, which this
+# line does not, and `compile.bat` (the documented native-Windows build
+# path) runs a bare `cargo build --release` with neither set up. Landed as
+# the opt-in `zlib-ng` feature below instead of unconditionally, so
+# `default = []` keeps this line's build exactly as it is today on every
+# platform this session could not verify (Windows MSVC, macOS -- see
+# `src/fastq.rs` for the full list of what was and was not checked).
 flate2 = "1.0"
 parquet = { version = "53.4", default-features = false, features = ["flate2", "arrow", "snap"] }
 arrow = "53.4"
@@ -49,6 +65,16 @@ pyo3 = { version = "0.22", features = ["abi3-py38", "extension-module"], optiona
 default = []
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen"]
 python = ["dep:pyo3", "arrow/pyarrow"]
+# Opt-in: swaps flate2's inflate backend from miniz_oxide (default) to
+# zlib-ng, measured 2.7-3.8x faster decompressing a realistic .fastq.gz
+# through this crate's own read path (see the `flate2` dependency comment
+# above and `src/fastq.rs`). Not in `default` because it needs a C
+# compiler and cmake at build time that this crate otherwise does not --
+# true of the manylinux wheel containers and Bioconda, not guaranteed on
+# a contributor's native Windows machine building via `compile.bat`.
+# Enable with `cargo build --release --features zlib-ng`, or for the
+# Python wheel `maturin build --release --features python,zlib-ng`.
+zlib-ng = ["flate2/zlib-ng"]
 
 [dev-dependencies]
 # Test-only: used to build throwaway sample-discovery fixture directories.

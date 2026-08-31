@@ -10,6 +10,12 @@ right and explicit: what happens when a sample exists in one layer but not
 another, when IDs need light normalization to match across layers, and when
 a caller needs to know exactly which samples got dropped and why.
 
+**Status: frozen.** Per `docs/audit/PLAN.md` §2 ("Qué se poda"), this
+module is frozen: stable, not accepting new features, and a candidate for
+extraction into a separate `fastdna-contrib` package in a future release.
+Freezing is not deleting -- see that section for the full reasoning behind
+the boundary.
+
 This module is deliberately independent of `fastdna.sklearn.KmerVectorizer`
 (built by a parallel agent, not merged when this module was written): the
 join utilities here work over *any* per-sample tabular feature
@@ -36,13 +42,20 @@ Three pieces:
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
+from . import _column_as_array
 from . import count as _count
+
+if TYPE_CHECKING:
+    import pandas
 
 __all__ = ["kmer_feature_table", "join_omics_layers", "normalize_sample_ids", "JoinReport"]
 
@@ -71,7 +84,14 @@ _ID_FROM_STRATEGIES = {
 }
 
 
-def kmer_feature_table(sample_paths, *, k=31, min_count=1, top_features=None, id_from="filename"):
+def kmer_feature_table(
+    sample_paths: Union[Dict[str, Union[str, os.PathLike]], Iterable[Union[str, os.PathLike]]],
+    *,
+    k: int = 31,
+    min_count: int = 1,
+    top_features: Optional[int] = None,
+    id_from: str = "filename",
+) -> pa.Table:
     """Runs `fastdna.count()` once per sample and assembles the results
     into a single wide `pyarrow.Table`: one row per `sample_id`, one column
     per k-mer, plus a `sample_id` column.
@@ -136,43 +156,93 @@ def kmer_feature_table(sample_paths, *, k=31, min_count=1, top_features=None, id
                 )
             id_to_path[sample_id] = path
 
-    # Per-sample {kmer_sequence: frequency} dicts, computed once each.
-    per_sample_counts = {}
-    for sample_id, path in id_to_path.items():
-        result = _count(path, k=k, min_count=min_count)
-        table = result.table
-        sequences = table.column("kmer_sequence").to_pylist()
-        frequencies = table.column("frequency").to_pylist()
-        per_sample_counts[sample_id] = dict(zip(sequences, frequencies))
+    # Everything below this point is a columnar operation over Arrow arrays,
+    # not a Python loop over cells. That is not a stylistic preference: this
+    # function is O(samples x vocabulary) by construction -- a 50-sample
+    # cohort with a 10,000-k-mer vocabulary is a 500,000-cell table -- and
+    # the previous implementation touched every one of those cells at least
+    # three times from Python. It built a `{kmer: frequency}` dict per
+    # sample (two `to_pylist()` calls and one dict construction each), then
+    # accumulated cross-sample totals by iterating every (sample, k-mer)
+    # pair one at a time, then materialised the output with one
+    # `dict.get()` per cell. Arrow does each of those three passes in C++
+    # instead, leaving Python with `samples` kernel invocations and one
+    # transpose rather than several million interpreter steps.
+    #
+    # The output is unchanged, column for column and value for value: the
+    # k-mer alphabet is ASCII `ACGT`, so Arrow's bytewise string ordering
+    # and Python's `sorted()` agree exactly, and `to_pylist()` on the
+    # `uint32` frequency column yields the same Python ints the dict held.
+    sample_ids = list(id_to_path)
+    if not sample_ids:
+        # No samples: there is nothing to concatenate or group, and
+        # `pa.concat_arrays([])` cannot infer a type from an empty list.
+        # Returns exactly what the row-by-row version returned here.
+        return pa.table({"sample_id": sample_ids})
 
-    # Total count per k-mer, summed across all samples -- used both to pick
+    per_sample_sequences = []
+    per_sample_frequencies = []
+    for sample_id in sample_ids:
+        # `with_sequence=True`: this function's output columns *are* k-mer
+        # sequences, so the decoded column is not skippable overhead here
+        # the way it is for the ML-facing paths that stay in `u64` space.
+        table = _count(id_to_path[sample_id], k=k, min_count=min_count, with_sequence=True).table
+        # `_column_as_array` flattens the `ChunkedArray` a `Table.column()`
+        # hands back, so `pa.concat_arrays` below sees one contiguous
+        # `Array` per sample regardless of how many chunks it arrived in.
+        per_sample_sequences.append(_column_as_array(table.column("kmer_sequence")))
+        per_sample_frequencies.append(_column_as_array(table.column("frequency")))
+
+    # Total count per k-mer across all samples -- used both to pick
     # `top_features` (when set) and, either way, to fix a deterministic
-    # column order.
-    totals = {}
-    for counts in per_sample_counts.values():
-        for kmer, freq in counts.items():
-            totals[kmer] = totals.get(kmer, 0) + freq
+    # column order. One hash-aggregate over the stacked per-sample columns
+    # replaces the nested dict accumulation.
+    stacked = pa.table(
+        {
+            "kmer": pa.concat_arrays(per_sample_sequences),
+            "total": pa.concat_arrays(per_sample_frequencies),
+        }
+    )
+    totals = stacked.group_by("kmer").aggregate([("total", "sum")])
+    kmers = totals.column("kmer")
 
     if top_features is not None:
-        ranked = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
-        vocabulary = sorted(kmer for kmer, _ in ranked[:top_features])
+        # `(-count, kmer)` in the old Python sort key, expressed as Arrow's
+        # own two-key sort: highest total first, ties broken by the k-mer's
+        # own sequence. The kept slice is then re-sorted by sequence alone,
+        # because the emitted column order is always alphabetical -- the
+        # ranking only decides *which* k-mers survive, never where they sit.
+        ranked = pc.sort_indices(
+            totals, sort_keys=[("total_sum", "descending"), ("kmer", "ascending")]
+        )
+        kept = kmers.take(ranked[:top_features])
+        vocabulary = kept.take(pc.sort_indices(kept)).to_pylist()
     else:
-        vocabulary = sorted(totals)
+        vocabulary = kmers.take(pc.sort_indices(kmers)).to_pylist()
 
-    sample_ids = list(id_to_path)
-    # The per-sample dicts, resolved once rather than once per cell of the
-    # output: a 10,000-k-mer vocabulary over 50 samples used to do 500,000
-    # lookups into `per_sample_counts` on top of the 500,000 count lookups
-    # the table actually needs -- the sample order is fixed, so 50 suffice.
-    counts_in_order = [per_sample_counts[sid] for sid in sample_ids]
+    vocabulary_array = pa.array(vocabulary, type=pa.string())
+    rows = []
+    for sequences, frequencies in zip(per_sample_sequences, per_sample_frequencies):
+        # One vectorized hash lookup per *sample* in place of one Python
+        # dict lookup per cell. `index_in` resolves each vocabulary entry to
+        # its position in this sample's own k-mer list (null when the sample
+        # never saw it), `take` gathers the frequencies at those positions,
+        # and the nulls become 0 -- "not observed in this sample", which is
+        # the sparse-count semantics documented above, not a missing value.
+        positions = pc.index_in(vocabulary_array, value_set=sequences)
+        aligned = pc.take(frequencies, positions)
+        rows.append(pc.fill_null(aligned, 0).to_pylist())
+
+    # `rows` is one list per sample; the table wants one column per k-mer.
+    # `zip(*rows)` is that transpose, done once in C rather than by
+    # re-indexing every sample once per k-mer column.
     columns = {"sample_id": sample_ids}
-    for kmer in vocabulary:
-        columns[kmer] = [counts.get(kmer, 0) for counts in counts_in_order]
+    columns.update(zip(vocabulary, map(list, zip(*rows))))
 
     return pa.table(columns)
 
 
-def normalize_sample_ids(ids, *, strategy="lower_strip_punct"):
+def normalize_sample_ids(ids: Iterable[Any], *, strategy: str = "lower_strip_punct") -> List[str]:
     """Normalizes a list/Series of sample-ID strings so that IDs differing
     only cosmetically (case, punctuation, whitespace) can be made to match
     across layers before a join.
@@ -371,7 +441,12 @@ def _fill_missing(df, on, column_owner_ids):
     return df
 
 
-def join_omics_layers(layers, *, on="sample_id", how="inner"):
+def join_omics_layers(
+    layers: Dict[str, Any],  # each value: pandas.DataFrame, polars.DataFrame, or pyarrow.Table
+    *,
+    on: str = "sample_id",
+    how: Union[str, Dict[str, str]] = "inner",
+) -> Tuple["pandas.DataFrame", JoinReport]:
     """Joins several omics layers into a single `pandas.DataFrame`, on the
     `on` column (default `"sample_id"`) that each layer's table must carry
     alongside its own feature columns.

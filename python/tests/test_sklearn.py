@@ -59,7 +59,9 @@ def test_transform_shape_and_values_match_manual_counts(tmp_path):
     a = write_fastq(tmp_path, "a.fastq", ["ACGTACGTAC"] * 3)
     b = write_fastq(tmp_path, "b.fastq", ["ACGTACGTAC"] * 6)
 
-    vec = KmerVectorizer(k=5, top_features=None)
+    # representation="count": this test asserts on raw per-sample counts,
+    # not the default presence (0/1) representation.
+    vec = KmerVectorizer(k=5, top_features=None, representation="count")
     vec.fit([str(a), str(b)])
     matrix = vec.transform([str(a), str(b)])
 
@@ -418,7 +420,15 @@ def test_get_params_round_trips():
     vec = KmerVectorizer(k=21, min_count=3, top_features=500, threads=2)
     params = vec.get_params()
 
-    assert params == {"k": 21, "min_count": 3, "top_features": 500, "threads": 2}
+    assert params == {
+        "k": 21,
+        "min_count": 3,
+        "top_features": 500,
+        "threads": 2,
+        "counts": None,
+        "representation": "presence",
+        "chunk_size": None,
+    }
 
     from sklearn.base import clone
 
@@ -454,14 +464,16 @@ def test_transform_columns_line_up_positionally_with_get_feature_names_out(tmp_p
     a = write_fastq(tmp_path, "a.fastq", reads)
     b = write_fastq(tmp_path, "b.fastq", ["TTTTGGGGCCCCAAAATTTTGGGGCCCCAAAA"] * 2)
 
-    vec = KmerVectorizer(k=k, top_features=None).fit([str(a), str(b)])
+    # representation="count": this test compares transform()'s values
+    # against raw per-sample frequencies, not the default presence (0/1).
+    vec = KmerVectorizer(k=k, top_features=None, representation="count").fit([str(a), str(b)])
     names = list(vec.get_feature_names_out())
     dense = vec.transform([str(a), str(b)]).toarray()
 
     assert len(names) == dense.shape[1] == len(vec.vocabulary_)
 
     for sample_index, path in enumerate([a, b]):
-        table = fastdna.count(str(path), k=k).table
+        table = fastdna.count(str(path), k=k, with_sequence=True).table
         truth = dict(
             zip(table.column("kmer_sequence").to_pylist(), table.column("frequency").to_pylist())
         )
@@ -513,7 +525,7 @@ def test_leakage_guarantee_check_actually_catches_a_leaky_transform(tmp_path):
             # their own k-mers to the vocabulary.
             for path in [str(p) for p in X]:
                 table = fastdna.count(
-                    path, k=self.k, min_count=self.min_count, threads=self.threads
+                    path, k=self.k, min_count=self.min_count, threads=self.threads, with_sequence=True
                 ).table
                 known = set(int(x) for x in self.vocabulary_.tolist())
                 for kmer, seq in zip(
@@ -627,3 +639,139 @@ def test_cross_validation_vocabulary_excludes_kmers_unique_to_the_test_fold(tmp_
         checked_splits += 1
 
     assert checked_splits == 3
+
+
+# ---------------------------------------------------------------------------
+# chunk_size -- streaming vocabulary learning over a cohort too large to hold
+# in memory all at once (docs/audit/ml-gaps.md G-9).
+#
+# `chunk_size` is designed to be exact, not approximate: folding each
+# batch's local (prevalence, total_freq) tally into a running one is plain
+# addition, so the final vocabulary must be bit-for-bit identical to what
+# `chunk_size=None` produces on the same cohort, for any chunk_size and any
+# ordering. Every test below leans on that -- comparing a chunked run
+# directly against an unchunked control -- rather than asserting some
+# specific vocabulary content, so a merge bug (e.g. overwriting instead of
+# summing a k-mer's running tally across chunks) would show up as a mismatch
+# against the control, not just as "a plausible-looking vocabulary".
+# ---------------------------------------------------------------------------
+
+
+def _chunk_size_test_cohort(tmp_path):
+    """5 samples sharing a common backbone motif (so at least one k-mer's
+    prevalence must be summed *across* chunk boundaries for every chunk_size
+    tested below) plus a private marker motif per sample (so each sample
+    also contributes k-mers no other sample has, and a chunk boundary that
+    splits the cohort differently still has real, non-trivial content on
+    both sides of the split).
+    """
+    backbone = "ACGTACGTACGTACGTACGT"
+    markers = [
+        "GCTAAAGACAATTACATAAC",
+        "ATACACGTCAGCACGAAACT",
+        "TGTTGGCCCAGTGTGAATCG",
+        "CTTAAGGGTTAAGTAAGTGT",
+        "CTGTGTCCACCCCATCGGAC",
+    ]
+    paths = []
+    for i, marker in enumerate(markers):
+        p = write_fastq(tmp_path, f"s{i}.fastq", [backbone] * 3 + [marker] * 3)
+        paths.append(str(p))
+    return paths
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 1000])
+def test_chunked_fit_matches_unchunked_fit_exactly(tmp_path, chunk_size):
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+
+    chunked = KmerVectorizer(k=k, top_features=None, chunk_size=chunk_size).fit(paths)
+    unchunked = KmerVectorizer(k=k, top_features=None).fit(paths)
+
+    assert list(chunked.vocabulary_) == list(unchunked.vocabulary_), (
+        f"chunk_size={chunk_size} produced a different vocabulary order than "
+        "the unchunked control -- the running tally must be a bit-for-bit "
+        "sum, not an approximation"
+    )
+    assert chunked.n_features_in_ == unchunked.n_features_in_
+    assert list(chunked.get_feature_names_out()) == list(unchunked.get_feature_names_out())
+
+
+def test_chunked_fit_respects_top_features_cap_identically(tmp_path):
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+
+    capped_chunked = KmerVectorizer(k=k, top_features=3, chunk_size=2).fit(paths)
+    capped_unchunked = KmerVectorizer(k=k, top_features=3).fit(paths)
+
+    assert len(capped_chunked.vocabulary_) == 3
+    assert list(capped_chunked.vocabulary_) == list(capped_unchunked.vocabulary_)
+
+
+def test_chunk_size_larger_than_cohort_is_a_noop(tmp_path):
+    # A single "chunk" covering the whole cohort must degenerate to exactly
+    # the unchunked path.
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+
+    chunked = KmerVectorizer(k=k, top_features=None, chunk_size=10_000).fit(paths)
+    unchunked = KmerVectorizer(k=k, top_features=None).fit(paths)
+    assert list(chunked.vocabulary_) == list(unchunked.vocabulary_)
+
+
+def test_chunked_fit_then_transform_matches_unchunked(tmp_path):
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+
+    chunked = KmerVectorizer(k=k, top_features=None, chunk_size=2).fit(paths)
+    unchunked = KmerVectorizer(k=k, top_features=None).fit(paths)
+
+    matrix_chunked = chunked.transform(paths)
+    matrix_unchunked = unchunked.transform(paths)
+    assert (matrix_chunked != matrix_unchunked).nnz == 0
+
+
+def test_chunked_fit_transform_matches_unchunked_fit_transform(tmp_path):
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+
+    matrix_chunked = KmerVectorizer(k=k, top_features=None, chunk_size=2).fit_transform(paths)
+    matrix_unchunked = KmerVectorizer(k=k, top_features=None).fit_transform(paths)
+    assert (matrix_chunked != matrix_unchunked).nnz == 0
+
+
+def test_chunk_size_interoperates_with_precomputed_cohort_counts(tmp_path):
+    """`chunk_size` and `counts=` (a precomputed `fastdna.CohortCounts`) are
+    not mutually exclusive: each chunk becomes `self.counts.subset(...)` for
+    that batch's sample_ids only, instead of one all-at-once `subset()`
+    call. Must still be exact.
+    """
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+    cohort = fastdna.count_cohort(paths, k=k)
+
+    chunked = KmerVectorizer(k=k, top_features=None, counts=cohort, chunk_size=2)
+    chunked.fit(list(cohort.sample_ids))
+
+    unchunked = KmerVectorizer(k=k, top_features=None, counts=cohort)
+    unchunked.fit(list(cohort.sample_ids))
+
+    assert list(chunked.vocabulary_) == list(unchunked.vocabulary_)
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, -100])
+def test_non_positive_chunk_size_raises_valueerror(tmp_path, bad_value):
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTAC"] * 3)
+    with pytest.raises(ValueError):
+        KmerVectorizer(k=5, chunk_size=bad_value).fit([str(path)])
+
+
+def test_chunk_size_default_is_none_and_unused(tmp_path):
+    # The opt-in contract: omitting chunk_size entirely must behave
+    # identically to passing chunk_size=None explicitly (and to every test
+    # above this section, none of which pass chunk_size at all).
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTAC"] * 3)
+    vec = KmerVectorizer(k=5, top_features=None)
+    assert vec.chunk_size is None
+    vec.fit([str(path)])
+    assert len(vec.vocabulary_) == 2

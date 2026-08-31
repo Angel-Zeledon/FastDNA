@@ -1,0 +1,168 @@
+# Configuration for the FastDNA documentation site (audit finding H-20).
+#
+# The point of this site is to *publish docstrings that already exist*, not
+# to write a second copy of them. `python/fastdna/` is ~12,000 lines of
+# Python whose 30 submodules each carry a long, carefully written module
+# docstring and a curated `__all__`; until this file existed, the only way
+# to read any of it was to open the source on GitHub, and the README
+# documented 5 of the 15 names in `fastdna.__all__` and none of the
+# submodules.
+#
+# MkDocs + mkdocstrings rather than Sphinx: these docstrings are Markdown
+# prose (headings, fenced code, tables), not reStructuredText. mkdocstrings
+# renders them as-is; Sphinx would mean either rewriting every docstring or
+# adding and configuring myst-parser to reach the same place.
+#
+# mkdocstrings' Python handler reads the package *statically* (via griffe),
+# so building this site does NOT require the `fastdna._core` Rust extension
+# to be compiled, nor scikit-learn/scipy/matplotlib/shap to be installed.
+# That is deliberate: the docs job in .github/workflows/docs.yml needs no
+# Rust toolchain and no maturin build. Do not switch the handler to dynamic
+# analysis without also giving that job a compiled extension module.
+
+site_name: FastDNA
+site_description: >-
+  Fast canonical k-mer counting from FASTQ, with a zero-copy Arrow bridge to
+  Python and a leakage-aware machine-learning layer on top of it.
+# Used only for the sitemap and the <link rel="canonical"> tag. This is the
+# default GitHub Pages URL for this repository; it is correct only once
+# Pages is actually enabled (see .github/workflows/docs.yml, which does not
+# assume it has been).
+site_url: https://angel-zeledon.github.io/FastDNA/
+repo_url: https://github.com/Angel-Zeledon/FastDNA
+repo_name: Angel-Zeledon/FastDNA
+# No "edit this page" links: most of the text on the API pages does not live
+# in the Markdown file being viewed, it lives in a Python docstring, so an
+# edit link would send people to a three-line file containing `::: fastdna.x`.
+edit_uri: ""
+copyright: MIT OR Apache-2.0
+
+# The repository already has a `docs/` directory full of internal design
+# documents, benchmark methodology and audit reports written for maintainers
+# (docs/BENCHMARKS.md, docs/design-minimizer-counting.md, docs/audit/...).
+# Those are not this site. `docs_dir` therefore points at a subdirectory that
+# contains only the site's own pages, so `mkdocs build` neither publishes nor
+# has to be told to ignore ~400 KB of internal Markdown.
+docs_dir: docs/site
+# Build output goes under `target/`, which .gitignore already ignores, so a
+# local `mkdocs build` never leaves an untracked directory in `git status`.
+site_dir: target/docs-site
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - content.code.copy
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          # The package is not installed in the docs build environment; it is
+          # read from the source tree. `python` is the `python-source`
+          # directory declared in pyproject.toml's [tool.maturin].
+          paths: [python]
+          options:
+            # This codebase's parameter documentation is NumPy-style
+            # ("Parameters" / "----------"); 105 such sections across 18
+            # modules. Everything else in the docstrings is plain Markdown
+            # prose, which is passed through untouched.
+            #
+            # The alternative -- `docstring_style: null`, i.e. no section
+            # parsing at all -- is worse here, not simpler: Python-Markdown
+            # would turn every "Parameters/----------" into a setext <h2> and
+            # every 4-space-indented parameter description into a code block.
+            docstring_style: numpy
+            docstring_section_style: table
+            docstring_options:
+              # Griffe's NumPy parser warns about three docstrings in this
+              # package, and `mkdocs build --strict` turns any warning into a
+              # build failure. All three defects are in the docstrings
+              # themselves, and fixing docstrings is a change to
+              # `python/fastdna/*.py`, not to the docs configuration:
+              #
+              #   * cv.py `lineage_groups` and annotate.py `annotate_rule` /
+              #     `export_bed` continue in ordinary prose *inside* the
+              #     `Parameters` block instead of closing it first, so lines
+              #     like "Why **single** linkage: ..." parse as a parameter
+              #     named "Why". numpydoc itself would object to the same
+              #     lines. The prose still renders, but as extra rows of the
+              #     parameter table rather than as a paragraph.
+              #   * genomic_model.py indents seven continuation lines by 2
+              #     spaces where NumPy style wants 4.
+              #
+              # Suppressing the warnings keeps `--strict` meaningful for
+              # everything it is actually here to catch -- broken internal
+              # links, dangling nav entries, unresolvable `:::` identifiers --
+              # instead of making the build unable to pass at all. The cost is
+              # that a *new* malformed docstring will not fail this build
+              # either: remove this line once those three are corrected.
+              warnings: false
+            # `show_source: false` on purpose. The source is one click away
+            # on GitHub, and several of these modules are 1,000+ lines with
+            # long explanatory comment blocks that would dwarf the rendered
+            # documentation on the page.
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            show_signature_annotations: true
+            separate_signature: true
+            # Members in the order the author wrote them, which in this
+            # codebase is a deliberate reading order (the entry point first,
+            # its supporting types after it), not alphabetical noise.
+            members_order: source
+            filters: ["!^_"]
+            # These classes document their constructor parameters in the
+            # class docstring (scikit-learn convention, e.g.
+            # `fastdna.sklearn.KmerVectorizer`), so the `__init__` entry
+            # would otherwise render as an undocumented duplicate.
+            merge_init_into_class: true
+            inherited_members: false
+
+# Every page below exists and has real content. There are no stub pages: an
+# area with nothing accurate to say about it is simply not listed.
+nav:
+  - Overview: index.md
+  - Installation: installation.md
+  - Getting started: getting-started.md
+  - API reference:
+      - Counting: api/counting.md
+      - Sketching and comparison: api/sketching.md
+      - Cohorts and features: api/cohorts.md
+      - Evaluation and validation: api/evaluation.md
+      - Models and workflows: api/models.md
+      - Genomics utilities: api/genomics.md

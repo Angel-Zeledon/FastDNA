@@ -79,7 +79,7 @@ import pathlib
 import warnings
 from collections.abc import Mapping
 from functools import partial
-from typing import NamedTuple
+from typing import Any, Iterable, NamedTuple, Optional, Sequence, Union
 
 import numpy as np
 import pyarrow as pa
@@ -96,6 +96,18 @@ __all__ = [
     "kinship_matrix",
     "prefilter_association",
 ]
+
+# A path accepted anywhere in this module: a `str`, or anything implementing
+# `os.PathLike` (e.g. `pathlib.Path`) -- every such parameter is converted
+# with `str(path)` before use, matching `fastdna/__init__.py`'s own
+# `_PathLike` convention.
+_PathLike = Union[str, os.PathLike]
+
+# The cohort input accepted by `cohort_presence_matrix`, `export_pyseer_kmers`
+# and `kinship_matrix`: an iterable of paths (sample ids derived from each
+# file name) or an explicit `{sample_id: path}` mapping -- see
+# `_resolve_cohort`.
+_CohortPaths = Union[Iterable[_PathLike], Mapping[str, _PathLike]]
 
 
 class ScreeningOnlyWarning(UserWarning):
@@ -205,7 +217,14 @@ def _positive_int_or_none(value, name):
     return int(value)
 
 
-def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers=None):
+def cohort_presence_matrix(
+    paths: _CohortPaths,
+    *,
+    k: int = 31,
+    min_count: int = 2,
+    min_samples: int = 2,
+    max_kmers: Optional[int] = None,
+) -> tuple[sparse.csr_matrix, list[str], list[str]]:
     """Counts every sample once and returns the cohort as one sparse matrix.
 
     This is the substrate a k-mer GWAS (and any other cohort-level model)
@@ -508,7 +527,14 @@ class PyseerExport(NamedTuple):
     gzipped: bool
 
 
-def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2):
+def export_pyseer_kmers(
+    paths: _CohortPaths,
+    out_path: _PathLike,
+    *,
+    k: int = 31,
+    min_count: int = 2,
+    min_samples: int = 2,
+) -> PyseerExport:
     """Writes the cohort as a pyseer `--kmers` input file.
 
     Format targeted
@@ -614,7 +640,9 @@ def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2):
     )
 
 
-def kinship_matrix(paths, *, k=21, sketch_size=10_000):
+def kinship_matrix(
+    paths: _CohortPaths, *, k: int = 21, sketch_size: int = 10_000
+) -> tuple[np.ndarray, list[str]]:
     """A sample-by-sample similarity matrix derived from FastDNA's Mash
     distances -- the population-structure covariance a mixed-model GWAS
     needs as its random effect.
@@ -871,7 +899,14 @@ _SCREENING_METADATA = {
 }
 
 
-def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", top_n=None):
+def prefilter_association(
+    matrix: Union[sparse.spmatrix, np.ndarray],
+    phenotype: Union[Sequence[Any], np.ndarray],  # array-like; converted with np.asarray() below
+    kmer_sequences: Sequence[str],
+    *,
+    test: str = "fisher",
+    top_n: Optional[int] = None,
+) -> pa.Table:
     """A fast, **unadjusted** per-k-mer screen of a binary or continuous
     phenotype.
 

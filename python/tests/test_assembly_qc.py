@@ -303,7 +303,9 @@ class TestEvaluateKmersLowLevelEntryPoint:
         assert math.isinf(result.qv)
 
     def test_accepts_an_iterable_of_kmer_strings(self, reads_path):
-        reads_counts = fastdna.count(str(reads_path), k=_K)
+        # with_sequence=True: this test pulls decoded strings straight out
+        # of the table below, which needs the column present.
+        reads_counts = fastdna.count(str(reads_path), k=_K, with_sequence=True)
 
         # A minimal, deliberately tiny assembly k-mer "set" as a plain
         # list of canonical k-mer strings pulled straight from the reads'

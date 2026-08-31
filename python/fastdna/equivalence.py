@@ -183,7 +183,7 @@ the full column count.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -220,7 +220,7 @@ class EquivalenceClasses(NamedTuple):
     members: object  # pyarrow.Table
 
 
-def collapse_equivalence_classes(matrix, kmer_sequences) -> EquivalenceClasses:
+def collapse_equivalence_classes(matrix: sparse.spmatrix, kmer_sequences: Sequence[str]) -> EquivalenceClasses:
     """Collapses columns of `matrix` that share an identical presence/
     absence profile into one equivalence class each.
 

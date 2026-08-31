@@ -81,6 +81,9 @@ rather than left to chance.)
 """
 from __future__ import annotations
 
+import os
+from typing import Iterable, Union
+
 import pyarrow as pa
 
 from . import _core
@@ -165,7 +168,9 @@ def _translate_table(ids, sequences, frames, table, to_stop):
     return pa.Table.from_batches([batch])
 
 
-def translate(sequences, *, frame=1, table=1, to_stop=False):
+def translate(
+    sequences: Union[str, Iterable[str]], *, frame: int = 1, table: int = 1, to_stop: bool = False
+) -> Union[str, list[str]]:
     """Translate DNA in one reading frame.
 
     Parameters
@@ -220,7 +225,9 @@ def translate(sequences, *, frame=1, table=1, to_stop=False):
     return proteins[0] if was_single else proteins
 
 
-def translate_six_frames(sequences, *, table=1, to_stop=False):
+def translate_six_frames(
+    sequences: Union[str, Iterable[str]], *, table: int = 1, to_stop: bool = False
+) -> Union[dict[int, str], list[dict[int, str]]]:
     """Translate DNA in all six reading frames at once.
 
     The reason to want all six: for an unannotated read or contig, nothing
@@ -280,7 +287,9 @@ def translate_six_frames(sequences, *, table=1, to_stop=False):
     return grouped[0] if was_single else grouped
 
 
-def translate_file(path, *, frames=(1, 2, 3, -1, -2, -3), table=1):
+def translate_file(
+    path: Union[str, os.PathLike], *, frames: Iterable[int] = (1, 2, 3, -1, -2, -3), table: int = 1
+) -> pa.Table:
     """Stream a FASTA or FASTQ file (optionally gzipped) through the Rust
     reader and translate every record.
 
@@ -359,7 +368,7 @@ def translate_file(path, *, frames=(1, 2, 3, -1, -2, -3), table=1):
     return pa.Table.from_batches([batch])
 
 
-def protein_kmers(proteins, k=3):
+def protein_kmers(proteins: Union[str, Iterable[str]], k: int = 3) -> pa.Table:
     """Count k-mers of *amino acids* within each protein.
 
     The protein-level counterpart of `fastdna.count()`'s DNA k-mers, and a

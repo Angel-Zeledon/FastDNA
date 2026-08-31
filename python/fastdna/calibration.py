@@ -85,6 +85,8 @@ not at module scope, matching `fastdna.cv` and `fastdna.rules`.
 
 from __future__ import annotations
 
+from typing import Any, Optional
+
 import numpy as np
 
 __all__ = ["CalibratedEstimator", "calibrate"]
@@ -195,7 +197,16 @@ class CalibratedEstimator:
         Which calibration method `calibrate()` fit.
     """
 
-    def __init__(self, estimator, classes, method, *, calib_scores=None, calib_labels01=None, platt=None):
+    def __init__(
+        self,
+        estimator: Any,  # any fitted scikit-learn-style estimator; too varied to type precisely
+        classes: np.ndarray,
+        method: str,
+        *,
+        calib_scores: Optional[np.ndarray] = None,
+        calib_labels01: Optional[np.ndarray] = None,
+        platt: Optional[Any] = None,  # a fitted sklearn.linear_model.LogisticRegression, or None
+    ) -> None:
         self.estimator_ = estimator
         self.classes_ = classes
         self.method = method
@@ -203,7 +214,7 @@ class CalibratedEstimator:
         self._calib_labels01 = calib_labels01
         self._platt = platt
 
-    def predict_proba(self, X):
+    def predict_proba(self, X: Any) -> np.ndarray:  # array-like or scipy sparse matrix
         """`(n_samples, 2)` calibrated probabilities, columns ordered as
         `classes_` -- unlike the wrapped estimator's own `predict_proba()`
         (which, for `SetCoveringClassifier`, is a hard 0/1), these numbers
@@ -219,7 +230,9 @@ class CalibratedEstimator:
             positive = self._platt.predict_proba(scores.reshape(-1, 1))[:, 1]
         return np.column_stack((1.0 - positive, positive))
 
-    def predict_interval(self, X):
+    def predict_interval(
+        self, X: Any  # array-like or scipy sparse matrix
+    ) -> tuple[np.ndarray, np.ndarray]:
         """The Venn-ABERS multiprobability interval `(p0, p1)`, each a
         float64 array of shape `(n_samples,)`: the two isotonic-regression
         probabilities described in the module docstring, `p0 <= p1`. The
@@ -242,7 +255,7 @@ class CalibratedEstimator:
         _point, p0, p1 = _ivap_predict(self._calib_scores, self._calib_labels01, scores)
         return p0, p1
 
-    def predict(self, X):
+    def predict(self, X: Any) -> np.ndarray:  # array-like or scipy sparse matrix
         """The predicted label per sample (the class with the higher
         calibrated probability), taken from `classes_`.
         """
@@ -250,7 +263,13 @@ class CalibratedEstimator:
         return self.classes_[proba.argmax(axis=1)]
 
 
-def calibrate(estimator, X_calib, y_calib, *, method="venn_abers"):
+def calibrate(
+    estimator: Any,  # any fitted scikit-learn-style estimator; too varied to type precisely
+    X_calib: Any,  # array-like or scipy sparse matrix
+    y_calib: Any,  # array-like, accepted by np.asarray()
+    *,
+    method: str = "venn_abers",
+) -> CalibratedEstimator:
     """Wraps a fitted, score-producing estimator so its probabilities are
     genuinely calibrated, using a held-out calibration set.
 

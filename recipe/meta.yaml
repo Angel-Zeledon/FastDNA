@@ -39,7 +39,7 @@ source:
   # because it reliably carries Cargo.lock, which a reproducible
   # vendored-deps build needs; a maturin-built PyPI sdist may or may not,
   # depending on how it was produced. Check before switching to pypi.org.
-  url: https://github.com/anzeledon/fastdna/archive/refs/tags/v{{ version }}.tar.gz
+  url: https://github.com/Angel-Zeledon/FastDNA/archive/refs/tags/v{{ version }}.tar.gz
   # PLACEHOLDER -- 64 zeros, the right shape for a sha256 but not a real
   # checksum of anything. There is no tagged release yet to compute one
   # from. Replace before submitting.
@@ -80,7 +80,7 @@ test:
   # or copied in a `run_test.sh`).
 
 about:
-  home: https://github.com/anzeledon/fastdna
+  home: https://github.com/Angel-Zeledon/FastDNA
   # Dual-licensed, the Rust ecosystem's convention: see Cargo.toml's
   # `license = "MIT OR Apache-2.0"` and both LICENSE files in the source
   # tree. Bioconda requires an explicit license and license_file, and both
@@ -112,12 +112,12 @@ about:
 
     See the project README for benchmarks against KMC3 and FastK, the
     Python API reference, and stated limitations.
-  doc_url: https://github.com/anzeledon/fastdna#readme
-  dev_url: https://github.com/anzeledon/fastdna
+  doc_url: https://github.com/Angel-Zeledon/FastDNA#readme
+  dev_url: https://github.com/Angel-Zeledon/FastDNA
 
 extra:
   recipe-maintainers:
-    - anzeledon
+    - Angel-Zeledon
   # `identifiers:` intentionally omitted -- it would carry a Zenodo/paper
   # DOI, and this project has none yet. An empty entry parses as null and
   # is worse than leaving the key out; add the block back once a DOI exists.

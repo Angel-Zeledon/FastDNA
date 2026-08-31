@@ -1,0 +1,162 @@
+"""fastdna.count_cohort() / CohortCounts: count once, reuse everywhere.
+
+The two tests that matter are the equivalence (the fast path cannot change
+the answer) and the read-count (the fast path has to actually be fast).
+Without the second, this module could be doing nothing useful and the
+other tests would still pass.
+"""
+from __future__ import annotations
+
+import pytest
+
+import fastdna
+
+# Guarded, and in this order, on purpose: a bare `import numpy` above the
+# `importorskip`s (the shape test_sklearn.py and others used to have) makes
+# pytest raise during *collection* rather than skipping in an environment
+# with none of these installed -- see
+# `test_optional_dependencies.py::test_the_test_suite_itself_collects_in_the_environment_ci_builds`,
+# which exists specifically to catch a module reintroducing this.
+pytest.importorskip("sklearn")
+pytest.importorskip("scipy")
+np = pytest.importorskip("numpy")
+
+from sklearn.linear_model import LogisticRegression  # noqa: E402
+from sklearn.model_selection import cross_val_score  # noqa: E402
+from sklearn.pipeline import make_pipeline  # noqa: E402
+
+from fastdna.sklearn import KmerVectorizer  # noqa: E402
+
+
+def _cohort(tmp_path, n=12):
+    rng = np.random.default_rng(0)
+    bases = np.array(list("ACGT"))
+    paths = []
+    for i in range(n):
+        seq = "".join(rng.choice(bases, size=600))
+        reads = [seq[j : j + 100] for j in range(0, 500, 50)]
+        p = tmp_path / f"S{i:02d}.fastq"
+        p.write_text("".join(f"@r{j}\n{r}\n+\n{'I' * len(r)}\n" for j, r in enumerate(reads)))
+        paths.append(str(p))
+    return paths
+
+
+def test_count_cohort_derives_sample_ids_from_filenames(tmp_path):
+    paths = _cohort(tmp_path, n=3)
+    counts = fastdna.count_cohort(paths, k=11)
+
+    assert len(counts) == 3
+    assert set(counts.sample_ids) == {"S00", "S01", "S02"}
+    assert sum(counts.row_counts) == len(counts.kmers)
+
+
+def test_count_cohort_accepts_an_explicit_id_mapping(tmp_path):
+    paths = _cohort(tmp_path, n=2)
+    mapping = {"patientA": paths[0], "patientB": paths[1]}
+    counts = fastdna.count_cohort(mapping, k=11)
+    assert counts.sample_ids == ("patientA", "patientB")
+
+
+def test_count_cohort_rejects_a_filename_collision(tmp_path):
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    a_dir.mkdir()
+    b_dir.mkdir()
+    for d in (a_dir, b_dir):
+        (d / "S1.fastq").write_text("@r\nACGTACGTACGT\n+\nIIIIIIIIIIII\n")
+    with pytest.raises(ValueError, match="S1"):
+        fastdna.count_cohort([str(a_dir / "S1.fastq"), str(b_dir / "S1.fastq")], k=6)
+
+
+def test_count_cohort_rejects_an_empty_input():
+    with pytest.raises(ValueError):
+        fastdna.count_cohort([], k=11)
+
+
+def test_subset_preserves_per_sample_rows(tmp_path):
+    paths = _cohort(tmp_path, n=6)
+    counts = fastdna.count_cohort(paths, k=11)
+
+    picked = [counts.sample_ids[0], counts.sample_ids[3]]
+    sub = counts.subset(picked)
+
+    assert sub.sample_ids == tuple(picked)
+    assert len(sub.kmers) == sum(sub.row_counts)
+    assert sub.row_counts == (counts.row_counts[0], counts.row_counts[3])
+    # And the actual k-mer/frequency values must be untouched by the slice.
+    assert sub.kmers.to_pylist() == counts.subset([picked[0]]).kmers.to_pylist() + counts.subset(
+        [picked[1]]
+    ).kmers.to_pylist()
+
+
+def test_subset_names_a_missing_sample_instead_of_returning_less(tmp_path):
+    """A fold silently missing samples would produce a plausible-looking
+    score computed over the wrong cohort. It has to fail, not shrink."""
+    paths = _cohort(tmp_path, n=4)
+    counts = fastdna.count_cohort(paths, k=11)
+    with pytest.raises(KeyError, match="no_existe"):
+        counts.subset([counts.sample_ids[0], "no_existe"])
+
+
+def test_subset_of_empty_selection_is_empty(tmp_path):
+    paths = _cohort(tmp_path, n=3)
+    counts = fastdna.count_cohort(paths, k=11)
+    empty = counts.subset([])
+    assert len(empty) == 0
+    assert len(empty.kmers) == 0
+
+
+def test_counts_artifact_is_immutable(tmp_path):
+    """A fold that could mutate the shared artifact would be a silent way
+    for one fold's view to leak into another's."""
+    import dataclasses
+
+    paths = _cohort(tmp_path, n=2)
+    counts = fastdna.count_cohort(paths, k=11)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        counts.k = 21
+
+
+def test_vectorizer_with_artifact_matches_vectorizer_with_paths(tmp_path):
+    """The equivalence check: the fast path cannot change the answer."""
+    paths = _cohort(tmp_path, n=8)
+    counts = fastdna.count_cohort(paths, k=11)
+
+    from_paths = KmerVectorizer(k=11, top_features=200, representation="count").fit_transform(paths)
+    from_artifact = KmerVectorizer(
+        k=11, top_features=200, representation="count", counts=counts
+    ).fit_transform(list(counts.sample_ids))
+
+    assert from_paths.shape == from_artifact.shape
+    np.testing.assert_array_equal(from_paths.toarray(), from_artifact.toarray())
+
+
+def test_cross_validation_with_the_artifact_never_recounts(tmp_path, monkeypatch):
+    """The point of the whole module, measured directly: with the
+    artifact, a 3-fold cross-validation must make ZERO calls to
+    fastdna.count(). Without it, it makes one per sample per fold.
+    """
+    paths = _cohort(tmp_path, n=9)
+    counts = fastdna.count_cohort(paths, k=11)
+    y = np.array([0, 1, 0, 1, 0, 1, 0, 1, 0])
+
+    calls = {"n": 0}
+    real_count = fastdna.count
+
+    def counting_spy(*args, **kwargs):
+        calls["n"] += 1
+        return real_count(*args, **kwargs)
+
+    monkeypatch.setattr(fastdna, "count", counting_spy)
+    monkeypatch.setattr("fastdna.sklearn.fastdna.count", counting_spy)
+
+    pipeline = make_pipeline(
+        KmerVectorizer(k=11, top_features=200, counts=counts),
+        LogisticRegression(max_iter=1000),
+    )
+    cross_val_score(pipeline, list(counts.sample_ids), y, cv=3)
+
+    assert calls["n"] == 0, (
+        f"cross-validation with counts= read {calls['n']} FASTQ files; with the "
+        "artifact it must read none"
+    )

@@ -19,7 +19,7 @@ fn small_counter() -> KmerCounter {
 fn csv_export_to_an_unwritable_path_names_the_path() {
     let bad = std::path::Path::new("no_such_directory_xyz").join("out.csv");
 
-    let result = export::export_csv(&small_counter(), &bad, 4, 1);
+    let result = export::export_csv(&small_counter(), &bad, 4, 1, false);
 
     match result {
         Err(FastDnaError::Io { path, .. }) => {
@@ -33,7 +33,7 @@ fn csv_export_to_an_unwritable_path_names_the_path() {
 fn parquet_export_to_an_unwritable_path_names_the_path() {
     let bad = std::path::Path::new("no_such_directory_xyz").join("out.parquet");
 
-    let result = export::export_parquet(&small_counter(), &bad, 4, 1);
+    let result = export::export_parquet(&small_counter(), &bad, 4, 1, false);
 
     assert!(matches!(result, Err(FastDnaError::Io { .. })), "got {result:?}");
 }
@@ -68,7 +68,7 @@ fn successful_csv_export_reports_rows_written() {
     let scratch = ScratchDir::new("fastdna_export_test");
     let out = scratch.0.join("ok.csv");
 
-    let written = export::export_csv(&small_counter(), &out, 4, 1).expect("must succeed");
+    let written = export::export_csv(&small_counter(), &out, 4, 1, false).expect("must succeed");
 
     assert_eq!(written, 2);
 }

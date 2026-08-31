@@ -97,4 +97,77 @@ def test_to_pandas_returns_a_dataframe_with_the_current_view(counts):
 
     assert isinstance(df, pd.DataFrame)
     assert len(df) <= 2
-    assert set(df.columns) == {"kmer_u64", "kmer_sequence", "frequency"}
+    # kmer_sequence is off by default (see count()'s own docstring); the
+    # `counts` fixture above does not ask for it.
+    assert set(df.columns) == {"kmer_u64", "frequency"}
+
+
+# --------------------------------------------------------------------------
+# top() rejects arguments pyarrow.Table.slice() would have accepted
+# --------------------------------------------------------------------------
+
+
+def test_top_rejects_arguments_pyarrow_would_have_accepted(counts):
+    """`pyarrow.Table.slice` responds to None, negatives and floats instead
+    of raising, and each response is plausible but wrong. Fixed here so
+    `top()` does not inherit that behaviour.
+    """
+    # The worst failure: slice(0, None) means "to the end".
+    with pytest.raises(TypeError, match="non-negative int"):
+        counts.top(None)
+
+    # A negative n arrived at through arithmetic looked like "no k-mer passed".
+    with pytest.raises(ValueError, match="n >= 0"):
+        counts.top(-5)
+
+    with pytest.raises(TypeError, match="non-negative int"):
+        counts.top(2.5)
+
+    # bool is a subclass of int in Python; top(True) means nothing.
+    with pytest.raises(TypeError, match="non-negative int"):
+        counts.top(True)
+
+    # The legitimate cases stay intact.
+    assert len(counts.top(0)) == 0
+    assert len(counts.top(10**9)) == len(counts)
+
+
+# --------------------------------------------------------------------------
+# filter() rejects negative bounds, but allows an empty (inverted) band
+# --------------------------------------------------------------------------
+
+
+def test_filter_rejects_negative_bounds_but_allows_an_empty_band(counts):
+    """A negative threshold can never exclude anything over uint32
+    frequencies, so `filter(min_count=-3)` used to return the whole table.
+    An inverted band, by contrast, is a legitimate result and stays allowed.
+    """
+    with pytest.raises(ValueError, match="min_count must be >= 0"):
+        counts.filter(min_count=-3)
+    with pytest.raises(ValueError, match="max_count must be >= 0"):
+        counts.filter(max_count=-1)
+    with pytest.raises(TypeError, match="min_count must be an int"):
+        counts.filter(min_count="5")
+    with pytest.raises(TypeError, match="min_count must be an int"):
+        counts.filter(min_count=True)
+
+    # Inverted band: empty view, not an exception -- documented decision.
+    assert len(counts.filter(min_count=10**6, max_count=1)) == 0
+
+    # And the ordinary cases stay intact.
+    assert len(counts.filter(min_count=0)) == len(counts)
+
+
+# --------------------------------------------------------------------------
+# sort_by() with an unknown column names the valid ones
+# --------------------------------------------------------------------------
+
+
+def test_sort_by_unknown_column_lists_the_valid_ones(counts):
+    with pytest.raises(ValueError) as excinfo:
+        counts.sort_by("freq")  # the real name is "frequency"
+
+    message = str(excinfo.value)
+    assert "freq" in message
+    assert "frequency" in message, "the message must name the valid columns"
+    assert "FieldRef" not in message, "Arrow's internal vocabulary must not leak through"

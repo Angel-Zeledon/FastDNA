@@ -21,9 +21,14 @@ with the events.
 """
 
 import threading
+from typing import Any, Callable, Optional, Union
+
+__all__ = ["make_progress_adapter"]
 
 
-def make_progress_adapter(progress):
+def make_progress_adapter(
+    progress: Optional[Union[bool, Callable[[Any], None]]],
+) -> Optional[Callable[[Any], None]]:
     """Builds the callable passed to `_core.count`'s `progress` parameter.
 
     - `progress is None` -> returns `None`; `_core.count` stays silent.

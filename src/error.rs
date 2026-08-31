@@ -4,7 +4,22 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// Every fallible operation in the FastDNA core returns this type.
+///
+/// `#[non_exhaustive]`: adding a variant must stay a minor change. Without
+/// it, a consumer writing an exhaustive `match` with no wildcard arm stops
+/// compiling every time this enum grows -- and it has grown repeatedly
+/// (`Load` and `NoSamplesFound` both carry comments noting they postdate
+/// the original spec's error table), with more coming as the k-mer
+/// database and set-operation work lands. The attribute forces outside
+/// callers to write a `_ =>` arm today so that tomorrow's variant is
+/// absorbed by it.
+///
+/// Applied to the enum and not to individual variants on purpose: marking
+/// variants would force this crate's own construction sites into
+/// functional-update syntax, and these variants have required fields with
+/// no sensible default.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum FastDnaError {
     /// An underlying I/O failure, carrying the path that caused it.
     Io { path: PathBuf, source: std::io::Error },
@@ -30,14 +45,32 @@ pub enum FastDnaError {
     /// A configuration value supplied by the caller is not usable.
     InvalidConfig { parameter: &'static str, reason: String },
     /// Serialization or writer failure while exporting results.
-    Export { path: PathBuf, reason: String },
+    ///
+    /// `source` carries the original `ParquetError`/`ArrowError`/`io::Error`
+    /// when there was one. Flattening a typed cause into `reason: String`
+    /// and returning `None` from `source()` would be the same mistake
+    /// `export.rs`'s `export_err` already argues against for `Io`: it
+    /// "erases their real type and misleads callers". `Option` rather than
+    /// mandatory because some construction sites (a config-value rejection
+    /// with no underlying error object, for one) have nothing to carry.
+    Export {
+        path: PathBuf,
+        reason: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     /// A file that was supposed to be a previously-saved artifact (e.g. a
     /// `GenomeSketch` written by `save`) could not be read back -- corrupt
     /// JSON, a foreign file, or data that fails the loader's own
     /// consistency checks. Deliberately distinct from `Export`: an error
     /// while reading must never claim to be an error while writing, which
     /// is what reusing `Export` for both would tell a caller.
-    Load { path: PathBuf, reason: String },
+    ///
+    /// Same `source` contract as `Export` above.
+    Load {
+        path: PathBuf,
+        reason: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     /// The caller asked to stop before the work finished.
     ///
     /// Not an error in the "something broke" sense -- it is a normal
@@ -67,15 +100,21 @@ impl fmt::Display for FastDnaError {
                 "no FASTQ files found in {} (expected .fastq, .fq, .fastq.gz or .fq.gz)",
                 dir.display()
             ),
+            // These two messages name the *parameter*, not some interface's
+            // syntax. They used to say "lower --top-features or use
+            // --format sparse" and "raise --min-count or use --approx-vocab":
+            // none of those four flags exist in `cli.rs`, and these errors
+            // reach Python as `MemoryError`, where the parameter is called
+            // `top_features` and there are no flags at all.
             FastDnaError::MatrixTooLarge { estimated_bytes, limit } => write!(
                 f,
                 "dense matrix would need {estimated_bytes} bytes, over the {limit} byte limit; \
-                 lower --top-features or use --format sparse"
+                 lower `top_features` to keep fewer k-mer columns, or raise the byte limit"
             ),
             FastDnaError::VocabTooLarge { estimated_bytes, limit } => write!(
                 f,
                 "vocabulary table would need {estimated_bytes} bytes, over the {limit} byte limit; \
-                 raise --min-count or use --approx-vocab"
+                 raise `min_count` to drop rare k-mers, or raise the byte limit"
             ),
             FastDnaError::MismatchedK { left, right } => {
                 write!(f, "cannot compare sketches built with different k: {left} and {right}")
@@ -90,10 +129,10 @@ impl fmt::Display for FastDnaError {
             FastDnaError::InvalidConfig { parameter, reason } => {
                 write!(f, "invalid configuration for {parameter}: {reason}")
             }
-            FastDnaError::Export { path, reason } => {
+            FastDnaError::Export { path, reason, .. } => {
                 write!(f, "export failed for {}: {reason}", path.display())
             }
-            FastDnaError::Load { path, reason } => {
+            FastDnaError::Load { path, reason, .. } => {
                 write!(f, "load failed for {}: {reason}", path.display())
             }
             FastDnaError::Cancelled => write!(f, "operation cancelled by caller"),
@@ -105,6 +144,9 @@ impl std::error::Error for FastDnaError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             FastDnaError::Io { source, .. } => Some(source),
+            FastDnaError::Export { source, .. } | FastDnaError::Load { source, .. } => {
+                source.as_ref().map(|e| &**e as &(dyn std::error::Error + 'static))
+            }
             _ => None,
         }
     }
@@ -155,5 +197,85 @@ mod tests {
         let msg = FastDnaError::MatrixTooLarge { estimated_bytes: 8_000_000_000, limit: 4_000_000_000 }.to_string();
         assert!(msg.contains("8000000000"));
         assert!(msg.contains("4000000000"));
+    }
+
+    /// These messages reach both the CLI and Python (as `MemoryError`).
+    /// They used to name four flags -- `--top-features`, `--format sparse`,
+    /// `--min-count` as the vocabulary remedy, and `--approx-vocab` -- of
+    /// which only `--min-count` exists, and none of which means anything
+    /// to a caller coming in through Python.
+    #[test]
+    fn size_limit_messages_do_not_name_flags_that_do_not_exist() {
+        let messages = [
+            FastDnaError::MatrixTooLarge { estimated_bytes: 8_000_000_000, limit: 4_000_000_000 }
+                .to_string(),
+            FastDnaError::VocabTooLarge { estimated_bytes: 8_000_000_000, limit: 4_000_000_000 }
+                .to_string(),
+        ];
+
+        for msg in &messages {
+            for ghost in ["--top-features", "--format sparse", "--approx-vocab"] {
+                assert!(
+                    !msg.contains(ghost),
+                    "message names {ghost}, which does not exist in cli.rs: {msg}"
+                );
+            }
+        }
+
+        assert!(messages[0].contains("top_features"), "{}", messages[0]);
+        assert!(messages[1].contains("min_count"), "{}", messages[1]);
+    }
+
+    /// `Io` already exposed its cause; `Export` and `Load` flattened it to
+    /// text and returned `None`, the same type-erasure the comment on
+    /// `export.rs::export_err` already objects to when wrapping Arrow in
+    /// `Io`.
+    #[test]
+    fn export_and_load_expose_their_underlying_cause() {
+        use std::error::Error;
+
+        let cause = std::io::Error::other("the parquet writer failed");
+        let err = FastDnaError::Export {
+            path: PathBuf::from("counts.parquet"),
+            reason: cause.to_string(),
+            source: Some(Box::new(cause)),
+        };
+
+        match err.source() {
+            Some(source) => {
+                assert!(source.to_string().contains("the parquet writer failed"));
+                assert!(
+                    source.downcast_ref::<std::io::Error>().is_some(),
+                    "the cause must stay the original type, not a string"
+                );
+            }
+            None => panic!("Export must expose its cause"),
+        }
+        assert!(err.to_string().contains("counts.parquet"));
+    }
+
+    /// The field is optional on purpose: some sites construct these
+    /// variants from their own check, with no underlying error object.
+    #[test]
+    fn export_without_a_cause_reports_no_source_rather_than_a_synthetic_one() {
+        use std::error::Error;
+
+        let err = FastDnaError::Load {
+            path: PathBuf::from("sample.sig"),
+            reason: "sketch_size does not match the number of hashes".to_string(),
+            source: None,
+        };
+        assert!(err.source().is_none());
+        assert!(err.to_string().contains("sample.sig"));
+    }
+
+    /// An integration test outside the crate is what makes
+    /// `#[non_exhaustive]` take effect; this one, inside the crate, only
+    /// checks that the attribute compiles and the variants stay
+    /// constructible.
+    #[test]
+    fn non_exhaustive_does_not_block_construction_inside_the_crate() {
+        let _ = FastDnaError::Cancelled;
+        let _ = FastDnaError::InvalidK { k: 5 };
     }
 }

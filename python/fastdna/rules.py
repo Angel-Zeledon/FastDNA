@@ -4,6 +4,13 @@ Roadmap item A4 (`docs/ml-differentiation-roadmap.md`, bucket A, rank #4):
 a rule-based binary classifier whose entire learned model is a handful of
 literal DNA sequences, each tagged "present" or "absent".
 
+## Status: frozen
+
+Per `docs/audit/PLAN.md` §2 ("Qué se poda"), this module is frozen: stable,
+not accepting new features, and a candidate for extraction into a separate
+`fastdna-contrib` package in a future release. Freezing is not deleting --
+see that section for the full reasoning behind the boundary.
+
 ## Scientific basis
 
 - Marchand & Shawe-Taylor, "The Set Covering Machine", JMLR 3 (2002)
@@ -61,12 +68,15 @@ imported here.
 
 from __future__ import annotations
 
+import os
 from itertools import repeat
-from typing import NamedTuple
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Union
 
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
+
+__all__ = ["Rule", "SetCoveringClassifier"]
 
 _RULE_TYPES = ("conjunction", "disjunction")
 _TIEBREAKERS = ("max_coverage", "first")
@@ -90,7 +100,7 @@ class Rule(NamedTuple):
     feature_name: str
     presence: bool
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{'present' if self.presence else 'absent'}({self.feature_name})"
 
 
@@ -326,7 +336,13 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         Column count of the training `X`; `predict()` requires the same.
     """
 
-    def __init__(self, max_rules=10, rule_type="conjunction", tiebreaker="max_coverage", class_weight=None):
+    def __init__(
+        self,
+        max_rules: int = 10,
+        rule_type: str = "conjunction",
+        tiebreaker: str = "max_coverage",
+        class_weight: Optional[Union[str, Dict[Any, float]]] = None,
+    ) -> None:
         # scikit-learn convention (the same one KmerVectorizer follows):
         # __init__ only assigns the parameters, unchanged and unvalidated,
         # so get_params()/set_params()/clone() can always rebuild an
@@ -338,7 +354,12 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
 
     # -- fitting ----------------------------------------------------------
 
-    def fit(self, X, y, feature_names=None):
+    def fit(
+        self,
+        X: Any,  # binary presence matrix: dense array-like or scipy sparse (duck-typed via .toarray(), scipy not imported here)
+        y: Union[Sequence[Any], np.ndarray],
+        feature_names: Optional[Sequence[str]] = None,
+    ) -> "SetCoveringClassifier":
         """Greedily learns the rule set.
 
         Parameters
@@ -648,7 +669,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
                 mask |= holds
         return mask
 
-    def predict(self, X):
+    def predict(self, X: Any) -> np.ndarray:  # X: same duck-typed dense/sparse matrix as fit()
         """The predicted label per sample, taken from `classes_` so the
         caller's own label dtype (strings included) round-trips.
         """
@@ -659,7 +680,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         fired = self._rule_mask(X, "predict")
         return self.classes_[fired.astype(int)]
 
-    def predict_proba(self, X):
+    def predict_proba(self, X: Any) -> np.ndarray:  # X: same duck-typed dense/sparse matrix as fit()
         """The rule-consistent hard 0/1 decision, shaped like a probability:
         `(n_samples, 2)` columns ordered as `classes_`.
 
@@ -692,7 +713,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
     # -- interpretation ---------------------------------------------------
 
     @property
-    def rules_(self):
+    def rules_(self) -> list[Rule]:
         """The learned rules (see the class docstring); raises
         `NotFittedError` before `fit()`.
 
@@ -702,7 +723,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         check_is_fitted(self, "classes_")
         return list(self._rules_)
 
-    def explain(self):
+    def explain(self) -> str:
         """The model as one line of human-readable text, e.g.
 
             resistant IF present(ACGTACGTA) AND absent(TTGCATTGC)
@@ -722,7 +743,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         connective = " AND " if self.rule_type == "conjunction" else " OR "
         return f"{label} IF " + connective.join(str(rule) for rule in self._rules_)
 
-    def export_rules_fasta(self, path):
+    def export_rules_fasta(self, path: Union[str, os.PathLike]) -> list[Rule]:
         """Writes the rule k-mers to `path` as FASTA, ready for BLAST.
 
         Each record is two lines, matching `fastdna.interpret`'s exporter:

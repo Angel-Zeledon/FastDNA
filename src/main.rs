@@ -210,6 +210,7 @@ fn run_paired_dir(args: &Cli, dir: &Path) -> Result<()> {
         &config,
         args.min_count,
         args.max_count,
+        args.with_sequence,
     )?;
     let elapsed = start_time.elapsed().as_secs_f64();
 
@@ -358,10 +359,16 @@ fn run(args: Cli) -> Result<()> {
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"));
     let records_written = if wants_parquet {
-        export::export_parquet(&counter, &args.output, args.kmer_size, args.min_count)
-            .inspect_err(|_| pb_export.abandon())?
+        export::export_parquet(
+            &counter,
+            &args.output,
+            args.kmer_size,
+            args.min_count,
+            args.with_sequence,
+        )
+        .inspect_err(|_| pb_export.abandon())?
     } else {
-        export::export_csv(&counter, &args.output, args.kmer_size, args.min_count)
+        export::export_csv(&counter, &args.output, args.kmer_size, args.min_count, args.with_sequence)
             .inspect_err(|_| pb_export.abandon())?
     };
 
