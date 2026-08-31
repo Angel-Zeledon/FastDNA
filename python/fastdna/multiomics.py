@@ -52,6 +52,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from . import _column_as_array
+from . import _core
 from . import count as _count
 
 if TYPE_CHECKING:
@@ -133,13 +134,13 @@ def kmer_feature_table(
     if top_features is not None and (
         not isinstance(top_features, int) or isinstance(top_features, bool) or top_features <= 0
     ):
-        raise ValueError(f"top_features must be a positive int or None, got {top_features!r}")
+        raise _core.InvalidConfigError(f"top_features must be a positive int or None, got {top_features!r}")
 
     if isinstance(sample_paths, dict):
         id_to_path = dict(sample_paths)
     else:
         if id_from not in _ID_FROM_STRATEGIES:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"id_from={id_from!r} is not supported; only {sorted(_ID_FROM_STRATEGIES)} "
                 "are implemented -- pass an explicit {sample_id: path} dict instead if you "
                 "need a different convention."
@@ -149,7 +150,7 @@ def kmer_feature_table(
         for path in sample_paths:
             sample_id = derive(path)
             if sample_id in id_to_path:
-                raise ValueError(
+                raise _core.InvalidConfigError(
                     f"two input paths both derive sample_id {sample_id!r} under "
                     f"id_from={id_from!r} ({id_to_path[sample_id]!r} and {path!r}); "
                     "pass an explicit {sample_id: path} dict to disambiguate."
@@ -294,7 +295,7 @@ def normalize_sample_ids(ids: Iterable[Any], *, strategy: str = "lower_strip_pun
     column rather than used as a Series in its own right.
     """
     if strategy != "lower_strip_punct":
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"strategy={strategy!r} is not supported; only 'lower_strip_punct' is implemented."
         )
 
@@ -537,30 +538,30 @@ def join_omics_layers(
       to guess why they ended up with fewer rows than expected.
     """
     if not layers:
-        raise ValueError("join_omics_layers requires at least one layer")
+        raise _core.InvalidConfigError("join_omics_layers requires at least one layer")
 
     if isinstance(how, dict):
         missing = set(layers) - set(how)
         if missing:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"how dict is missing an entry for layer(s) {sorted(missing)}; every layer in "
                 "`layers` must have an explicit 'inner' or 'outer' entry in a per-layer `how`."
             )
         extra = set(how) - set(layers)
         if extra:
-            raise ValueError(f"how dict names layer(s) not present in `layers`: {sorted(extra)}")
+            raise _core.InvalidConfigError(f"how dict names layer(s) not present in `layers`: {sorted(extra)}")
         per_layer_how = dict(how)
     elif how in ("inner", "outer"):
         per_layer_how = {name: how for name in layers}
     else:
-        raise ValueError(f"how must be 'inner', 'outer', or a per-layer dict, got {how!r}")
+        raise _core.InvalidConfigError(f"how must be 'inner', 'outer', or a per-layer dict, got {how!r}")
 
     frames = {}
     layer_sample_ids = {}
     for name, table in layers.items():
         df = _as_pandas(table)
         if on not in df.columns:
-            raise ValueError(f"layer {name!r} has no {on!r} column (columns: {list(df.columns)})")
+            raise _core.InvalidConfigError(f"layer {name!r} has no {on!r} column (columns: {list(df.columns)})")
         # `layer_sample_ids` (below) is built with `set(...)`, which
         # silently collapses duplicates, while the sequential
         # `DataFrame.merge` a few lines down fans them out -- two sample
@@ -575,7 +576,7 @@ def join_omics_layers(
         # explicitly (rename, aggregate, or pick one) before joining.
         duplicate_ids = sorted(df.loc[df[on].duplicated(keep=False), on].unique().tolist())
         if duplicate_ids:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"layer {name!r} has duplicate {on!r} value(s) {duplicate_ids}; "
                 "join_omics_layers requires unique sample IDs per layer, since a "
                 "duplicate silently fans out into multiple rows during the merge. "

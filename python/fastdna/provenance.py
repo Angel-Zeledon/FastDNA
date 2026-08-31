@@ -202,6 +202,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
+from . import _core
+
 __all__ = ["SCHEMA_VERSION", "InputFile", "Provenance", "capture"]
 
 #: Version of the dict/JSON layout `Provenance.to_dict()` emits, written
@@ -892,7 +894,7 @@ def capture(
         to_report("run.html", metadata=prov.to_metadata())
     """
     if input_identity not in ("sampled", "sha256"):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             "input_identity must be 'sampled' (a framed digest over a few windows of each "
             "file -- a change detector) or 'sha256' (the whole file -- a content identity), "
             "got {!r}. See fastdna.provenance's module docstring for what each one "
@@ -900,18 +902,18 @@ def capture(
         )
     for name, value in (("chunk_bytes", chunk_bytes), ("sampled_chunks", sampled_chunks)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError("{} must be an int >= 1, got {!r}".format(name, value))
+            raise _core.InvalidConfigError("{} must be an int >= 1, got {!r}".format(name, value))
 
     recorded: List[InputFile] = []
     for entry in inputs or ():
         path = os.fspath(entry) if isinstance(entry, os.PathLike) else str(entry)
         if not os.path.exists(path):
-            raise FileNotFoundError(
+            raise _core.IoNotFoundError(
                 "provenance input {!r} does not exist; a block naming a file that cannot be "
                 "found records nothing checkable.".format(path)
             )
         if not os.path.isfile(path):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "provenance input {!r} is not a regular file. A directory has no single "
                 "content identity -- pass its files individually, or digest a manifest of "
                 "them.".format(path)

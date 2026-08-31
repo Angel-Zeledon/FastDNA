@@ -122,6 +122,8 @@ from typing import Any, NamedTuple, Optional
 import numpy as np
 import pyarrow as pa
 
+from . import _core
+
 __all__ = [
     "log2_mic",
     "MicRegressor",
@@ -164,18 +166,18 @@ def log2_mic(mic_values: np.ndarray) -> np.ndarray:  # mic_values is array-like,
     """
     values = np.asarray(mic_values, dtype=np.float64)
     if values.ndim != 1:
-        raise ValueError(f"log2_mic() needs a 1-D array of MIC values, got shape {values.shape}")
+        raise _core.InvalidConfigError(f"log2_mic() needs a 1-D array of MIC values, got shape {values.shape}")
     if values.size == 0:
-        raise ValueError("log2_mic() received an empty array of MIC values.")
+        raise _core.InvalidConfigError("log2_mic() received an empty array of MIC values.")
     if not np.all(np.isfinite(values)):
         bad_count = int((~np.isfinite(values)).sum())
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"log2_mic() requires finite MIC values (no NaN/inf), got {bad_count} non-finite "
             "value(s)."
         )
     if np.any(values <= 0):
         bad = values[values <= 0]
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"log2_mic() requires strictly positive MIC values (log2 of zero or a negative value "
             f"is undefined), got {bad[:5].tolist()}{', ...' if bad.size > 5 else ''}. A MIC of 0 "
             "usually means 'no growth at the lowest tested dilution' -- encode it as that dilution's "
@@ -259,7 +261,7 @@ class MicRegressor:
         n_samples = X.shape[0]
         y_log2 = log2_mic(y)
         if y_log2.shape[0] != n_samples:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"MicRegressor.fit(): X has {n_samples} rows but y has {y_log2.shape[0]} entries -- "
                 "they must line up one MIC value per sample (row) of X."
             )
@@ -389,17 +391,17 @@ def mic_regression_report(
     pred_log2 = log2_mic(mic_pred)
 
     if true_log2.shape[0] != pred_log2.shape[0]:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"mic_regression_report() needs one prediction per true value: mic_true has "
             f"{true_log2.shape[0]} entries but mic_pred has {pred_log2.shape[0]}."
         )
     if true_log2.shape[0] < 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"mic_regression_report() needs at least 2 samples to compute R^2, got "
             f"{true_log2.shape[0]}."
         )
     if not isinstance(tolerance_log2, (int, float)) or isinstance(tolerance_log2, bool) or tolerance_log2 <= 0:
-        raise ValueError(f"tolerance_log2 must be a positive number, got {tolerance_log2!r}")
+        raise _core.InvalidConfigError(f"tolerance_log2 must be a positive number, got {tolerance_log2!r}")
 
     r2 = float(r2_score(true_log2, pred_log2))
     mae = float(mean_absolute_error(true_log2, pred_log2))

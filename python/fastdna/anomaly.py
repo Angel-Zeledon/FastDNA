@@ -135,6 +135,7 @@ from typing import Any, Iterable, Union
 import numpy as np
 import pyarrow as pa
 
+from . import _core
 from . import sketch as _sketch
 
 __all__ = ["CohortOutlierFlagger", "flag_cohort"]
@@ -184,7 +185,7 @@ def _isolation_forest(detector_kwargs):
 def _validate_cohort_paths(paths):
     paths = [str(p) for p in paths]
     if len(paths) < _MIN_COHORT:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"a cohort of at least {_MIN_COHORT} samples is required to estimate a "
             f"robust reference distribution, got {len(paths)}. With fewer samples the "
             "median absolute deviation of the cohort's own distances is not an "
@@ -196,7 +197,7 @@ def _validate_cohort_paths(paths):
     seen = set()
     for path in paths:
         if path in seen:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"paths contains a duplicate entry: {path!r}. Each cohort member may "
                 "appear only once; a duplicated sample would contribute an exact 0.0 "
                 "distance to its own twin and pull that sample's statistic toward "
@@ -325,7 +326,7 @@ class CohortOutlierFlagger:
         nothing.
         """
         if method == "isolation_forest":
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "method='isolation_forest' is not available on CohortOutlierFlagger, "
                 "which scores NEW samples against an already-fitted cohort. An "
                 "isolation forest's splits come from the range its training data "
@@ -338,9 +339,9 @@ class CohortOutlierFlagger:
                 "meaningful past the cohort's own spread."
             )
         if method not in _METHODS:
-            raise ValueError(f"method must be one of {_METHODS!r}, got {method!r}")
+            raise _core.InvalidConfigError(f"method must be one of {_METHODS!r}, got {method!r}")
         if not threshold > 0:
-            raise ValueError(f"threshold must be a positive number of robust z units, got {threshold!r}")
+            raise _core.InvalidConfigError(f"threshold must be a positive number of robust z units, got {threshold!r}")
         if detector_kwargs:
             raise TypeError(
                 f"CohortOutlierFlagger got unexpected keyword arguments "
@@ -566,7 +567,7 @@ def flag_cohort(
     within one call).
     """
     if method not in _METHODS:
-        raise ValueError(f"method must be one of {_METHODS!r}, got {method!r}")
+        raise _core.InvalidConfigError(f"method must be one of {_METHODS!r}, got {method!r}")
 
     paths = _validate_cohort_paths(paths)
 
