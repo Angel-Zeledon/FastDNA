@@ -130,13 +130,14 @@ known-good samples.
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Union
+from typing import Any, Iterable, Sequence, Union
 
 import numpy as np
 import pyarrow as pa
 
 from . import _core
 from . import sketch as _sketch
+from fastdna import _PathLike
 
 __all__ = ["CohortOutlierFlagger", "flag_cohort"]
 
@@ -507,7 +508,7 @@ class CohortOutlierFlagger:
 
 
 def flag_cohort(
-    paths: Iterable[Union[str, os.PathLike]],
+    paths: Sequence[_PathLike],
     *,
     k: int = 21,
     sketch_size: int = 1000,
@@ -530,7 +531,7 @@ def flag_cohort(
 
     Parameters
     ----------
-    paths : iterable of str or pathlib.Path
+    paths : sequence of str or pathlib.Path
         The cohort, at least `4` samples (see `_MIN_COHORT`). Duplicates are
         refused.
     k, sketch_size : forwarded to `fastdna.sketch()` for every sample.

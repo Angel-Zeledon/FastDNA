@@ -17,13 +17,13 @@ them (docs/ml-genomics-roadmap.md, item 5).
 
 from __future__ import annotations
 
-import os
-from typing import Any, Iterable, Union
+from typing import Any, Sequence
 
 import numpy as np
 import pyarrow as pa
 
 import fastdna
+from fastdna import _PathLike
 
 __all__ = ["embed_cohort"]
 
@@ -133,7 +133,7 @@ def _reduce(distance_matrix, method, n_components, method_kwargs):
 
 
 def embed_cohort(
-    paths: Iterable[Union[str, os.PathLike]],
+    paths: Sequence[_PathLike],
     *,
     k: int = 21,
     sketch_size: int = 1000,
@@ -149,6 +149,51 @@ def embed_cohort(
     (QIIME2 and friends), generalized here to also support UMAP and t-SNE
     over the same precomputed distance matrix.
 
+    Parameters
+    ----------
+    paths : sequence of str or pathlib.Path
+        The cohort's FASTQ(.gz) files, at least 2. Each entry must be
+        unique; a duplicated path would silently corrupt its own
+        distance-matrix row (see below).
+    k, sketch_size : int, default 21, 1000
+        Forwarded to `fastdna.compare_all()`/`fastdna.sketch()` for every
+        sample.
+    metric : {"mash_distance", "jaccard"}, default "mash_distance"
+        Which `compare_all()` metric to embed. See "Similarity-vs-distance
+        handling" below for how each is turned into a proper distance.
+    method : {"umap", "tsne", "pcoa"}, default "umap"
+        Which dimensionality-reduction method to run over the precomputed
+        distance matrix. See the pipeline description below for what each
+        one needs and requires.
+    n_components : {2, 3}, default 2
+        Output dimensionality.
+    **method_kwargs
+        Forwarded verbatim to the underlying estimator's constructor (e.g.
+        `n_neighbors=` for UMAP, `perplexity=` for TSNE, `random_state=`
+        for any of them).
+
+    Returns
+    -------
+    pyarrow.Table
+        One row per input path (in `paths` order), columns `sample`, `x`,
+        `y` (and `z` when `n_components == 3`) -- consistent with
+        `compare_all()` and `KmerCounts.table` already returning
+        `pyarrow.Table`s, so the result composes directly with
+        `.to_pandas()`, DuckDB, Polars, or a plotting library without any
+        extra conversion step.
+
+    Raises
+    ------
+    ValueError
+        If `n_components` is not 2 or 3, if `paths` contains a duplicate
+        entry, or if `method`/`metric` is not one of the supported values.
+    ImportError
+        If the optional dependency the requested `method` needs
+        (`umap-learn` for `"umap"`, `scikit-learn` for `"tsne"`/`"pcoa"`)
+        is not installed.
+
+    Notes
+    -----
     Pipeline:
       1. `fastdna.compare_all(paths, k=k, sketch_size=sketch_size,
          metric=metric)` builds each sample's sketch once and computes
@@ -192,13 +237,6 @@ def embed_cohort(
     dependency is not installed raises a clear `ImportError` naming the
     missing package and the `pip install` command to fix it, instead of a
     raw `ModuleNotFoundError` from deep inside sklearn/umap internals.
-
-    Returns a `pyarrow.Table` with one row per input path (in `paths`
-    order) and columns `sample`, `x`, `y` (and `z` when `n_components ==
-    3`) -- consistent with `compare_all()` and `KmerCounts.table` already
-    returning `pyarrow.Table`s, so the result composes directly with
-    `.to_pandas()`, DuckDB, Polars, or a plotting library without any
-    extra conversion step.
     """
     if n_components not in (2, 3):
         raise fastdna._core.InvalidConfigError(f"n_components must be 2 or 3, got {n_components!r}")

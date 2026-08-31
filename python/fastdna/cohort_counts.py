@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     import numpy as np
 
 import fastdna
-from fastdna import _column_as_array
+from fastdna import _column_as_array, _PathLike
 
 __all__ = ["CohortCounts", "count_cohort"]
 
@@ -62,6 +62,24 @@ class CohortCounts:
     across every fold of a cross-validation (that sharing is the entire
     point of building it once), and a fold that could mutate it would be
     a silent way for one fold's view to leak into another's.
+
+    Attributes
+    ----------
+    sample_ids : tuple of str
+        Every sample's id, in the order its rows were stacked.
+    kmers : pyarrow.Array of uint64
+        Every sample's `kmer_u64` column, concatenated in `sample_ids`
+        order.
+    frequencies : pyarrow.Array of uint32
+        Every sample's `frequency` column, concatenated in `sample_ids`
+        order, aligned row-for-row with `kmers`.
+    row_counts : tuple of int
+        `row_counts[i]` is how many rows `sample_ids[i]` contributed --
+        what `offsets`/`subset` use to slice the stack back apart.
+    k : int
+        The k-mer size every sample was counted at.
+    min_count : int
+        The `min_count` every sample was counted at.
     """
 
     sample_ids: tuple[str, ...]
@@ -97,10 +115,23 @@ class CohortCounts:
         the whole reason `CohortCounts` exists: a cross-validation fold
         becomes a slice of one array instead of a fresh counting pass.
 
-        Raises `KeyError` naming every `sample_id` that is not in this
-        cohort, rather than silently returning a shorter result: a fold
-        quietly missing samples would produce a plausible-looking score
-        computed over the wrong cohort.
+        Parameters
+        ----------
+        sample_ids : sequence of str
+            The subset to slice out, in the order the result should have.
+
+        Returns
+        -------
+        CohortCounts
+            A new instance holding only `sample_ids`' rows.
+
+        Raises
+        ------
+        KeyError
+            Naming every `sample_id` that is not in this cohort, rather
+            than silently returning a shorter result: a fold quietly
+            missing samples would produce a plausible-looking score
+            computed over the wrong cohort.
         """
         import numpy as np
 
@@ -133,7 +164,7 @@ class CohortCounts:
         )
 
 
-def _sample_id_from_path(path) -> str:
+def _sample_id_from_path(path: _PathLike) -> str:
     """The file's stem with a trailing `.fastq`/`.fq`/`.gz` suffix
     stripped -- the same convention `multiomics._sample_id_from_filename`
     already uses, kept identical here so a cohort built either way gets
@@ -150,7 +181,7 @@ def _sample_id_from_path(path) -> str:
 
 def count_cohort(
     # directory path, {sample_id: path} mapping, or iterable of paths -- see docstring
-    samples: Union[str, os.PathLike, Mapping[str, Union[str, os.PathLike]], Iterable[Union[str, os.PathLike]]],
+    samples: Union[_PathLike, Mapping[str, _PathLike], Iterable[_PathLike]],
     *,
     k: int = 31,
     min_count: int = 1,
@@ -160,19 +191,42 @@ def count_cohort(
     """Counts every sample in `samples` exactly once and returns the
     result as one `CohortCounts`.
 
-    `samples` is a directory (every FASTQ/FASTA file in it, sample_id
-    derived from the filename), a `Mapping[sample_id, path]` (explicit
-    ids), or a list/iterable of paths (ids derived from the filenames).
-    Two different paths producing the same derived sample_id is a
-    `ValueError` naming both -- silently keeping only one would drop a
-    sample from the cohort without saying so.
-
     `with_sequence` is never requested here: nothing that consumes a
     `CohortCounts` (`KmerVectorizer`, `fastdna.audit()`) needs the decoded
     `kmer_sequence` column, and it is the majority of a count's cost (see
     `export::counts_schema`'s doc comment). `KmerVectorizer` decodes the
     handful of k-mers that survive vocabulary selection directly from
     their `kmer_u64` values instead.
+
+    Parameters
+    ----------
+    samples : str, os.PathLike, Mapping[str, path], or iterable of path
+        A directory (every FASTQ/FASTA file in it, sample_id derived from
+        the filename), a `Mapping[sample_id, path]` (explicit ids), or a
+        list/iterable of paths (ids derived from the filenames).
+    k : int, default 31
+        Forwarded to `fastdna.count()` for every sample.
+    min_count : int, default 1
+        Forwarded to `fastdna.count()` for every sample.
+    threads : int, optional
+        Forwarded to `fastdna.count()` for every sample.
+    progress : callable, optional
+        Called as `progress(completed, total, sample_id)` after each
+        sample finishes counting, for a caller that wants to report
+        progress across a cohort's worth of files.
+
+    Returns
+    -------
+    CohortCounts
+        Every sample's counts, stacked in `samples` order.
+
+    Raises
+    ------
+    ValueError
+        If `samples` is empty, if `samples` is a directory containing no
+        FASTQ/FASTA files, or if two different paths derive the same
+        sample_id -- silently keeping only one would drop a sample from
+        the cohort without saying so.
     """
     if isinstance(samples, Mapping):
         pairs = [(str(sid), str(p)) for sid, p in samples.items()]
