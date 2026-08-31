@@ -48,7 +48,7 @@ more uncertain.**
 from __future__ import annotations
 
 import math
-from typing import Any, Optional
+from typing import Any, List, NamedTuple, Optional
 
 from . import _core
 
@@ -56,6 +56,7 @@ __all__ = [
     "uncertainty_score",
     "prioritize_for_review",
     "suggest_reference_additions",
+    "ReviewEntry",
 ]
 
 _VALID_METHODS = ("margin", "entropy")
@@ -238,38 +239,49 @@ def uncertainty_score(
     result. Larger return value = more uncertain (consistent convention
     across both methods).
 
-    `ranked_results_or_probs` accepts either of two shapes, distinguished
-    structurally:
+    Parameters
+    ----------
+    ranked_results_or_probs : ranked-tuples list or (probs, labels) pair
+        One query's classification result, in either of two shapes,
+        distinguished structurally:
 
-    - Ranked-tuples shape: a list of `(label, score)` pairs, best-first,
-      e.g. ``[("E. coli", 0.82), ("Shigella", 0.79), ("Salmonella", 0.10)]``.
-      This is the shape ``fastdna.taxonomy.classify()`` is documented to
-      return. Scores need not sum to 1.
-    - Probability-vector shape: a `(probs, labels)` pair of equal-length
-      sequences, e.g. ``([0.82, 0.79, 0.10], ["E. coli", "Shigella",
-      "Salmonella"])`` -- the shape you'd build from a scikit-learn
-      classifier's ``predict_proba()`` output for one sample plus
-      ``classifier.classes_``.
+        - Ranked-tuples shape: a list of `(label, score)` pairs,
+          best-first, e.g.
+          ``[("E. coli", 0.82), ("Shigella", 0.79), ("Salmonella", 0.10)]``.
+          This is the shape ``fastdna.taxonomy.classify()`` is documented
+          to return. Scores need not sum to 1.
+        - Probability-vector shape: a `(probs, labels)` pair of
+          equal-length sequences, e.g. ``([0.82, 0.79, 0.10], ["E. coli",
+          "Shigella", "Salmonella"])`` -- the shape you'd build from a
+          scikit-learn classifier's ``predict_proba()`` output for one
+          sample plus ``classifier.classes_``.
+    method : {"margin", "entropy"}, default "margin"
+        - ``"margin"``: ``1 - (top1_score - top2_score)``. A small gap
+          between the best and second-best candidate means the classifier
+          is nearly torn between them -- high uncertainty, so this returns
+          a value close to 1. A wide gap (confident top pick) returns a
+          value close to 0. Only the top two scores matter, by
+          construction (Settles 2009, "smallest margin" query strategy).
+        - ``"entropy"``: Shannon entropy (base 2) of the full score
+          distribution over *all* provided candidates, after normalizing
+          to a probability-like distribution (see `_normalize`). A
+          sharply-peaked distribution (confident) has low entropy; a
+          spread-out/near-uniform distribution (uncertain across many
+          candidates) has high entropy. Ranges from 0 (fully certain, all
+          mass on one candidate) up to ``log2(n)`` for ``n`` candidates
+          (fully uniform).
 
-    `method`:
+    Returns
+    -------
+    float
+        The uncertainty score. Larger means more uncertain, for both
+        methods.
 
-    - ``"margin"`` (default): ``1 - (top1_score - top2_score)``. A small
-      gap between the best and second-best candidate means the classifier
-      is nearly torn between them -- high uncertainty, so this returns a
-      value close to 1. A wide gap (confident top pick) returns a value
-      close to 0. Only the top two scores matter, by construction (Settles
-      2009, "smallest margin" query strategy).
-    - ``"entropy"``: Shannon entropy (base 2) of the full score
-      distribution over *all* provided candidates, after normalizing to a
-      probability-like distribution (see `_normalize`). A sharply-peaked
-      distribution (confident) has low entropy; a spread-out/near-uniform
-      distribution (uncertain across many candidates) has high entropy.
-      Ranges from 0 (fully certain, all mass on one candidate) up to
-      ``log2(n)`` for ``n`` candidates (fully uniform).
-
-    Raises `ValueError` for malformed input: empty results, mismatched
-    `probs`/`labels` lengths, or entries that aren't `(label, score)`
-    pairs.
+    Raises
+    ------
+    ValueError
+        For malformed input: empty results, mismatched `probs`/`labels`
+        lengths, or entries that aren't `(label, score)` pairs.
     """
     if method not in _VALID_METHODS:
         raise _core.InvalidConfigError(
@@ -293,40 +305,80 @@ def _iter_batch(batch_of_results):
     return list(batch_of_results)
 
 
+class ReviewEntry(NamedTuple):
+    """One entry in the review queue built by `prioritize_for_review`.
+
+    A plain 3-tuple in every respect (positional unpacking,
+    `entry[0]`/`entry[1]`/`entry[2]` indexing, and equality all behave
+    exactly as they would for `tuple[Any, float, Any]`) that additionally
+    supports attribute access (`entry.query_id`, `entry.uncertainty_score`,
+    `entry.original_result`) -- table-row-per-entry small results,
+    matching this package's own convention for "a scalar per row" results
+    (e.g. `fastdna.mic.MicRegressionReport`).
+
+    Attributes
+    ----------
+    query_id : Any
+        The caller-supplied identifier for this query, as given in
+        `batch_of_results`. Not interpreted.
+    uncertainty_score : float
+        This query's uncertainty score under whichever `method`
+        `prioritize_for_review` was called with. Larger means more
+        uncertain.
+    original_result : Any
+        The query's own `ranked_results_or_probs` value, passed through
+        unchanged -- either shape `uncertainty_score` accepts.
+    """
+
+    query_id: Any
+    uncertainty_score: float
+    original_result: Any
+
+
 def prioritize_for_review(
     batch_of_results: Any,  # list of (query_id, result) tuples, or {query_id: result} dict
     *,
     method: str = "margin",
     top_n: Optional[int] = None,
-) -> list[tuple[Any, float, Any]]:
+) -> List[ReviewEntry]:
     """Turns a batch of per-query classification results into a review
     queue, most-uncertain-first.
 
-    `batch_of_results`: either
+    Parameters
+    ----------
+    batch_of_results : list of (query_id, result) tuples, or {query_id: result} dict
+        Either
 
-    - a list of `(query_id, ranked_results_or_probs)` tuples, or
-    - a dict `{query_id: ranked_results_or_probs}`,
+        - a list of `(query_id, ranked_results_or_probs)` tuples, or
+        - a dict `{query_id: ranked_results_or_probs}`,
 
-    where `ranked_results_or_probs` is one query's result in either shape
-    accepted by `uncertainty_score`. `query_id` is any caller-supplied
-    hashable identifier (e.g. a sample/read name) used only to label the
-    output -- it is not interpreted.
+        where `ranked_results_or_probs` is one query's result in either
+        shape accepted by `uncertainty_score`. `query_id` is any
+        caller-supplied hashable identifier (e.g. a sample/read name) used
+        only to label the output -- it is not interpreted.
+    method : {"margin", "entropy"}, default "margin"
+        Passed through to `uncertainty_score` for every entry (so all
+        entries in one batch are scored the same way -- comparing
+        "margin" on one entry against "entropy" on another would not be
+        meaningful).
+    top_n : int, optional
+        If given, truncates the returned queue to the `top_n` most
+        uncertain entries; if `None` (default), the full queue is
+        returned.
 
-    `method`: passed through to `uncertainty_score` for every entry (so all
-    entries in one batch are scored the same way -- comparing "margin" on
-    one entry against "entropy" on another would not be meaningful).
+    Returns
+    -------
+    list of ReviewEntry
+        Sorted by `uncertainty_score` descending (most uncertain -- i.e.
+        the entries most worth a human/expert's attention -- first). Ties
+        are broken by the input order (stable sort), so results are
+        reproducible.
 
-    `top_n`: if given, truncates the returned queue to the `top_n` most
-    uncertain entries; if `None` (default), the full queue is returned.
-
-    Returns a list of `(query_id, uncertainty_score, original_result)`
-    tuples, sorted by `uncertainty_score` descending (most uncertain --
-    i.e. the entries most worth a human/expert's attention -- first). Ties
-    are broken by the input order (stable sort), so results are
-    reproducible.
-
-    Raises `ValueError` if `batch_of_results` is empty, or if any entry is
-    malformed (propagated from `uncertainty_score`).
+    Raises
+    ------
+    ValueError
+        If `batch_of_results` is empty, or if any entry is malformed
+        (propagated from `uncertainty_score`).
     """
     entries = _iter_batch(batch_of_results)
     if len(entries) == 0:
@@ -336,10 +388,10 @@ def prioritize_for_review(
         )
 
     scored = [
-        (query_id, uncertainty_score(result, method=method), result)
+        ReviewEntry(query_id, uncertainty_score(result, method=method), result)
         for query_id, result in entries
     ]
-    scored.sort(key=lambda entry: entry[1], reverse=True)
+    scored.sort(key=lambda entry: entry.uncertainty_score, reverse=True)
 
     if top_n is not None:
         scored = scored[:top_n]
@@ -348,10 +400,10 @@ def prioritize_for_review(
 
 
 def suggest_reference_additions(
-    prioritized_queue: list[tuple[Any, float, Any]],
+    prioritized_queue: List[ReviewEntry],
     *,
     uncertainty_threshold: float,
-) -> list[tuple[Any, float, Any]]:
+) -> List[ReviewEntry]:
     """Convenience filter over `prioritize_for_review`'s output: returns
     just the entries at or above `uncertainty_threshold`.
 
@@ -365,25 +417,28 @@ def suggest_reference_additions(
     or silently discarding the sample, which is the exact failure mode
     active learning exists to avoid.
 
-    `prioritized_queue`: the output of `prioritize_for_review` -- a list of
-    `(query_id, uncertainty_score, original_result)` tuples.
+    Parameters
+    ----------
+    prioritized_queue : list of ReviewEntry
+        The output of `prioritize_for_review`.
+    uncertainty_threshold : float
+        Entries with `uncertainty_score >=` this value are returned. Since
+        both `uncertainty_score` methods use the "larger = more uncertain"
+        convention, higher thresholds are stricter (fewer, more-uncertain
+        entries returned). The right threshold is workflow/method-dependent
+        (e.g. an entropy score is bounded by ``log2(n)`` for ``n``
+        candidates, while a margin score is always in ``[0, 1]``) --
+        callers should pick it based on their own data rather than a value
+        hardcoded here.
 
-    `uncertainty_threshold`: entries with `uncertainty_score >=` this value
-    are returned. Since both `uncertainty_score` methods use the "larger =
-    more uncertain" convention, higher thresholds are stricter (fewer,
-    more-uncertain entries returned). The right threshold is
-    workflow/method-dependent (e.g. an entropy score is bounded by
-    ``log2(n)`` for ``n`` candidates, while a margin score is always in
-    ``[0, 1]``) -- callers should pick it based on their own data rather
-    than a value hardcoded here.
-
-    Returns a list in the same `(query_id, uncertainty_score,
-    original_result)` shape as `prioritized_queue`, preserving the
-    most-uncertain-first order, containing only the entries that cleared
-    the threshold.
+    Returns
+    -------
+    list of ReviewEntry
+        The subset of `prioritized_queue` that cleared the threshold,
+        preserving the most-uncertain-first order.
     """
     return [
         entry
         for entry in prioritized_queue
-        if entry[1] >= uncertainty_threshold
+        if entry.uncertainty_score >= uncertainty_threshold
     ]
