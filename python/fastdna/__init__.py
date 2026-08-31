@@ -46,6 +46,8 @@ __all__ = [
     # Re-exported at the bottom of this module (see the comment there).
     "CohortCounts",
     "count_cohort",
+    "audit",
+    "explain",
 ]
 
 # A path accepted anywhere in this module: a `str`, or anything implementing
@@ -1126,3 +1128,16 @@ def estimate_spectrum(
 # resolved when it is actually called, not at import time, so only the
 # early binding matters here.
 from .cohort_counts import CohortCounts, count_cohort  # noqa: E402
+
+# `fastdna.audit(...)` and `fastdna.explain(...)` -- the two functions this
+# package's own differentiator (docs/audit/ml-gaps.md's "unified thesis")
+# is built around -- were previously reachable only via `from fastdna.audit
+# import audit` / `from fastdna.explain import explain`, one import per
+# function, from a submodule whose name collides with the function itself
+# (`fastdna.audit.audit`, not `fastdna.audit(...)`). Re-exported here so
+# the natural spelling works; neither module imports anything from this
+# one at its own import time, so this carries none of `cohort_counts`'s
+# circular-import constraint above -- it is placed at the end purely for
+# consistency with that re-export, not because it needs to be.
+from .audit import audit  # noqa: E402
+from .explain import explain  # noqa: E402
