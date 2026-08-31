@@ -306,7 +306,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -518,7 +518,7 @@ class AuditReport:
     lineage_threshold: float
     confounding: Confounding
     per_fold: pa.Table
-    covariates: tuple
+    covariates: Tuple[CovariateAudit, ...]
 
     def to_markdown(self) -> str:
         scoring_label = self.scoring if self.scoring is not None else "estimator default"
@@ -979,18 +979,18 @@ def _validate_covariates(covariates, n_samples):
 
 
 def audit(
-    estimator,
-    paths,
-    phenotype,
+    estimator: Any,  # unfitted/fitted sklearn estimator or Pipeline; soft dependency, not imported at module level
+    paths: Sequence[Any],  # ordinarily real FASTQ(.gz) paths, but a precomputed feature matrix when groups= is given -- see below
+    phenotype: Union[Sequence[Any], np.ndarray],
     *,
-    groups=None,
-    covariates=None,
-    n_splits=5,
-    scoring=None,
-    k=21,
-    sketch_size=1000,
-    lineage_threshold=0.01,
-    random_state=0,
+    groups: Optional[Union[Sequence[int], np.ndarray]] = None,
+    covariates: Optional[Mapping[str, Union[Sequence[Any], np.ndarray]]] = None,
+    n_splits: int = 5,
+    scoring: Optional[Union[str, Callable[..., float]]] = None,
+    k: int = 21,
+    sketch_size: int = 1000,
+    lineage_threshold: float = 0.01,
+    random_state: Optional[int] = 0,
 ) -> AuditReport:
     """Fits and scores `estimator` under ordinary (random) cross-validation
     and under `cv.LineageKFold`, and reports the gap -- the arXiv 2502.07749

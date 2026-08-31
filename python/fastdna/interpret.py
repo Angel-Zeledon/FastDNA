@@ -37,11 +37,11 @@ on its `.transform()` output, and runs `top_features`/
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Any, Sequence, Union
 
 import pyarrow as pa
 
+from fastdna import _PathLike
 from . import _core
 
 # Deliberately no top-level `numpy` import: like scikit-learn/scipy/UMAP/
@@ -160,7 +160,7 @@ def top_features(
 def export_top_features_fasta(
     importances: Union[Sequence[float], "np.ndarray"],
     feature_names: Sequence[str],
-    path: Union[str, os.PathLike],
+    path: _PathLike,
     *,
     n: int = 20,
 ) -> pa.Table:

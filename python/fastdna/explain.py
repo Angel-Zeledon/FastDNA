@@ -59,13 +59,13 @@ checks a naive read of `model.coef_`/`get_feature_names_out()` skips.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
 
+from fastdna import _PathLike
 from . import _core
 
 __all__ = ["explain", "ExplainReport", "FeatureExplanation"]
@@ -120,7 +120,7 @@ class ExplainReport:
     `top_n` selected them in).
     """
 
-    features: tuple
+    features: Tuple[FeatureExplanation, ...]
     n_lineages: int
     lineage_threshold: float
 
@@ -285,10 +285,11 @@ def _cochran_mantel_haenszel(x, y, strata):
 def explain(
     vectorizer: Any,  # fastdna.sklearn.KmerVectorizer; soft dependency, not imported here
     importances: Union[Sequence[float], np.ndarray],
-    paths: Sequence[Union[str, os.PathLike]],
+    paths: Sequence[_PathLike],
     phenotype: Optional[Union[Sequence[int], np.ndarray]] = None,
     *,
     top_n: int = 20,
+    k: int = 21,
     lineage_threshold: Optional[float] = None,
     annotation: Optional[Any] = None,  # fastdna.annotate.Annotation; soft dependency, not imported here
 ) -> ExplainReport:
@@ -323,6 +324,13 @@ def explain(
         identifiability and lineage attribution alone.
     top_n : int, default 20
         How many top features (by `|importance|`) to explain.
+    k : int, default 21
+        The k-mer length forwarded to `fastdna.cv.lineage_groups` for the
+        lineage-attribution and within-lineage association checks. This is
+        independent of whatever `k` the caller's `vectorizer` was fitted
+        with -- `explain()` sketches `paths` itself to detect lineages, it
+        does not read `vectorizer`'s own k. The default (21) matches
+        `fastdna.cv.lineage_groups`'s own default.
     lineage_threshold : float or None, default None
         Forwarded to `fastdna.cv.lineage_groups`; `None` uses that
         function's own default (0.01).
@@ -387,7 +395,7 @@ def explain(
 
     labels = _cv.lineage_groups(
         paths,
-        k=21,
+        k=k,
         distance_threshold=lineage_threshold if lineage_threshold is not None else 0.01,
     )
     n_lineages_total = int(np.unique(labels).size)
