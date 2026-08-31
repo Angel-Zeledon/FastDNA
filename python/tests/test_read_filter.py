@@ -132,3 +132,142 @@ def test_filter_reads_defaults_to_a_min_fraction_of_point_one(tmp_path):
     out = tmp_path / "filtered.fastq"
     stats = table.filter_reads(str(sample), mode="keep", output=str(out))
     assert stats.reads_written == 1
+
+
+# ---------------------------------------------------------------------
+# KmerTable.filter_reads_paired -- synchronized R1/R2 filtering
+# ---------------------------------------------------------------------
+
+
+def write_paired_fastqs(tmp_path, reads):
+    """Writes matched r1.fastq/r2.fastq files from `[(id, r1_seq, r2_seq), ...]`."""
+    r1 = tmp_path / "r1.fastq"
+    r2 = tmp_path / "r2.fastq"
+    write_fastq(r1, [(f"{read_id}/1", seq1) for read_id, seq1, _ in reads])
+    write_fastq(r2, [(f"{read_id}/2", seq2) for read_id, _, seq2 in reads])
+    return r1, r2
+
+
+def test_filter_reads_paired_keep_mode_writes_a_pair_if_either_mate_matches(tmp_path):
+    table = reference_table(tmp_path)
+    r1, r2 = write_paired_fastqs(
+        tmp_path,
+        [
+            ("a", "AAAAAAAA", "GCGCGCGC"),  # only R1 matches
+            ("b", "GCGCGCGC", "AAAAAAAA"),  # only R2 matches
+            ("c", "GCGCGCGC", "GCGCGCGC"),  # neither matches
+        ],
+    )
+
+    out1 = tmp_path / "out1.fastq"
+    out2 = tmp_path / "out2.fastq"
+    stats = table.filter_reads_paired(
+        str(r1), str(r2), mode="keep", output=str(out1), output2=str(out2), min_fraction=0.5
+    )
+
+    assert stats.pairs_total == 3
+    assert stats.pairs_written == 2
+    text1 = out1.read_text()
+    text2 = out2.read_text()
+    assert "@a/1" in text1 and "@a/2" in text2
+    assert "@b/1" in text1 and "@b/2" in text2
+    assert "@c/1" not in text1 and "@c/2" not in text2
+
+
+def test_filter_reads_paired_discard_mode_writes_a_pair_only_if_neither_mate_matches(tmp_path):
+    table = reference_table(tmp_path)
+    r1, r2 = write_paired_fastqs(
+        tmp_path,
+        [
+            ("a", "AAAAAAAA", "GCGCGCGC"),
+            ("b", "GCGCGCGC", "AAAAAAAA"),
+            ("c", "GCGCGCGC", "GCGCGCGC"),
+        ],
+    )
+
+    out1 = tmp_path / "out1.fastq"
+    out2 = tmp_path / "out2.fastq"
+    stats = table.filter_reads_paired(
+        str(r1), str(r2), mode="discard", output=str(out1), output2=str(out2), min_fraction=0.5
+    )
+
+    assert stats.pairs_total == 3
+    assert stats.pairs_written == 1
+    text1 = out1.read_text()
+    text2 = out2.read_text()
+    assert "@c/1" in text1 and "@c/2" in text2
+    assert "@a/1" not in text1 and "@b/1" not in text1
+
+
+def test_filter_reads_paired_accepts_single_paths_not_only_sequences(tmp_path):
+    table = reference_table(tmp_path)
+    r1, r2 = write_paired_fastqs(tmp_path, [("only", "AAAAAAAA", "GCGCGCGC")])
+
+    out1 = tmp_path / "out1.fastq"
+    out2 = tmp_path / "out2.fastq"
+    stats = table.filter_reads_paired(
+        r1, r2, mode="keep", output=out1, output2=out2, min_fraction=0.5
+    )
+    assert stats.pairs_written == 1
+
+
+def test_filter_reads_paired_rejects_an_unknown_mode(tmp_path):
+    table = reference_table(tmp_path)
+    r1, r2 = write_paired_fastqs(tmp_path, [("a", "AAAAAAAA", "GCGCGCGC")])
+
+    with pytest.raises(ValueError):
+        table.filter_reads_paired(
+            str(r1), str(r2), mode="bogus", output=str(tmp_path / "o1.fastq"), output2=str(tmp_path / "o2.fastq")
+        )
+
+
+def test_filter_reads_paired_rejects_output_and_output2_being_the_same_file(tmp_path):
+    table = reference_table(tmp_path)
+    r1, r2 = write_paired_fastqs(tmp_path, [("a", "AAAAAAAA", "GCGCGCGC")])
+    shared = tmp_path / "shared.fastq"
+
+    with pytest.raises(ValueError):
+        table.filter_reads_paired(str(r1), str(r2), mode="keep", output=str(shared), output2=str(shared))
+
+
+def test_filter_reads_paired_must_not_overwrite_its_own_r1_input(tmp_path):
+    table = reference_table(tmp_path)
+    r1, r2 = write_paired_fastqs(tmp_path, [("a", "AAAAAAAA", "GCGCGCGC")])
+    original_r1 = r1.read_bytes()
+    out2 = tmp_path / "out2.fastq"
+
+    with pytest.raises(ValueError):
+        table.filter_reads_paired(str(r1), str(r2), mode="keep", output=str(r1), output2=str(out2))
+
+    assert r1.read_bytes() == original_r1, "the R1 input file must survive untouched"
+
+
+def test_filter_reads_paired_must_not_overwrite_the_reference_table(tmp_path):
+    table = reference_table(tmp_path)
+    r1, r2 = write_paired_fastqs(tmp_path, [("a", "AAAAAAAA", "GCGCGCGC")])
+    table_path = tmp_path / "reference.parquet"
+    original_size = table_path.stat().st_size
+    out2 = tmp_path / "out2.fastq"
+
+    with pytest.raises(ValueError):
+        table.filter_reads_paired(
+            str(r1), str(r2), mode="keep", output=str(table_path), output2=str(out2)
+        )
+
+    assert table_path.stat().st_size == original_size
+    fastdna.KmerTable.open(str(table_path))  # must still be a valid table
+
+
+def test_filter_reads_paired_raises_on_desynchronized_mate_streams(tmp_path):
+    table = reference_table(tmp_path)
+    # R1 has two reads, R2 only one -- the two streams cannot be
+    # reconciled past the first pair.
+    r1 = tmp_path / "r1.fastq"
+    r2 = tmp_path / "r2.fastq"
+    write_fastq(r1, [("a/1", "GCGCGCGC"), ("b/1", "GCGCGCGC")])
+    write_fastq(r2, [("a/2", "GCGCGCGC")])
+
+    out1 = tmp_path / "out1.fastq"
+    out2 = tmp_path / "out2.fastq"
+    with pytest.raises(ValueError):
+        table.filter_reads_paired(str(r1), str(r2), mode="keep", output=str(out1), output2=str(out2))

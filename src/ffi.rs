@@ -1306,6 +1306,82 @@ fn filter_reads(
     Ok(PyFilterStats { reads_total: stats.reads_total, reads_written: stats.reads_written })
 }
 
+/// The Python-visible outcome of a `filter_reads_paired` call: how many
+/// *pairs* were read in total, and how many pairs were written -- the
+/// Python-visible counterpart of `read_filter::PairedFilterStats`.
+#[pyclass(name = "PairedFilterStats", module = "fastdna._core")]
+struct PyPairedFilterStats {
+    #[pyo3(get)]
+    pairs_total: u64,
+    #[pyo3(get)]
+    pairs_written: u64,
+}
+
+#[pymethods]
+impl PyPairedFilterStats {
+    fn __repr__(&self) -> String {
+        format!("PairedFilterStats(pairs_total={}, pairs_written={})", self.pairs_total, self.pairs_written)
+    }
+}
+
+/// Filters synchronized R1/R2 FASTQ/FASTA file pairs against `table`,
+/// writing pairs that should be kept to `output`/`output2` -- the
+/// Python-visible counterpart of `fastdna filter --input2 ... --output2
+/// ...` / `read_filter::run_filter_paired`. See `read_filter.rs`'s module
+/// doc comment ("Paired-end (R1/R2) synchronized filtering") for the full
+/// design: a pair is kept or discarded as *one unit* if either mate
+/// matches the reference, never independently per mate, and both mates of
+/// a kept pair are always written together so the two output streams can
+/// never drift out of sync with each other.
+///
+/// `inputs`/`inputs2` are each concatenated into one stream first (the
+/// same multi-file convention `filter_reads`'s own `inputs` already uses),
+/// and it is those two streams that are paired, record by record; they do
+/// not need to hold the same number of *files*, only the same *total*
+/// record count -- see `fastq::PairedSourceReader`'s doc comment. A
+/// genuine mismatch there raises rather than silently truncating either
+/// side.
+///
+/// `table` is taken as an already-open `KmerTable` (`python/fastdna/
+/// __init__.py`'s `KmerTable.filter_reads_paired` calls this with
+/// `self._raw`), the same "the Python wrapper builds the call, the FFI
+/// function takes already-open handles" shape `filter_reads` already uses.
+///
+/// Released under `py.allow_threads` for the same reason `filter_reads`
+/// already is: filtering real FASTQ files is I/O- and CPU-bound work with
+/// nothing Python-specific in it.
+#[pyfunction]
+#[pyo3(signature = (table, inputs, inputs2, mode, output, output2, min_fraction=0.1))]
+#[allow(clippy::too_many_arguments)]
+fn filter_reads_paired(
+    py: Python<'_>,
+    table: PyRef<'_, PyKmerTable>,
+    inputs: Vec<String>,
+    inputs2: Vec<String>,
+    mode: &str,
+    output: String,
+    output2: String,
+    min_fraction: f64,
+) -> PyResult<PyPairedFilterStats> {
+    let mode = parse_filter_mode(mode)?;
+    let table_inner = table.inner.clone();
+    let inputs_r1: Vec<crate::fastq::InputSpec> =
+        inputs.iter().map(|p| crate::fastq::InputSpec::from_arg(std::path::Path::new(p))).collect();
+    let inputs_r2: Vec<crate::fastq::InputSpec> =
+        inputs2.iter().map(|p| crate::fastq::InputSpec::from_arg(std::path::Path::new(p))).collect();
+    let output_path = PathBuf::from(output);
+    let output2_path = PathBuf::from(output2);
+
+    let stats = py.allow_threads(|| -> Result<read_filter::PairedFilterStats, FastDnaError> {
+        let index = read_filter::ReferenceIndex::from_table(&table_inner)?;
+        read_filter::run_filter_paired(
+            inputs_r1, inputs_r2, &index, mode, min_fraction, &output_path, &output2_path,
+        )
+    })?;
+
+    Ok(PyPairedFilterStats { pairs_total: stats.pairs_total, pairs_written: stats.pairs_written })
+}
+
 /// The Python-visible outcome of a `profile_reads` call: how many reads were
 /// read in total, and how many of those yielded at least one k-mer to
 /// profile -- the Python-visible counterpart of `read_profile::
@@ -2160,6 +2236,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFracSketch>()?;
     m.add_class::<PyKmerTable>()?;
     m.add_class::<PyFilterStats>()?;
+    m.add_class::<PyPairedFilterStats>()?;
     m.add_class::<PyProfileStats>()?;
     m.add_class::<PyKmerDatabase>()?;
     m.add_function(wrap_pyfunction!(count, m)?)?;
@@ -2180,6 +2257,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ktab_intersect, m)?)?;
     m.add_function(wrap_pyfunction!(ktab_diff, m)?)?;
     m.add_function(wrap_pyfunction!(filter_reads, m)?)?;
+    m.add_function(wrap_pyfunction!(filter_reads_paired, m)?)?;
     m.add_function(wrap_pyfunction!(profile_reads, m)?)?;
     Ok(())
 }

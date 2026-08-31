@@ -255,6 +255,279 @@ fn filter_rejects_an_out_of_range_min_fraction() {
     assert!(!stderr.is_empty());
 }
 
+// ---------------------------------------------------------------------
+// Paired-end (--input2/--output2) filtering
+// ---------------------------------------------------------------------
+
+fn build_reference_and_paired_sample(scratch: &ScratchDir) -> (PathBuf, PathBuf, PathBuf) {
+    let reference_fastq = scratch.path("reference.fastq");
+    write_fastq(&reference_fastq, &[("ref1", "GGGGGGGGGGGG")]);
+    let reference_table = scratch.path("reference.parquet");
+    run_fastdna(&[
+        "count",
+        "--input",
+        reference_fastq.to_str().unwrap(),
+        "-k",
+        "4",
+        "-o",
+        reference_table.to_str().unwrap(),
+    ]);
+
+    // pair "a": only R1 matches the reference. pair "b": only R2 matches.
+    // pair "c": neither mate matches.
+    let r1 = scratch.path("r1.fastq");
+    write_fastq(
+        &r1,
+        &[
+            ("a/1", "GGGGGGGGGGGG"),
+            ("b/1", "ACATACATACAT"),
+            ("c/1", "ACATACATACAT"),
+        ],
+    );
+    let r2 = scratch.path("r2.fastq");
+    write_fastq(
+        &r2,
+        &[
+            ("a/2", "ACATACATACAT"),
+            ("b/2", "GGGGGGGGGGGG"),
+            ("c/2", "ACATACATACAT"),
+        ],
+    );
+
+    (reference_table, r1, r2)
+}
+
+#[test]
+fn paired_keep_mode_writes_a_pair_if_either_mate_matches() {
+    let scratch = ScratchDir::new("paired_keep");
+    let (reference_table, r1, r2) = build_reference_and_paired_sample(&scratch);
+
+    let out1 = scratch.path("out1.fastq");
+    let out2 = scratch.path("out2.fastq");
+    run_fastdna(&[
+        "filter",
+        "--input",
+        r1.to_str().unwrap(),
+        "--input2",
+        r2.to_str().unwrap(),
+        "--table",
+        reference_table.to_str().unwrap(),
+        "--mode",
+        "keep",
+        "--min-fraction",
+        "0.5",
+        "-o",
+        out1.to_str().unwrap(),
+        "--output2",
+        out2.to_str().unwrap(),
+    ]);
+
+    let ids1 = read_fastq_ids(&out1);
+    let ids2 = read_fastq_ids(&out2);
+    assert_eq!(ids1, vec!["a/1", "b/1"], "pairs a and b each have a matching mate");
+    assert_eq!(ids2, vec!["a/2", "b/2"], "R2 output must stay synchronized with R1's kept pairs");
+}
+
+#[test]
+fn paired_discard_mode_writes_a_pair_only_if_neither_mate_matches() {
+    let scratch = ScratchDir::new("paired_discard");
+    let (reference_table, r1, r2) = build_reference_and_paired_sample(&scratch);
+
+    let out1 = scratch.path("out1.fastq");
+    let out2 = scratch.path("out2.fastq");
+    run_fastdna(&[
+        "filter",
+        "--input",
+        r1.to_str().unwrap(),
+        "--input2",
+        r2.to_str().unwrap(),
+        "--table",
+        reference_table.to_str().unwrap(),
+        "--mode",
+        "discard",
+        "--min-fraction",
+        "0.5",
+        "-o",
+        out1.to_str().unwrap(),
+        "--output2",
+        out2.to_str().unwrap(),
+    ]);
+
+    let ids1 = read_fastq_ids(&out1);
+    let ids2 = read_fastq_ids(&out2);
+    assert_eq!(ids1, vec!["c/1"], "only pair c has no matching mate on either side");
+    assert_eq!(ids2, vec!["c/2"]);
+}
+
+#[test]
+fn paired_gzip_outputs_are_real_gzip_streams_readable_back() {
+    let scratch = ScratchDir::new("paired_gzip");
+    let (reference_table, r1, r2) = build_reference_and_paired_sample(&scratch);
+
+    let out1 = scratch.path("out1.fastq.gz");
+    let out2 = scratch.path("out2.fastq.gz");
+    run_fastdna(&[
+        "filter",
+        "--input",
+        r1.to_str().unwrap(),
+        "--input2",
+        r2.to_str().unwrap(),
+        "--table",
+        reference_table.to_str().unwrap(),
+        "--mode",
+        "discard",
+        "--min-fraction",
+        "0.5",
+        "-o",
+        out1.to_str().unwrap(),
+        "--output2",
+        out2.to_str().unwrap(),
+    ]);
+
+    assert_eq!(read_gzipped_fastq_ids(&out1), vec!["c/1"]);
+    assert_eq!(read_gzipped_fastq_ids(&out2), vec!["c/2"]);
+}
+
+#[test]
+fn input2_without_output2_is_rejected() {
+    let scratch = ScratchDir::new("input2_no_output2");
+    let (reference_table, r1, r2) = build_reference_and_paired_sample(&scratch);
+    let out1 = scratch.path("out1.fastq");
+
+    let stderr = run_fastdna_expect_failure(&[
+        "filter",
+        "--input",
+        r1.to_str().unwrap(),
+        "--input2",
+        r2.to_str().unwrap(),
+        "--table",
+        reference_table.to_str().unwrap(),
+        "--mode",
+        "keep",
+        "-o",
+        out1.to_str().unwrap(),
+    ]);
+    assert!(!stderr.is_empty());
+    assert!(!out1.exists(), "no output should be written before the argument-shape error");
+}
+
+#[test]
+fn output2_without_input2_is_rejected() {
+    let scratch = ScratchDir::new("output2_no_input2");
+    let (reference_table, r1, _r2) = build_reference_and_paired_sample(&scratch);
+    let out1 = scratch.path("out1.fastq");
+    let out2 = scratch.path("out2.fastq");
+
+    let stderr = run_fastdna_expect_failure(&[
+        "filter",
+        "--input",
+        r1.to_str().unwrap(),
+        "--table",
+        reference_table.to_str().unwrap(),
+        "--mode",
+        "keep",
+        "-o",
+        out1.to_str().unwrap(),
+        "--output2",
+        out2.to_str().unwrap(),
+    ]);
+    assert!(!stderr.is_empty());
+}
+
+#[test]
+fn output_and_output2_pointing_at_the_same_file_are_rejected() {
+    let scratch = ScratchDir::new("paired_same_output");
+    let (reference_table, r1, r2) = build_reference_and_paired_sample(&scratch);
+    let shared = scratch.path("shared.fastq");
+
+    let stderr = run_fastdna_expect_failure(&[
+        "filter",
+        "--input",
+        r1.to_str().unwrap(),
+        "--input2",
+        r2.to_str().unwrap(),
+        "--table",
+        reference_table.to_str().unwrap(),
+        "--mode",
+        "keep",
+        "-o",
+        shared.to_str().unwrap(),
+        "--output2",
+        shared.to_str().unwrap(),
+    ]);
+    assert!(!stderr.is_empty());
+    assert!(!shared.exists(), "neither mate should be written when both outputs collide");
+}
+
+#[test]
+fn paired_output_must_not_overwrite_an_r1_or_r2_input_file() {
+    let scratch = ScratchDir::new("paired_overwrite_input");
+    let (reference_table, r1, r2) = build_reference_and_paired_sample(&scratch);
+    let original_r1 = std::fs::read(&r1).unwrap();
+    let out2 = scratch.path("out2.fastq");
+
+    let stderr = run_fastdna_expect_failure(&[
+        "filter",
+        "--input",
+        r1.to_str().unwrap(),
+        "--input2",
+        r2.to_str().unwrap(),
+        "--table",
+        reference_table.to_str().unwrap(),
+        "--mode",
+        "keep",
+        // --output points back at the R1 input file itself.
+        "-o",
+        r1.to_str().unwrap(),
+        "--output2",
+        out2.to_str().unwrap(),
+    ]);
+    assert!(!stderr.is_empty());
+    assert_eq!(std::fs::read(&r1).unwrap(), original_r1, "the R1 input file must survive untouched");
+}
+
+#[test]
+fn paired_desync_between_r1_and_r2_is_reported_not_silently_truncated() {
+    let scratch = ScratchDir::new("paired_desync");
+    let reference_fastq = scratch.path("reference.fastq");
+    write_fastq(&reference_fastq, &[("ref1", "GGGGGGGGGGGG")]);
+    let reference_table = scratch.path("reference.parquet");
+    run_fastdna(&[
+        "count",
+        "--input",
+        reference_fastq.to_str().unwrap(),
+        "-k",
+        "4",
+        "-o",
+        reference_table.to_str().unwrap(),
+    ]);
+
+    // R1 has two reads, R2 only one.
+    let r1 = scratch.path("r1.fastq");
+    write_fastq(&r1, &[("a/1", "ACATACATACAT"), ("b/1", "ACATACATACAT")]);
+    let r2 = scratch.path("r2.fastq");
+    write_fastq(&r2, &[("a/2", "ACATACATACAT")]);
+
+    let out1 = scratch.path("out1.fastq");
+    let out2 = scratch.path("out2.fastq");
+    let stderr = run_fastdna_expect_failure(&[
+        "filter",
+        "--input",
+        r1.to_str().unwrap(),
+        "--input2",
+        r2.to_str().unwrap(),
+        "--table",
+        reference_table.to_str().unwrap(),
+        "--mode",
+        "keep",
+        "-o",
+        out1.to_str().unwrap(),
+        "--output2",
+        out2.to_str().unwrap(),
+    ]);
+    assert!(!stderr.is_empty());
+}
+
 #[test]
 fn filter_output_composes_as_a_valid_count_input() {
     // Not a strict requirement of S4, but a useful smoke test: filtered

@@ -79,25 +79,56 @@
 //! stages do not need a second code path, and this module reuses exactly
 //! that convention rather than inventing a FASTA writer.
 //!
-//! # Scope: single-end only
+//! # Scope: single-end filtering
 //!
 //! Each `--input`/`inputs` file is filtered independently, read by read;
 //! several files are read as one concatenated stream into one output file,
 //! the same convention `count`'s own multi-file `--input` already
-//! establishes (`fastq::MultiSourceReader`). **Paired-end (R1/R2)
-//! synchronized filtering -- where a pair is kept or discarded as one unit
-//! if either mate matches, which is the standard convention real pipelines
-//! rely on -- is not implemented here.** Passing a sample's R1 and R2 files
-//! both via `--input` filters each mate independently against the
-//! reference and writes whichever of them individually passes, in file
-//! order; a mate can be written while its partner is silently dropped, and
-//! the two output streams are not kept synchronized against each other by
-//! anything in this module. Wiring `cohort::discovery`'s pairing logic
-//! through a real paired-aware filtering pass (reading both mates in lock
-//! step, deciding on the pair, writing two synchronized output streams) is
-//! real, additional work beyond this module's current single-stream
-//! writer, and is left as an explicitly documented follow-up rather than
-//! shipped half-correct.
+//! establishes (`fastq::MultiSourceReader`). Passing a sample's R1 and R2
+//! files both via `--input` in this mode filters each mate independently
+//! against the reference and writes whichever of them individually passes,
+//! in file order; a mate can be written while its partner is silently
+//! dropped, and the two output streams are not kept synchronized against
+//! each other. For that reason paired-end input should go through
+//! `--input2`/`--output2` (below), not through `--input` alone.
+//!
+//! # Paired-end (R1/R2) synchronized filtering
+//!
+//! [`filter_records_paired`]/[`run_filter_paired`] (CLI: `--input2`/
+//! `--output2`; Python: `KmerTable.filter_reads_paired`) filter a sample's
+//! R1 and R2 streams in lock step and decide once per *pair*, not once per
+//! mate -- the standard convention real pipelines rely on (BBDuk's
+//! `in1=`/`in2=`/`out1=`/`out2=`, `kmc_tools filter`'s equivalent paired
+//! mode): **a pair is kept or discarded as a unit if *either* mate matches
+//! the reference**, never independently per mate. The reasoning is the
+//! same "keep vs. discard mode" section above, applied to the pair as a
+//! whole: under `--mode keep` (targeted enrichment), a pair whose R1 alone
+//! carries the organism/panel of interest is exactly as useful as one
+//! whose R2 does, or both do -- discarding it because only one mate
+//! individually cleared the threshold would throw away real signal for no
+//! reason tied to the reference's actual content. Symmetrically, under
+//! `--mode discard` (host/contaminant removal), a pair with *either* mate
+//! mapping to the host is contaminated as a pair -- a fragment does not
+//! stop being of host origin because only one of its two reads happened to
+//! carry the tell-tale k-mers, and keeping the "clean" mate on its own
+//! would silently reintroduce a synchronization bug of a different kind
+//! (an unpaired mate reads as different data to every downstream tool that
+//! assumes R1[i]/R2[i] are still the same fragment). Filtering each mate
+//! independently and requiring *both* to match/not-match would be the
+//! stricter alternative, but it is not what BBDuk or `kmc_tools filter` do,
+//! and it would silently discard pairs whose contaminating fragment
+//! happened to sequence unevenly between its two reads -- a common, benign
+//! artifact of library prep and coverage, not a sign the pair is clean.
+//!
+//! Both mates of a pair that is written are always written together, one
+//! to `--output`/`output1` and the other to `--output2`, so the two output
+//! streams can never drift out of sync with each other: unlike the
+//! single-end scope note above, there is no way for this path to write one
+//! mate while silently dropping its partner. `fastq::PairedSourceReader`
+//! is what makes the two mate streams available in lock step; see its own
+//! doc comment for how it composes two `MultiSourceReader`s and for how it
+//! reports a genuine desynchronization (the two sides' total record counts
+//! actually differ) rather than silently truncating to the shorter one.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -108,7 +139,10 @@ use flate2::Compression;
 
 use crate::atomic::AtomicFile;
 use crate::error::{FastDnaError, Result};
-use crate::fastq::{FastqReadError, FastqRecord, InputSpec, MultiSourceReader, RecordSource};
+use crate::fastq::{
+    FastqReadError, FastqRecord, InputSpec, MultiSourceReader, PairedReadError, PairedRecordSide,
+    PairedSourceReader, RecordSource,
+};
 use crate::kmer;
 use crate::ktab::KmerTable;
 
@@ -459,6 +493,218 @@ pub fn run_filter(
     Ok(stats)
 }
 
+/// Outcome of a paired-end filtering run: how many *pairs* were read in
+/// total, and how many pairs were written -- the paired counterpart of
+/// [`FilterStats`], whose fields count individual reads. A pair is always
+/// written or dropped as one unit (see [`filter_records_paired`]), so
+/// there is exactly one "written" count, not one per mate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PairedFilterStats {
+    pub pairs_total: u64,
+    pub pairs_written: u64,
+}
+
+/// The paired counterpart of `failing_location`: resolves which file (and
+/// per-file record number) to blame for a `PairedReadError`, given which
+/// `side` it names. Falls back to `fallback_r1`/`fallback_r2` plus the
+/// running pair count when that side has no file of its own yet (mirrors
+/// `failing_location`'s own fallback for the same reason: an in-memory
+/// source, or a failure before any file was opened).
+fn paired_failing_location(
+    source: &PairedSourceReader,
+    side: PairedRecordSide,
+    fallback_r1: &Path,
+    fallback_r2: &Path,
+    pairs_so_far: u64,
+) -> (PathBuf, u64) {
+    let (r1_source, r2_source) = source.current_sources();
+    match side {
+        PairedRecordSide::R1 => {
+            r1_source.unwrap_or_else(|| (fallback_r1.to_path_buf(), pairs_so_far + 1))
+        }
+        PairedRecordSide::R2 => {
+            r2_source.unwrap_or_else(|| (fallback_r2.to_path_buf(), pairs_so_far + 1))
+        }
+    }
+}
+
+/// Streams synchronized (R1, R2) record pairs out of `source`, deciding
+/// keep/discard once per *pair* via `read_is_match` applied to each mate
+/// and combined with `||` (see the module doc comment's "paired-end"
+/// section for why `||`, not `&&`, is the standard convention), and
+/// writing kept pairs to `writer1`/`writer2` in lock step. One pass per
+/// side, one record buffer per side reused via `next_pair_into`, one k-mer
+/// scratch buffer shared and reused across both mates via
+/// `matching_fraction` -- neither input stream is ever materialized
+/// beyond the one pair currently being decided.
+#[allow(clippy::too_many_arguments)]
+pub fn filter_records_paired<W: Write>(
+    mut source: PairedSourceReader,
+    index: &ReferenceIndex,
+    mode: FilterMode,
+    min_fraction: f64,
+    writer1: &mut W,
+    writer2: &mut W,
+    fallback_r1: &Path,
+    fallback_r2: &Path,
+) -> Result<PairedFilterStats> {
+    let mut rec1 = FastqRecord::default();
+    let mut rec2 = FastqRecord::default();
+    let mut kmer_buf: Vec<u64> = Vec::new();
+    let mut stats = PairedFilterStats::default();
+
+    loop {
+        match source.next_pair_into(&mut rec1, &mut rec2) {
+            Ok(true) => {
+                let match1 = read_is_match(&rec1.seq, index, min_fraction, &mut kmer_buf);
+                let match2 = read_is_match(&rec2.seq, index, min_fraction, &mut kmer_buf);
+                let pair_matches = match1 || match2;
+                let keep = match mode {
+                    FilterMode::Keep => pair_matches,
+                    FilterMode::Discard => !pair_matches,
+                };
+                if keep {
+                    write_fastq_record(writer1, &rec1)
+                        .map_err(|e| FastDnaError::Io { path: fallback_r1.to_path_buf(), source: e })?;
+                    write_fastq_record(writer2, &rec2)
+                        .map_err(|e| FastDnaError::Io { path: fallback_r2.to_path_buf(), source: e })?;
+                    stats.pairs_written += 1;
+                }
+                stats.pairs_total += 1;
+            }
+            Ok(false) => break,
+            Err(PairedReadError::Io(side, io_err)) => {
+                let (path, _) =
+                    paired_failing_location(&source, side, fallback_r1, fallback_r2, stats.pairs_total);
+                return Err(FastDnaError::Io { path, source: io_err });
+            }
+            Err(PairedReadError::Malformed(side, reason)) => {
+                let (path, record) =
+                    paired_failing_location(&source, side, fallback_r1, fallback_r2, stats.pairs_total);
+                return Err(FastDnaError::MalformedFastq { path, record, reason });
+            }
+            Err(PairedReadError::Desync(side)) => {
+                let (path, record) =
+                    paired_failing_location(&source, side, fallback_r1, fallback_r2, stats.pairs_total);
+                let reason = format!(
+                    "{} ran out of reads before its mate, at pair {record}: the two input streams \
+                     do not hold the same total number of records, so they cannot be kept \
+                     synchronized past this point",
+                    side.label(),
+                );
+                return Err(FastDnaError::MalformedFastq { path, record, reason });
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Rejects an `--output`/`--output2` pair that would overwrite the
+/// reference table, any R1/R2 input file, or each other. The paired
+/// counterpart of `guard_against_output_overwrite`, for the same reason
+/// that one lives here rather than only in the CLI: `ffi.rs::
+/// filter_reads_paired` calls straight into `run_filter_paired` with no
+/// CLI layer in front of it.
+///
+/// `output1 == output2` gets its own explicit rejection (the single-end
+/// guard has no equivalent, single-output case): were it allowed, both
+/// mates would be written to one destination via two independent
+/// `AtomicFile` guards, each renaming its own temp file over the same
+/// path -- whichever commits last silently wins, and the run "succeeds"
+/// while quietly destroying one mate's own output.
+fn guard_against_paired_output_overwrite(
+    inputs_r1: &[InputSpec],
+    inputs_r2: &[InputSpec],
+    index: &ReferenceIndex,
+    output1: &Path,
+    output2: &Path,
+) -> Result<()> {
+    if crate::atomic::same_file(output1, output2) {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "output2",
+            reason: format!(
+                "output ({}) and output2 ({}) resolve to the same file: writing both mates of a \
+                 pair to one destination would leave it holding only whichever mate's write \
+                 committed last",
+                output1.display(),
+                output2.display()
+            ),
+        });
+    }
+
+    for output in [output1, output2] {
+        if crate::atomic::same_file(index.table_path(), output) {
+            return Err(FastDnaError::InvalidConfig {
+                parameter: "output",
+                reason: format!(
+                    "points at the reference table {} and would overwrite it",
+                    index.table_path().display()
+                ),
+            });
+        }
+        for input in inputs_r1.iter().chain(inputs_r2.iter()) {
+            if let InputSpec::File(path) = input {
+                if crate::atomic::same_file(path, output) {
+                    return Err(FastDnaError::InvalidConfig {
+                        parameter: "output",
+                        reason: format!(
+                            "points at the input file {} and would overwrite it",
+                            path.display()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The full paired-end filtering run: opens `inputs_r1`/`inputs_r2` as two
+/// synchronized streams (see `fastq::PairedSourceReader`), filters them
+/// against `index` under `mode`/`min_fraction` deciding once per pair
+/// (`filter_records_paired`), and writes the kept pairs to
+/// `output1`/`output2` (FASTQ, each gzipped iff its own extension says
+/// so), atomically -- shared by the CLI (`main.rs::run_filter`) and the
+/// Python binding (`ffi.rs::filter_reads_paired`) so both go through
+/// exactly one validated, tested path, the same shape `run_filter` already
+/// gives the single-end case.
+#[allow(clippy::too_many_arguments)]
+pub fn run_filter_paired(
+    inputs_r1: Vec<InputSpec>,
+    inputs_r2: Vec<InputSpec>,
+    index: &ReferenceIndex,
+    mode: FilterMode,
+    min_fraction: f64,
+    output1: &Path,
+    output2: &Path,
+) -> Result<PairedFilterStats> {
+    validate_min_fraction(min_fraction)?;
+    guard_against_paired_output_overwrite(&inputs_r1, &inputs_r2, index, output1, output2)?;
+
+    let source = PairedSourceReader::new(inputs_r1, inputs_r2);
+    source.validate()?;
+
+    let (mut writer1, pending1) = open_output(output1)?;
+    let (mut writer2, pending2) = open_output(output2)?;
+    let fallback_r1 = PathBuf::from("<R1 inputs>");
+    let fallback_r2 = PathBuf::from("<R2 inputs>");
+    // On error, `pending1`/`pending2` (the `AtomicFile` guards) are dropped
+    // by this `?`'s unwind, which removes both abandoned temp files and
+    // leaves `output1`/`output2` untouched -- nothing extra to clean up
+    // here, and neither output is left half-written.
+    let stats = filter_records_paired(
+        source, index, mode, min_fraction, &mut writer1, &mut writer2, &fallback_r1, &fallback_r2,
+    )?;
+
+    writer1.finish().map_err(|e| FastDnaError::Io { path: output1.to_path_buf(), source: e })?;
+    writer2.finish().map_err(|e| FastDnaError::Io { path: output2.to_path_buf(), source: e })?;
+    pending1.commit()?;
+    pending2.commit()?;
+
+    Ok(stats)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -776,6 +1022,269 @@ mod tests {
             FilterMode::Keep,
             2.0,
             &PathBuf::from("does-not-matter.fastq"),
+        );
+        assert!(matches!(result, Err(FastDnaError::InvalidConfig { .. })));
+        cleanup(&[p]);
+    }
+
+    // ======================================================================
+    // Paired-end (R1/R2 synchronized) filtering
+    // ======================================================================
+
+    /// A fresh, unique scratch directory for one paired-end test.
+    fn paired_dir(name: &str) -> PathBuf {
+        let unique = std::process::id() as u64 * 1_000_000
+            + std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() as u64;
+        let dir = std::env::temp_dir().join(format!("fastdna_read_filter_paired_{name}_{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn paired_reader_over(dir: &Path, r1_text: &str, r2_text: &str) -> PairedSourceReader {
+        let r1 = dir.join("r1.fastq");
+        let r2 = dir.join("r2.fastq");
+        std::fs::write(&r1, r1_text.as_bytes()).unwrap();
+        std::fs::write(&r2, r2_text.as_bytes()).unwrap();
+        PairedSourceReader::new(vec![InputSpec::File(r1)], vec![InputSpec::File(r2)])
+    }
+
+    // -- filter_records_paired: pair-level OR semantics ---------------------
+
+    #[test]
+    fn keep_mode_writes_a_pair_if_either_mate_matches() {
+        // Reference is a homopolymer "AAAA" (k=4, canonical encoding 0).
+        let (index, p) = build_index("paired_keep_or", 4, &[0]);
+        let dir = paired_dir("keep_or");
+        let source = paired_reader_over(
+            &dir,
+            // pair a: only R1 matches
+            "@a/1\nAAAAAAAA\n+\nIIIIIIII\n\
+             @b/1\nGGGGGGGG\n+\nIIIIIIII\n\
+             @c/1\nGGGGGGGG\n+\nIIIIIIII\n",
+            // pair a's R2 does not match; pair b's R2 matches; pair c matches neither
+            "@a/2\nGGGGGGGG\n+\nIIIIIIII\n\
+             @b/2\nAAAAAAAA\n+\nIIIIIIII\n\
+             @c/2\nGGGGGGGG\n+\nIIIIIIII\n",
+        );
+
+        let mut out1: Vec<u8> = Vec::new();
+        let mut out2: Vec<u8> = Vec::new();
+        let stats = filter_records_paired(
+            source, &index, FilterMode::Keep, 1.0, &mut out1, &mut out2, Path::new("<r1>"), Path::new("<r2>"),
+        )
+        .unwrap();
+
+        assert_eq!(stats.pairs_total, 3);
+        assert_eq!(stats.pairs_written, 2, "pairs a and b each have one matching mate; c has none");
+        let text1 = String::from_utf8(out1).unwrap();
+        let text2 = String::from_utf8(out2).unwrap();
+        assert!(text1.contains("@a/1") && text2.contains("@a/2"));
+        assert!(text1.contains("@b/1") && text2.contains("@b/2"));
+        assert!(!text1.contains("@c/1") && !text2.contains("@c/2"));
+
+        cleanup(&[p]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discard_mode_writes_a_pair_only_if_neither_mate_matches() {
+        let (index, p) = build_index("paired_discard_or", 4, &[0]);
+        let dir = paired_dir("discard_or");
+        let source = paired_reader_over(
+            &dir,
+            "@a/1\nAAAAAAAA\n+\nIIIIIIII\n\
+             @b/1\nGGGGGGGG\n+\nIIIIIIII\n\
+             @c/1\nGGGGGGGG\n+\nIIIIIIII\n",
+            "@a/2\nGGGGGGGG\n+\nIIIIIIII\n\
+             @b/2\nAAAAAAAA\n+\nIIIIIIII\n\
+             @c/2\nGGGGGGGG\n+\nIIIIIIII\n",
+        );
+
+        let mut out1: Vec<u8> = Vec::new();
+        let mut out2: Vec<u8> = Vec::new();
+        let stats = filter_records_paired(
+            source, &index, FilterMode::Discard, 1.0, &mut out1, &mut out2, Path::new("<r1>"), Path::new("<r2>"),
+        )
+        .unwrap();
+
+        assert_eq!(stats.pairs_total, 3);
+        assert_eq!(stats.pairs_written, 1, "only pair c has no matching mate on either side");
+        let text1 = String::from_utf8(out1).unwrap();
+        let text2 = String::from_utf8(out2).unwrap();
+        assert!(text1.contains("@c/1") && text2.contains("@c/2"));
+        assert!(!text1.contains("@a/1") && !text2.contains("@a/2"));
+        assert!(!text1.contains("@b/1") && !text2.contains("@b/2"));
+
+        cleanup(&[p]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pair_with_no_kmers_on_either_side_is_kept_under_discard_and_dropped_under_keep() {
+        let (index, p) = build_index("paired_zero_match", 8, &[]);
+        let dir = paired_dir("zero_match");
+
+        let make_source =
+            || paired_reader_over(&dir, "@a/1\nAC\n+\nII\n", "@a/2\nAC\n+\nII\n");
+
+        let mut kept: Vec<u8> = Vec::new();
+        let mut kept2: Vec<u8> = Vec::new();
+        let stats_discard = filter_records_paired(
+            make_source(), &index, FilterMode::Discard, 0.0, &mut kept, &mut kept2, Path::new("<t>"), Path::new("<t>"),
+        )
+        .unwrap();
+        assert_eq!(stats_discard.pairs_written, 1);
+
+        let mut dropped: Vec<u8> = Vec::new();
+        let mut dropped2: Vec<u8> = Vec::new();
+        let stats_keep = filter_records_paired(
+            make_source(), &index, FilterMode::Keep, 0.0, &mut dropped, &mut dropped2, Path::new("<t>"), Path::new("<t>"),
+        )
+        .unwrap();
+        assert_eq!(stats_keep.pairs_written, 0);
+
+        cleanup(&[p]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_desynchronized_pair_of_streams_is_reported_not_silently_truncated() {
+        let (index, p) = build_index("paired_desync", 4, &[]);
+        let dir = paired_dir("desync");
+        // R1 has two reads, R2 only one: the streams cannot be reconciled
+        // past the first pair.
+        let source = paired_reader_over(
+            &dir,
+            "@a/1\nACGTACGT\n+\nIIIIIIII\n@b/1\nTTTTTTTT\n+\nIIIIIIII\n",
+            "@a/2\nGGGGGGGG\n+\nIIIIIIII\n",
+        );
+
+        let mut out1: Vec<u8> = Vec::new();
+        let mut out2: Vec<u8> = Vec::new();
+        let result = filter_records_paired(
+            source, &index, FilterMode::Discard, 0.0, &mut out1, &mut out2, Path::new("<r1>"), Path::new("<r2>"),
+        );
+        match result {
+            Err(FastDnaError::MalformedFastq { reason, .. }) => {
+                assert!(reason.contains("R2"), "the reason must name the side that ran out: {reason}");
+            }
+            other => panic!("expected MalformedFastq (desync), got {other:?}"),
+        }
+
+        cleanup(&[p]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- guard_against_paired_output_overwrite -------------------------------
+
+    #[test]
+    fn paired_guard_rejects_output_and_output2_resolving_to_the_same_file() {
+        let (index, p) = build_index("paired_guard_same_output", 4, &[]);
+        let dir = paired_dir("guard_same_output");
+        let shared = dir.join("shared.fastq");
+
+        let result = guard_against_paired_output_overwrite(&[], &[], &index, &shared, &shared);
+        assert!(matches!(result, Err(FastDnaError::InvalidConfig { .. })));
+
+        cleanup(&[p]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paired_guard_rejects_an_output_pointing_at_the_reference_table() {
+        let (index, p) = build_index("paired_guard_table", 4, &[]);
+        let dir = paired_dir("guard_table");
+        let other = dir.join("other.fastq");
+
+        let result = guard_against_paired_output_overwrite(&[], &[], &index, index.table_path(), &other);
+        assert!(matches!(result, Err(FastDnaError::InvalidConfig { .. })));
+
+        let result2 = guard_against_paired_output_overwrite(&[], &[], &index, &other, index.table_path());
+        assert!(matches!(result2, Err(FastDnaError::InvalidConfig { .. })));
+
+        cleanup(&[p]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paired_guard_rejects_an_output_pointing_at_an_r1_or_r2_input_file() {
+        let (index, p) = build_index("paired_guard_inputs", 4, &[]);
+        let dir = paired_dir("guard_inputs");
+        let r1 = dir.join("r1.fastq");
+        let r2 = dir.join("r2.fastq");
+        std::fs::write(&r1, b"@a/1\nACGT\n+\nIIII\n").unwrap();
+        std::fs::write(&r2, b"@a/2\nACGT\n+\nIIII\n").unwrap();
+        let clean_output = dir.join("clean.fastq");
+
+        let inputs_r1 = vec![InputSpec::File(r1.clone())];
+        let inputs_r2 = vec![InputSpec::File(r2.clone())];
+
+        let result_r1 =
+            guard_against_paired_output_overwrite(&inputs_r1, &inputs_r2, &index, &r1, &clean_output);
+        assert!(matches!(result_r1, Err(FastDnaError::InvalidConfig { .. })));
+
+        let result_r2 =
+            guard_against_paired_output_overwrite(&inputs_r1, &inputs_r2, &index, &clean_output, &r2);
+        assert!(matches!(result_r2, Err(FastDnaError::InvalidConfig { .. })));
+
+        cleanup(&[p]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- run_filter_paired: end-to-end through real files, including gzip --
+
+    #[test]
+    fn run_filter_paired_writes_synchronized_gzip_outputs_for_both_mates() {
+        use flate2::read::MultiGzDecoder;
+        use std::io::Read;
+
+        let (index, p) = build_index("run_filter_paired_gzip", 4, &[0]); // "AAAA"
+        let dir = paired_dir("run_filter_paired_gzip");
+        let r1 = dir.join("r1.fastq");
+        let r2 = dir.join("r2.fastq");
+        std::fs::write(&r1, b"@a/1\nAAAAAAAA\n+\nIIIIIIII\n@b/1\nGGGGGGGG\n+\nIIIIIIII\n").unwrap();
+        std::fs::write(&r2, b"@a/2\nGGGGGGGG\n+\nIIIIIIII\n@b/2\nGGGGGGGG\n+\nIIIIIIII\n").unwrap();
+        let out1 = dir.join("out1.fastq.gz");
+        let out2 = dir.join("out2.fastq.gz");
+
+        let stats = run_filter_paired(
+            vec![InputSpec::File(r1)],
+            vec![InputSpec::File(r2)],
+            &index,
+            FilterMode::Keep,
+            0.5,
+            &out1,
+            &out2,
+        )
+        .unwrap();
+        assert_eq!(stats.pairs_total, 2);
+        assert_eq!(stats.pairs_written, 1, "only pair a has a matching mate (R1)");
+
+        let decode = |path: &Path| -> String {
+            let compressed = std::fs::read(path).unwrap();
+            let mut decoder = MultiGzDecoder::new(compressed.as_slice());
+            let mut text = String::new();
+            decoder.read_to_string(&mut text).unwrap();
+            text
+        };
+        assert_eq!(decode(&out1), "@a/1\nAAAAAAAA\n+\nIIIIIIII\n");
+        assert_eq!(decode(&out2), "@a/2\nGGGGGGGG\n+\nIIIIIIII\n");
+
+        cleanup(&[p]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_filter_paired_rejects_an_invalid_min_fraction_before_touching_any_file() {
+        let (index, p) = build_index("run_filter_paired_invalid_fraction", 4, &[]);
+        let result = run_filter_paired(
+            vec![InputSpec::File(PathBuf::from("does-not-exist-r1.fastq"))],
+            vec![InputSpec::File(PathBuf::from("does-not-exist-r2.fastq"))],
+            &index,
+            FilterMode::Keep,
+            2.0,
+            &PathBuf::from("does-not-matter1.fastq"),
+            &PathBuf::from("does-not-matter2.fastq"),
         );
         assert!(matches!(result, Err(FastDnaError::InvalidConfig { .. })));
         cleanup(&[p]);

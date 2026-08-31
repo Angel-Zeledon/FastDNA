@@ -754,22 +754,42 @@ pub struct DiffArgs {
 /// `ref=`/`k=` host-removal or targeted-enrichment workflow
 /// (`docs/feature-gap-analysis.md`'s S4).
 ///
-/// **Single-end only today.** Each `--input` file is filtered
+/// **Single-end by default.** Each `--input` file is filtered
 /// independently, read by read, and several files are filtered as one
 /// concatenated stream into `--output` -- the same convention `count`'s own
-/// multi-file `--input` already uses. Paired-end (R1/R2) synchronized
-/// filtering, where a pair is kept or discarded as a unit if either mate
-/// matches, is **not** implemented: passing both mates via `--input`
-/// filters each independently and can desynchronize them. See
-/// `read_filter.rs`'s module doc comment for the full explanation and why
-/// this was scoped out rather than shipped half-correct.
+/// multi-file `--input` already uses.
+///
+/// **Paired-end, via `--input2`/`--output2`.** Given together (see
+/// `FilterArgs::validate`), `--input` is read as the R1 stream and
+/// `--input2` as R2 -- BBDuk's `in1=`/`in2=`/`out1=`/`out2=` convention,
+/// spelled with this crate's own flag names. The two streams are read in
+/// lock step and a pair is kept or discarded as a unit if *either* mate
+/// matches the reference, never independently per mate, so the two output
+/// streams (`--output` for R1, `--output2` for R2) can never drift out of
+/// sync with each other. See `read_filter.rs`'s module doc comment
+/// ("Paired-end (R1/R2) synchronized filtering") for the full design and
+/// the reasoning behind "either mate matches".
 #[derive(Args, Debug)]
 pub struct FilterArgs {
-    /// Input FASTQ/FASTA file(s), optionally gzipped, or "-" for stdin.
-    /// See this subcommand's own doc comment for the single-end/paired-end
+    /// Input FASTQ/FASTA file(s), optionally gzipped, or "-" for stdin. In
+    /// paired-end mode (`--input2` also given) this is the R1 side. See
+    /// this subcommand's own doc comment for the single-end/paired-end
     /// scope note.
     #[arg(short, long, value_name = "FILE", num_args = 1.., required = true)]
     pub input: Vec<PathBuf>,
+
+    /// R2 (reverse mate) input file(s) for paired-end filtering, required
+    /// together with `--output2` (`FilterArgs::validate`), and omitted
+    /// entirely for single-end filtering. `--input`/`--input2` do *not*
+    /// need to name the same number of individual files -- each side is
+    /// concatenated into one stream first (the same multi-file convention
+    /// `--input` already uses on its own), and it is those two streams
+    /// that are paired, record by record; only their *total* record counts
+    /// need to agree. A genuine mismatch there is reported as an error
+    /// naming whichever side ran out first, not silently truncated -- see
+    /// `fastq::PairedSourceReader`'s doc comment.
+    #[arg(long, value_name = "FILE", num_args = 1..)]
+    pub input2: Vec<PathBuf>,
 
     /// The reference k-mer table to filter against: a `.parquet` file
     /// written by `fastdna count`, or by `union`/`intersect`/`diff` -- any
@@ -777,11 +797,11 @@ pub struct FilterArgs {
     #[arg(long, value_name = "FILE")]
     pub table: PathBuf,
 
-    /// "keep" writes only reads that match the reference (targeted
-    /// enrichment: keep only reads that look like this organism/panel).
-    /// "discard" writes only reads that do *not* match it
-    /// (host/contaminant removal: remove this reference's reads and keep
-    /// the rest of the sample).
+    /// "keep" writes only reads (or, in paired-end mode, pairs) that match
+    /// the reference (targeted enrichment: keep only reads that look like
+    /// this organism/panel). "discard" writes only reads/pairs that do
+    /// *not* match it (host/contaminant removal: remove this reference's
+    /// reads and keep the rest of the sample).
     #[arg(long, value_enum)]
     pub mode: CliFilterMode,
 
@@ -794,15 +814,61 @@ pub struct FilterArgs {
     /// at all is enough". A read that yields *no* canonical k-mers of its
     /// own (shorter than the table's `k`, or entirely ambiguous bases)
     /// never matches, regardless of this value -- see
-    /// `read_filter::matching_fraction`'s doc comment.
+    /// `read_filter::matching_fraction`'s doc comment. In paired-end mode
+    /// this threshold is applied to each mate independently; the pair-level
+    /// keep/discard decision then combines both mates' individual match
+    /// results with a logical OR (see `FilterArgs`'s own doc comment).
     #[arg(long, default_value_t = 0.1, value_parser = parse_min_fraction)]
     pub min_fraction: f64,
 
     /// Output path for the reads this run keeps (FASTQ, optionally `.gz`;
     /// gzip is chosen by this path's own extension, matching every other
-    /// gzip-aware path in this crate).
+    /// gzip-aware path in this crate). In paired-end mode this is the R1
+    /// output; see `--output2` for R2.
     #[arg(short, long, value_name = "FILE")]
     pub output: PathBuf,
+
+    /// R2 (reverse mate) output path, required together with `--input2`
+    /// and omitted entirely for single-end filtering. See `--input2`'s doc
+    /// comment and `FilterArgs`'s own doc comment.
+    #[arg(long, value_name = "FILE")]
+    pub output2: Option<PathBuf>,
+}
+
+impl FilterArgs {
+    /// Whether `--input2`/`--output2` were given, switching this run into
+    /// paired-end mode. Only meaningful after `validate` has confirmed the
+    /// two are given together (or not at all) -- see that method.
+    pub fn is_paired(&self) -> bool {
+        !self.input2.is_empty()
+    }
+
+    /// Cross-flag validation clap cannot express declaratively:
+    /// `--input2` and `--output2` must be given together, naming both a
+    /// paired-end run's R2 input and its R2 output, or neither at all for
+    /// a single-end run. Deliberately does *not* require `--input` and
+    /// `--input2` to name the same number of *files* -- see `--input2`'s
+    /// own doc comment for why that would reject legitimate input (e.g. an
+    /// R1 side split across lanes with an already-concatenated R2 side);
+    /// a genuine record-count mismatch between the two streams is instead
+    /// caught while reading them (`fastq::PairedSourceReader`), the same
+    /// "the check that matters lives where the real invariant is" shape
+    /// `CountArgs::validate` already follows for `--paired-dir`.
+    pub fn validate(&self) -> Result<(), String> {
+        match (self.input2.is_empty(), self.output2.is_some()) {
+            (true, false) | (false, true) => Ok(()),
+            (true, true) => Err(
+                "--output2 was given without --input2: paired-end filtering needs both an R2 \
+                 input and an R2 output, or neither"
+                    .to_string(),
+            ),
+            (false, false) => Err(
+                "--input2 was given without --output2: paired-end filtering needs both an R2 \
+                 input and an R2 output, or neither"
+                    .to_string(),
+            ),
+        }
+    }
 }
 
 /// `fastdna matrix`: builds a cohort-wide k-mer presence/count matrix

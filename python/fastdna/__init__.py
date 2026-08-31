@@ -875,20 +875,82 @@ class KmerTable:
         regardless of `min_fraction` -- see `src/read_filter.rs`'s module
         doc comment for why.
 
-        Single-end only: each of `inputs` is filtered independently, read by
+        Single-end: each of `inputs` is filtered independently, read by
         read, and several files are filtered as one concatenated stream
         into `output` -- the same convention `fastdna count`'s own
-        multi-file input already uses. Paired-end (R1/R2) synchronized
-        filtering, where a pair is kept or discarded as a unit if either
-        mate matches, is **not** implemented: passing both mates in
-        `inputs` filters each independently and can desynchronize them --
-        see `src/read_filter.rs`'s module doc comment for the full
-        explanation.
+        multi-file input already uses. Passing a sample's R1 and R2 files
+        both in `inputs` here filters each mate independently and can
+        desynchronize them (a mate written while its partner is silently
+        dropped) -- for paired-end input, use `filter_reads_paired`
+        instead, which filters both mates in lock step and decides once
+        per pair. See `src/read_filter.rs`'s module doc comment for the
+        full explanation of both modes.
         """
         if isinstance(inputs, (str, os.PathLike)):
             inputs = [inputs]
         return _core.filter_reads(
             self._raw, [str(p) for p in inputs], mode, str(output), min_fraction
+        )
+
+    def filter_reads_paired(
+        self,
+        inputs: Union[_PathLike, Sequence[_PathLike]],
+        inputs2: Union[_PathLike, Sequence[_PathLike]],
+        *,
+        mode: str,
+        output: _PathLike,
+        output2: _PathLike,
+        min_fraction: float = 0.1,
+    ) -> "_core.PairedFilterStats":
+        """Streams synchronized R1/R2 FASTQ/FASTA file pairs against this
+        table and writes pairs that should be kept to `output`/`output2` --
+        the paired-end counterpart of `filter_reads` (`fastdna filter
+        --input2 ... --output2 ...`, `docs/feature-gap-analysis.md`'s S4,
+        `src/read_filter.rs`).
+
+        `inputs`/`inputs2` are each concatenated into one stream first (the
+        same multi-file convention `filter_reads`'s own `inputs` already
+        uses), and it is those two streams that are paired, record by
+        record -- they do not need to hold the same number of *files*, only
+        the same *total* record count. Either may be a single path-like
+        value instead of a list, wrapped in a one-element list the same way
+        `filter_reads` already does.
+
+        A pair is kept or discarded as *one unit*: `mode="keep"` writes a
+        pair if *either* mate matches this table; `mode="discard"` writes a
+        pair only if *neither* mate matches it -- never independently per
+        mate, which is what two separate `filter_reads` calls over
+        `inputs`/`inputs2` would do instead, and which can desynchronize
+        the two output files (a mate written while its partner is silently
+        dropped). Both mates of a kept pair are always written together, to
+        `output`/`output2` respectively, so the two output files can never
+        drift out of sync with each other. See `src/read_filter.rs`'s
+        module doc comment ("Paired-end (R1/R2) synchronized filtering")
+        for the full design and why "either mate matches" (not "both") is
+        the standard convention real pipelines (BBDuk, `kmc_tools filter`)
+        rely on.
+
+        `min_fraction` and the "a read with no k-mers of its own never
+        matches" rule are exactly as `filter_reads` documents, applied to
+        each mate independently before the pair-level OR.
+
+        Raises `ValueError` if the two input streams desynchronize -- one
+        side has more total records than the other, so they cannot be kept
+        paired past that point -- or if `output` and `output2` resolve to
+        the same file.
+        """
+        if isinstance(inputs, (str, os.PathLike)):
+            inputs = [inputs]
+        if isinstance(inputs2, (str, os.PathLike)):
+            inputs2 = [inputs2]
+        return _core.filter_reads_paired(
+            self._raw,
+            [str(p) for p in inputs],
+            [str(p) for p in inputs2],
+            mode,
+            str(output),
+            str(output2),
+            min_fraction,
         )
 
     def profile_reads(
