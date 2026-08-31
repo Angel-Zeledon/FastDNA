@@ -200,8 +200,9 @@ import re
 import sys
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from fastdna import _PathLike
 from . import _core
 
 __all__ = ["SCHEMA_VERSION", "InputFile", "Provenance", "capture"]
@@ -212,10 +213,6 @@ __all__ = ["SCHEMA_VERSION", "InputFile", "Provenance", "capture"]
 #: later needs to know which layout it is looking at without guessing from
 #: which keys happen to be present.
 SCHEMA_VERSION = 1
-
-# A path accepted anywhere in this module -- the same alias, and the same
-# `str()`-at-the-boundary convention, `fastdna/__init__.py` uses.
-_PathLike = Union[str, os.PathLike]
 
 # (import name, distribution name) for every package whose *behaviour* can
 # change a number this library reports. Keyed in the output by the
