@@ -7,6 +7,9 @@ the Rust/Python boundary, per the packaging design (docs/superpowers/specs/
 2026-08-22-fastdna-python-design.md, §9).
 """
 
+import os
+from typing import Union
+
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -15,6 +18,15 @@ from ._progress import make_progress_adapter
 from .spectrum import suggest_min_count as _suggest_min_count
 
 __version__ = _core.__version__
+
+# The path type accepted anywhere in the package: a `str`, or anything
+# implementing `os.PathLike` (e.g. `pathlib.Path`). Every submodule that
+# takes a single-sample path imports this rather than redefining its own
+# `Union[str, os.PathLike]` alias, so `path: _PathLike` means the same thing
+# everywhere in the public API -- see each submodule's own `_PathLike`
+# import for the "one sample" half of the package-wide path convention
+# (`paths: Sequence[_PathLike]` is the cohort half).
+_PathLike = Union[str, os.PathLike]
 
 
 def _column_as_array(column):

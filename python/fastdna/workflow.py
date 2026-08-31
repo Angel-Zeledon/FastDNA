@@ -93,14 +93,15 @@ intermediate artifact, not a single verdict.
 from __future__ import annotations
 
 import inspect
-from collections.abc import Mapping
-from typing import NamedTuple, Optional
+from collections.abc import Iterable, Mapping
+from typing import NamedTuple, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 from sklearn.base import clone
 from sklearn.model_selection import cross_val_predict
 
+from . import _PathLike
 from .annotate import annotate_rule, load_annotation
 from .cv import LineageKFold, lineage_groups, permutation_importance_pvalues
 from .equivalence import EquivalenceClasses, collapse_equivalence_classes
@@ -109,6 +110,11 @@ from .gwas import _resolve_cohort, cohort_presence_matrix, kinship_matrix, prefi
 from .rules import SetCoveringClassifier
 
 __all__ = ["AssociationWorkflow", "AssociationResult"]
+
+# The cohort input accepted by AssociationWorkflow: as in
+# gwas.cohort_presence_matrix, an iterable of paths (sample ids derived
+# from each file name) or an explicit {sample_id: path} mapping.
+_CohortPaths = Union[Iterable[_PathLike], Mapping[str, _PathLike]]
 
 
 class AssociationResult(NamedTuple):
@@ -169,7 +175,7 @@ class AssociationResult(NamedTuple):
     importance: Optional[pa.Table]
     annotations: Optional[pa.Table]
 
-    def to_report(self, path, *, calibration_interval=None, metadata=None, **kwargs):
+    def to_report(self, path: _PathLike, *, calibration_interval=None, metadata=None, **kwargs):
         """`fastdna.report.to_report()`, populated from this result's own
         `classifier` and `calibration` (`None` when `run()` was called with
         `cv=False` -- the report then shows "no calibration report was
@@ -188,6 +194,23 @@ class AssociationResult(NamedTuple):
         auto-derived entries above -- pass `metadata={"n_samples": ...}` to
         override one specifically. `**kwargs` (e.g. `title=`) are forwarded
         to `fastdna.report.to_report()` unchanged.
+
+        Parameters
+        ----------
+        path : str or os.PathLike
+            Destination report file. Required: writing it is this method's
+            entire purpose, so there is no in-memory-only form to fall
+            back to.
+        calibration_interval : tuple of (float, float), optional
+            See above.
+        metadata : dict, optional
+            See above.
+        **kwargs
+            Forwarded to `fastdna.report.to_report()` (e.g. `title=`).
+
+        Returns
+        -------
+        Whatever `fastdna.report.to_report()` returns.
         """
         from .report import to_report as _to_report
 
@@ -286,19 +309,38 @@ class AssociationWorkflow:
         One label per sample. A `{sample_id: value}` mapping is matched by
         id (order-independent); a plain array/list must already be aligned
         to `paths`' order. See `_align_phenotype`.
+    k : int, optional
+        K-mer length for the association matrix -- an explicit, top-level
+        parameter rather than something buried inside `matrix_kwargs`
+        (this package's own convention: `k` is never hidden in a forwarded
+        kwargs dict). `None` (the default) leaves `gwas.
+        cohort_presence_matrix`'s own default (31) untouched. Deliberately
+        forwarded to `matrix_kwargs` only, **not** to `lineage_kwargs`:
+        the lineage/kinship stage sketches at a shorter k by design (see
+        `gwas.kinship_matrix`'s own docstring -- a sketch answers "how
+        related are these genomes", where 31-mers are needlessly brittle),
+        so coupling the two would silently change population-structure
+        clustering behavior whenever a caller only meant to change the
+        association matrix's resolution. Pass `lineage_kwargs={"k": ...}`
+        directly to change the lineage k instead. Giving both `k=` and a
+        conflicting `matrix_kwargs={"k": ...}` raises `ValueError` rather
+        than picking one silently.
     collapse_equivalence : bool, default True
         Runs `equivalence.collapse_equivalence_classes` on the cohort
         matrix before anything downstream sees it. `False` keeps the raw,
         uncollapsed k-mer columns.
     matrix_kwargs : dict, optional
-        Forwarded to `gwas.cohort_presence_matrix` (e.g. `k`, `min_count`,
-        `min_samples`, `max_kmers`).
+        Forwarded to `gwas.cohort_presence_matrix` (e.g. `min_count`,
+        `min_samples`, `max_kmers`, and `k` if not passed via the
+        top-level `k=` above).
     groups : array-like, optional
         Precomputed lineage labels, one per sample, aligned to `paths`'
         order. `None` (the default) derives them with `cv.lineage_groups`.
     lineage_kwargs : dict, optional
         Forwarded to `cv.lineage_groups` when `groups` is not given (e.g.
-        `k`, `sketch_size`, `distance_threshold`).
+        `k`, `sketch_size`, `distance_threshold`). Its own `k` is
+        independent of the top-level `k=` above -- see that parameter's
+        entry for why.
     n_splits : int, default 5
         Folds for the default `cv.LineageKFold` evaluation splitter. Must
         not exceed the number of distinct lineages found -- `LineageKFold`
@@ -334,8 +376,13 @@ class AssociationWorkflow:
         `ValueError` unchanged, not a workflow-specific one.
     permutation_random_state : int, optional
         Forwarded to `cv.permutation_importance_pvalues` as `random_state`.
-    reference_fasta, annotation_path : path, optional
-        Must be given together or not at all. When given, every rule of
+    reference_fasta, annotation_path : str or os.PathLike, optional
+        Must be given together or not at all. These are a second,
+        domain-specific pair of path inputs -- a reference genome and its
+        annotation -- distinct from `paths` (the cohort) above; they keep
+        their own descriptive names rather than being forced into
+        `path`/`paths`, but are still typed as `_PathLike` like every
+        other single-file path in this package. When given, every rule of
         the fitted classifier (via its `.rules_`, as
         `rules.SetCoveringClassifier` exposes) is located in the reference
         with `annotate.load_annotation`/`annotate.annotate_rule`. Given
@@ -351,13 +398,33 @@ class AssociationWorkflow:
         The last `run()` call's result, cached so `plot_significance()`/
         `plot_population_structure()` need no argument. `None` before the
         first `run()`.
+
+    Notes
+    -----
+    `run()`, not `.fit()`/`.predict()`: every other stateful class in this
+    package (`rules.SetCoveringClassifier`, `sklearn.KmerVectorizer`,
+    `calibration.CalibratedEstimator`, ...) follows scikit-learn's
+    `.fit()`/`.predict()` shape, because each of those genuinely learns
+    parameters from `X`/`y` and then predicts from them. `AssociationWorkflow`
+    does not fit a single thing itself -- it orchestrates eight independent
+    stages (a feature matrix, an equivalence collapse, lineage grouping, a
+    classifier fit *and* its cross-validated evaluation, a screen, optional
+    annotation, optional permutation importance) and returns every
+    intermediate artifact from all of them at once, not one fitted estimator
+    or one prediction. `.run()` names that honestly; shoehorning it into
+    `.fit()` would imply an `X`/`y`-shaped contract and a single learned
+    state this class does not have, and `.predict()` has no meaning here at
+    all -- there is nothing this class predicts on new data. This is
+    therefore a deliberate, considered exception to the package's own
+    fit/predict convention, not an oversight.
     """
 
     def __init__(
         self,
-        paths,
+        paths: _CohortPaths,
         phenotype,
         *,
+        k: Optional[int] = None,
         collapse_equivalence=True,
         matrix_kwargs=None,
         groups=None,
@@ -369,8 +436,8 @@ class AssociationWorkflow:
         screen_kwargs=None,
         n_permutations=None,
         permutation_random_state=None,
-        reference_fasta=None,
-        annotation_path=None,
+        reference_fasta: Optional[_PathLike] = None,
+        annotation_path: Optional[_PathLike] = None,
         annotate_kwargs=None,
     ):
         if (reference_fasta is None) != (annotation_path is None):
@@ -382,8 +449,19 @@ class AssociationWorkflow:
 
         self.paths = paths
         self.phenotype = phenotype
+        self.k = k
         self.collapse_equivalence = collapse_equivalence
         self.matrix_kwargs = dict(matrix_kwargs) if matrix_kwargs else {}
+        if k is not None:
+            existing = self.matrix_kwargs.get("k")
+            if existing is not None and existing != k:
+                raise ValueError(
+                    f"k={k!r} and matrix_kwargs={{'k': {existing!r}, ...}} disagree -- k is an "
+                    "explicit top-level parameter (this package's own convention: k is never "
+                    "buried inside a forwarded kwargs dict), so pass it once. Either drop 'k' "
+                    "from matrix_kwargs, or drop the top-level k= and keep matrix_kwargs['k']."
+                )
+            self.matrix_kwargs.setdefault("k", k)
         self.groups = groups
         self.lineage_kwargs = dict(lineage_kwargs) if lineage_kwargs else {}
         self.n_splits = n_splits
@@ -405,6 +483,15 @@ class AssociationWorkflow:
     def run(self) -> AssociationResult:
         """Executes the full pipeline (see the module docstring) and
         returns the `AssociationResult`, also cached as `self.result_`.
+
+        Not named `.fit()`: see this class's own docstring, "Notes",
+        for why -- this method orchestrates several independent stages and
+        returns every intermediate artifact from all of them, not a single
+        fitted estimator.
+
+        Returns
+        -------
+        AssociationResult
         """
         sample_ids, path_strings = _resolve_cohort(self.paths, caller="AssociationWorkflow")
         cohort_mapping = dict(zip(sample_ids, path_strings))
@@ -513,8 +600,25 @@ class AssociationWorkflow:
     def plot_significance(self, **kwargs):
         """`fastdna.plotting.plot_significance` over this workflow's own
         `result_.screening`. Needs `run()` (with `screen=True`, the
-        default) to have been called first. `**kwargs` are forwarded to
-        `plotting.plot_significance` (e.g. `x`, `positions`, `ax`).
+        default) to have been called first.
+
+        Parameters
+        ----------
+        **kwargs
+            Forwarded to `plotting.plot_significance` (e.g. `x`,
+            `positions`, `ax`).
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+
+        Raises
+        ------
+        ValueError
+            If `run()` has not been called yet, or was called with
+            `screen=False`.
+        ImportError
+            If `matplotlib` is not installed (raised by `plotting.py`).
         """
         if self.result_ is None:
             raise ValueError("plot_significance() needs run() to have been called first.")
@@ -538,9 +642,26 @@ class AssociationWorkflow:
         but does not return it): this method obtains it with a second,
         independent call to `gwas.kinship_matrix` -- a second sketch pass
         over the cohort -- the first time it is called, and caches the
-        result for later calls. `**kwargs` are forwarded to
-        `plotting.plot_population_structure` (e.g. `kind`, `ax`); passing
-        `groups=` here overrides the cached lineage groups.
+        result for later calls.
+
+        Parameters
+        ----------
+        **kwargs
+            Forwarded to `plotting.plot_population_structure` (e.g.
+            `kind`, `ax`); passing `groups=` here overrides the cached
+            lineage groups.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+
+        Raises
+        ------
+        ValueError
+            If `run()` has not been called yet.
+        ImportError
+            If `matplotlib`/`scipy` is not installed (raised by
+            `plotting.py`).
         """
         if self.result_ is None:
             raise ValueError("plot_population_structure() needs run() to have been called first.")
