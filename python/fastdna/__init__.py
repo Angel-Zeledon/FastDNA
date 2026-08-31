@@ -1134,10 +1134,26 @@ from .cohort_counts import CohortCounts, count_cohort  # noqa: E402
 # is built around -- were previously reachable only via `from fastdna.audit
 # import audit` / `from fastdna.explain import explain`, one import per
 # function, from a submodule whose name collides with the function itself
-# (`fastdna.audit.audit`, not `fastdna.audit(...)`). Re-exported here so
-# the natural spelling works; neither module imports anything from this
-# one at its own import time, so this carries none of `cohort_counts`'s
-# circular-import constraint above -- it is placed at the end purely for
-# consistency with that re-export, not because it needs to be.
-from .audit import audit  # noqa: E402
-from .explain import explain  # noqa: E402
+# (`fastdna.audit.audit`, not `fastdna.audit(...)`).
+#
+# Re-exported here, but LAZILY (PEP 562 module `__getattr__`), not with a
+# plain top-level `from .audit import audit`: unlike `cohort_counts.py`,
+# both `audit.py` and `explain.py` import `numpy` at module scope, so an
+# eager import here would make `import fastdna` alone unconditionally
+# require numpy -- silently breaking this package's own "heavy optional
+# dependencies (scikit-learn, scipy, numpy, ...) stay out of the core
+# import" contract for every caller, not just those who use `audit`/
+# `explain`. `__getattr__` defers that cost to the first actual access of
+# `fastdna.audit`/`fastdna.explain`, exactly like `TYPE_CHECKING`-only
+# imports above defer pandas/polars, but for a real runtime attribute
+# instead of a type annotation.
+def __getattr__(name: str) -> Any:
+    if name == "audit":
+        from .audit import audit
+
+        return audit
+    if name == "explain":
+        from .explain import explain
+
+        return explain
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
