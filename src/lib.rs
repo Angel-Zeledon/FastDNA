@@ -11,12 +11,17 @@ pub mod export;
 pub mod fastq;
 pub mod hll;
 pub mod kmer;
+pub mod ktab;
 pub mod mem_estimate;
 pub mod metagenomics;
+pub mod ntcard;
 pub mod pipeline;
 pub mod preview;
 pub mod progress;
 pub mod qc;
+pub mod read_filter;
+pub mod read_profile;
+pub mod setops;
 pub mod sketch;
 pub mod translate;
 

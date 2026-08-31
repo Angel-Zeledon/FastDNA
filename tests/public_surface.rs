@@ -25,6 +25,7 @@ fn the_documented_public_modules_are_reachable() {
     use fastdna_core::counter::KmerCounter;
     use fastdna_core::error::FastDnaError;
     use fastdna_core::kmer::{canonical_kmer_u64, extract_canonical_kmers};
+    use fastdna_core::ktab::KmerTable;
     use fastdna_core::pipeline::CountStrategy;
     use fastdna_core::sketch::GenomeSketch;
 
@@ -43,4 +44,9 @@ fn the_documented_public_modules_are_reachable() {
 
     let err = FastDnaError::InvalidK { k: 99 };
     assert!(err.to_string().contains("99"));
+
+    match KmerTable::open("does-not-exist-anywhere.parquet") {
+        Err(FastDnaError::Io { .. }) => {}
+        other => panic!("expected an Io error opening a missing table, got {other:?}"),
+    }
 }

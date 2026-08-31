@@ -38,9 +38,11 @@ __all__ = [
     "FracSketch",
     "frac_sketch",
     "load_frac_sketch",
+    "KmerTable",
     "compare",
     "compare_all",
     "estimate_cardinality",
+    "estimate_spectrum",
     # Re-exported at the bottom of this module (see the comment there).
     "CohortCounts",
     "count_cohort",
@@ -723,6 +725,218 @@ def load_frac_sketch(path: _PathLike) -> FracSketch:
     return FracSketch(_core.load_frac_sketch(str(path)))
 
 
+class KmerTable:
+    """Random-access query handle over a sorted k-mer table --
+    `docs/feature-gap-analysis.md`'s S1: the database-with-a-query-API gap
+    against KMC3's `.kmc_pre`/`.kmc_suf`, FastK's `.ktab` and Jellyfish's
+    `.jf`.
+
+    No new file format and no separate build step: any `.parquet` file the
+    Rust core's exporter writes is already a valid k-mer table (see
+    `src/ktab.rs`'s module doc comment for why), so `fastdna count -o
+    counts.parquet` (the CLI) followed by `KmerTable.open("counts.parquet")`
+    is the whole workflow, no conversion step in between. `count()` (this
+    module's Python function) currently only returns an in-memory
+    `KmerCounts` rather than writing a file itself; a Python-only pipeline
+    that needs a table to `open()` later should either shell out to the CLI
+    or write `.table` with `pyarrow.parquet.write_table` directly (which
+    will not carry this table's footer metadata, so `KmerTable.open` will
+    reject it -- writing a table Python itself can later query is future
+    work, not yet wired through `count()`).
+
+    Behaves like a read-only mapping from a canonical k-mer to its
+    frequency: `table["ACGT..."]`/`table.get(...)` accept either a DNA
+    sequence of exactly `table.k` bases or the table's raw `kmer_u64`
+    integer encoding directly, `len(table)` is the distinct-k-mer count,
+    and `kmer in table` tests presence without raising.
+
+    Point lookups (`get`/`__getitem__`) decode at most one Parquet row
+    group per call, pruned via that row group's own min/max k-mer
+    statistics -- not an O(1) in-memory index. Looping `get()` over many
+    k-mers against the same table is fine (the OS page cache absorbs
+    repeated file opens within one process), but there is currently no
+    batched lookup or range-iteration entry point exposed to Python; the
+    Rust-side `KmerTable::range`/`iter` exist (`src/ktab.rs`) for a caller
+    who needs that and is comfortable adding a small binding, but nothing
+    in Python reaches them yet.
+    """
+
+    def __init__(self, raw: "_core.KmerTable"):
+        self._raw = raw
+
+    @classmethod
+    def open(cls, path: _PathLike) -> "KmerTable":
+        """Opens `path` and validates it as a queryable k-mer table (footer
+        metadata and per-row-group statistics only, not a full scan).
+        Raises `ValueError` (specifically `fastdna._core.LoadError`, a
+        `ValueError` subclass) for a file that is not one, matching every
+        other `*.load`/`.open` entry point in this package.
+        """
+        return cls(_core.KmerTable.open(str(path)))
+
+    @property
+    def k(self) -> int:
+        return self._raw.k
+
+    def get(self, kmer: Union[str, int]) -> Optional[int]:
+        """The frequency recorded for `kmer`, or `None` if it is absent."""
+        return self._raw.get(kmer)
+
+    def __getitem__(self, kmer: Union[str, int]) -> int:
+        return self._raw[kmer]
+
+    def __contains__(self, kmer: Union[str, int]) -> bool:
+        return kmer in self._raw
+
+    def __len__(self) -> int:
+        return len(self._raw)
+
+    def __repr__(self) -> str:
+        return f"KmerTable(k={self.k}, len={len(self)})"
+
+    def union(self, *others: "KmerTable", output: _PathLike, combine: str = "sum") -> "KmerTable":
+        """Every k-mer present in `self` or any of `others`, written to
+        `output` and reopened as a new `KmerTable` -- the Python-visible
+        counterpart of `fastdna union` / `setops::union`
+        (`docs/feature-gap-analysis.md`'s S2). Streams a linear merge-join
+        over every table's already-sorted rows rather than materializing
+        any of them in memory (see `src/setops.rs`'s module doc comment).
+
+        `combine` ("sum", the default, "min" or "max") decides how several
+        tables' own frequencies for the same k-mer are folded into the
+        result's single `frequency` column; "sum" is the natural "combine
+        these samples into one" reading. The result is itself a valid
+        `KmerTable` -- set operations compose, e.g. `a.union(b, output=...)
+        .difference(c, output=...)`.
+        """
+        raw = _core.ktab_union([self._raw, *(o._raw for o in others)], str(output), combine)
+        return KmerTable(raw)
+
+    def intersect(self, *others: "KmerTable", output: _PathLike, combine: str = "min") -> "KmerTable":
+        """Only k-mers present in `self` *and* every one of `others`,
+        written to `output` and reopened as a new `KmerTable` -- the
+        Python-visible counterpart of `fastdna intersect` / `setops::
+        intersect`.
+
+        `combine` ("min", the default, "sum" or "max") folds every table's
+        own count for a shared k-mer into the result's single `frequency`
+        column; "min" is the conservative reading ("this k-mer's support is
+        only as strong as its rarest observation"), matching kmc_tools'
+        own default reducer for `simple ... intersect`.
+        """
+        raw = _core.ktab_intersect([self._raw, *(o._raw for o in others)], str(output), combine)
+        return KmerTable(raw)
+
+    def difference(
+        self, *subtract: "KmerTable", output: _PathLike, max_subtract_count: int = 0
+    ) -> "KmerTable":
+        """Every k-mer in `self` that is absent from every table in
+        `subtract`, or that never exceeds `max_subtract_count` in any of
+        them -- the reference-subtraction/host-removal use case (see
+        `setops::diff`'s doc comment for the full rationale, including why
+        a nonzero threshold matters for a real host genome). Written to
+        `output` and reopened as a new `KmerTable` -- the Python-visible
+        counterpart of `fastdna diff` / `setops::diff`.
+
+        Kept rows carry `self`'s own original counts, never blended with
+        `subtract`'s -- this filters `self`'s table, it does not combine
+        the two sides.
+        """
+        raw = _core.ktab_diff(
+            self._raw, [t._raw for t in subtract], str(output), max_subtract_count
+        )
+        return KmerTable(raw)
+
+    def filter_reads(
+        self,
+        inputs: Union[_PathLike, Sequence[_PathLike]],
+        *,
+        mode: str,
+        output: _PathLike,
+        min_fraction: float = 0.1,
+    ) -> "_core.FilterStats":
+        """Streams one or more FASTQ/FASTA files against this table and
+        writes reads that should be kept to `output` -- the Python-visible
+        counterpart of `fastdna filter` (`docs/feature-gap-analysis.md`'s
+        S4). Output is always FASTQ, even when every input was FASTA (the
+        existing synthetic-quality convention `src/fastq.rs`'s FASTA reader
+        already establishes), gzipped iff `output`'s own extension says so.
+
+        `mode="keep"` writes only reads that match this table (targeted
+        enrichment: keep only reads that look like this organism/panel);
+        `mode="discard"` writes only reads that do *not* match it
+        (host/contaminant removal: remove this reference's reads, keep the
+        rest of the sample).
+
+        A read "matches" when at least `min_fraction` of its own canonical
+        k-mers are found in this table (`>=`, inclusive -- a read exactly at
+        the threshold matches). A read with no k-mers of its own (shorter
+        than `self.k`, or entirely ambiguous bases) never matches,
+        regardless of `min_fraction` -- see `src/read_filter.rs`'s module
+        doc comment for why.
+
+        Single-end only: each of `inputs` is filtered independently, read by
+        read, and several files are filtered as one concatenated stream
+        into `output` -- the same convention `fastdna count`'s own
+        multi-file input already uses. Paired-end (R1/R2) synchronized
+        filtering, where a pair is kept or discarded as a unit if either
+        mate matches, is **not** implemented: passing both mates in
+        `inputs` filters each independently and can desynchronize them --
+        see `src/read_filter.rs`'s module doc comment for the full
+        explanation.
+        """
+        if isinstance(inputs, (str, os.PathLike)):
+            inputs = [inputs]
+        return _core.filter_reads(
+            self._raw, [str(p) for p in inputs], mode, str(output), min_fraction
+        )
+
+    def profile_reads(
+        self,
+        inputs: Union[_PathLike, Sequence[_PathLike]],
+        *,
+        output: _PathLike,
+        summary: _PathLike = "read_profile_summary.parquet",
+    ) -> "_core.ProfileStats":
+        """Streams one or more FASTQ/FASTA files against this table and
+        writes each read's k-mer profile -- the Python-visible counterpart
+        of `fastdna profile` (`docs/feature-gap-analysis.md`'s S3,
+        `src/read_profile.rs`).
+
+        Two Parquet files are written:
+
+        - `output`: the RLE-compressed per-read profile (`read_id`,
+          `start`, `run_length`, `count`) -- read position `i` maps to the
+          count this table records for the k-mer starting at position `i`
+          of that read. See `src/read_profile.rs`'s module doc comment for
+          why this is run-length-encoded rather than one row per base (real
+          sequencing data yields long runs of identical counts, the same
+          regularity FastK's own `.prof` format exploits), and for the
+          lossless round-trip this format guarantees.
+        - `summary` (defaults alongside `output`): one row per read --
+          `read_id`, `n_kmers`, `n_present_kmers` (how many of that read's
+          own canonical k-mers were found in this table at all),
+          `min_count`, `median_count`, `max_count` over the full per-position
+          count sequence (including positions whose k-mer was entirely
+          absent, i.e. count `0`) -- enough to drive error detection and QV
+          estimation without decompressing a single RLE run.
+
+        A read shorter than `self.k` (or entirely ambiguous bases) yields no
+        profile rows and an all-null summary row, not an error -- ordinary
+        input, not malformed input.
+
+        Single-end only, the same scope `filter_reads` documents: each of
+        `inputs` is profiled independently, read by read, and several files
+        are profiled as one concatenated stream into the same pair of
+        output files.
+        """
+        if isinstance(inputs, (str, os.PathLike)):
+            inputs = [inputs]
+        return _core.profile_reads(
+            self._raw, [str(p) for p in inputs], str(output), str(summary)
+        )
+
+
 def compare(path_a: _PathLike, path_b: _PathLike, *, k: int = 21, sketch_size: int = 1000) -> float:
     """Sugar for building two sketches and comparing them in one call:
     `fastdna.compare(a, b)` is `fastdna.sketch(a).jaccard(fastdna.sketch(b))`.
@@ -802,6 +1016,45 @@ def estimate_cardinality(path: _PathLike, *, k: int = 31, precision: int = 14) -
     "roughly how many distinct k-mers" is enough to plan around.
     """
     return _core.estimate_cardinality(str(path), k, precision)
+
+
+def estimate_spectrum(
+    paths: Union[_PathLike, Sequence[_PathLike]],
+    *,
+    k: int = 31,
+    precision: int = 14,
+    max_frequency: Optional[int] = None,
+) -> Dict[int, int]:
+    """Estimates the k-mer frequency spectrum -- how many distinct k-mers
+    occur exactly once, twice, ... -- across one or more FASTQ(.gz)/
+    FASTA(.gz) files, in one streaming pass and a fixed, small amount of
+    memory (`2**precision * 16` bytes, 256 KB at the default) regardless of
+    input size, via an ntCard-style sketch (`docs/feature-gap-analysis.md`'s
+    S7(a); Rust core in `src/ntcard.rs`).
+
+    This is the same question `KmerCounts.spectrum()` answers exactly, from
+    a completed `count()`: `{depth: distinct k-mers observed at that
+    depth}`. The two are directly interchangeable wherever a caller accepts
+    either -- in particular, `fastdna.genomescope.profile_genome(spectrum,
+    k=k)` fits its coverage model over either shape the same way. Useful
+    when a file is too large to `count()` in available memory (or the exact
+    table is simply not needed), the same trade `estimate_cardinality`
+    already makes for the distinct-k-mer count alone.
+
+    `paths` is a single path or a sequence of paths (several lanes of the
+    same sample are aggregated into one spectrum, matching `count`'s own
+    multi-file `--input`); `"-"` means standard input.
+
+    Accuracy is a per-run, measured property, not a guaranteed bound on
+    every input -- see `src/ntcard.rs`'s module doc comment for the actual
+    numbers this implementation was measured at, and why f1 (the
+    error/noise class) is the hardest one to estimate precisely.
+    """
+    if isinstance(paths, (str, os.PathLike)):
+        path_list = [str(paths)]
+    else:
+        path_list = [str(p) for p in paths]
+    return _core.estimate_spectrum(path_list, k, precision, max_frequency)
 
 
 # Imported at the end of the module, deliberately: `cohort_counts.py` does

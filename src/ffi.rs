@@ -52,7 +52,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use flate2::read::MultiGzDecoder;
-use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
@@ -63,14 +63,19 @@ use crate::error::FastDnaError;
 use crate::export;
 use crate::fastq::FastqReader;
 use crate::kmer;
+use crate::ktab::{self, KmerTable};
 use crate::pipeline::{process_stream_parallel_with_policy, MemoryPolicy, PipelineConfig};
 use crate::preview;
 use crate::progress::Progress;
 use crate::qc::QcSummary;
+use crate::read_filter;
+use crate::read_profile;
+use crate::setops;
 use crate::sketch::{FracSketch, GenomeSketch};
 use crate::translate::{self, Frame, StopHandling, TranslationTable};
 use crate::hll;
 use crate::metagenomics;
+use crate::ntcard;
 
 // The base every FastDNA-specific exception inherits from, alongside
 // whichever ordinary Python builtin it already behaved as before this
@@ -1147,6 +1152,316 @@ fn load_frac_sketch(path: String) -> PyResult<PyFracSketch> {
     Ok(PyFracSketch { inner })
 }
 
+/// The Python-visible random-access query handle over a sorted k-mer table
+/// (`ktab::KmerTable`) -- the query-side counterpart to `count()`'s
+/// write-only Parquet output (`docs/feature-gap-analysis.md`'s S1). Every
+/// counting run's default `.parquet` output already qualifies: no separate
+/// conversion step exists, see `ktab.rs`'s module doc comment.
+#[pyclass(name = "KmerTable", module = "fastdna._core")]
+struct PyKmerTable {
+    inner: KmerTable,
+}
+
+/// Accepts either a Python `int` (the table's raw `kmer_u64` encoding,
+/// taken as-is) or a `str` (a DNA sequence of exactly the table's `k`,
+/// canonicalized the same way counting does) -- see `ktab::
+/// encode_query_kmer`'s doc comment for the same contract on the Rust/CLI
+/// side. Kept as a free function rather than inlined into every
+/// `#[pymethods]` call site so `get` and `__getitem__` cannot drift on what
+/// counts as a valid argument.
+fn extract_kmer_arg(kmer: &Bound<'_, PyAny>, k: usize) -> PyResult<u64> {
+    if let Ok(raw) = kmer.extract::<u64>() {
+        return Ok(raw);
+    }
+    let sequence: String = kmer.extract().map_err(|_| {
+        PyValueError::new_err(
+            "kmer must be a DNA sequence (str) of length k, or the table's raw kmer_u64 encoding (a non-negative int)",
+        )
+    })?;
+    Ok(ktab::encode_query_kmer(&sequence, k)?)
+}
+
+#[pymethods]
+impl PyKmerTable {
+    /// Opens `path` and validates it as a queryable k-mer table (footer
+    /// metadata and per-row-group statistics only -- see `KmerTable::open`'s
+    /// doc comment for exactly what is and is not checked). Raises
+    /// `LoadError` for a file that is not a FastDNA k-mer table.
+    #[staticmethod]
+    fn open(py: Python<'_>, path: String) -> PyResult<Self> {
+        let inner = py.allow_threads(|| KmerTable::open(path))?;
+        Ok(Self { inner })
+    }
+
+    #[getter]
+    fn k(&self) -> usize {
+        self.inner.k()
+    }
+
+    /// Total row count (the table's distinct-k-mer count), read once from
+    /// Parquet metadata at `open` time -- no row was ever decoded to answer
+    /// this.
+    fn __len__(&self) -> usize {
+        self.inner.len() as usize
+    }
+
+    /// The frequency recorded for `kmer`, or `None` if it is absent from the
+    /// table. See `extract_kmer_arg` for what `kmer` may be.
+    fn get(&self, py: Python<'_>, kmer: &Bound<'_, PyAny>) -> PyResult<Option<u32>> {
+        let encoded = extract_kmer_arg(kmer, self.inner.k())?;
+        Ok(py.allow_threads(|| self.inner.get(encoded))?)
+    }
+
+    /// Same lookup as `get`, but raises `KeyError` instead of returning
+    /// `None` for an absent k-mer -- the usual Python mapping convention
+    /// (`table[kmer]` vs. `table.get(kmer)`), mirroring `dict`.
+    fn __getitem__(&self, py: Python<'_>, kmer: &Bound<'_, PyAny>) -> PyResult<u32> {
+        match self.get(py, kmer)? {
+            Some(count) => Ok(count),
+            None => Err(PyKeyError::new_err(kmer.repr()?.to_string())),
+        }
+    }
+
+    /// `kmer in table` -- `True` iff `get(kmer)` would not be `None`.
+    fn __contains__(&self, py: Python<'_>, kmer: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(self.get(py, kmer)?.is_some())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("KmerTable(k={}, len={})", self.inner.k(), self.inner.len())
+    }
+}
+
+/// The Python-visible outcome of a `filter_reads` call: how many reads were
+/// read in total, and how many were written to the output under the
+/// chosen mode -- the Python-visible counterpart of `read_filter::
+/// FilterStats`.
+#[pyclass(name = "FilterStats", module = "fastdna._core")]
+struct PyFilterStats {
+    #[pyo3(get)]
+    reads_total: u64,
+    #[pyo3(get)]
+    reads_written: u64,
+}
+
+#[pymethods]
+impl PyFilterStats {
+    fn __repr__(&self) -> String {
+        format!("FilterStats(reads_total={}, reads_written={})", self.reads_total, self.reads_written)
+    }
+}
+
+/// Parses `filter_reads`'s `mode` string argument into `read_filter::
+/// FilterMode`. A plain string rather than a Python enum, for the same
+/// reason `parse_combine_op` above is: nothing else in this FFI surface
+/// exposes a Python-level enum type.
+fn parse_filter_mode(mode: &str) -> PyResult<read_filter::FilterMode> {
+    match mode {
+        "keep" => Ok(read_filter::FilterMode::Keep),
+        "discard" => Ok(read_filter::FilterMode::Discard),
+        other => Err(PyValueError::new_err(format!("mode must be 'keep' or 'discard' -- got '{other}'"))),
+    }
+}
+
+/// Filters one or more FASTQ/FASTA files against `table`, writing reads
+/// that should be kept to `output` -- the Python-visible counterpart of
+/// `fastdna filter` / `read_filter::run_filter`
+/// (`docs/feature-gap-analysis.md`'s S4). See `read_filter.rs`'s module doc
+/// comment for the full design: threshold semantics (`min_fraction`,
+/// inclusive `>=`), what `mode` ("keep"/"discard") means, and the
+/// documented single-end-only scope (each of `inputs` is filtered
+/// independently; paired-end R1/R2 synchronization is not implemented).
+///
+/// `table` is taken as an already-open `KmerTable` (`python/fastdna/
+/// __init__.py`'s `KmerTable.filter_reads` calls this with `self._raw`),
+/// the same "the Python wrapper builds the call, the FFI function takes
+/// already-open handles" shape `ktab_union`/`ktab_intersect`/`ktab_diff`
+/// already use.
+///
+/// Released under `py.allow_threads` like every other bulk I/O operation in
+/// this module: filtering a real FASTQ file is I/O- and CPU-bound work with
+/// nothing Python-specific in it, and holding the GIL for it would freeze
+/// the calling interpreter for the duration.
+#[pyfunction]
+#[pyo3(signature = (table, inputs, mode, output, min_fraction=0.1))]
+fn filter_reads(
+    py: Python<'_>,
+    table: PyRef<'_, PyKmerTable>,
+    inputs: Vec<String>,
+    mode: &str,
+    output: String,
+    min_fraction: f64,
+) -> PyResult<PyFilterStats> {
+    let mode = parse_filter_mode(mode)?;
+    let table_inner = table.inner.clone();
+    let input_specs: Vec<crate::fastq::InputSpec> =
+        inputs.iter().map(|p| crate::fastq::InputSpec::from_arg(std::path::Path::new(p))).collect();
+    let output_path = PathBuf::from(output);
+
+    let stats = py.allow_threads(|| -> Result<read_filter::FilterStats, FastDnaError> {
+        let index = read_filter::ReferenceIndex::from_table(&table_inner)?;
+        read_filter::run_filter(input_specs, &index, mode, min_fraction, &output_path)
+    })?;
+
+    Ok(PyFilterStats { reads_total: stats.reads_total, reads_written: stats.reads_written })
+}
+
+/// The Python-visible outcome of a `profile_reads` call: how many reads were
+/// read in total, and how many of those yielded at least one k-mer to
+/// profile -- the Python-visible counterpart of `read_profile::
+/// ProfileStats`.
+#[pyclass(name = "ProfileStats", module = "fastdna._core")]
+struct PyProfileStats {
+    #[pyo3(get)]
+    reads_total: u64,
+    #[pyo3(get)]
+    reads_profiled: u64,
+}
+
+#[pymethods]
+impl PyProfileStats {
+    fn __repr__(&self) -> String {
+        format!("ProfileStats(reads_total={}, reads_profiled={})", self.reads_total, self.reads_profiled)
+    }
+}
+
+/// Profiles one or more FASTQ/FASTA files against `table`, writing an
+/// RLE-compressed per-read profile to `output` and a per-read summary table
+/// to `summary` -- the Python-visible counterpart of `fastdna profile` /
+/// `read_profile::run_profile` (`docs/feature-gap-analysis.md`'s S3). See
+/// `read_profile.rs`'s module doc comment for the full design: why the
+/// profile is RLE-compressed rather than one row per base, the summary
+/// table's column naming, and the single-end-only scope shared with
+/// `filter_reads`.
+///
+/// `table` is taken as an already-open `KmerTable`, the same "the Python
+/// wrapper builds the call, the FFI function takes already-open handles"
+/// shape `filter_reads`/`ktab_union`/`ktab_intersect`/`ktab_diff` already
+/// use.
+///
+/// Released under `py.allow_threads` like every other bulk I/O operation in
+/// this module: profiling a real FASTQ file is I/O- and CPU-bound work with
+/// nothing Python-specific in it, and holding the GIL for it would freeze
+/// the calling interpreter for the duration.
+#[pyfunction]
+#[pyo3(signature = (table, inputs, output, summary))]
+fn profile_reads(
+    py: Python<'_>,
+    table: PyRef<'_, PyKmerTable>,
+    inputs: Vec<String>,
+    output: String,
+    summary: String,
+) -> PyResult<PyProfileStats> {
+    let table_inner = table.inner.clone();
+    let input_specs: Vec<crate::fastq::InputSpec> =
+        inputs.iter().map(|p| crate::fastq::InputSpec::from_arg(std::path::Path::new(p))).collect();
+    let output_path = PathBuf::from(output);
+    let summary_path = PathBuf::from(summary);
+
+    let stats = py.allow_threads(|| -> Result<read_profile::ProfileStats, FastDnaError> {
+        let index = read_profile::ProfileIndex::from_table(&table_inner)?;
+        read_profile::run_profile(input_specs, &index, &output_path, &summary_path)
+    })?;
+
+    Ok(PyProfileStats { reads_total: stats.reads_total, reads_profiled: stats.reads_profiled })
+}
+
+/// Parses the `combine` string argument `ktab_union`/`ktab_intersect`
+/// accept into `setops::CombineOp`. A plain string rather than a Python
+/// enum: nothing else in this FFI surface (`ffi.rs`) exposes a Python-level
+/// enum type, and a mistyped value is exactly as actionable as a `ValueError`
+/// naming the three valid spellings.
+fn parse_combine_op(combine: &str) -> PyResult<setops::CombineOp> {
+    match combine {
+        "sum" => Ok(setops::CombineOp::Sum),
+        "min" => Ok(setops::CombineOp::Min),
+        "max" => Ok(setops::CombineOp::Max),
+        other => Err(PyValueError::new_err(format!(
+            "combine must be one of 'sum', 'min', 'max' -- got '{other}'"
+        ))),
+    }
+}
+
+/// Union of several k-mer tables, written to `output` and reopened as a new
+/// `KmerTable` -- the Python-visible counterpart of `fastdna union` /
+/// `setops::union` (`docs/feature-gap-analysis.md`'s S2). See `setops::
+/// union`'s doc comment for the streaming merge and what `combine` ("sum",
+/// "min" or "max") means.
+///
+/// Takes a `Vec` of already-open tables rather than a variadic `*args`
+/// spelling: `python/fastdna/__init__.py`'s `KmerTable.union(*others,
+/// output=...)` builds this list on the Python side, keeping the choice of
+/// call-site ergonomics (a method taking `*others`) separate from this
+/// FFI function's own shape.
+///
+/// Released under `py.allow_threads` like every other bulk operation in
+/// this module (`count`, `sketch`, ...): merging and re-exporting a real
+/// k-mer table is I/O- and CPU-bound work with nothing Python-specific in
+/// it, and holding the GIL for it would freeze the calling interpreter for
+/// the duration.
+#[pyfunction]
+#[pyo3(signature = (tables, output, combine="sum"))]
+fn ktab_union(py: Python<'_>, tables: Vec<PyRef<'_, PyKmerTable>>, output: String, combine: &str) -> PyResult<PyKmerTable> {
+    let combine = parse_combine_op(combine)?;
+    let inner: Vec<KmerTable> = tables.iter().map(|t| t.inner.clone()).collect();
+    let opened = py.allow_threads(|| -> Result<KmerTable, FastDnaError> {
+        let rows = setops::union(&inner, combine)?;
+        let k = inner.first().map(KmerTable::k).unwrap_or(0);
+        export::export_pairs_parquet(rows, &output, k)?;
+        KmerTable::open(&output)
+    })?;
+    Ok(PyKmerTable { inner: opened })
+}
+
+/// Intersection of several k-mer tables, written to `output` and reopened
+/// as a new `KmerTable` -- the Python-visible counterpart of `fastdna
+/// intersect` / `setops::intersect`. See `ktab_union`'s doc comment for why
+/// this takes a `Vec` of already-open tables and runs under `py.
+/// allow_threads`.
+#[pyfunction]
+#[pyo3(signature = (tables, output, combine="min"))]
+fn ktab_intersect(
+    py: Python<'_>,
+    tables: Vec<PyRef<'_, PyKmerTable>>,
+    output: String,
+    combine: &str,
+) -> PyResult<PyKmerTable> {
+    let combine = parse_combine_op(combine)?;
+    let inner: Vec<KmerTable> = tables.iter().map(|t| t.inner.clone()).collect();
+    let opened = py.allow_threads(|| -> Result<KmerTable, FastDnaError> {
+        let rows = setops::intersect(&inner, combine)?;
+        let k = inner.first().map(KmerTable::k).unwrap_or(0);
+        export::export_pairs_parquet(rows, &output, k)?;
+        KmerTable::open(&output)
+    })?;
+    Ok(PyKmerTable { inner: opened })
+}
+
+/// Asymmetric difference (`a` minus `subtract`), written to `output` and
+/// reopened as a new `KmerTable` -- the Python-visible counterpart of
+/// `fastdna diff` / `setops::diff` (the reference-subtraction/host-removal
+/// use case). See `setops::diff`'s doc comment for what
+/// `max_subtract_count` means and `ktab_union`'s for why this runs under
+/// `py.allow_threads`.
+#[pyfunction]
+#[pyo3(signature = (a, subtract, output, max_subtract_count=0))]
+fn ktab_diff(
+    py: Python<'_>,
+    a: PyRef<'_, PyKmerTable>,
+    subtract: Vec<PyRef<'_, PyKmerTable>>,
+    output: String,
+    max_subtract_count: u32,
+) -> PyResult<PyKmerTable> {
+    let a_inner = a.inner.clone();
+    let subtract_inner: Vec<KmerTable> = subtract.iter().map(|t| t.inner.clone()).collect();
+    let opened = py.allow_threads(|| -> Result<KmerTable, FastDnaError> {
+        let rows = setops::diff(&a_inner, &subtract_inner, max_subtract_count)?;
+        export::export_pairs_parquet(rows, &output, a_inner.k())?;
+        KmerTable::open(&output)
+    })?;
+    Ok(PyKmerTable { inner: opened })
+}
+
 /// Estimates the number of distinct canonical k-mers across an *entire*
 /// FASTQ(.gz) file using HyperLogLog, in a fixed, small amount of memory
 /// (`2^precision` bytes) regardless of file size -- unlike `peek()`'s
@@ -1161,6 +1476,49 @@ fn load_frac_sketch(path: String) -> PyResult<PyFracSketch> {
 #[pyo3(signature = (path, k=31, precision=hll::DEFAULT_PRECISION))]
 fn estimate_cardinality(py: Python<'_>, path: String, k: usize, precision: u32) -> PyResult<f64> {
     Ok(py.allow_threads(|| hll::estimate_cardinality(path, k, precision))?)
+}
+
+/// Estimates the k-mer frequency spectrum -- how many distinct canonical
+/// k-mers occur exactly once, twice, ... -- across one or more FASTQ(.gz)/
+/// FASTA(.gz) files, in one streaming pass and a fixed, small amount of
+/// memory (`2^precision * 16` bytes) regardless of input size, via an
+/// ntCard-style sketch (`ntcard.rs`; `docs/feature-gap-analysis.md`'s
+/// S7(a)).
+///
+/// Returns a plain `{depth: distinct_kmers}` dict, the same shape
+/// `KmerCounts.spectrum()` returns from an *exact* count -- so this can be
+/// handed straight to `fastdna.genomescope.profile_genome(spectrum, k=k)`
+/// wherever an exact spectrum is too expensive to compute first. A
+/// module-level function, not a method, matching `estimate_cardinality`'s
+/// own precedent: there is no persistent object here for a method to hang
+/// off, only a streaming computation over file paths.
+///
+/// See `ntcard.rs`'s module doc comment for the algorithm and its
+/// measured accuracy (f1, the error/noise class, is the hardest to
+/// estimate and is characterized separately from every other class).
+/// Released under `py.allow_threads` like `estimate_cardinality`/`count`/
+/// `peek`'s own I/O-bound work.
+#[pyfunction]
+#[pyo3(signature = (paths, k=31, precision=hll::DEFAULT_PRECISION, max_frequency=None))]
+fn estimate_spectrum(
+    py: Python<'_>,
+    paths: Vec<String>,
+    k: usize,
+    precision: u32,
+    max_frequency: Option<u32>,
+) -> PyResult<PyObject> {
+    let estimate =
+        py.allow_threads(|| ntcard::estimate_spectrum(&paths, k, precision, max_frequency))?;
+
+    let dict = PyDict::new_bound(py);
+    for (depth, count) in estimate.spectrum {
+        // Rounded to the nearest non-negative integer, matching
+        // `KmerCounts.spectrum()`'s all-integer contract -- see
+        // `ntcard::write_spectrum`'s own doc comment for the same
+        // rounding rule applied to the CLI's file output.
+        dict.set_item(depth, count.round().max(0.0) as u64)?;
+    }
+    Ok(dict.into())
 }
 
 /// The schema of the frame-translation table `translate_sequences()` and
@@ -1793,6 +2151,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPreview>()?;
     m.add_class::<PySketch>()?;
     m.add_class::<PyFracSketch>()?;
+    m.add_class::<PyKmerTable>()?;
+    m.add_class::<PyFilterStats>()?;
+    m.add_class::<PyProfileStats>()?;
     m.add_class::<PyKmerDatabase>()?;
     m.add_function(wrap_pyfunction!(count, m)?)?;
     m.add_function(wrap_pyfunction!(peek, m)?)?;
@@ -1802,10 +2163,16 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(frac_sketch, m)?)?;
     m.add_function(wrap_pyfunction!(load_frac_sketch, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_cardinality, m)?)?;
+    m.add_function(wrap_pyfunction!(estimate_spectrum, m)?)?;
     m.add_function(wrap_pyfunction!(translate_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(translate_file, m)?)?;
     m.add_function(wrap_pyfunction!(protein_kmers, m)?)?;
     m.add_function(wrap_pyfunction!(build_database, m)?)?;
     m.add_function(wrap_pyfunction!(cohort_presence_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(ktab_union, m)?)?;
+    m.add_function(wrap_pyfunction!(ktab_intersect, m)?)?;
+    m.add_function(wrap_pyfunction!(ktab_diff, m)?)?;
+    m.add_function(wrap_pyfunction!(filter_reads, m)?)?;
+    m.add_function(wrap_pyfunction!(profile_reads, m)?)?;
     Ok(())
 }

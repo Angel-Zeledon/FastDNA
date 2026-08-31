@@ -260,6 +260,88 @@ pub fn extract_canonical_kmers(seq: &[u8], k: usize) -> Vec<u64> {
     kmers
 }
 
+/// [`extract_canonical_kmers_into`], but also records the 0-based read
+/// position each k-mer's first base occupies -- the positional counterpart
+/// `read_profile.rs` needs (`docs/feature-gap-analysis.md`'s S3) to map a
+/// reference count back to "this is the count at read position `i`", not
+/// merely "these are the k-mers this read contains" (which is all the plain
+/// extractor's caller-order-only output supports).
+///
+/// This is deliberately the *same* rolling loop as
+/// [`extract_canonical_kmers_into`], with one additional piece of
+/// bookkeeping, rather than a second implementation reasoned about
+/// separately: `valid_len` already tracks exactly what is needed for the
+/// position, since a k-mer is only emitted (`valid_len >= k`) once `k`
+/// consecutive bases have rolled through with no ambiguous-base reset in
+/// between, so the current loop index `i` (0-based, the position of the
+/// base that just completed the window) minus `k - 1` is always the start
+/// of that k-mer, with no separate bookkeeping of "where did the last reset
+/// happen" required. Any divergence between this function and
+/// `extract_canonical_kmers_into` on which k-mers are emitted (as opposed to
+/// where they are positioned) would be a bug, not a design choice -- see
+/// this module's tests, which pin the two against each other on the same
+/// input.
+///
+/// A read position with no valid k-mer of its own (inside the first `k - 1`
+/// bases of the read, or too close to an ambiguous base for a full `k`-base
+/// window to have rolled through since the last reset) simply has no entry
+/// in `out`. Callers must treat that as "no data for this position", not "a
+/// count of zero" -- the same distinction `read_filter.rs`'s "a read with no
+/// k-mers never matches" already draws between an empty extraction and a
+/// genuine zero.
+///
+/// `out` is cleared first, matching `extract_canonical_kmers_into`'s
+/// buffer-reuse convention.
+///
+/// Positions are `u32`: a read longer than `u32::MAX` (~4.3 billion) bases
+/// is not a real sequencing read on any platform this crate targets, and
+/// capping here keeps the RLE run fields this feeds (`read_profile::RleRun`)
+/// a fixed 12 bytes instead of 24. Callers responsible for a `usize`-length
+/// input (`read_profile::run_profile`) reject an oversized read explicitly,
+/// before calling this function, rather than silently truncating a position
+/// here.
+pub fn extract_canonical_kmers_with_positions_into(seq: &[u8], k: usize, out: &mut Vec<(u32, u64)>) {
+    out.clear();
+    if seq.len() < k || k == 0 || k > 32 {
+        return;
+    }
+    // See this function's doc comment: a caller with a `usize`-length input
+    // is responsible for rejecting an oversized read before this call. This
+    // assert is a cheap, release-mode-free tripwire, not the enforcement
+    // point itself -- the same division of labor `reverse_complement_u64`'s
+    // own `debug_assert!` on `k` already uses in this file.
+    debug_assert!(seq.len() <= u32::MAX as usize, "read of {} bases exceeds the u32 position cap", seq.len());
+    out.reserve(seq.len() - k + 1);
+
+    let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let top_shift = 2 * (k - 1);
+
+    let mut fwd: u64 = 0;
+    let mut rev: u64 = 0;
+    let mut valid_len: usize = 0;
+
+    for (i, &base) in seq.iter().enumerate() {
+        if let Some(bits) = base_to_bits(base) {
+            fwd = ((fwd << 2) | bits) & mask;
+            rev = (rev >> 2) | (complement_bits(bits) << top_shift);
+            valid_len += 1;
+
+            if valid_len >= k {
+                // `i` is the position of the last base rolled into this
+                // k-mer; the first is `k - 1` positions earlier. `i + 1 >=
+                // k` is guaranteed here (valid_len <= i + 1), so this
+                // subtraction cannot underflow.
+                let start = (i + 1 - k) as u32;
+                out.push((start, fwd.min(rev)));
+            }
+        } else {
+            fwd = 0;
+            rev = 0;
+            valid_len = 0;
+        }
+    }
+}
+
 /// Decodes a u64 k-mer and *appends* its `k` ASCII bases to `out`.
 ///
 /// The allocation-free half of [`decode_kmer`]. Every byte written comes from
@@ -399,6 +481,51 @@ mod tests {
 
         extract_canonical_kmers_into(b"TTTTGGGG", 4, &mut buf);
         assert_eq!(buf, extract_canonical_kmers(b"TTTTGGGG", 4));
+    }
+
+    // -- extract_canonical_kmers_with_positions_into ----------------------
+
+    #[test]
+    fn positional_extraction_agrees_with_the_plain_extractor_on_which_kmers_are_emitted() {
+        let seq = b"ACGTTGCAAACCGGTTNGATTACAGATTACAGATTACAGATTACACCGGTTAANCGCGCGATCG";
+        for k in 1..=32usize {
+            let plain = extract_canonical_kmers(seq, k);
+            let mut positional = Vec::new();
+            extract_canonical_kmers_with_positions_into(seq, k, &mut positional);
+            let positional_kmers: Vec<u64> = positional.iter().map(|&(_, km)| km).collect();
+            assert_eq!(positional_kmers, plain, "k-mer set diverges from the plain extractor at k = {k}");
+        }
+    }
+
+    #[test]
+    fn positional_extraction_numbers_positions_sequentially_with_no_ambiguous_bases() {
+        let mut out = Vec::new();
+        extract_canonical_kmers_with_positions_into(b"ACGTACGT", 4, &mut out);
+        let positions: Vec<u32> = out.iter().map(|&(p, _)| p).collect();
+        // 8 bases, k=4 -> 5 windows, one per starting position 0..=4.
+        assert_eq!(positions, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// An ambiguous base leaves a gap of `k - 1` positions with no k-mer of
+    /// their own on either side of it (not merely at the reset point
+    /// itself): a full `k`-base window has to roll through with no
+    /// ambiguous base inside it before the next k-mer can be emitted.
+    #[test]
+    fn positional_extraction_leaves_a_gap_around_an_ambiguous_base() {
+        let mut out = Vec::new();
+        // k=4: "ACGT" (positions 0..=3 valid), "N" at position 4, then
+        // "ACGT" again (positions 5..=8). The first k-mer after the reset
+        // can only start at position 5 (needs bases 5,6,7,8 all valid).
+        extract_canonical_kmers_with_positions_into(b"ACGTNACGT", 4, &mut out);
+        let positions: Vec<u32> = out.iter().map(|&(p, _)| p).collect();
+        assert_eq!(positions, vec![0, 5], "position 5 is the first fully-valid window after the reset");
+    }
+
+    #[test]
+    fn positional_extraction_of_a_too_short_read_yields_nothing() {
+        let mut out = vec![(99u32, 99u64)];
+        extract_canonical_kmers_with_positions_into(b"ACG", 4, &mut out);
+        assert!(out.is_empty(), "a read shorter than k must clear the reused buffer, not leave stale data");
     }
 
     #[test]

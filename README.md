@@ -378,8 +378,9 @@ already done.
 ## Command-line interface
 
 The `fastdna` CLI is installed separately from the Python package -- see
-[Building from source](#building-from-source). It counts k-mers in one
-FASTQ(.gz) file and writes the frequency table plus a QC report:
+[Building from source](#building-from-source). Its default mode counts
+k-mers in one or more FASTQ(.gz) file(s) and writes the frequency table plus
+a QC report:
 
 ```bash
 fastdna --input sample.fastq.gz --output counts.parquet -k 31
@@ -391,7 +392,52 @@ chosen by extension: `.parquet` writes Arrow/Snappy Parquet, anything else
 writes CSV. Every exporter writes the same three columns: `kmer_u64`
 (`uint64`), `kmer_sequence` (string), `frequency` (`uint32`).
 
+### Subcommands
+
+Counting is also reachable as an explicit `fastdna count ...` subcommand,
+identical in every way to giving no subcommand at all -- both forms are
+covered by this project's compatibility contract (see `CHANGELOG.md`'s "Qué
+cubre este contrato"), so existing scripts that call `fastdna --input ...`
+with no subcommand word keep working unchanged. Four more subcommands expose
+Rust-core functionality that, before this section, was reachable only from
+the Python binding (`fastdna.sketch()`, `.compare_all()`,
+`.estimate_cardinality()`, `.peek()`) -- pipeline users who never leave the
+shell can now sketch, compare, estimate cardinality, and preview a file
+without writing Python:
+
+| Subcommand | What it does | Equivalent Python call |
+|---|---|---|
+| `fastdna count ...` | Count k-mers (the default; see [Flags](#flags) below) | `fastdna.count(...)` |
+| `fastdna sketch --input FILE -k 21 --sketch-size 1000 -o out.json` | Build a MinHash sketch of one file and save it as JSON | `fastdna.sketch(...)` + `Sketch.save(...)` |
+| `fastdna dist --input FILE... [--metric jaccard\|containment\|mash]` | Pairwise comparison across two or more sketches and/or files | `fastdna.compare_all(...)` |
+| `fastdna card --input FILE -k 31 [--precision 14]` | HyperLogLog estimate of the number of distinct k-mers | `fastdna.estimate_cardinality(...)` |
+| `fastdna peek --input FILE [--n-reads 10000]` | Quick preview: read length stats, GC content, a suggested k | `fastdna.peek(...)` |
+
+`fastdna <subcommand> --help` prints each one's full flag list.
+
+`fastdna sketch` sketches a single file (multiple lanes of one sample should
+be concatenated first, e.g. via `cat`, the same expectation the Python
+binding's `GenomeSketch::from_path` already has). `fastdna dist` accepts any
+mix of previously saved sketches (`.json`, as written by `fastdna sketch`)
+and raw FASTQ/FASTA files, sketching the latter on the fly with its own
+`-k`/`--sketch-size`; `--metric containment` prints both directions of every
+pair (containment is asymmetric -- `A.containment(B) != B.containment(A)` in
+general), while `jaccard` and `mash` print one row per unordered pair. Without
+`--output`, `fastdna dist` prints its CSV table to stdout, so it composes
+directly with a shell pipe.
+
+```bash
+fastdna sketch --input sampleA.fastq.gz -k 21 --sketch-size 1000 -o a.json
+fastdna sketch --input sampleB.fastq.gz -k 21 --sketch-size 1000 -o b.json
+fastdna dist --input a.json b.json --metric mash
+```
+
 ### Flags
+
+`fastdna count`'s flags (identical whether or not the `count` word is given
+explicitly -- see [Subcommands](#subcommands) above). `sketch`/`dist`/
+`card`/`peek` each have their own, smaller flag set, listed in the
+[Subcommands](#subcommands) table and in `fastdna <subcommand> --help`.
 
 | Flag | Default | Description |
 |---|---|---|

@@ -70,22 +70,22 @@ const R2: &str = "@r2a\nTTGCAACGTT\n+\nIIIIIIIIII\n@r2b\nACGTACGTTG\n+\nIIIIIIII
 #[test]
 fn paired_dir_alone_parses_and_validates() {
     let cli = Cli::parse_from(["fastdna", "--paired-dir", "samples", "--paired-output", "out"]);
-    assert_eq!(cli.paired_dir.as_deref(), Some(Path::new("samples")));
-    assert_eq!(cli.paired_output.as_deref(), Some(Path::new("out")));
-    assert!(cli.validate().is_ok());
+    assert_eq!(cli.count.paired_dir.as_deref(), Some(Path::new("samples")));
+    assert_eq!(cli.count.paired_output.as_deref(), Some(Path::new("out")));
+    assert!(cli.count.validate().is_ok());
 }
 
 #[test]
 fn paired_dir_without_paired_output_is_rejected() {
     let cli = Cli::parse_from(["fastdna", "--paired-dir", "samples"]);
-    let err = cli.validate().expect_err("--paired-dir needs somewhere to write");
+    let err = cli.count.validate().expect_err("--paired-dir needs somewhere to write");
     assert!(err.contains("--paired-output"), "message must name the missing flag: {err}");
 }
 
 #[test]
 fn paired_output_without_paired_dir_is_rejected() {
     let cli = Cli::parse_from(["fastdna", "--input", "s.fastq", "--paired-output", "out"]);
-    let err = cli.validate().expect_err("--paired-output alone is meaningless");
+    let err = cli.count.validate().expect_err("--paired-output alone is meaningless");
     assert!(err.contains("--paired-dir"), "message must name the flag it depends on: {err}");
 }
 
@@ -93,7 +93,7 @@ fn paired_output_without_paired_dir_is_rejected() {
 fn combining_input_and_paired_dir_is_rejected() {
     let cli =
         Cli::parse_from(["fastdna", "--input", "s.fastq", "--paired-dir", "d", "--paired-output", "o"]);
-    let err = cli.validate().expect_err("--input and --paired-dir must not both be given");
+    let err = cli.count.validate().expect_err("--input and --paired-dir must not both be given");
     assert!(err.contains("--input") && err.contains("--paired-dir"), "message: {err}");
 }
 
@@ -103,9 +103,9 @@ fn combining_input_and_paired_dir_is_rejected() {
 #[test]
 fn plain_input_only_invocation_is_unaffected() {
     let cli = Cli::parse_from(["fastdna", "--input", "s.fastq"]);
-    assert!(cli.paired_dir.is_none());
-    assert!(cli.paired_output.is_none());
-    assert!(cli.validate().is_ok());
+    assert!(cli.count.paired_dir.is_none());
+    assert!(cli.count.paired_output.is_none());
+    assert!(cli.count.validate().is_ok());
 }
 
 /// Giving neither `--input` nor `--paired-dir` used to only fail deep inside
@@ -116,7 +116,7 @@ fn plain_input_only_invocation_is_unaffected() {
 #[test]
 fn neither_input_nor_paired_dir_is_rejected_by_validate_before_any_run_starts() {
     let cli = Cli::parse_from(["fastdna"]);
-    let err = cli.validate().expect_err("one of --input or --paired-dir is required");
+    let err = cli.count.validate().expect_err("one of --input or --paired-dir is required");
     assert!(err.contains("--input") && err.contains("--paired-dir"), "message: {err}");
 }
 

@@ -10,13 +10,16 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use rustc_hash::FxHashMap;
 
 use crate::atomic::AtomicFile;
+use crate::cohort::matrix::CohortMatrix;
 use crate::counter::KmerCounter;
 use crate::error::{FastDnaError, Result};
 use crate::kmer;
+use crate::ktab;
 
 /// Wraps an Arrow/Parquet serialization or writer failure. These are not I/O
 /// errors: the bytes may never touch a disk (e.g. a schema mismatch building
@@ -153,6 +156,26 @@ impl ChunkBuffers {
     }
 }
 
+/// Writes `counter`'s finalized table as Parquet, plus two footer
+/// key-value metadata entries -- `fastdna.sorted_by=kmer_u64` and
+/// `fastdna.k=<k>` (`ktab::SORTED_BY_KEY`/`ktab::K_KEY`) -- recording that
+/// this file's rows are what `ktab::KmerTable::open` requires before it
+/// will treat a `.parquet` file as a queryable k-mer table.
+///
+/// This is not conditional on any flag: `counter.iter()` is *always*
+/// globally sorted ascending by `kmer_u64` (`counter.rs`'s `CountTable`
+/// invariant, upheld by every merge path that can produce a `KmerCounter`,
+/// in-memory or disk-spilled), so every file this function writes already
+/// satisfies the one property `ktab.rs` needs -- the metadata simply
+/// records a fact that was already true, rather than changing what gets
+/// written. Concretely: `fastdna count -o counts.parquet` needs no extra
+/// step or flag to become queryable with `fastdna query --table
+/// counts.parquet`; see `ktab.rs`'s module doc comment for the full
+/// "no new file format" design this follows. Adding footer metadata is not
+/// a schema change (`CHANGELOG.md`'s compatibility contract governs
+/// columns, not footer key-value pairs), so this is safe for every
+/// existing caller, including `--with-sequence` output and every per-sample
+/// file `cohort::batch` writes.
 pub fn export_counts_parquet<P: AsRef<Path>>(
     counter: &KmerCounter,
     output_path: P,
@@ -166,6 +189,10 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
 
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![
+            KeyValue::new(ktab::SORTED_BY_KEY.to_string(), Some(ktab::SORTED_BY_VALUE.to_string())),
+            KeyValue::new(ktab::K_KEY.to_string(), Some(k.to_string())),
+        ]))
         .build();
 
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
@@ -203,6 +230,223 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
     writer.close().map_err(|e| export_err(path, e))?;
     pending.commit()?;
     Ok(total_written)
+}
+
+/// Writes an already ascending, already-deduplicated `(kmer_u64,
+/// frequency)` stream to `output_path` in exactly the shape and footer
+/// metadata `export_counts_parquet` writes -- so a set operation's result
+/// (`setops.rs`'s `union`/`intersect`/`diff`) is immediately reopenable
+/// with `ktab::KmerTable::open`, no conversion step, the same "declare it,
+/// don't reinvent it" move `ktab.rs`'s own module doc comment makes for
+/// `count`'s output.
+///
+/// Unlike `export_counts_parquet`, there is no `KmerCounter` to iterate --
+/// the caller has already merged several tables into one sorted stream,
+/// possibly failing partway through (a Parquet read error surfacing from
+/// one of the *input* tables), so `pairs` yields `Result` rather than a bare
+/// tuple and this function propagates that error exactly like one of its
+/// own I/O failures.
+///
+/// No `kmer_sequence` column and no `min_count` filtering: both are
+/// `count`-specific knobs on a raw counting run, and a set operation's
+/// output is already exactly the rows its caller decided to keep -- there
+/// is nothing left here to filter, and the sequence is reconstructible from
+/// `kmer_u64` by any caller who wants it (`kmer::decode_kmer`), the same as
+/// every other lean-by-default table this crate writes.
+///
+/// Sharing the chunking/writer machinery (`ChunkBuffers`, `write_chunk`)
+/// with `export_counts_parquet` rather than duplicating it means the two
+/// can never drift on row-group size, compression, or footer metadata.
+pub fn export_pairs_parquet<P, I>(pairs: I, output_path: P, k: usize) -> Result<usize>
+where
+    P: AsRef<Path>,
+    I: IntoIterator<Item = Result<(u64, u32)>>,
+{
+    let path = output_path.as_ref();
+    let (file, pending) = AtomicFile::create(path)?;
+    let schema = counts_schema(false);
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![
+            KeyValue::new(ktab::SORTED_BY_KEY.to_string(), Some(ktab::SORTED_BY_VALUE.to_string())),
+            KeyValue::new(ktab::K_KEY.to_string(), Some(k.to_string())),
+        ]))
+        .build();
+
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| export_err(path, e))?;
+    let chunk_size = 131_072;
+    let mut total_written = 0;
+    let mut chunk = ChunkBuffers::with_capacity(chunk_size, k, false);
+
+    for pair in pairs {
+        let (kmer_bits, count) = pair?;
+        chunk.push(kmer_bits, k, count);
+
+        if chunk.len() >= chunk_size {
+            total_written += chunk.len();
+            let full = std::mem::replace(&mut chunk, ChunkBuffers::with_capacity(chunk_size, k, false));
+            write_chunk(&mut writer, &schema, full, path)?;
+        }
+    }
+
+    if !chunk.is_empty() {
+        total_written += chunk.len();
+        write_chunk(&mut writer, &schema, chunk, path)?;
+    }
+
+    writer.close().map_err(|e| export_err(path, e))?;
+    pending.commit()?;
+    Ok(total_written)
+}
+
+/// The schema `export_cohort_matrix_parquet` writes: one row per nonzero
+/// `(sample, k-mer)` entry of a `CohortMatrix`, in long/"tidy"/COO form --
+/// `sample_id`, `kmer_u64`, optionally `kmer_sequence`, then `count`.
+///
+/// A long table, not a dense `samples x kmers` grid, because that is
+/// exactly the shape `CohortMatrix` already holds in memory (`cohort::
+/// matrix`'s module doc comment: it is built as `(row, col, value)` COO
+/// triples specifically to avoid ever materializing the dense form). A
+/// real cohort's matrix is overwhelmingly zero -- most k-mers are private
+/// to a handful of samples -- so writing the dense grid would inflate a
+/// file that is mostly zero bytes by orders of magnitude for no benefit;
+/// this format writes exactly the `nnz` nonzero entries `CohortMatrix`
+/// already counted, no more.
+///
+/// `sample_id` is a plain string column rather than a row index: a caller
+/// opening this file in DuckDB, pandas or polars should not have to also
+/// carry around a separate `row -> sample_id` lookup table just to know
+/// whose k-mer a row belongs to -- the whole point of writing a generic
+/// Parquet file (`docs/feature-gap-analysis.md`'s S6) is that it is usable
+/// with no FastDNA-specific tooling at all. `kmer_u64` (not the decoded
+/// sequence) is the default k-mer identifier for the same reason
+/// `counts_schema`'s own doc comment gives for `count`'s output: it is an
+/// 8-byte fixed-width column, against a variable-length ASCII string that,
+/// for realistic `k`, is several times larger; it reconstructs to the
+/// exact same canonical sequence via `kmer::decode_kmer` given `k` (recorded
+/// in this file's own footer metadata, see below) -- so nothing is lost by
+/// leaving `kmer_sequence` opt-in.
+pub fn cohort_matrix_schema(with_sequence: bool) -> Arc<Schema> {
+    let mut fields = vec![
+        Field::new("sample_id", DataType::Utf8, false),
+        Field::new("kmer_u64", DataType::UInt64, false),
+    ];
+    if with_sequence {
+        fields.push(Field::new("kmer_sequence", DataType::Utf8, false));
+    }
+    fields.push(Field::new("count", DataType::UInt32, false));
+    Arc::new(Schema::new(fields))
+}
+
+/// Writes a `CohortMatrix` (`cohort::matrix::build_cohort_matrix`, or
+/// `cohort::matrix::build_cohort_matrix_from_directory`/`_from_files`) as a
+/// Parquet file under `cohort_matrix_schema` -- the generic, FastDNA-tool-
+/// independent file artifact `docs/feature-gap-analysis.md`'s S6 named as
+/// the one piece still missing once the matrix-building engine and its
+/// Python wiring (`gwas.py::cohort_presence_matrix`) had already landed.
+///
+/// `sample_ids[i]` names row `i` of `matrix` (i.e. every entry in
+/// `matrix.row` equal to `i`); its length must equal `matrix.n_samples`.
+/// This is a distinct argument, not a field of `CohortMatrix` itself,
+/// because building the matrix (`build_cohort_matrix`) never needs a
+/// sample's *name* -- only `count_samples`'s caller (the CLI, or a future
+/// Python entry point) does, once it is time to write a human-readable
+/// file.
+///
+/// Footer key-value metadata records `fastdna.k`, `fastdna.n_samples`,
+/// `fastdna.n_kmers`, `fastdna.n_candidates` and (when truncation happened)
+/// `fastdna.truncation_cutoff` -- the same numbers `gwas.py`'s truncation
+/// warning is built from, so a caller reading this file back (with no
+/// FastDNA library at all, just any Parquet reader that exposes footer
+/// metadata) can recover whether `--max-kmers` truncated anything and by
+/// how much, without recomputing it. Unlike `export_counts_parquet`'s
+/// `fastdna.sorted_by=kmer_u64` metadata, this file makes no such claim:
+/// rows are grouped by sample first (see `build_cohort_matrix`'s own pass
+/// 3, which is where `matrix.row`/`matrix.col`/`matrix.value` come from),
+/// not globally sorted by `kmer_u64`, so this file is not a valid
+/// `ktab::KmerTable` and does not claim to be one.
+///
+/// Returns the number of rows written (`matrix.row.len()`, i.e. the
+/// matrix's `nnz`). Goes through `AtomicFile` like every other exporter in
+/// this module: a disk-full error or an interrupted run must leave the
+/// previous good file in place rather than a truncated one a downstream
+/// reader would happily treat as complete.
+pub fn export_cohort_matrix_parquet<P: AsRef<Path>>(
+    matrix: &CohortMatrix,
+    sample_ids: &[String],
+    output_path: P,
+    k: usize,
+    with_sequence: bool,
+) -> Result<usize> {
+    let path = output_path.as_ref();
+    if sample_ids.len() != matrix.n_samples {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "sample_ids",
+            reason: format!(
+                "export_cohort_matrix_parquet: expected {} sample id(s) (CohortMatrix::n_samples), \
+                 got {}",
+                matrix.n_samples,
+                sample_ids.len()
+            ),
+        });
+    }
+
+    let (file, pending) = AtomicFile::create(path)?;
+    let schema = cohort_matrix_schema(with_sequence);
+
+    let mut metadata = vec![
+        KeyValue::new("fastdna.k".to_string(), Some(k.to_string())),
+        KeyValue::new("fastdna.n_samples".to_string(), Some(matrix.n_samples.to_string())),
+        KeyValue::new("fastdna.n_kmers".to_string(), Some(matrix.n_kmers.to_string())),
+        KeyValue::new("fastdna.n_candidates".to_string(), Some(matrix.n_candidates.to_string())),
+    ];
+    if let Some(cutoff) = matrix.truncation_cutoff {
+        metadata.push(KeyValue::new("fastdna.truncation_cutoff".to_string(), Some(cutoff.to_string())));
+    }
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(metadata))
+        .build();
+
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| export_err(path, e))?;
+
+    let nnz = matrix.row.len();
+    let chunk_size = 131_072;
+    let mut start = 0usize;
+    while start < nnz {
+        let end = (start + chunk_size).min(nnz);
+
+        let sample_id_col: ArrayRef = Arc::new(StringArray::from_iter_values(
+            matrix.row[start..end].iter().map(|&r| sample_ids[r as usize].as_str()),
+        ));
+        let kmer_u64_col: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+            matrix.col[start..end].iter().map(|&c| matrix.kmer_u64[c as usize]),
+        ));
+        let mut columns: Vec<ArrayRef> = vec![sample_id_col, kmer_u64_col];
+        if with_sequence {
+            let seq_col: ArrayRef = Arc::new(StringArray::from_iter_values(
+                matrix.col[start..end].iter().map(|&c| matrix.kmer_sequences[c as usize].as_str()),
+            ));
+            columns.push(seq_col);
+        }
+        let count_col: ArrayRef = Arc::new(UInt32Array::from(matrix.value[start..end].to_vec()));
+        columns.push(count_col);
+
+        let batch = RecordBatch::try_new(schema.clone(), columns).map_err(|e| export_err(path, e))?;
+        writer.write(&batch).map_err(|e| export_err(path, e))?;
+        start = end;
+    }
+
+    // `close` is called even for an empty (`nnz == 0`) matrix: a cohort
+    // whose min_samples/max_kmers left no surviving column must still
+    // produce a valid, openable, zero-row Parquet file under this schema --
+    // the same "empty result is still a real file" discipline
+    // `export_pairs_parquet`'s own empty-stream test pins down.
+    writer.close().map_err(|e| export_err(path, e))?;
+    pending.commit()?;
+    Ok(nnz)
 }
 
 pub fn export_parquet<P: AsRef<Path>>(
@@ -588,5 +832,283 @@ mod tests {
 
         let _ = std::fs::remove_file(&lean_path);
         let _ = std::fs::remove_file(&full_path);
+    }
+
+    /// `export_pairs_parquet`'s output must be indistinguishable from
+    /// `export_counts_parquet`'s: same schema, same footer metadata, so a
+    /// set operation's result (`setops.rs`) reopens as a valid `KmerTable`
+    /// with no special-casing anywhere in `ktab.rs`.
+    #[test]
+    fn export_pairs_parquet_round_trips_and_is_a_valid_kmer_table() {
+        use crate::ktab::KmerTable;
+
+        let dir = std::env::temp_dir().join("fastdna_export_pairs_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pairs.parquet");
+
+        let pairs: Vec<Result<(u64, u32)>> = vec![Ok((1, 5)), Ok((2, 7)), Ok((100, 1))];
+        let written = export_pairs_parquet(pairs, &path, 4).unwrap();
+        assert_eq!(written, 3);
+
+        let table = KmerTable::open(&path).unwrap();
+        assert_eq!(table.k(), 4);
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.get(1).unwrap(), Some(5));
+        assert_eq!(table.get(2).unwrap(), Some(7));
+        assert_eq!(table.get(100).unwrap(), Some(1));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An empty stream (e.g. an intersection with no shared k-mers) must
+    /// still write a valid, openable, zero-row table -- not be rejected or
+    /// skipped -- so a caller can always reopen a set operation's result
+    /// without special-casing "what if there were no matches".
+    #[test]
+    fn export_pairs_parquet_of_an_empty_stream_is_a_valid_empty_table() {
+        use crate::ktab::KmerTable;
+
+        let dir = std::env::temp_dir().join("fastdna_export_pairs_empty_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty_pairs.parquet");
+
+        let pairs: Vec<Result<(u64, u32)>> = Vec::new();
+        let written = export_pairs_parquet(pairs, &path, 4).unwrap();
+        assert_eq!(written, 0);
+
+        let table = KmerTable::open(&path).unwrap();
+        assert!(table.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A failure partway through the input stream (e.g. a Parquet read
+    /// error surfacing from one of a set operation's own input tables) must
+    /// propagate as an error from this function, not be silently swallowed
+    /// or produce a truncated-but-successful file.
+    #[test]
+    fn export_pairs_parquet_propagates_an_error_from_the_stream() {
+        let dir = std::env::temp_dir().join("fastdna_export_pairs_err_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("err_pairs.parquet");
+
+        let pairs: Vec<Result<(u64, u32)>> =
+            vec![Ok((1, 1)), Err(FastDnaError::Internal { detail: "boom".to_string() })];
+        let result = export_pairs_parquet(pairs, &path, 4);
+        assert!(matches!(result, Err(FastDnaError::Internal { .. })));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------
+    // export_cohort_matrix_parquet
+    // -----------------------------------------------------------------
+
+    /// Two samples sharing k-mer 1, each with one private k-mer -- the same
+    /// small fixture shape `cohort/matrix.rs`'s own unit tests use, built
+    /// through the real `build_cohort_matrix` rather than a hand-rolled
+    /// `CohortMatrix` literal, so this test also pins down that the two
+    /// modules' expectations of each other's shape stay in sync.
+    fn small_cohort_matrix() -> (crate::cohort::matrix::CohortMatrix, Vec<String>) {
+        use crate::cohort::matrix::build_cohort_matrix;
+
+        let mut sample_0 = KmerCounter::new();
+        sample_0.insert_batch(&[1, 1, 1, 5]);
+        let mut sample_1 = KmerCounter::new();
+        sample_1.insert_batch(&[1, 1, 9, 9, 9, 9]);
+
+        let matrix = build_cohort_matrix(&[sample_0, sample_1], 1, None, 4);
+        (matrix, vec!["sample_0".to_string(), "sample_1".to_string()])
+    }
+
+    /// Without `--with-sequence` the file must carry exactly `sample_id`,
+    /// `kmer_u64`, `count` -- no more, no less -- mirroring `counts_schema`'s
+    /// own default-lean convention.
+    #[test]
+    fn cohort_matrix_parquet_schema_without_sequence_has_three_columns() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let (matrix, sample_ids) = small_cohort_matrix();
+        let dir = std::env::temp_dir().join("fastdna_export_cohort_matrix_schema_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cohort_no_seq.parquet");
+
+        let written = export_cohort_matrix_parquet(&matrix, &sample_ids, &path, 4, false).unwrap();
+        assert_eq!(written, matrix.row.len());
+
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let schema = batch.schema();
+            let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(names, vec!["sample_id", "kmer_u64", "count"]);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `--with-sequence` inserts `kmer_sequence` between `kmer_u64` and
+    /// `count`, and every value in it must equal `decode_kmer(kmer_u64, k)`
+    /// -- the same "derivable, but written when asked" contract
+    /// `export_counts_parquet`'s own sequence column keeps.
+    #[test]
+    fn cohort_matrix_parquet_with_sequence_adds_a_matching_column() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use arrow::array::{Array, StringArray as RtStrings, UInt64Array as RtU64s};
+
+        let (matrix, sample_ids) = small_cohort_matrix();
+        let dir = std::env::temp_dir().join("fastdna_export_cohort_matrix_seq_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cohort_with_seq.parquet");
+
+        export_cohort_matrix_parquet(&matrix, &sample_ids, &path, 4, true).unwrap();
+
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+        let mut seen = 0usize;
+        for batch in reader {
+            let batch = batch.unwrap();
+            let schema = batch.schema();
+            let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(names, vec!["sample_id", "kmer_u64", "kmer_sequence", "count"]);
+
+            let kmers = batch.column(1).as_any().downcast_ref::<RtU64s>().unwrap();
+            let seqs = batch.column(2).as_any().downcast_ref::<RtStrings>().unwrap();
+            for row in 0..batch.num_rows() {
+                assert_eq!(seqs.value(row), kmer::decode_kmer(kmers.value(row), 4));
+            }
+            seen += batch.num_rows();
+        }
+        assert_eq!(seen, matrix.row.len());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every `(sample_id, kmer_u64, count)` row written must exactly match
+    /// what `CohortMatrix`'s own `(row, col, value)` COO triples encode --
+    /// the round-trip this schema exists to make possible with no
+    /// FastDNA-specific reader.
+    #[test]
+    fn cohort_matrix_parquet_rows_round_trip_the_coo_triples() {
+        use std::collections::HashSet;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use arrow::array::{Array, StringArray as RtStrings, UInt32Array as RtU32s, UInt64Array as RtU64s};
+
+        let (matrix, sample_ids) = small_cohort_matrix();
+        let dir = std::env::temp_dir().join("fastdna_export_cohort_matrix_roundtrip_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cohort_roundtrip.parquet");
+
+        export_cohort_matrix_parquet(&matrix, &sample_ids, &path, 4, false).unwrap();
+
+        let expected: HashSet<(String, u64, u32)> = matrix
+            .row
+            .iter()
+            .zip(&matrix.col)
+            .zip(&matrix.value)
+            .map(|((&r, &c), &v)| (sample_ids[r as usize].clone(), matrix.kmer_u64[c as usize], v))
+            .collect();
+
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+        let mut actual: HashSet<(String, u64, u32)> = HashSet::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let ids = batch.column(0).as_any().downcast_ref::<RtStrings>().unwrap();
+            let kmers = batch.column(1).as_any().downcast_ref::<RtU64s>().unwrap();
+            let counts = batch.column(2).as_any().downcast_ref::<RtU32s>().unwrap();
+            for row in 0..batch.num_rows() {
+                actual.insert((ids.value(row).to_string(), kmers.value(row), counts.value(row)));
+            }
+        }
+
+        assert_eq!(actual, expected);
+    }
+
+    /// A schema mismatch here is a caller bug (a `sample_ids` list built for
+    /// the wrong cohort), and must be rejected before any file is written --
+    /// not silently truncated or panicking on an out-of-bounds index.
+    #[test]
+    fn cohort_matrix_parquet_rejects_a_sample_ids_length_mismatch() {
+        let (matrix, _sample_ids) = small_cohort_matrix();
+        let dir = std::env::temp_dir().join("fastdna_export_cohort_matrix_mismatch_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("should_not_exist.parquet");
+
+        let wrong_ids = vec!["only_one".to_string()];
+        let result = export_cohort_matrix_parquet(&matrix, &wrong_ids, &path, 4, false);
+        match result {
+            Err(FastDnaError::InvalidConfig { parameter, .. }) => assert_eq!(parameter, "sample_ids"),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        assert!(!path.exists(), "no file must be written on a rejected call");
+    }
+
+    /// An empty matrix (e.g. `min_samples` above the cohort size, or
+    /// `min_samples` filtering out every candidate) must still produce a
+    /// valid, openable, zero-row file under the schema -- not be rejected --
+    /// mirroring `export_pairs_parquet`'s own empty-stream guarantee.
+    #[test]
+    fn cohort_matrix_parquet_of_an_empty_matrix_is_a_valid_zero_row_file() {
+        use crate::cohort::matrix::build_cohort_matrix;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let matrix = build_cohort_matrix(&[], 1, None, 4);
+        let dir = std::env::temp_dir().join("fastdna_export_cohort_matrix_empty_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty_cohort.parquet");
+
+        let written = export_cohort_matrix_parquet(&matrix, &[], &path, 4, false).unwrap();
+        assert_eq!(written, 0);
+
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+        let total: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(total, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The footer must carry `k`/`n_samples`/`n_kmers`/`n_candidates`, and
+    /// `truncation_cutoff` specifically when `max_kmers` actually truncated
+    /// something -- so a caller with no FastDNA library, just a Parquet
+    /// reader that exposes footer key-value metadata, can recover the same
+    /// facts `gwas.py`'s truncation warning is built from.
+    #[test]
+    fn cohort_matrix_parquet_footer_metadata_reports_truncation() {
+        use crate::cohort::matrix::build_cohort_matrix;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let mut sample_0 = KmerCounter::new();
+        sample_0.insert_batch(&[1, 2, 3]);
+        let mut sample_1 = KmerCounter::new();
+        sample_1.insert_batch(&[1, 2, 3]);
+        let matrix = build_cohort_matrix(&[sample_0, sample_1], 1, Some(1), 4);
+        assert!(matrix.truncation_cutoff.is_some(), "fixture must actually truncate");
+
+        let sample_ids = vec!["s0".to_string(), "s1".to_string()];
+        let dir = std::env::temp_dir().join("fastdna_export_cohort_matrix_footer_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("footer.parquet");
+        export_cohort_matrix_parquet(&matrix, &sample_ids, &path, 4, false).unwrap();
+
+        let file = File::open(&path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let metadata = builder.metadata().clone();
+        let kvs = metadata.file_metadata().key_value_metadata().unwrap();
+        let get = |key: &str| kvs.iter().find(|kv| kv.key == key).and_then(|kv| kv.value.clone());
+
+        assert_eq!(get("fastdna.k"), Some("4".to_string()));
+        assert_eq!(get("fastdna.n_samples"), Some("2".to_string()));
+        assert_eq!(get("fastdna.n_kmers"), Some(matrix.n_kmers.to_string()));
+        assert_eq!(get("fastdna.n_candidates"), Some(matrix.n_candidates.to_string()));
+        assert_eq!(
+            get("fastdna.truncation_cutoff"),
+            matrix.truncation_cutoff.map(|c| c.to_string()),
+            "truncation_cutoff must be recorded exactly when the matrix itself was truncated"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

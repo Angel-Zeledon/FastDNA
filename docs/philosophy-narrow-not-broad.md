@@ -1,5 +1,22 @@
 # Why FastDNA stays narrow: a decision record
 
+> **SUPERSEDED 2026-08-27.** The strategic conclusion below — "stay narrow,
+> ship the cheapest high-value items opportunistically" — has been reversed.
+> The active goal is now to become **the most complete library for genomics
+> ML**, closing every item in `docs/feature-gap-analysis.md` and
+> `docs/ml-differentiation-roadmap.md`, not just cherry-picking. See
+> `docs/goal-most-complete-genomics-ml-library.md` for the current decision.
+>
+> What still holds from this document, unchanged: the boundary against
+> becoming a *general-purpose bioinformatics framework* (no aligner, no
+> pangenome graphs, no interval algebra — `minimap2`/`vg`/`bedtools`'s
+> territory, zero code reuse with this project's k-mer engine, unrelated to
+> the ML mission), and the two technical corrections below (the
+> reverse-complement bit-trick derivation, and why a counting engine needs a
+> total map and syncmers don't provide one). Only the "stay small within our
+> own territory" posture is reversed — that territory is now being filled
+> in completely, aggressively, not selectively.
+
 Date: 2026-08-25. This records a strategic decision, not a technical design.
 Two external proposals (received the same day, unsolicited) argued for
 turning FastDNA into a broad next-generation bioinformatics framework —

@@ -253,17 +253,21 @@ class TestQvFormulaArithmetic:
 
 
 class TestFastaVsFastqAssemblyPaths:
-    """The assembly side dispatches on file extension (module docstring):
-    FASTA goes through the pure-Python fallback, but a caller who already
-    converted their assembly to FASTQ (a common workaround: dummy quality
-    scores) should get routed through the real `fastdna.count()` path and
-    reach an equivalent answer.
+    """The assembly side always goes through `fastdna.count()`'s Rust
+    pipeline now (module docstring, B4): the Rust core content-sniffs
+    FASTA vs. FASTQ from the file's own first byte, not from its
+    extension, so a genuine FASTA assembly and a caller-converted FASTQ
+    workaround (dummy quality scores) reach `evaluate_assembly()` through
+    the exact same code path and must produce an identical answer -- there
+    is no longer a "slow path" and a "fast path" to compare here, just one
+    path exercised through two file shapes.
     """
 
     def test_fastq_assembly_path_matches_fasta_assembly_path(self, tmp_path, reads_path):
         fasta_assembly = write_fasta(tmp_path, "assembly.fasta", [_REFERENCE])
-        # Dummy quality string of 'I' per base, one record -- exactly the
-        # workaround described in the module docstring.
+        # Dummy quality string of 'I' per base, one record -- the
+        # conversion this module's docstring calls "no longer a special
+        # case" now that both shapes take the same path.
         fastq_assembly = write_fastq(tmp_path, "assembly.fastq", [_REFERENCE])
 
         from_fasta = evaluate_assembly(str(fasta_assembly), str(reads_path), k=_K)
@@ -273,6 +277,65 @@ class TestFastaVsFastqAssemblyPaths:
         assert from_fasta.assembly_kmers_found_in_reads == from_fastq.assembly_kmers_found_in_reads
         assert from_fasta.qv == from_fastq.qv
         assert from_fasta.completeness == pytest.approx(from_fastq.completeness)
+
+
+class TestFastPathMatchesPurePythonFallback:
+    """B4 regression coverage: `evaluate_assembly()` was switched from the
+    pure-Python `_count_fasta_kmers` extractor to the Rust-backed
+    `_assembly_kmer_counts` (`fastdna.count()`). These tests pin that the
+    swap changed *only* speed, not semantics -- the two extractors must
+    agree exactly, k-mer for k-mer and count for count, on the same FASTA
+    fixture, including on inputs with wrapped lines and ambiguous ('N')
+    bases that exercise `_canonical_kmers`'s run-splitting logic.
+    """
+
+    def test_fast_path_matches_pure_python_path_on_perfect_reference(self, tmp_path):
+        from fastdna.assembly_qc import _assembly_kmer_counts, _count_fasta_kmers
+
+        assembly = write_fasta(tmp_path, "assembly.fasta", [_REFERENCE])
+
+        fast = _assembly_kmer_counts(str(assembly), _K)
+        slow = _count_fasta_kmers(str(assembly), _K)
+
+        assert fast == slow
+        assert sum(fast.values()) == sum(slow.values()) == 300 - _K + 1
+
+    def test_fast_path_matches_pure_python_path_with_wrapped_lines_and_ambiguous_bases(self, tmp_path):
+        from fastdna.assembly_qc import _assembly_kmer_counts, _count_fasta_kmers
+
+        with_n = _REFERENCE[:150] + "N" + _REFERENCE[151:]
+        wrapped = tmp_path / "wrapped.fasta"
+        wrapped.write_text(
+            ">contig0\n" + "\n".join(with_n[i : i + 60] for i in range(0, len(with_n), 60)) + "\n"
+        )
+
+        fast = _assembly_kmer_counts(str(wrapped), _K)
+        slow = _count_fasta_kmers(str(wrapped), _K)
+
+        assert fast == slow
+        # Sanity: the N really did remove some k-mers relative to the
+        # N-free reference, so this is not a vacuous "both empty" match.
+        assert 0 < sum(fast.values()) < 300 - _K + 1
+
+    # A wall-clock "the new path must be faster" assertion was deliberately
+    # tried here and then removed, not skipped for convenience: measured
+    # directly (see this task's own verification notes), `_assembly_kmer_counts`
+    # (through `fastdna.count()`, with `with_sequence=True` so it can hand
+    # back decoded k-mer strings) is *not* uniformly faster than
+    # `_count_fasta_kmers` at these fixture sizes -- even up to a 2 Mb
+    # single-contig assembly. The counting itself is genuinely faster in
+    # Rust (that is what the rest of this project's benchmarks establish),
+    # but this function's own job does not stop at counting: it must also
+    # decode every distinct k-mer back into a Python string and materialize
+    # a Python dict from it (`table.column(...).to_pylist()` twice, then
+    # `dict(zip(...))`), and *that* per-element FFI/object-creation cost --
+    # not the counting -- is what dominates wall time for a single
+    # already-in-memory-sized assembly file. This is why B4's actual value
+    # is "one shared, native FASTA-capable code path instead of two" and
+    # correctness-preserving, not a proven wall-clock win on every input
+    # shape; a real win would need a way to keep the k-mer/count pairs on
+    # the Rust side of the boundary rather than decoding all of them into
+    # Python objects, which is a separate, larger change out of scope here.
 
 
 class TestEvaluateKmersLowLevelEntryPoint:

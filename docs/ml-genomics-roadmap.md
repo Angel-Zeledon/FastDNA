@@ -1,5 +1,34 @@
 # FastDNA x Machine Learning — feature roadmap
 
+> **Audit pass, 2026-08-27**: every "Status" line below was re-checked
+> against the actual code on this date (not just against this doc's own
+> "dispatched" claims), per `docs/goal-most-complete-genomics-ml-library.md`'s
+> instruction to verify before executing anything on these lists. All nine
+> dispatched wave-1/wave-2 modules exist and do substantially what they were
+> scoped to do; one bundled sub-item (Snakemake/Nextflow workflow templates,
+> part of feature 4) was found genuinely incomplete despite the bundle being
+> marked dispatched. The analysis/reasoning below is otherwise unchanged from
+> the original write-up -- this is a status correction, not a rewrite.
+>
+> **Follow-up, same date (2026-08-27), later pass**: this audit's own claim
+> that "no `workflow_templates/` directory ... exists anywhere in this repo"
+> (below) was itself imprecise -- a `workflow_templates/` directory *did*
+> exist (commit `9d692f8`, before this audit was written), with a single-file
+> `Snakefile.example` and `fastdna.nf` per engine. What that commit shipped
+> was real but narrow: each file only shelled out plain single-file `fastdna
+> count`, with no config file, no paired-end handling, and no combined/
+> cohort-level output -- not the runnable, cohort-scale pipeline this
+> roadmap item and `docs/goal-most-complete-genomics-ml-library.md` call for.
+> That gap is now closed: `workflow_templates/snakemake/` (`config.yaml` +
+> `workflow/Snakefile` + `README.md`) and `workflow_templates/nextflow/`
+> (`main.nf` + `nextflow.config` + `README.md`) both ship a real paired-end
+> cohort pipeline -- per-sample counting via `fastdna count`'s multi-file
+> `--input`, combined into one cohort table via `fastdna union` -- verified
+> by a real `fastdna` release build plus real end-to-end `snakemake`/
+> `nextflow run` executions against it (see `CHANGELOG.md`'s `[Unreleased]`
+> entry for the exact verification steps). The old single-file stubs were
+> removed as superseded. Feature 4 is fully shipped as of this date.
+
 Living reference for the "make FastDNA the library every biotechnologist knows"
 push. Ten features, in two waves. Each entry: what it is, why it matters, what
 it's built on, and its status. Written so the vision survives even if the
@@ -36,8 +65,11 @@ FastDNA with zero genomics-specific plumbing.
 
 **Built on**: `fastdna.count()` (existing, stable).
 
-**Status**: dispatched to a parallel agent (wave 1, task A). New file
-`python/fastdna/sklearn.py`.
+**Status**: **Shipped.** `python/fastdna/sklearn.py`. Grown well past the
+original scope since dispatch (per `CHANGELOG.md`): `chunk_size=` for
+batched vocabulary construction, `counts=` to reuse a precomputed
+`CohortCounts` instead of recounting, `representation=` (presence/count/
+relative/clr) with a `DepthConfoundingWarning`.
 
 ---
 
@@ -57,12 +89,14 @@ similarity purely from the size mismatch.
 **Built on**: `fastdna.sketch()` / `Sketch.containment()` /
 `Sketch.mash_distance()` (existing, stable).
 
-**Status**: dispatched to a parallel agent (wave 1, task B). New file
-`python/fastdna/taxonomy.py`. A "gather"-style multi-organism decomposition
-(sourmash's answer to "what's the *set* of organisms present") was offered
-as a stretch goal only if time allowed and the approximation could be done
-honestly over a bottom-k sketch — check the agent's final report for whether
-it was attempted.
+**Status**: **Shipped, including the stretch goal.** `python/fastdna/
+taxonomy.py`'s `classify()` and `check_sample_identity()` both exist, and
+the "gather"-style multi-organism decomposition stretch goal was also
+completed: `taxonomy.gather()` (line ~426) is a real function, not just
+offered-and-declined. Both `classify`/`gather` accept a `scale` parameter to
+use `FracSketch` (see `ml-differentiation-roadmap.md`'s B1) internally
+instead of the fixed-count `Sketch`, for unbiased containment at large size
+mismatches.
 
 ---
 
@@ -82,13 +116,27 @@ need (most assemblies don't have one), and Merqury's k-mer-based approach
 project's own valley-detection instead of a hardcoded constant.
 
 **Built on**: `fastdna.count()`, `KmerCounts.spectrum()` /
-`.suggest_min_count()` (existing, stable) plus a pure-Python FASTA k-mer
-extractor for the assembly side, since the Rust core is FASTQ-only today —
-see the agent's report for the exact approach taken and the stated
-performance limitation that implies.
+`.suggest_min_count()` (existing, stable). The assembly side now also goes
+through `fastdna.count()` directly (the Rust core's native, content-sniffed
+FASTA support -- `feature-gap-analysis.md`'s Q1); a pure-Python FASTA
+k-mer extractor is kept in the module, unused by `evaluate_assembly()`
+itself, as a manual building block for `evaluate_kmers()`'s lower-level
+entry point.
 
-**Status**: dispatched to a parallel agent (wave 1, task C). New file
-`python/fastdna/assembly_qc.py`.
+**Status**: **Shipped, including the B4 follow-up --
+see `ml-differentiation-roadmap.md`'s B4.** `python/fastdna/assembly_qc.py::
+evaluate_assembly()` works and is tested. Its module docstring previously
+explained that the Rust core had "no FASTA support" and so the assembly
+side had to go through a slow pure-Python k-mer extractor unless the
+caller manually renamed the assembly to `.fastq`; that gap is now closed.
+`src/fastq.rs` gained native FASTA support (`feature-gap-analysis.md`'s
+Q1), and `evaluate_assembly()`'s assembly-side extraction
+(`_assembly_kmer_counts`) now always calls `fastdna.count()` directly,
+regardless of the assembly file's extension. Note: this was measured, not
+assumed, to be a correctness/maintenance win rather than an unconditional
+wall-clock one -- see `assembly_qc.py`'s own module docstring for the
+measured caveat (decoding k-mers back to Python strings has a real fixed
+cost that dominates at small-to-medium fixture sizes).
 
 ---
 
@@ -110,10 +158,29 @@ readable summary loses people in the first five minutes.
 **Built on**: existing stable API for (a)/(b); pure documentation/config for
 (c)/(d).
 
-**Status**: dispatched to a parallel agent (wave 1, task D). New files under
-`python/fastdna/interop.py`, `workflow_templates/`, `conda-recipe/`, plus one
-small permitted edit to `python/fastdna/__init__.py` for `_repr_html_`
-(the *only* agent across all ten permitted to touch that file).
+**Status**: **Shipped, 4 of 4 sub-items landed** (as of the 2026-08-27
+follow-up pass; (c) was the last to close -- see this doc's top-of-file note).
+- (a) **Shipped.** `_repr_html_` exists on both `KmerCounts`
+  (`python/fastdna/__init__.py:389`) and `Sketch` (`__init__.py:602`).
+- (b) **Shipped.** `python/fastdna/interop.py`'s `count_from_sequences()`/
+  `sketch_from_sequences()` accept plain strings, `(id, seq)` pairs, and
+  duck-typed Biopython `SeqRecord`-like objects.
+- (c) **Shipped 2026-08-27.** `workflow_templates/snakemake/` (`config.yaml`,
+  `workflow/Snakefile`, `README.md`) and `workflow_templates/nextflow/`
+  (`main.nf`, `nextflow.config`, `README.md`): a config-driven cohort
+  pipeline that counts paired-end FASTQ samples per-sample via `fastdna
+  count`'s multi-file `--input`, then folds every sample's Parquet table
+  into one cohort-level table via `fastdna union`. Verified against a real
+  release build of `fastdna` (exact flags confirmed via `--help` output) and
+  by running both templates end-to-end for real (Docker `snakemake/
+  snakemake` and a real `nextflow run`) over a small paired-end fixture --
+  see `CHANGELOG.md`'s `[Unreleased]` entry for the full verification
+  record. An earlier, narrower pair of single-file stubs (commit `9d692f8`:
+  `Snakefile.example`/`fastdna.nf`, single-sample-only, no config, no
+  combined output) was superseded and removed.
+- (d) **Shipped, unverified/unsubmitted** — same evidence as
+  `feature-gap-analysis.md`'s Q5: `recipe/meta.yaml` exists with a
+  placeholder `source.sha256`.
 
 ---
 
@@ -137,8 +204,7 @@ wins in this whole roadmap.
 **Built on**: `fastdna.compare_all()` (existing, stable, wave-1-independent
 — this needed no mocking or contract assumptions to build against).
 
-**Status**: dispatched to a parallel agent (wave 2, task E). New file
-`python/fastdna/embed.py`.
+**Status**: **Shipped.** `python/fastdna/embed.py`.
 
 ---
 
@@ -163,33 +229,27 @@ this was dispatched — built and tested against a documented stand-in
 matching that contract; needs an integration pass once both are merged (see
 the agent's own report for exactly what it assumed).
 
-**Status**: dispatched to a parallel agent (wave 2, task F). New file
-`python/fastdna/interpret.py`.
+**Status**: **Shipped.** `python/fastdna/interpret.py`.
 
 ---
 
 ### 7. `fastdna.anomaly` — outlier detection for surveillance
 
-**What**: wraps an unsupervised outlier detector (isolation forest /
-one-class SVM, via scikit-learn) over per-sample genomic-profile features
-(sketch-derived or spectrum-derived, both already existing and stable — no
-dependency on the in-flight `KmerVectorizer`) to flag samples that deviate
-from a cohort's established baseline.
+**What (as originally scoped)**: wraps an unsupervised outlier detector
+(isolation forest / one-class SVM, via scikit-learn) over per-sample
+genomic-profile features to flag samples that deviate from a cohort's
+established baseline, framed around emerging-pathogen surveillance.
 
-**Why it matters**: emerging-pathogen surveillance and lab-contamination
-detection both reduce to "does this new sample look like the ones we've
-already seen" — a direct, practical use of the same profile representations
-already built for classification, applied as unsupervised outlier detection
-instead of supervised classification.
-
-**Built on**: `fastdna.sketch()`/`compare_all()` and/or
-`KmerCounts.spectrum()` (existing, stable) — deliberately scoped to avoid
-depending on the in-flight `KmerVectorizer` or `taxonomy` modules, so it
-could be built and fully tested in isolation without assuming their
-not-yet-landed contracts.
-
-**Status**: dispatched to a parallel agent (wave 2, task G). New file
-`python/fastdna/anomaly.py`.
+**Status**: **Shipped, but not as originally framed --
+superseded by `ml-differentiation-roadmap.md`'s A5, deliberately.** The
+original "surveillance"-framed module was deleted (commit `c8870e3`: "audit:
+surveillance framing had no literature support") and rebuilt as *cohort QC
+outlier flagging* (reference-based contamination screening, Mash Screen /
+NCBI STAT style — a claim the literature does support). The shipped module,
+`python/fastdna/anomaly.py`'s `CohortOutlierFlagger`/`flag_cohort()`, fills
+this roadmap slot's practical need (unsupervised deviation-from-baseline
+detection over sketch/spectrum profiles) under the more defensible framing.
+See A5 in `ml-differentiation-roadmap.md` for the full rationale.
 
 ---
 
@@ -213,8 +273,7 @@ need to depend on the in-flight `taxonomy` module's not-yet-landed exact
 API — the connection to `taxonomy.classify()` is by input shape, documented
 in the agent's own module, not a hard import.
 
-**Status**: dispatched to a parallel agent (wave 2, task H). New file
-`python/fastdna/active_learning.py`.
+**Status**: **Shipped.** `python/fastdna/active_learning.py`.
 
 ---
 
@@ -237,8 +296,9 @@ than inventing new computation.
 tabular-join logic — does not require `KmerVectorizer` to exist, though it
 becomes more useful alongside it.
 
-**Status**: dispatched to a parallel agent (wave 2, task I). New file
-`python/fastdna/multiomics.py`.
+**Status**: **Shipped.** `python/fastdna/multiomics.py`. `kmer_feature_table()`
+was since rewritten with vectorized Arrow operations instead of per-cell
+Python dicts (`CHANGELOG.md`, performance pass).
 
 ---
 
@@ -253,12 +313,12 @@ becomes more useful alongside it.
   other agent's in-flight work — features 6 and 8 above were explicitly
   scoped to depend only on already-stable APIs or on documented contracts
   rather than another in-flight module, specifically to keep true
-  parallelism safe. Expect a real integration pass is still needed:
-  reconciling `KmerVectorizer`'s actual shipped API against what features 6
-  assumed, wiring `taxonomy.classify()`'s actual output shape into what
-  feature 8 expects as an example, and resolving any overlapping edits to
-  shared files (only `python/fastdna/__init__.py` was permitted to be
-  touched, and only by the wave-1 ecosystem agent, to minimize this).
+  parallelism safe. The integration pass this section anticipated has
+  happened in substance (all nine dispatched modules are live, tested, and
+  cross-referenced correctly with each other's real APIs as of the
+  2026-08-27 audit). Workflow templates (feature 4c) were the one leftover
+  gap this audit found, and were closed the same day -- see feature 4's
+  status above and `CHANGELOG.md`'s `[Unreleased]` entry.
 - **Every new module is pure Python**, importable explicitly
   (`from fastdna.sklearn import KmerVectorizer`, etc.), matching the
   project's existing convention of keeping heavier/optional dependencies
@@ -270,6 +330,9 @@ becomes more useful alongside it.
   Transformer) — build a co-occurrence matrix of k-mers across a large
   cohort and factorize it (SVD/GloVe-style) into dense vectors, enabling
   similarity search and transfer learning without the compute cost of a
-  full sequence-transformer pretraining run. Not dispatched as a task yet;
-  flagged here so the idea isn't lost. Likely the natural "wave 3" anchor
-  once waves 1 and 2 are integrated and stable.
+  full sequence-transformer pretraining run. **Status: still not shipped,
+  and no longer just "not started yet" -- `ml-differentiation-roadmap.md`'s
+  C3 has since evaluated this idea specifically and parked it** ("no
+  2022-2026 evidence they beat presence/absence on phenotype tasks"). Kept
+  here as a record of the idea's origin; treat C3's framing as the current
+  word on its priority, not this paragraph's "natural wave 3 anchor".

@@ -25,45 +25,63 @@ idea, without the plot) a caller can chart themselves.
 
 ## The FASTA/FASTQ mismatch, and how this module handles it
 
-`fastdna.count()` reads **FASTQ** (4-line records, via a Rust
-`FastqReader` that expects an `@id` / sequence / `+` / quality-string
-quartet) -- verified empirically and by reading `src/fastq.rs`: it has no
-FASTA support, and feeding a 2-line FASTA record to it raises
-`FastDnaError::MalformedFastq` (via `PyErr`), not a silently-wrong
-"parsed" result, because that reader treats a record's second line as the
-quality string it must decode as a Phred byte per sequence character
-(and expects a `+` separator line it never finds).
+`fastdna.count()` used to read **FASTQ only**. That changed when the Rust
+core grew native FASTA support (`src/fastq.rs`'s `Format::Fasta`, see its
+`sniff_format`): `FastqReader` now decides FASTA vs. FASTQ from the
+stream's own first non-blank byte (`>` vs. anything else), not from the
+file's extension, and a FASTA record is handed a synthetic Phred-40
+quality string (`src/fastq.rs::SYNTHETIC_FASTA_QUALITY`) picked
+specifically to be high enough that `min_quality`'s default 3'-trim is a
+no-op on it. `tests/fasta_input.rs::a_fasta_file_counts_identically_to_the_equivalent_fastq`
+pins the property that makes this trustworthy: a FASTA file and the
+equivalent FASTQ file (same sequences, all-`I` quality) produce
+byte-identical k-mer counts through the exact pipeline `fastdna.count()`
+drives (`process_stream_parallel`).
 
 A genome assembly is normally distributed as FASTA (no per-base quality --
 there is nothing to report; it is a piece of the reads' own consensus, not
-a re-sequenced observation), so `evaluate_assembly()`'s assembly side
-cannot go through `fastdna.count()`'s fast Rust path. Two paths exist,
-chosen automatically by the assembly file's extension:
+a re-sequenced observation). Previously that meant `evaluate_assembly()`'s
+assembly side could not use `fastdna.count()` and had to fall back to a
+pure-Python FASTA reader/k-mer extractor in this module. That fallback is
+no longer used by `evaluate_assembly()`: since the Rust core now content-
+sniffs FASTA vs. FASTQ (and gzip is decided by the trailing `.gz` in the
+filename, independent of the format itself), `assembly_path` -- whatever
+its extension (`.fasta`/`.fa`/`.fna`/`.fastq`/`.fq`, `.gz` or not) --
+always goes through the same `fastdna.count()` code path as the reads
+side, gaining the Rust core's native FASTA handling and its multithreaded
+counting core instead of a hand-rolled Python k-mer loop.
 
-1. **`.fasta`/`.fa`/`.fna`(`.gz`)** (the common case): parsed by a small
-   pure-Python FASTA reader in this module, and k-mers extracted with a
-   plain-Python reimplementation of the Rust core's own canonical-k-mer
-   scheme (`src/kmer.rs`: A=00, C=01, G=10, T=11, canonical = the
-   lexicographically smaller of the k-mer and its reverse complement --
-   see `_canonical_kmers` below for why comparing the *strings*
-   lexicographically, without reimplementing the 2-bit packing, gives
-   exactly the same answer as the Rust core's own u64 comparison).
-   **This path is genuinely slow** -- pure Python, one hash-set insert per
-   base, no threading, no SIMD -- and is the honest cost of the Rust core
-   having no FASTA support to hand off to. Fine for a bacterial-genome-scale
-   assembly (megabases); expect real, possibly multi-minute+ latency for a
-   mammalian-scale one (gigabases). This is a real limitation, not a
-   nitpick to file away -- do not reach for this path expecting
-   `fastdna.count()`-grade throughput.
-2. **`.fastq`/`.fq`(`.gz`)**: if the assembly was *already* converted to
-   FASTQ by the caller (a common workaround: append a dummy quality string
-   such as all-`I` to each contig, e.g. with `seqkit fq2fa`'s inverse or a
-   one-line script), this module recognizes the extension and routes it
-   through the real `fastdna.count()` path instead -- full speed, no
-   pure-Python fallback needed. This is why `evaluate_kmers()` (the
-   lower-level entry point below) exists too: a caller who already has
-   *both* sides as k-mer sets/counts by whatever means can skip file
-   handling entirely.
+That said, this is a correctness/maintenance win first and a *measured*
+performance win second, not an assumed one: this function must ask
+`fastdna.count()` for `with_sequence=True` (it needs each k-mer back as a
+string, to build the `{kmer: count}` mapping `evaluate_kmers` compares
+against), and decoding every distinct k-mer plus materializing a Python
+dict from it is real per-element FFI/object-creation work on *both* sides
+of this swap -- it does not disappear just because the counting itself
+moved to Rust. Measured directly on single-contig FASTA fixtures from 20
+kb up to 2 Mb, `_assembly_kmer_counts` (this path) was consistently
+*slower* in wall time than the old `_count_fasta_kmers`, not faster: the
+counting stage is faster in Rust, but the fixed cost of spinning up
+`fastdna.count()`'s worker-thread pipeline and then decoding+dict-building
+its output dominates at these sizes. The win this change is really after
+is a maintenance/correctness one (one native-FASTA-capable counting core
+instead of two independently-maintained k-mer extractors that must be kept
+in canonicalization-lockstep by hand) plus the *shape* of the runtime
+curve on genuinely large, many-contig assemblies (megabase-to-gigabase,
+thousands of contigs) where the old pure-Python loop's lack of threading
+or SIMD was the documented concern -- not a proven win on every input
+size. See `python/tests/test_assembly_qc.py::
+TestFastPathMatchesPurePythonFallback`'s own comment for the measurement
+that established this.
+
+The pure-Python helpers below (`_canonical_kmers`, `_iter_fasta_sequences`,
+`_count_fasta_kmers`) are kept, unused by `evaluate_assembly()` itself, as
+a manual building block for `evaluate_kmers()` (the lower-level entry
+point below): a caller who wants to build an assembly k-mer multiset by
+some other means -- e.g. from an in-memory string with no file on disk at
+all, since `fastdna.count()` only takes a path -- can still reach for
+`_count_fasta_kmers`/`_canonical_kmers` directly and hand the result to
+`evaluate_kmers()`.
 
 ## Confidence note on the QV formula
 
@@ -108,11 +126,6 @@ __all__ = [
     "evaluate_kmers",
     "evaluate_assembly",
 ]
-
-#: File extensions recognized as "already FASTQ" (see module docstring,
-#: path 2): routed through the real `fastdna.count()` path instead of the
-#: pure-Python FASTA fallback.
-_FASTQ_EXTENSIONS = (".fastq", ".fastq.gz", ".fq", ".fq.gz")
 
 #: A k-mer containing any base outside A/C/G/T breaks the current window,
 #: exactly like `kmer.rs::extract_canonical_kmers`'s `None` branch (an
@@ -228,13 +241,15 @@ def _iter_fasta_sequences(path):
 
 
 def _count_fasta_kmers(path, k: int) -> Counter:
-    """The pure-Python fallback (module docstring, path 1): builds a
-    `Counter` mapping each canonical k-mer found anywhere in `path`'s
-    contigs to how many times it occurs across the whole assembly
-    (across and within contigs -- a k-mer inside a collapsed repeat or
-    duplicated region legitimately occurs more than once). See the module
-    docstring for why this is a real performance limitation, not a
-    corner cut for convenience.
+    """Pure-Python FASTA k-mer extraction, kept as a manual building block
+    for `evaluate_kmers()` (module docstring), *not* used by
+    `evaluate_assembly()` itself anymore -- that now goes through
+    `fastdna.count()` (see `_assembly_kmer_counts` below) since the Rust
+    core gained native FASTA support. Builds a `Counter` mapping each
+    canonical k-mer found anywhere in `path`'s contigs to how many times
+    it occurs across the whole assembly (across and within contigs -- a
+    k-mer inside a collapsed repeat or duplicated region legitimately
+    occurs more than once).
     """
     counts: Counter = Counter()
     for contig_seq in _iter_fasta_sequences(path):
@@ -242,33 +257,38 @@ def _count_fasta_kmers(path, k: int) -> Counter:
     return counts
 
 
-def _is_fastq_path(path) -> bool:
-    lower = str(path).lower()
-    return lower.endswith(_FASTQ_EXTENSIONS)
-
-
 def _assembly_kmer_counts(assembly_path, k: int) -> Counter:
-    """Dispatches on `assembly_path`'s extension between the two paths
-    described in the module docstring."""
-    if _is_fastq_path(assembly_path):
-        # Already FASTQ (a caller-side workaround, e.g. a dummy quality
-        # string appended to each contig) -- use the real, fast Rust path.
-        # `min_quality=0.0`: the quality string here is fabricated (an
-        # assembly has no per-base quality of its own), so quality-based
-        # trimming would silently depend on whatever filler character the
-        # caller happened to pick rather than on anything real -- disabled
-        # here to keep this path's behavior equivalent to the pure-FASTA
-        # path, which has no quality signal to trim on at all.
-        # `with_sequence=True`: this function's whole job is building a
-        # {sequence: count} mapping, so the decoded column is not overhead
-        # to avoid here the way it is in the ML-facing paths -- it is the
-        # thing being asked for.
-        counted = fastdna.count(assembly_path, k=k, min_count=1, min_quality=0.0, with_sequence=True)
-        table = counted.table
-        return Counter(
-            dict(zip(table.column("kmer_sequence").to_pylist(), table.column("frequency").to_pylist()))
-        )
-    return _count_fasta_kmers(assembly_path, k)
+    """Builds a `{canonical k-mer: count}` mapping for the assembly at
+    `assembly_path`, via `fastdna.count()`'s Rust pipeline -- no
+    extension-based dispatch needed (module docstring): the Rust core
+    content-sniffs FASTA vs. FASTQ from the file's own first non-blank
+    byte, and gzip is decided separately, from the trailing `.gz` in the
+    filename. Works unchanged whether `assembly_path` is `.fasta`, `.fa`,
+    `.fna`, already-FASTQ (the old caller-side workaround), or any of
+    those gzipped.
+
+    `min_quality=0.0`: a genuine FASTA assembly has no per-base quality of
+    its own (`fastdna.count()` fabricates a synthetic Q40 string for it,
+    `src/fastq.rs::SYNTHETIC_FASTA_QUALITY`, chosen specifically so the
+    default `min_quality=20.0` 3'-trim would be a no-op on it anyway) --
+    disabled explicitly here rather than relying on that margin, so this
+    function's behavior does not depend on `fastdna.count()`'s own default
+    ever changing, and so an already-FASTQ assembly with a caller-supplied
+    quality string is not silently trimmed either.
+    `min_count=1`: every observed k-mer counts, no frequency filtering --
+    this function's job is the assembly's *raw* k-mer multiset, not a
+    reliability-filtered subset (that filtering happens on the reads side
+    only, via `min_count_used`/`suggest_min_count`, see `evaluate_kmers`).
+    `with_sequence=True`: this function's whole job is building a
+    `{sequence: count}` mapping, so the decoded `kmer_sequence` column is
+    not overhead to avoid here the way it is in the ML-facing paths -- it
+    is the thing being asked for.
+    """
+    counted = fastdna.count(str(assembly_path), k=k, min_count=1, min_quality=0.0, with_sequence=True)
+    table = counted.table
+    return Counter(
+        dict(zip(table.column("kmer_sequence").to_pylist(), table.column("frequency").to_pylist()))
+    )
 
 
 def _qv_from_counts(k_shared: int, k_total: int, k: int) -> tuple[float, float]:
@@ -404,7 +424,9 @@ def evaluate_kmers(
 
     `assembly_kmers` is either a `Mapping[str, int]` from canonical k-mer
     string to how many times it occurs in the assembly (as produced by
-    `_count_fasta_kmers`/`evaluate_assembly`'s own internals), or any
+    `_assembly_kmer_counts`/`evaluate_assembly`'s own internals, or by the
+    pure-Python `_count_fasta_kmers` for a caller building one by hand from
+    e.g. an in-memory sequence with no file on disk), or any
     iterable of canonical k-mer strings (each occurrence listed
     separately -- e.g. `["ACGT", "ACGT", "CCGA"]` for a k-mer occurring
     twice), which is turned into a `collections.Counter` first. Every
@@ -515,14 +537,19 @@ def evaluate_assembly(
     the FASTA-handling discussion).
 
     `assembly_path`: the assembly to grade. Normally a FASTA file
-    (`.fasta`/`.fa`/`.fna`, optionally `.gz`), parsed and k-mer-counted in
-    pure Python since the Rust core has no FASTA support (see the module
-    docstring -- **this is measurably slower** than `fastdna.count()`'s
-    Rust path; expect it to dominate this function's runtime). If
-    `assembly_path` instead has a FASTQ-like extension
-    (`.fastq`/`.fq`(`.gz`)) -- i.e. the caller already converted their
-    assembly to FASTQ with a dummy quality string, a common workaround --
-    it is routed through the real, fast `fastdna.count()` path instead.
+    (`.fasta`/`.fa`/`.fna`, optionally `.gz`), counted through
+    `fastdna.count()`'s native FASTA-capable Rust pipeline (see the module
+    docstring's "FASTA/FASTQ mismatch" section for the full story,
+    including a measured caveat: this is a correctness/maintenance win
+    confirmed over the old pure-Python extractor, not an unconditional
+    wall-clock one at every input size). The Rust core content-sniffs
+    FASTA vs. FASTQ from the file's own first non-blank byte rather than
+    its extension, so no dispatch or caller-side conversion is needed
+    here. A FASTQ-like extension (`.fastq`/`.fq`(`.gz`)) -- e.g. an
+    assembly a caller already converted to FASTQ with a dummy quality
+    string, formerly the only way to reach `fastdna.count()` at all for
+    this side -- works exactly the same way and is no longer a special
+    case.
 
     `reads_path`: the raw FASTQ(.gz) reads the assembly was built from --
     genuinely FASTQ, so this side always goes through `fastdna.count()`
