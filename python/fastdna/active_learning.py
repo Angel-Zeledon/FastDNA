@@ -50,6 +50,8 @@ from __future__ import annotations
 import math
 from typing import Any, Optional
 
+from . import _core
+
 __all__ = [
     "uncertainty_score",
     "prioritize_for_review",
@@ -135,7 +137,7 @@ def _is_ranked_tuples(result):
 
 def _scores_from_ranked_tuples(ranked_results):
     if len(ranked_results) == 0:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             "uncertainty_score: ranked_results is empty -- need at least "
             "one (label, score) candidate to compute an uncertainty score."
         )
@@ -149,12 +151,12 @@ def _scores_from_ranked_tuples(ranked_results):
 
 def _scores_from_probability_vector(probs, labels):
     if len(probs) == 0 or len(labels) == 0:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             "uncertainty_score: probability vector and label list must be "
             "non-empty."
         )
     if len(probs) != len(labels):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"uncertainty_score: probs has {len(probs)} entries but labels "
             f"has {len(labels)} -- they must be the same length and "
             "correspond position-by-position."
@@ -170,7 +172,7 @@ def _extract_scores(ranked_results_or_probs):
         return _scores_from_ranked_tuples(ranked_results_or_probs)
 
     if len(ranked_results_or_probs) != 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             "uncertainty_score: probability-vector input must be a "
             "(probs, labels) pair of equal-length sequences."
         )
@@ -270,7 +272,7 @@ def uncertainty_score(
     pairs.
     """
     if method not in _VALID_METHODS:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"uncertainty_score: unknown method {method!r}, expected one "
             f"of {_VALID_METHODS}"
         )
@@ -328,7 +330,7 @@ def prioritize_for_review(
     """
     entries = _iter_batch(batch_of_results)
     if len(entries) == 0:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             "prioritize_for_review: batch_of_results is empty -- nothing "
             "to prioritize."
         )

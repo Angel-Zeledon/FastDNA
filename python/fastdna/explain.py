@@ -66,6 +66,8 @@ from typing import Any, Optional, Sequence, Union
 import numpy as np
 import pyarrow as pa
 
+from . import _core
+
 __all__ = ["explain", "ExplainReport", "FeatureExplanation"]
 
 _ALPHA = 0.05
@@ -338,7 +340,7 @@ def explain(
 
     importances = np.asarray(importances, dtype=np.float64)
     if importances.shape[0] != len(vectorizer.vocabulary_):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"importances has {importances.shape[0]} entries but the vectorizer's "
             f"vocabulary has {len(vectorizer.vocabulary_)}. Pass the importances aligned "
             "with vectorizer.get_feature_names_out(), e.g. model.coef_[0]."
@@ -346,18 +348,18 @@ def explain(
 
     paths = [str(p) for p in paths]
     if len(paths) < 2:
-        raise ValueError(f"explain() needs at least 2 samples to detect lineages, got {len(paths)}")
+        raise _core.InvalidConfigError(f"explain() needs at least 2 samples to detect lineages, got {len(paths)}")
 
     if phenotype is not None:
         phenotype = np.asarray(phenotype)
         if phenotype.shape[0] != len(paths):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype has {phenotype.shape[0]} entries but paths has {len(paths)}. "
                 "Pass one phenotype value per path, in the same order."
             )
         distinct = set(np.unique(phenotype).tolist())
         if not distinct <= {0, 1}:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"explain()'s within-lineage association check only supports a binary "
                 f"0/1 phenotype; got values {sorted(distinct)}. Pass phenotype=None to skip "
                 "that check for a continuous or multi-class outcome."

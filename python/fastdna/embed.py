@@ -129,7 +129,7 @@ def _reduce(distance_matrix, method, n_components, method_kwargs):
         reducer = MDS(n_components=n_components, dissimilarity="precomputed", **method_kwargs)
         return np.asarray(reducer.fit_transform(distance_matrix))
 
-    raise ValueError(f"method must be 'umap', 'tsne', or 'pcoa', got {method!r}")
+    raise fastdna._core.InvalidConfigError(f"method must be 'umap', 'tsne', or 'pcoa', got {method!r}")
 
 
 def embed_cohort(
@@ -201,7 +201,7 @@ def embed_cohort(
     extra conversion step.
     """
     if n_components not in (2, 3):
-        raise ValueError(f"n_components must be 2 or 3, got {n_components!r}")
+        raise fastdna._core.InvalidConfigError(f"n_components must be 2 or 3, got {n_components!r}")
 
     str_paths = [str(p) for p in paths]
 
@@ -212,7 +212,7 @@ def embed_cohort(
     seen = set()
     for p in str_paths:
         if p in seen:
-            raise ValueError(
+            raise fastdna._core.InvalidConfigError(
                 f"paths contains a duplicate entry: {p!r}. Each sample may "
                 "appear only once; a duplicated path would silently corrupt "
                 "its distance-matrix row."

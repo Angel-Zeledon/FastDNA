@@ -81,10 +81,12 @@ from __future__ import annotations
 
 import os
 import warnings
+from typing import Any, Iterable, Union
 
 import numpy as np
 import pyarrow as pa
 
+from . import _core
 from .anomaly import CohortOutlierFlagger
 
 __all__ = ["GenomicModel", "OutOfDistributionWarning"]
@@ -104,7 +106,9 @@ class OutOfDistributionWarning(UserWarning):
     """
 
 
-def _validate_paths(paths, label):
+def _validate_paths(
+    paths: Union[Iterable[Union[str, os.PathLike]], str, os.PathLike], label: str
+) -> list[str]:
     """Turns `paths` into a list of path strings, accepting a single bare
     path (str/PathLike) as a convenience for the common "score one new
     sample" case rather than forcing every caller to wrap it in a list.
@@ -113,7 +117,7 @@ def _validate_paths(paths, label):
         paths = [paths]
     paths = [str(p) for p in paths]
     if not paths:
-        raise ValueError(f"{label} requires at least one path, got an empty sequence")
+        raise _core.NoSamplesFoundError(f"{label} requires at least one path, got an empty sequence")
     return paths
 
 
@@ -156,7 +160,7 @@ class GenomicModel:
         was fitted on. Typically a fitted `fastdna.sklearn.KmerVectorizer`
         -- see the module docstring for why this is duck-typed rather than
         a hard `isinstance` check against that specific class.
-    training_paths : iterable of str or pathlib.Path
+    paths : iterable of str or pathlib.Path
         The real FASTQ(.gz) paths of the cohort `estimator`/`vectorizer`
         were trained on -- **actual files**, not `sample_id` strings from
         a `fastdna.CohortCounts`/`KmerVectorizer(counts=...)` artifact,
@@ -167,7 +171,7 @@ class GenomicModel:
         `paths` parameter documents, for the identical reason. At least 4
         paths are required (`fastdna.anomaly`'s own minimum for a robust
         reference distribution); see that module's `ValueError` message
-        for why.
+        for why. Stored as `self.training_paths` (see Attributes below).
     k, sketch_size : int, default 21, 1000
         Forwarded to `CohortOutlierFlagger` for sketching every training
         and query sample. Independent of whatever `k` `vectorizer` itself
@@ -192,20 +196,20 @@ class GenomicModel:
 
     def __init__(
         self,
-        estimator,
-        vectorizer,
-        training_paths,
+        estimator: Any,  # a fitted scikit-learn-style classifier exposing .predict(); see module docstring
+        vectorizer: Any,  # a fitted transformer exposing .transform(paths); see module docstring
+        paths: Union[Iterable[Union[str, os.PathLike]], str, os.PathLike],
         *,
-        k=21,
-        sketch_size=1000,
-        outlier_method="robust_zscore",
-        outlier_threshold=3.5,
-    ):
+        k: int = 21,
+        sketch_size: int = 1000,
+        outlier_method: str = "robust_zscore",
+        outlier_threshold: float = 3.5,
+    ) -> None:
         if not hasattr(estimator, "predict"):
             raise TypeError(
                 f"estimator must already be fitted and expose .predict(X); got a "
                 f"{type(estimator).__name__} with no .predict method. Fit it first, e.g. "
-                "estimator.fit(vectorizer.transform(training_paths), y)."
+                "estimator.fit(vectorizer.transform(paths), y)."
             )
         if not hasattr(vectorizer, "transform"):
             raise TypeError(
@@ -218,7 +222,7 @@ class GenomicModel:
 
         self.estimator = estimator
         self.vectorizer = vectorizer
-        self.training_paths = _validate_paths(training_paths, "training_paths")
+        self.training_paths = _validate_paths(paths, "paths")
         self.k = k
         self.sketch_size = sketch_size
         self.outlier_method = outlier_method
@@ -234,16 +238,16 @@ class GenomicModel:
     @classmethod
     def fit(
         cls,
-        paths,
-        y,
+        paths: Union[Iterable[Union[str, os.PathLike]], str, os.PathLike],
+        y: np.ndarray,  # array-like of shape (n_samples,); training labels aligned with paths
         *,
-        vectorizer,
-        estimator,
-        k=21,
-        sketch_size=1000,
-        outlier_method="robust_zscore",
-        outlier_threshold=3.5,
-    ):
+        vectorizer: Any,  # an UNFITTED transformer exposing .fit/.transform (or .fit_transform)
+        estimator: Any,  # an UNFITTED scikit-learn-style estimator
+        k: int = 21,
+        sketch_size: int = 1000,
+        outlier_method: str = "robust_zscore",
+        outlier_threshold: float = 3.5,
+    ) -> "GenomicModel":
         """Fits `vectorizer` and `estimator` on `paths`/`y`, fits the
         domain-applicability check on the same `paths`, and returns a
         ready-to-use `GenomicModel` -- the one-call convenience for the
@@ -307,7 +311,7 @@ class GenomicModel:
             outlier_threshold=outlier_threshold,
         )
 
-    def predict(self, paths):
+    def predict(self, paths: Union[Iterable[Union[str, os.PathLike]], str, os.PathLike]) -> pa.Table:
         """Scores `paths` and checks each against the training cohort's
         distribution in one call.
 
@@ -362,7 +366,7 @@ class GenomicModel:
         X = self.vectorizer.transform(paths)
         predictions = np.asarray(self.estimator.predict(X))
         if predictions.shape[0] != len(paths):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"estimator.predict() returned {predictions.shape[0]} predictions for "
                 f"{len(paths)} input paths -- vectorizer.transform() and estimator.predict() "
                 "disagree about how many samples were given."
