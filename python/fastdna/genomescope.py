@@ -44,6 +44,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from . import _core
 from .spectrum import suggest_min_count
 
 __all__ = ["GenomeProfile", "profile_genome", "plot_spectrum_fit"]
@@ -143,7 +144,7 @@ def _clean_spectrum(spectrum):
     try:
         items = list(spectrum.items())
     except AttributeError:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"spectrum must be a mapping of {{depth: distinct k-mers}} (e.g. "
             f"KmerCounts.spectrum()), got {type(spectrum).__name__}"
         ) from None
@@ -154,18 +155,18 @@ def _clean_spectrum(spectrum):
             depth = int(depth)
             n_kmers = int(n_kmers)
         except (TypeError, ValueError):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"spectrum keys and values must be integers, got "
                 f"{depth!r}: {n_kmers!r}"
             ) from None
         if depth < 1:
-            raise ValueError(f"spectrum depths must be >= 1, got {depth}")
+            raise _core.InvalidConfigError(f"spectrum depths must be >= 1, got {depth}")
         if n_kmers < 0:
-            raise ValueError(f"spectrum counts must be >= 0, got {n_kmers} at depth {depth}")
+            raise _core.InvalidConfigError(f"spectrum counts must be >= 0, got {n_kmers} at depth {depth}")
         cleaned[depth] = n_kmers
 
     if not cleaned:
-        raise ValueError("spectrum is empty: there is nothing to profile")
+        raise _core.InvalidConfigError("spectrum is empty: there is nothing to profile")
     return cleaned
 
 
@@ -189,7 +190,7 @@ def _spectrum_and_k(source, k):
     """
     if hasattr(source, "items"):
         if k is None:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "k must be given when profiling a bare spectrum mapping: it "
                 "cannot be recovered from the spectrum itself, and both the "
                 "heterozygosity and error-rate estimates depend on it. Pass "
@@ -201,7 +202,7 @@ def _spectrum_and_k(source, k):
     if hasattr(source, "spectrum") and hasattr(source, "k"):
         source_k = int(source.k)
         if k is not None and int(k) != source_k:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"k={k} conflicts with the k-mer size these counts were "
                 f"actually built with (k={source_k}); omit k to use the "
                 f"counts' own value."
@@ -522,7 +523,7 @@ def profile_genome(
 
     spectrum, k = _spectrum_and_k(source, k)
     if k < 1:
-        raise ValueError(f"k must be >= 1, got {k}")
+        raise _core.InvalidKError(f"k must be >= 1, got {k}")
 
     # The error/signal boundary. `suggest_min_count` returns `default` when
     # the spectrum's shape is not unambiguous -- passing `None` as that
@@ -530,11 +531,11 @@ def profile_genome(
     # rather than into a silently-assumed cutoff of 2.
     fit_min_depth = suggest_min_count(spectrum, default=None)
     if fit_min_depth is None:
-        raise ValueError(_NO_PEAK_MESSAGE)
+        raise _core.InvalidConfigError(_NO_PEAK_MESSAGE)
 
     peak_depth, peak_count = _highest_peak(spectrum, above=fit_min_depth)
     if peak_depth is None:
-        raise ValueError(_NO_PEAK_MESSAGE)
+        raise _core.InvalidConfigError(_NO_PEAK_MESSAGE)
 
     observed_max_depth = max(spectrum)
     if max_coverage is None:
@@ -542,7 +543,7 @@ def profile_genome(
     else:
         max_coverage = int(max_coverage)
         if max_coverage <= peak_depth:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"max_coverage={max_coverage} is at or below the coverage "
                 f"peak (depth {peak_depth}); the fitted range would exclude "
                 "the peak the model is built around. Pass a larger value, or "

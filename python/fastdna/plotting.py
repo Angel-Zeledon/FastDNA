@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
-from . import _column_as_array
+from . import _column_as_array, _core
 
 if TYPE_CHECKING:
     # matplotlib, numpy and scipy are soft dependencies of this module (imported
@@ -173,11 +173,11 @@ def plot_significance(
     np = _numpy()
 
     if x not in ("index", "position"):
-        raise ValueError(f"x must be 'index' or 'position', got {x!r}")
+        raise _core.InvalidConfigError(f"x must be 'index' or 'position', got {x!r}")
 
     missing = [c for c in _REQUIRED_SIGNIFICANCE_COLUMNS if c not in table.column_names]
     if missing:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"table is missing required column(s) {missing}. plot_significance() expects the "
             "shape gwas.prefilter_association() returns -- kmer_sequence, p_value, p_bonferroni "
             f"and q_value_bh at minimum -- but this table only has {list(table.column_names)}."
@@ -190,7 +190,7 @@ def plot_significance(
 
     if x == "position":
         if positions is None:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "x='position' requires a companion `positions` array of real genomic "
                 "coordinates (e.g. from a gene-annotation lookup step) -- pass "
                 "positions=[...], or omit x (or pass x='index') to plot k-mers in the "
@@ -199,7 +199,7 @@ def plot_significance(
             )
         positions = np.asarray(positions)
         if positions.shape[0] != n:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"positions has {positions.shape[0]} entries but table has {n} rows; they "
                 "must line up one-to-one, positions[i] for table row i."
             )
@@ -207,7 +207,7 @@ def plot_significance(
         x_label = "genomic position"
     else:
         if positions is not None:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "positions was given but x='index' does not use it (it would be silently "
                 "ignored). Pass x='position' to plot against these coordinates."
             )
@@ -338,21 +338,21 @@ def plot_population_structure(
     dendrogram, linkage, squareform = _scipy_hierarchy()
 
     if kind not in ("dendrogram", "heatmap"):
-        raise ValueError(f"kind must be 'dendrogram' or 'heatmap', got {kind!r}")
+        raise _core.InvalidConfigError(f"kind must be 'dendrogram' or 'heatmap', got {kind!r}")
 
     matrix = np.asarray(distance_matrix, dtype=np.float64)
     sample_ids = list(sample_ids)
     n = len(sample_ids)
 
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
-        raise ValueError(f"distance_matrix must be square, got shape {matrix.shape}")
+        raise _core.InvalidConfigError(f"distance_matrix must be square, got shape {matrix.shape}")
     if matrix.shape[0] != n:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"sample_ids has {n} entries but distance_matrix is {matrix.shape[0]}x{matrix.shape[0]}; "
             "they must have the same length, one id per row/column."
         )
     if not np.allclose(matrix, matrix.T, atol=1e-8):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             "distance_matrix is not symmetric: some (i, j) entry disagrees with (j, i) by more "
             "than floating-point tolerance. A genuine Mash-distance matrix (e.g. from "
             "gwas.kinship_matrix or compare_all) is symmetric by construction, so this usually "
@@ -364,7 +364,7 @@ def plot_population_structure(
     if groups is not None:
         groups = np.asarray(groups)
         if groups.shape[0] != n:
-            raise ValueError(f"groups has {groups.shape[0]} entries but there are {n} samples")
+            raise _core.InvalidConfigError(f"groups has {groups.shape[0]} entries but there are {n} samples")
 
     # checks=False: the matrix is symmetric with a (near-)zero diagonal by
     # construction/validation above, and squareform's own strict

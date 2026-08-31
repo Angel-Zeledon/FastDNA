@@ -120,6 +120,7 @@ from typing import Iterable, Mapping, Optional, Union
 import pyarrow as pa
 
 import fastdna
+from fastdna import _core
 
 __all__ = [
     "AssemblyQC",
@@ -324,7 +325,7 @@ def _qv_from_counts(k_shared: int, k_total: int, k: int) -> tuple[float, float]:
     estimate is meaningful).
     """
     if k_total == 0:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             "assembly contains no valid k-mers (empty, or every contig is shorter than k); cannot estimate QV"
         )
     ratio = k_shared / k_total

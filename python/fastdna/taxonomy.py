@@ -31,7 +31,7 @@ from typing import Dict, Iterable, Mapping, NamedTuple, Optional, Union
 
 import pyarrow as pa
 
-from . import FracSketch, Sketch, frac_sketch as _frac_sketch, sketch as _sketch
+from . import FracSketch, Sketch, _core, frac_sketch as _frac_sketch, sketch as _sketch
 
 __all__ = [
     "build_reference_database",
@@ -246,7 +246,7 @@ def classify(
     higher `min_score` explicitly.
     """
     if metric not in _CLASSIFY_METRICS:
-        raise ValueError(f"metric must be one of {_CLASSIFY_METRICS!r}, got {metric!r}")
+        raise _core.InvalidConfigError(f"metric must be one of {_CLASSIFY_METRICS!r}, got {metric!r}")
 
     if not reference_db:
         return _empty_score_table()
@@ -403,7 +403,7 @@ def check_sample_identity(
     decision.
     """
     if metric not in _IDENTITY_METRICS:
-        raise ValueError(f"metric must be one of {_IDENTITY_METRICS!r}, got {metric!r}")
+        raise _core.InvalidConfigError(f"metric must be one of {_IDENTITY_METRICS!r}, got {metric!r}")
 
     sketch_a = _sketch(str(path_a), k=k, sketch_size=sketch_size)
     sketch_b = _sketch(str(path_b), k=k, sketch_size=sketch_size)
@@ -497,7 +497,7 @@ def gather(
     `min_containment` is actually compared against.
     """
     if not 0.0 <= min_containment <= 1.0:
-        raise ValueError(f"min_containment must be in [0.0, 1.0], got {min_containment!r}")
+        raise _core.InvalidConfigError(f"min_containment must be in [0.0, 1.0], got {min_containment!r}")
 
     if not reference_db:
         return pa.table(

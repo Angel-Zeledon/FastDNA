@@ -135,6 +135,7 @@ from dataclasses import dataclass
 import pyarrow as pa
 
 import fastdna
+from . import _core
 from .genomescope import profile_genome
 
 __all__ = ["GenerativeValidationReport", "validate_generated"]
@@ -246,7 +247,7 @@ def _sequences_from_source(source, label):
 
     sequences = [s for s in sequences if s]
     if not sequences:
-        raise ValueError(f"{label} contains no sequences to validate")
+        raise _core.InvalidConfigError(f"{label} contains no sequences to validate")
     return sequences
 
 
@@ -506,17 +507,17 @@ def validate_generated(
     else:
         k_values = tuple(int(x) for x in k)
     if not k_values:
-        raise ValueError("k must be a positive int or a non-empty sequence of them")
+        raise _core.InvalidConfigError("k must be a positive int or a non-empty sequence of them")
     for kv in k_values:
         if kv < 1:
-            raise ValueError(f"every k must be >= 1, got {kv}")
+            raise _core.InvalidKError(f"every k must be >= 1, got {kv}")
 
     generated_sequences = _sequences_from_source(generated, "generated")
     reference_sequences = _sequences_from_source(reference, "reference")
 
     resolved_repeat_k = repeat_k if repeat_k is not None else max(k_values)
     if resolved_repeat_k < 1:
-        raise ValueError(f"repeat_k must be >= 1, got {resolved_repeat_k}")
+        raise _core.InvalidKError(f"repeat_k must be >= 1, got {resolved_repeat_k}")
 
     # Counted once per (role, k) and cached, since repeat_k routinely
     # coincides with one of the composition k values (the default is

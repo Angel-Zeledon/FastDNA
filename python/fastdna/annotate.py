@@ -108,6 +108,8 @@ from typing import Any, NamedTuple, Optional, Union
 
 import pyarrow as pa
 
+from . import _core
+
 __all__ = [
     "Annotation",
     "Feature",
@@ -182,7 +184,7 @@ def _read_fasta(path: str) -> dict:
     try:
         fh = open(path, "r", encoding="utf-8")
     except FileNotFoundError as e:
-        raise FileNotFoundError(
+        raise _core.IoNotFoundError(
             f"load_annotation() could not find the reference FASTA file {path!r}."
         ) from e
 
@@ -206,7 +208,7 @@ def _read_fasta(path: str) -> dict:
             sequences[current_id] = "".join(chunks).upper()
 
     if not sequences:
-        raise ValueError(f"reference FASTA file {path!r} contains no sequences.")
+        raise _core.InvalidConfigError(f"reference FASTA file {path!r} contains no sequences.")
     return sequences
 
 
@@ -246,7 +248,7 @@ def _parse_gff3(path: str) -> list:
     try:
         fh = open(path, "r", encoding="utf-8")
     except FileNotFoundError as e:
-        raise FileNotFoundError(
+        raise _core.IoNotFoundError(
             f"load_annotation() could not find the GFF3 annotation file {path!r}."
         ) from e
 
@@ -261,7 +263,7 @@ def _parse_gff3(path: str) -> list:
 
             fields = line.split("\t")
             if len(fields) != 9:
-                raise ValueError(
+                raise _core.InvalidConfigError(
                     f"malformed GFF3 file {path!r} at line {line_no}: expected 9 "
                     f"tab-separated columns (GFF3 spec v1.26), got {len(fields)}: {line!r}"
                 )
@@ -269,7 +271,7 @@ def _parse_gff3(path: str) -> list:
             try:
                 start_i, end_i = int(start), int(end)
             except ValueError:
-                raise ValueError(
+                raise _core.InvalidConfigError(
                     f"malformed GFF3 file {path!r} at line {line_no}: start/end must be "
                     f"integers, got {start!r}/{end!r}"
                 )
@@ -307,12 +309,12 @@ def _parse_genbank(path: str) -> list:
     try:
         records = list(SeqIO.parse(path, "genbank"))
     except FileNotFoundError as e:
-        raise FileNotFoundError(
+        raise _core.IoNotFoundError(
             f"load_annotation() could not find the GenBank annotation file {path!r}."
         ) from e
 
     if not records:
-        raise ValueError(f"GenBank annotation file {path!r} contains no records.")
+        raise _core.InvalidConfigError(f"GenBank annotation file {path!r} contains no records.")
 
     features = []
     for record in records:
@@ -405,7 +407,7 @@ def load_annotation(
     elif suffix in _GENBANK_EXTENSIONS:
         features = _parse_genbank(annotation_path)
     else:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"load_annotation() does not recognize the annotation file extension "
             f"{suffix!r} of {annotation_path!r}. Supported formats: GFF3 "
             f"({', '.join(_GFF_EXTENSIONS)}) or GenBank ({', '.join(_GENBANK_EXTENSIONS)})."
@@ -413,7 +415,7 @@ def load_annotation(
 
     feature_seqids = {f.seqid for f in features}
     if features and not (feature_seqids & set(sequences)):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"none of the annotation's sequence ids ({sorted(feature_seqids)}) match any "
             f"sequence id in the reference FASTA ({sorted(sequences)}). Check that the "
             "annotation file and the reference FASTA describe the same assembly, and that "
@@ -426,10 +428,10 @@ def load_annotation(
 def _validate_kmer_sequence(kmer_sequence: str) -> str:
     kmer_sequence = str(kmer_sequence).upper()
     if not kmer_sequence:
-        raise ValueError("kmer_sequence must be a non-empty DNA sequence.")
+        raise _core.InvalidConfigError("kmer_sequence must be a non-empty DNA sequence.")
     invalid = sorted(set(kmer_sequence) - _VALID_BASES)
     if invalid:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"kmer_sequence {kmer_sequence!r} contains characters that are not valid DNA "
             f"bases (A/C/G/T/N): {invalid}."
         )
@@ -438,7 +440,7 @@ def _validate_kmer_sequence(kmer_sequence: str) -> str:
 
 def _validate_max_mismatches(max_mismatches) -> int:
     if isinstance(max_mismatches, bool) or not isinstance(max_mismatches, int) or max_mismatches < 0:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"max_mismatches must be a non-negative integer, got {max_mismatches!r}."
         )
     return max_mismatches
@@ -615,7 +617,7 @@ def annotate_rule(
 
     invalid = sorted(set(str(kmer_sequence).upper()) - _VALID_BASES)
     if invalid:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"annotate_rule() needs a real DNA sequence but rule.feature_name is "
             f"{kmer_sequence!r}, which contains non-DNA characters {invalid}. If this Rule "
             "came from a SetCoveringClassifier fitted without feature_names, feature_name is "
@@ -704,13 +706,13 @@ def export_bed(
     required = ("seqid", "start", "end", "strand")
     missing = [c for c in required if c not in table.column_names]
     if missing:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"export_bed() needs column(s) {missing}, but table only has "
             f"{list(table.column_names)}. Pass the pyarrow.Table annotate_rule() returns "
             "(or pa.concat_tables() of several)."
         )
     if name_column not in table.column_names:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"export_bed() name_column={name_column!r} is not a column of table "
             f"({list(table.column_names)})."
         )

@@ -190,6 +190,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from scipy import sparse
 
+from fastdna import _core
+
 __all__ = ["EquivalenceClasses", "collapse_equivalence_classes"]
 
 
@@ -270,7 +272,7 @@ def collapse_equivalence_classes(matrix: sparse.spmatrix, kmer_sequences: Sequen
 
     n_samples, n_kmers = matrix.shape
     if n_samples == 0 or n_kmers == 0:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"matrix is empty: shape {matrix.shape} has no "
             f"{'samples' if n_samples == 0 else 'k-mers'}. collapse_equivalence_classes() "
             "needs at least one sample and one k-mer column."
@@ -278,7 +280,7 @@ def collapse_equivalence_classes(matrix: sparse.spmatrix, kmer_sequences: Sequen
 
     kmer_sequences = list(kmer_sequences)
     if len(kmer_sequences) != n_kmers:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"kmer_sequences has {len(kmer_sequences)} entries but matrix has {n_kmers} "
             "columns. A silent mismatch here would label every class with the WRONG "
             "k-mer, so this is refused rather than truncated -- pass exactly the "

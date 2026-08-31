@@ -354,7 +354,7 @@ def translate_file(
     """
     frame_list = [int(frame) for frame in frames]
     if not frame_list:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             "frames must contain at least one reading frame; "
             f"pass e.g. frames=(1,) or frames={ALL_FRAMES} to translate all six"
         )

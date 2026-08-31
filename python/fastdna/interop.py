@@ -42,7 +42,7 @@ import tempfile
 import warnings
 from typing import Any, Iterable
 
-from . import KmerCounts, Sketch
+from . import KmerCounts, Sketch, _core
 from . import count as _count
 from . import sketch as _sketch
 
@@ -138,7 +138,7 @@ def _with_temp_fastq(sequences, fn):
         with os.fdopen(fd, "w", newline="\n") as fh:
             n_written = _write_fastq(sequences, fh)
         if n_written == 0:
-            raise ValueError("sequences produced no non-empty records to count/sketch")
+            raise _core.InvalidConfigError("sequences produced no non-empty records to count/sketch")
         return fn(path)
     finally:
         try:
