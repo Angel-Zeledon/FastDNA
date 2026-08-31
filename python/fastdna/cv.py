@@ -76,10 +76,28 @@ def _missing_dependency(caller, package, hint=None):
 
 
 def _validate_paths(paths, caller):
-    """The two ways a path list silently corrupts a distance matrix, refused
-    up front rather than after the sketching work is done: too few paths for
-    a pairwise structure to exist at all, and a duplicate entry, which would
-    map two rows to one index and leave the earlier one all zeros.
+    """Refuses the two ways a path list silently corrupts a distance matrix.
+
+    Checked up front rather than after the sketching work is done: too few
+    paths for a pairwise structure to exist at all, and a duplicate entry,
+    which would map two rows to one index and leave the earlier one all
+    zeros.
+
+    Parameters
+    ----------
+    paths : iterable of str or pathlib.Path
+    caller : str
+        Name of the calling function, used only to name it in raised error
+        messages.
+
+    Returns
+    -------
+    list of str
+
+    Raises
+    ------
+    ValueError
+        If fewer than 2 paths are given, or a path is duplicated.
     """
     paths = [str(p) for p in paths]
     if len(paths) < 2:
@@ -110,6 +128,17 @@ def _mash_distance_matrix(paths, k, sketch_size):
     is on an interpretable per-base-divergence scale, which is what makes a
     `distance_threshold` something a caller can reason about rather than
     tune blindly.
+
+    Parameters
+    ----------
+    paths : list of str
+        Sample paths, already validated by `_validate_paths()`.
+    k, sketch_size : int
+        Forwarded to `fastdna.compare_all()`.
+
+    Returns
+    -------
+    numpy.ndarray of float64, shape (len(paths), len(paths))
     """
     table = fastdna.compare_all(paths, k=k, sketch_size=sketch_size, metric="mash_distance")
 
@@ -133,6 +162,15 @@ def _relabel_by_first_appearance(labels):
     """Renumbers arbitrary cluster labels to `0, 1, 2, ...` in order of
     first appearance, so `groups[0]` is always `0` and the labelling is
     reproducible regardless of what `fcluster` happened to number things.
+
+    Parameters
+    ----------
+    labels : array-like of int
+        Arbitrary cluster labels, e.g. from `scipy.cluster.hierarchy.fcluster`.
+
+    Returns
+    -------
+    numpy.ndarray of int64, same shape as `labels`
     """
     mapping = {}
     out = np.empty(len(labels), dtype=np.int64)
@@ -225,6 +263,14 @@ def lineage_groups(
 def _n_samples(X):
     """`X`'s sample count, whether it is a list of paths, a NumPy array, or
     a sparse matrix (as `KmerVectorizer.transform()` returns).
+
+    Parameters
+    ----------
+    X : array-like, sparse matrix, or list
+
+    Returns
+    -------
+    int
     """
     shape = getattr(X, "shape", None)
     if shape is not None:
@@ -352,6 +398,15 @@ class LineageKFold:
         `X`/`y`/`groups` are accepted and ignored, matching scikit-learn's
         splitter signature; `cross_val_score` and `GridSearchCV` call this
         with all three.
+
+        Parameters
+        ----------
+        X, y, groups : ignored
+
+        Returns
+        -------
+        int
+            `self.n_splits`.
         """
         return self.n_splits
 
@@ -415,6 +470,27 @@ def _model_importances(fitted, n_features, model_repr):
     cancel and averaging them before taking magnitude would report noise as
     importance (the same defect `fastdna.interpret` had to fix in its SHAP
     reduction).
+
+    Parameters
+    ----------
+    fitted : fitted scikit-learn estimator
+        Must expose `coef_` or `feature_importances_`.
+    n_features : int
+        Expected width of the importances vector, checked against what
+        `fitted` actually reports.
+    model_repr : str
+        `type(model).__name__`, used only to name the model in raised
+        error messages.
+
+    Returns
+    -------
+    numpy.ndarray of float64, shape (n_features,)
+
+    Raises
+    ------
+    ValueError
+        If `fitted` exposes neither `coef_` nor `feature_importances_`, or
+        the importances it reports do not have `n_features` entries.
     """
     importances = getattr(fitted, "feature_importances_", None)
     if importances is None:
@@ -455,6 +531,19 @@ def _permute(y, groups, rng):
     destroy that association too, and a feature that merely tags a lineage
     would then look highly significant: the very confounding this module
     exists to control.
+
+    Parameters
+    ----------
+    y : array-like
+        Labels to permute.
+    groups : array-like of int or None
+        Lineage labels restricting the permutation, or `None` for a free
+        permutation.
+    rng : numpy.random.Generator
+
+    Returns
+    -------
+    numpy.ndarray, same shape as `y`
     """
     permuted = np.array(y, copy=True)
     if groups is None:

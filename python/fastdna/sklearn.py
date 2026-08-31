@@ -84,19 +84,46 @@ class _CohortCounts(NamedTuple):
     materialize the sequence column at all (`with_sequence=False`, the
     fast default -- see `export::counts_schema`'s doc comment for what
     that column costs at full cohort scale).
+
+    Attributes
+    ----------
+    kmers : pyarrow.UInt64Array
+        One row per (sample, k-mer): the `kmer_u64` encoding.
+    frequencies : pyarrow.UInt32Array
+        The per-sample raw count, aligned with `kmers`.
+    row_counts : list of int
+        Rows contributed by each sample, in `paths` order.
     """
 
-    kmers: object  # pyarrow.UInt64Array, one row per (sample, k-mer)
-    frequencies: object  # pyarrow.UInt32Array, aligned with `kmers`
-    row_counts: list  # rows contributed by each sample, in `paths` order
+    kmers: object
+    frequencies: object
+    row_counts: list
 
 
 def _validate_paths(X, method_name):
-    """Turns `X` into a list of path strings, rejecting the classic footgun
-    of passing a single path instead of a list of them: a bare string (or
-    `os.PathLike`) *is* iterable, so it would otherwise be iterated
-    character by character and surface as a baffling per-character
-    `FileNotFoundError` deep inside the counting loop.
+    """Turns `X` into a list of path strings.
+
+    Rejects the classic footgun of passing a single path instead of a list
+    of them: a bare string (or `os.PathLike`) *is* iterable, so it would
+    otherwise be iterated character by character and surface as a baffling
+    per-character `FileNotFoundError` deep inside the counting loop.
+
+    Parameters
+    ----------
+    X : iterable of str or pathlib.Path
+        Sample paths -- or, invalidly, a single bare path.
+    method_name : str
+        Name of the calling `KmerVectorizer` method, used only to name it
+        in the raised error message.
+
+    Returns
+    -------
+    list of str
+
+    Raises
+    ------
+    TypeError
+        If `X` is a single path rather than an iterable of them.
     """
     if isinstance(X, (str, os.PathLike)):
         # No leaf in the fastdna._core exception hierarchy inherits from
@@ -314,10 +341,28 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         self.representation = representation
 
     def _validated_fit_paths(self, X):
-        """The training-path checks `fit()` performs, shared verbatim with
-        `fit_transform()` so both reject the same mistakes with the same
-        messages (including naming `fit()`, which is the step that would
-        have raised either way).
+        """The training-path checks `fit()` performs.
+
+        Shared verbatim with `fit_transform()` so both reject the same
+        mistakes with the same messages (including naming `fit()`, which is
+        the step that would have raised either way).
+
+        Parameters
+        ----------
+        X : iterable of str or pathlib.Path
+            Training sample paths.
+
+        Returns
+        -------
+        list of str
+
+        Raises
+        ------
+        TypeError
+            If `X` is a single path rather than an iterable of them.
+        ValueError
+            If `X` is empty, contains a duplicate path, or `self.top_features`
+            is not a positive int or None.
         """
         paths = _validate_paths(X, "fit")
         if not paths:
@@ -370,6 +415,16 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         without `counts=` still does 20 counting passes, not 40 --
         `TransformerMixin.fit_transform`'s default of `fit(X).transform(X)`
         would count every training file twice.
+
+        Parameters
+        ----------
+        keys : list of str
+            Sample paths, or sample ids when `self.counts` is set -- each
+            counted (or sliced) exactly once.
+
+        Returns
+        -------
+        _CohortCounts
         """
         if self.counts is not None:
             subset = self.counts.subset(list(keys))
@@ -541,6 +596,31 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         signal is preferable), and remaining ties by the raw `kmer_u64`
         value purely for determinism, so `fit()` on identical input
         always yields an identical `vocabulary_`.
+
+        Both tallies are computed with one hash pass over the stacked
+        cohort rather than a Python loop: `dictionary_encode` assigns each
+        distinct k-mer a code (one C++ hash probe per row, replacing three
+        Python dict operations per row), after which prevalence is just
+        "how many rows carry this code" -- a k-mer appears at most once in
+        a sample's count table, so its row count *is* its sample count --
+        and total_freq is the same tally weighted by `frequency`. For a
+        20-sample cohort of a million k-mers each, that is 20 million
+        Python-level dict updates replaced by two `bincount` passes.
+
+        Parameters
+        ----------
+        distinct : np.ndarray
+            Distinct k-mer codes across the cohort.
+        prevalence : np.ndarray
+            Sample count for each entry in `distinct`.
+        total_freq : np.ndarray
+            Summed raw frequency for each entry in `distinct`.
+
+        Returns
+        -------
+        None
+            Sets `self.vocabulary_`, `self._feature_sequences_`, and
+            `self.n_features_in_`.
         """
         # `lexsort` takes its primary key last, so this is exactly the
         # `(-prevalence, -total_freq, kmer)` ordering described above.
@@ -570,6 +650,18 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         "silently ignored" case documented on `transform()`), replacing one
         Python dict lookup and up to three `list.append` calls per row of
         every sample's table.
+
+        Parameters
+        ----------
+        counts : _CohortCounts
+            The stacked cohort counts to project.
+        n_samples : int
+            Number of samples `counts` was stacked from -- the resulting
+            matrix's row count.
+
+        Returns
+        -------
+        scipy.sparse.csr_matrix of shape (n_samples, len(self.vocabulary_))
         """
         if self.representation not in _VALID_REPRESENTATIONS:
             raise ValueError(
@@ -711,8 +803,6 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         the files were read. `fastdna.count()` is deterministic, so the
         matrix is identical to the one two passes produced.
 
-        `y` is ignored, exactly as in `fit()`.
-
         `chunk_size`: this method's whole point is reusing one set of
         counts for both `_learn_vocabulary`/`_learn_vocabulary_streaming`
         *and* `_project()` -- but `_project()` needs every training
@@ -729,6 +819,25 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         memory but whose *projected matrix* does; for a cohort large
         enough that neither does, call `fit()` alone and `transform()` it
         in smaller batches instead (see `chunk_size` in `__init__`).
+
+        Parameters
+        ----------
+        X : iterable of str or pathlib.Path
+            FASTQ(.gz) file paths for the *training* samples only. See
+            `fit()`.
+        y : ignored
+            Accepted purely to satisfy scikit-learn's estimator API; never
+            read, exactly as in `fit()`.
+
+        Returns
+        -------
+        scipy.sparse.csr_matrix of shape (len(X), len(self.vocabulary_))
+            Same format `transform()` returns; see its docstring.
+
+        Raises
+        ------
+        TypeError, ValueError
+            See `fit()`.
         """
         paths = self._validated_fit_paths(X)
         if self.chunk_size is None:
@@ -787,6 +896,23 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         mattered most" into an actual DNA sequence that can be looked up
         (e.g. via BLAST) -- the payoff the design doc calls out (§9.6) for
         keeping this as sequences rather than raw integer encodings.
+
+        Parameters
+        ----------
+        input_features : ignored
+            Accepted only to match scikit-learn's
+            `get_feature_names_out(input_features=None)` signature
+            convention; see above for why it does not apply here.
+
+        Returns
+        -------
+        numpy.ndarray of object, shape (len(self.vocabulary_),)
+            The decoded k-mer sequence strings, in vocabulary order.
+
+        Raises
+        ------
+        sklearn.exceptions.NotFittedError
+            If called before `fit()`/`fit_transform()`.
         """
         check_is_fitted(self, "vocabulary_")
         return np.asarray(self._feature_sequences_, dtype=object)

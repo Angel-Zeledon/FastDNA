@@ -164,6 +164,26 @@ class CalibrationReport(NamedTuple):
 
 
 def _validate_binary_y_true(y_true, caller):
+    """Checks `y_true` is 1-D with exactly two distinct classes.
+
+    Parameters
+    ----------
+    y_true : array-like
+    caller : str
+        Name of the calling function, used only to name it in raised error
+        messages.
+
+    Returns
+    -------
+    y_true : numpy.ndarray
+    classes : numpy.ndarray
+        The two distinct labels found, sorted.
+
+    Raises
+    ------
+    ValueError
+        If `y_true` is not 1-D, or does not have exactly two classes.
+    """
     y_true = np.asarray(y_true)
     if y_true.ndim != 1:
         raise _core.InvalidConfigError(f"{caller} needs a 1-D y_true, got shape {y_true.shape}")
@@ -178,6 +198,27 @@ def _validate_binary_y_true(y_true, caller):
 
 
 def _validate_matching_length(y_true, scores, score_name, caller):
+    """Checks `scores` is 1-D with one entry per `y_true` label.
+
+    Parameters
+    ----------
+    y_true : array-like
+    scores : array-like
+    score_name : str
+        Name of the `scores` parameter at the call site (e.g. `"y_score"`),
+        used only in raised error messages.
+    caller : str
+        Name of the calling function, used only in raised error messages.
+
+    Returns
+    -------
+    numpy.ndarray of float64, same length as `y_true`
+
+    Raises
+    ------
+    ValueError
+        If `scores` is not 1-D, or its length does not match `y_true`.
+    """
     scores = np.asarray(scores, dtype=np.float64)
     if scores.ndim != 1:
         raise _core.InvalidConfigError(f"{caller} needs a 1-D {score_name}, got shape {scores.shape}")

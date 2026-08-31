@@ -85,13 +85,13 @@ not at module scope, matching `fastdna.cv` and `fastdna.rules`.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import numpy as np
 
 from . import _core
 
-__all__ = ["CalibratedEstimator", "calibrate"]
+__all__ = ["CalibratedEstimator", "VennAbersInterval", "calibrate"]
 
 _METHODS = ("venn_abers", "platt")
 
@@ -103,6 +103,28 @@ def _decision_scores(estimator, X, caller):
     `predict_proba()[:, 1]` -- which is exactly how `SetCoveringClassifier`
     reaches this path with its hard 0/1 output, the case this module exists
     to fix.
+
+    Parameters
+    ----------
+    estimator : fitted estimator
+        Must expose `decision_function()` or `predict_proba()`.
+    X : array-like or sparse matrix
+    caller : str
+        Name of the calling function/method, used only to name it in
+        raised error messages.
+
+    Returns
+    -------
+    numpy.ndarray of float64, shape (len(X),)
+
+    Raises
+    ------
+    TypeError
+        If `estimator` exposes neither `decision_function()` nor
+        `predict_proba()`.
+    ValueError
+        If the estimator's scores do not have one entry per row of `X`, or
+        contain a non-finite value.
     """
     if hasattr(estimator, "decision_function"):
         scores = estimator.decision_function(X)
@@ -149,8 +171,23 @@ def _ivap_predict(calib_scores, calib_labels01, query_scores):
     `SetCoveringClassifier` specifically, exactly 4 total regardless of how
     many samples are being scored.
 
-    Returns `(point, p0, p1)`, each a float64 array shaped like
-    `query_scores`.
+    Parameters
+    ----------
+    calib_scores : array-like of float
+        Held-out calibration scores from `_decision_scores()`.
+    calib_labels01 : array-like of float
+        Held-out calibration labels, encoded as 0.0/1.0.
+    query_scores : array-like of float
+        Scores to predict calibrated probabilities for.
+
+    Returns
+    -------
+    point : numpy.ndarray of float64
+        The point estimate `p1 / (1 - p0 + p1)`, shaped like `query_scores`.
+    p0 : numpy.ndarray of float64
+        The lower Venn-ABERS probability, shaped like `query_scores`.
+    p1 : numpy.ndarray of float64
+        The upper Venn-ABERS probability, shaped like `query_scores`.
     """
     from sklearn.isotonic import IsotonicRegression
 
@@ -188,6 +225,26 @@ def _ivap_predict(calib_scores, calib_labels01, query_scores):
     p1 = p1_by_unique[inverse]
     point = point_by_unique[inverse]
     return point, p0, p1
+
+
+class VennAbersInterval(NamedTuple):
+    """The Venn-ABERS multiprobability interval, `p0 <= p1`, from
+    `CalibratedEstimator.predict_interval()`.
+
+    See the module docstring and `_ivap_predict()` for how the two arrays
+    are computed; `predict_interval()`'s own docstring for why the gap
+    `p1 - p0` is itself informative.
+
+    Attributes
+    ----------
+    p0 : numpy.ndarray of float64, shape (n_samples,)
+        The lower Venn-ABERS probability per sample.
+    p1 : numpy.ndarray of float64, shape (n_samples,)
+        The upper Venn-ABERS probability per sample.
+    """
+
+    p0: np.ndarray
+    p1: np.ndarray
 
 
 class CalibratedEstimator:
@@ -229,6 +286,16 @@ class CalibratedEstimator:
         are fit to track the true positive rate on held-out data, and
         `fastdna.evaluation.calibration_report` on a further, disjoint
         held-out set is how that claim is checked rather than assumed.
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix
+            In whatever form the wrapped estimator's own scoring method
+            accepts.
+
+        Returns
+        -------
+        numpy.ndarray of float64, shape (n_samples, 2)
         """
         scores = _decision_scores(self.estimator_, X, "CalibratedEstimator.predict_proba")
         if self.method == "venn_abers":
@@ -240,7 +307,7 @@ class CalibratedEstimator:
 
     def predict_interval(
         self, X: Any  # array-like or scipy sparse matrix
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> "VennAbersInterval":
         """The Venn-ABERS multiprobability interval `(p0, p1)`, each a
         float64 array of shape `(n_samples,)`: the two isotonic-regression
         probabilities described in the module docstring, `p0 <= p1`. The
@@ -252,6 +319,23 @@ class CalibratedEstimator:
 
         Only defined for `method="venn_abers"` -- Platt scaling produces a
         single sigmoid-fit probability with no analogous interval.
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix
+            In whatever form the wrapped estimator's own scoring method
+            accepts.
+
+        Returns
+        -------
+        VennAbersInterval
+            `p0` and `p1`, each a float64 array of shape `(n_samples,)`.
+            Unpacks like a plain 2-tuple: `p0, p1 = est.predict_interval(X)`.
+
+        Raises
+        ------
+        ValueError
+            If this estimator was fit with `method="platt"`.
         """
         if self.method != "venn_abers":
             raise _core.InvalidConfigError(
@@ -261,11 +345,22 @@ class CalibratedEstimator:
             )
         scores = _decision_scores(self.estimator_, X, "CalibratedEstimator.predict_interval")
         _point, p0, p1 = _ivap_predict(self._calib_scores, self._calib_labels01, scores)
-        return p0, p1
+        return VennAbersInterval(p0=p0, p1=p1)
 
     def predict(self, X: Any) -> np.ndarray:  # array-like or scipy sparse matrix
         """The predicted label per sample (the class with the higher
         calibrated probability), taken from `classes_`.
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix
+            In whatever form the wrapped estimator's own scoring method
+            accepts.
+
+        Returns
+        -------
+        numpy.ndarray, shape (n_samples,)
+            Entries drawn from `classes_`.
         """
         proba = self.predict_proba(X)
         return self.classes_[proba.argmax(axis=1)]
