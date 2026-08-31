@@ -390,11 +390,19 @@ def load_annotation(
         unrecognized one raises `ValueError` naming the supported ones
         rather than guessing.
 
-    Raises `ValueError` if none of the annotation's `seqid`s match any
-    record id in the reference FASTA -- almost always a sign the two files
-    describe different assemblies, or that one uses accession numbers where
-    the other uses plain contig names, and finding that out from a
-    silent all-intergenic result later would be a far worse experience.
+    Returns
+    -------
+    Annotation
+
+    Raises
+    ------
+    ValueError
+        `annotation_path`'s extension is not recognized, or none of the
+        annotation's `seqid`s match any record id in the reference FASTA
+        -- almost always a sign the two files describe different
+        assemblies, or that one uses accession numbers where the other
+        uses plain contig names, and finding that out from a silent
+        all-intergenic result later would be a far worse experience.
     """
     reference_fasta_path = str(reference_fasta_path)
     annotation_path = str(annotation_path)
@@ -507,18 +515,39 @@ def locate_kmer(annotation: Annotation, kmer_sequence: str, *, max_mismatches: i
     suffix-array-caliber index) and `Hit`'s docstring for exactly what one
     returned entry means.
 
-    Returns **every** hit, in both orientations independently -- zero hits
-    (an empty list) is itself a real, meaningful answer ("not present in
-    this reference"), not an error; a repeated/multi-copy k-mer returns one
-    entry per occurrence rather than picking one.
-
     `max_mismatches=0` (the default) uses an exact hash-index lookup;
     `max_mismatches>0` uses a direct Hamming-distance scan of the whole
     reference. Both are substitution-only: no insertion or deletion is ever
     matched, at any `max_mismatches` (see module docstring).
 
-    Results are sorted by `(seqid, start, strand, feature_type, gene_name)`
-    for deterministic output across calls.
+    Parameters
+    ----------
+    annotation : Annotation
+        As returned by `load_annotation()`.
+    kmer_sequence : str
+        The DNA sequence to search for, A/C/G/T/N only (case-insensitive).
+    max_mismatches : int, default 0
+        Maximum Hamming distance (substitutions only, see above) a match
+        may have. `0` uses the exact hash-index path; anything greater
+        uses the direct Hamming-distance scan.
+
+    Returns
+    -------
+    list of Hit
+        **Every** hit, in both orientations independently, sorted by
+        `(seqid, start, strand, feature_type, gene_name)` for
+        deterministic output across calls -- zero hits (an empty list) is
+        itself a real, meaningful answer ("not present in this
+        reference"), not an error; a repeated/multi-copy k-mer returns
+        one entry per occurrence rather than picking one.
+
+    Raises
+    ------
+    TypeError
+        `annotation` is not an `Annotation` built by `load_annotation()`.
+    ValueError
+        `kmer_sequence` is empty or contains non-DNA characters, or
+        `max_mismatches` is not a non-negative integer.
     """
     if not isinstance(annotation, Annotation):
         raise TypeError(
@@ -579,27 +608,43 @@ def annotate_rule(
     per `Hit`, ready to attach to `SetCoveringClassifier.explain()` output
     or write out alongside it.
 
-    `rule` may be:
+    Parameters
+    ----------
+    rule : fastdna.rules.Rule or str
+        One of:
 
-    - a `fastdna.rules.Rule` (duck-typed via `.feature_name`/`.presence`/
-      `.feature_index` -- this module does not import `fastdna.rules`, the
-      same "no hard dependency on the producing module" stance
-      `fastdna.interpret` takes towards `fastdna.sklearn`): its
-      `feature_name` is used as the k-mer sequence, and `presence`/
-      `feature_index` are carried into the output table as extra columns.
-    - a plain string: used directly as the k-mer sequence; the output
-      table's `presence`/`feature_index` columns are all-null.
+        - a `fastdna.rules.Rule` (duck-typed via `.feature_name`/
+          `.presence`/`.feature_index` -- this module does not import
+          `fastdna.rules`, the same "no hard dependency on the producing
+          module" stance `fastdna.interpret` takes towards
+          `fastdna.sklearn`): its `feature_name` is used as the k-mer
+          sequence, and `presence`/`feature_index` are carried into the
+          output table as extra columns.
+        - a plain string: used directly as the k-mer sequence; the output
+          table's `presence`/`feature_index` columns are all-null.
+    annotation : Annotation
+        As returned by `load_annotation()`.
+    max_mismatches : int, default 0
+        Forwarded to `locate_kmer()`.
 
-    Raises `ValueError` if the resulting sequence is not valid DNA -- the
-    most common cause is a `Rule` whose classifier was fitted without
-    `feature_names`, so `feature_name` is a positional placeholder like
-    `"feature_2"` rather than a real k-mer (see
-    `SetCoveringClassifier.export_rules_fasta`, which refuses the same
-    input for the same reason).
+    Returns
+    -------
+    pyarrow.Table
+        A fixed schema, zero rows for a zero-hit k-mer -- so a caller can
+        `pa.concat_tables()` results across several rules without
+        special-casing "this one had no hits".
 
-    Always returns a `pyarrow.Table` with a fixed schema, zero rows for a
-    zero-hit k-mer -- so a caller can `pa.concat_tables()` results across
-    several rules without special-casing "this one had no hits".
+    Raises
+    ------
+    TypeError
+        `rule` is not a `fastdna.rules.Rule` (duck-typed) or a string.
+    ValueError
+        The resulting sequence is not valid DNA -- the most common cause
+        is a `Rule` whose classifier was fitted without `feature_names`,
+        so `feature_name` is a positional placeholder like `"feature_2"`
+        rather than a real k-mer (see
+        `SetCoveringClassifier.export_rules_fasta`, which refuses the
+        same input for the same reason).
     """
     if isinstance(rule, str):
         kmer_sequence = rule
@@ -672,6 +717,12 @@ def export_bed(
     1`, `chromEnd = end` (the 1-based inclusive end and the 0-based
     half-open end are numerically identical, so only `start` shifts).
 
+    BED's `score` field (column 5) is always written as `0`: nothing in
+    `table` is a score in BED's `0-1000` sense, and inventing one here
+    would be exactly the kind of fabricated threshold this project's other
+    modules (`gwas.prefilter_association`, `plotting.plot_significance`)
+    are written to avoid.
+
     Parameters
     ----------
     table : pyarrow.Table
@@ -690,12 +741,6 @@ def export_bed(
         rows with a null `gene_name` (e.g. `feature_type="intergenic"`
         hits) fall back to the literal string `"intergenic"` rather than
         writing an empty BED field, which is not valid BED.
-
-    BED's `score` field (column 5) is always written as `0`: nothing in
-    `table` is a score in BED's `0-1000` sense, and inventing one here
-    would be exactly the kind of fabricated threshold this project's other
-    modules (`gwas.prefilter_association`, `plotting.plot_significance`)
-    are written to avoid.
 
     Raises
     ------

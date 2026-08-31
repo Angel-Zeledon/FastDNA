@@ -38,11 +38,6 @@ RISE_FACTOR = 2.0
 def suggest_min_count(spectrum: Mapping[int, int], default: int = DEFAULT_MIN_COUNT) -> int:
     """Finds the valley floor between the error peak and the coverage peak.
 
-    `spectrum` maps depth (an int >= 1) to the number of distinct k-mers
-    observed at that depth -- e.g. `KmerCounts.spectrum()`, or any dict
-    shaped like it, such as `{1: 50_000, 2: 30_000, 3: 5_000, 4: 1_000,
-    5: 800, 6: 4_000, 7: 9_000, ...}`.
-
     Walks depths in ascending order, tracking the lowest count seen so far
     (the current valley-floor candidate). A depth is only accepted as the
     end of the valley -- i.e. the point where the *coverage* peak begins --
@@ -56,21 +51,34 @@ def suggest_min_count(spectrum: Mapping[int, int], default: int = DEFAULT_MIN_CO
     skipped), so a single sample with no k-mers at some depth cannot distort
     the shape by making its neighbors look adjacent.
 
-    Returns the valley **floor**'s own depth, not one above it: since
-    `min_count` is an inclusive lower bound, passing this return value
-    straight to `count(..., min_count=...)` *keeps* the k-mers at the
-    valley floor rather than discarding them as part of the error peak --
-    deliberately erring towards keeping ambiguous, boundary-depth k-mers
-    rather than discarding data that might belong to the real sample.
+    Parameters
+    ----------
+    spectrum : mapping of int to int
+        Maps depth (an int >= 1) to the number of distinct k-mers observed
+        at that depth -- e.g. `KmerCounts.spectrum()`, or any dict shaped
+        like it, such as `{1: 50_000, 2: 30_000, 3: 5_000, 4: 1_000,
+        5: 800, 6: 4_000, 7: 9_000, ...}`.
+    default : int, default DEFAULT_MIN_COUNT
+        Returned whenever the spectrum's shape is not unambiguous: fewer
+        than 3 distinct depths present, a walk that never finds a lower
+        floor before the data runs out (no error peak to walk past), or
+        one that never climbs back up by `RISE_FACTOR` from whatever
+        floor it does find (no coverage peak visible in the sample, even
+        if the tail is not perfectly monotonic). A wrong threshold here
+        is worse than no threshold, so every case this function is not
+        confident about returns the documented default instead of a
+        guess.
 
-    Falls back to `default` whenever the spectrum's shape is not
-    unambiguous: fewer than 3 distinct depths present, a walk that never
-    finds a lower floor before the data runs out (no error peak to walk
-    past), or one that never climbs back up by `RISE_FACTOR` from whatever
-    floor it does find (no coverage peak visible in the sample, even if the
-    tail is not perfectly monotonic). A wrong threshold here is worse than
-    no threshold, so every case this function is not confident about returns
-    the documented default instead of a guess.
+    Returns
+    -------
+    int
+        The valley **floor**'s own depth, not one above it: since
+        `min_count` is an inclusive lower bound, passing this return
+        value straight to `count(..., min_count=...)` *keeps* the k-mers
+        at the valley floor rather than discarding them as part of the
+        error peak -- deliberately erring towards keeping ambiguous,
+        boundary-depth k-mers rather than discarding data that might
+        belong to the real sample.
     """
     if not spectrum:
         return default
