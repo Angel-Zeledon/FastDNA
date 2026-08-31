@@ -778,8 +778,18 @@ fn run_diff(args: DiffArgs) -> Result<()> {
 }
 
 /// `fastdna filter`: thin console-output wrapper around `read_filter::
-/// run_filter` (see `cli::FilterArgs`'s doc comment for the full design).
+/// run_filter`/`run_filter_paired` (see `cli::FilterArgs`'s doc comment for
+/// the full design). Dispatches to the paired-end path when `--input2`/
+/// `--output2` were given (`FilterArgs::validate` has already confirmed
+/// they were given together, or not at all); otherwise this is the
+/// original single-end path, unchanged.
 fn run_filter(args: FilterArgs) -> Result<()> {
+    args.validate().map_err(|reason| FastDnaError::InvalidConfig { parameter: "filter", reason })?;
+
+    if args.is_paired() {
+        return run_filter_paired(args);
+    }
+
     // Same "would this write clobber something the run still needs to
     // read" guard every other subcommand runs: neither the reference table
     // nor any input file may be the output.
@@ -829,6 +839,108 @@ fn run_filter(args: FilterArgs) -> Result<()> {
     println!("Reads read:    {}", stats.reads_total);
     println!("Reads written: {}", stats.reads_written);
     println!("Output: {}", args.output.display());
+
+    Ok(())
+}
+
+/// The paired-end branch of `fastdna filter` (`--input2`/`--output2` both
+/// given). Mirrors `run_filter`'s single-end body: the same fast,
+/// pre-header overwrite guard (extended to both R1/R2 inputs and both
+/// outputs, plus the pair-specific "`--output` and `--output2` must not be
+/// the same file" check `read_filter::run_filter_paired` also makes
+/// authoritatively -- see that function's own doc comment for why both
+/// copies exist), then `read_filter::run_filter_paired` itself.
+fn run_filter_paired(args: FilterArgs) -> Result<()> {
+    // `FilterArgs::validate` (already run by the caller) guarantees
+    // `--output2` is `Some` whenever `is_paired()` is true; this match
+    // keeps that invariant enforced without panicking if it is ever
+    // violated by a caller that skips `validate` (e.g. a future direct
+    // construction of `FilterArgs`).
+    let output2 = match &args.output2 {
+        Some(path) => path.clone(),
+        None => {
+            return Err(FastDnaError::InvalidConfig {
+                parameter: "--output2",
+                reason: "required for paired-end filtering".to_string(),
+            })
+        }
+    };
+
+    if fastdna_core::atomic::same_file(&args.output, &output2) {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "--output2",
+            reason: format!(
+                "output ({}) and output2 ({}) resolve to the same file: writing both mates of a \
+                 pair to one destination would leave it holding only whichever mate's write \
+                 committed last",
+                args.output.display(),
+                output2.display()
+            ),
+        });
+    }
+    for output in [&args.output, &output2] {
+        if fastdna_core::atomic::same_file(&args.table, output) {
+            return Err(FastDnaError::InvalidConfig {
+                parameter: "--output",
+                reason: format!(
+                    "points at the reference table {} and would overwrite it",
+                    args.table.display()
+                ),
+            });
+        }
+        for input in args.input.iter().chain(args.input2.iter()) {
+            if fastdna_core::atomic::same_file(input, output) {
+                return Err(FastDnaError::InvalidConfig {
+                    parameter: "--output",
+                    reason: format!(
+                        "points at the input file {} and would overwrite it",
+                        input.display()
+                    ),
+                });
+            }
+        }
+    }
+    fastdna_core::atomic::preflight_writable(&args.output)?;
+    fastdna_core::atomic::preflight_writable(&output2)?;
+
+    let inputs_r1: Vec<InputSpec> = args.input.iter().map(|p| InputSpec::from_arg(p)).collect();
+    let inputs_r2: Vec<InputSpec> = args.input2.iter().map(|p| InputSpec::from_arg(p)).collect();
+
+    println!("==================================================");
+    println!(" FastDNA: Paired-End Read Filtering                 ");
+    println!("==================================================");
+    println!("R1 input:     {}", format_inputs(&inputs_r1));
+    println!("R2 input:     {}", format_inputs(&inputs_r2));
+    println!("Table:        {}", args.table.display());
+    println!("Mode:         {:?}", args.mode);
+    println!("Min fraction: {}", args.min_fraction);
+    println!("--------------------------------------------------");
+
+    let table = KmerTable::open(&args.table)?;
+    println!("Reference k:  {}", table.k());
+    println!("Reference kmers: {}", table.len());
+    let index = read_filter::ReferenceIndex::from_table(&table)?;
+
+    let pb = spinner("Filtering read pairs...");
+    let start = Instant::now();
+    let stats = read_filter::run_filter_paired(
+        inputs_r1,
+        inputs_r2,
+        &index,
+        args.mode.into(),
+        args.min_fraction,
+        &args.output,
+        &output2,
+    )
+    .inspect_err(|_| pb.abandon())?;
+    let elapsed = start.elapsed().as_secs_f64();
+    pb.finish_with_message(format!("Filtering completed in {elapsed:.2}s"));
+
+    println!("--------------------------------------------------");
+    println!("Pairs read:    {}", stats.pairs_total);
+    println!("Pairs written: {}", stats.pairs_written);
+    println!("Output R1: {}", args.output.display());
+    println!("Output R2: {}", output2.display());
 
     Ok(())
 }
