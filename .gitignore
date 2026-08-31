@@ -25,3 +25,4 @@ venv/
 
 # Stray atomic-write temp files from interrupted agent runs
 *.py.tmp.*
+/FastDNA/
