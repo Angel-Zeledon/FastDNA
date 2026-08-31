@@ -35,7 +35,7 @@
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
@@ -1405,6 +1405,8 @@ fn ktab_union(py: Python<'_>, tables: Vec<PyRef<'_, PyKmerTable>>, output: Strin
     let combine = parse_combine_op(combine)?;
     let inner: Vec<KmerTable> = tables.iter().map(|t| t.inner.clone()).collect();
     let opened = py.allow_threads(|| -> Result<KmerTable, FastDnaError> {
+        let input_paths: Vec<&Path> = inner.iter().map(KmerTable::path).collect();
+        setops::guard_against_output_overwrite(&input_paths, Path::new(&output))?;
         let rows = setops::union(&inner, combine)?;
         let k = inner.first().map(KmerTable::k).unwrap_or(0);
         export::export_pairs_parquet(rows, &output, k)?;
@@ -1429,6 +1431,8 @@ fn ktab_intersect(
     let combine = parse_combine_op(combine)?;
     let inner: Vec<KmerTable> = tables.iter().map(|t| t.inner.clone()).collect();
     let opened = py.allow_threads(|| -> Result<KmerTable, FastDnaError> {
+        let input_paths: Vec<&Path> = inner.iter().map(KmerTable::path).collect();
+        setops::guard_against_output_overwrite(&input_paths, Path::new(&output))?;
         let rows = setops::intersect(&inner, combine)?;
         let k = inner.first().map(KmerTable::k).unwrap_or(0);
         export::export_pairs_parquet(rows, &output, k)?;
@@ -1455,6 +1459,9 @@ fn ktab_diff(
     let a_inner = a.inner.clone();
     let subtract_inner: Vec<KmerTable> = subtract.iter().map(|t| t.inner.clone()).collect();
     let opened = py.allow_threads(|| -> Result<KmerTable, FastDnaError> {
+        let input_paths: Vec<&Path> =
+            std::iter::once(a_inner.path()).chain(subtract_inner.iter().map(KmerTable::path)).collect();
+        setops::guard_against_output_overwrite(&input_paths, Path::new(&output))?;
         let rows = setops::diff(&a_inner, &subtract_inner, max_subtract_count)?;
         export::export_pairs_parquet(rows, &output, a_inner.k())?;
         KmerTable::open(&output)

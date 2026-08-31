@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import pathlib
 import random
+import re
 
 import pytest
 
@@ -194,7 +195,11 @@ def test_in_distribution_negative_sample_predicted_correctly_and_not_flagged(tmp
 def test_out_of_distribution_sample_is_flagged_and_warns(tmp_path, fitted_model):
     outlier = str(_out_of_distribution_sample(tmp_path))
 
-    with pytest.warns(OutOfDistributionWarning, match=outlier):
+    # `match` is a regex, and `outlier` is a raw filesystem path -- on
+    # Windows its backslashes (e.g. `\Users`) are regex metacharacters
+    # (`\U` is an incomplete unicode-escape), so it must be escaped rather
+    # than passed through verbatim.
+    with pytest.warns(OutOfDistributionWarning, match=re.escape(outlier)):
         result = fitted_model.predict(outlier)
 
     row = result.to_pylist()[0]

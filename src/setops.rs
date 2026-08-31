@@ -71,9 +71,37 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::path::Path;
 
 use crate::error::{FastDnaError, Result};
 use crate::ktab::{KmerTable, RangeIter};
+
+/// Rejects a set operation whose `--output` would overwrite one of its own
+/// input tables. Shared by the CLI (`main.rs::guard_against_setops_output_
+/// overwrite`, which calls straight into this) and the Python FFI
+/// (`ffi.rs::ktab_union`/`ktab_intersect`/`ktab_diff`, which had no such
+/// guard at all before this existed here -- `a.intersect(b, output=a_path)`
+/// silently replaced `a` with the, frequently empty, intersection; see
+/// `tests/review_findings.rs`/`python/tests/test_review_findings.py`).
+///
+/// Living here, in `fastdna_core`, rather than duplicated once per FFI
+/// function means every current and future caller of a set operation --
+/// CLI, Python, anything else built on this crate -- inherits the same
+/// check from the same place: a set op's inputs are read lazily, row group
+/// by row group, over the whole run (`MultiTableMerge`'s own doc comment),
+/// so a truncated output file landing on top of a live input would corrupt
+/// the very read still in progress.
+pub fn guard_against_output_overwrite(input_paths: &[&Path], output: &Path) -> Result<()> {
+    for input in input_paths {
+        if crate::atomic::same_file(input, output) {
+            return Err(FastDnaError::InvalidConfig {
+                parameter: "output",
+                reason: format!("points at the input table {} and would overwrite it", input.display()),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// How several tables' individual frequencies for the same k-mer are folded
 /// into the single `frequency` column the output shape provides. See

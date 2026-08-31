@@ -121,6 +121,12 @@ pub struct ReferenceIndex {
     /// Ascending, deduplicated -- inherited directly from `KmerTable::iter`'s
     /// own guarantee, never re-sorted here.
     kmers: Vec<u64>,
+    /// The reference table's own file, kept so `run_filter` can reject an
+    /// `--output` that points back at it (the table is fully consumed into
+    /// `kmers` up front, so nothing would notice a truncated reference file
+    /// mid-run -- the damage would only surface the next time anyone tried
+    /// to reopen it). See `run_filter`'s own doc comment for the full guard.
+    table_path: PathBuf,
 }
 
 impl ReferenceIndex {
@@ -134,7 +140,7 @@ impl ReferenceIndex {
             let (kmer, _count) = row?;
             kmers.push(kmer);
         }
-        Ok(Self { k: table.k(), kmers })
+        Ok(Self { k: table.k(), kmers, table_path: table.path().to_path_buf() })
     }
 
     /// The `k` every resident k-mer was packed with (the reference table's
@@ -142,6 +148,12 @@ impl ReferenceIndex {
     /// own.
     pub fn k(&self) -> usize {
         self.k
+    }
+
+    /// The reference table's own file -- see the field's doc comment for
+    /// why `run_filter` needs it.
+    pub fn table_path(&self) -> &Path {
+        &self.table_path
     }
 
     /// Number of distinct k-mers held in memory.
@@ -282,7 +294,18 @@ impl OutputWriter {
     fn finish(self) -> io::Result<()> {
         match self {
             OutputWriter::Plain(mut w) => w.flush(),
-            OutputWriter::Gz(w) => w.finish().map(|_| ()),
+            // `GzEncoder::finish()` writes the deflate tail and the 8-byte
+            // gzip trailer into the inner `BufWriter` -- but does not flush
+            // that `BufWriter` itself. Returning right after `finish()`
+            // would let those last bytes ride on `BufWriter`'s own `Drop`,
+            // which flushes on a best-effort basis and discards any error
+            // (a disk-full write there would be silently swallowed, and
+            // `AtomicFile::commit` would then rename a truncated `.gz` into
+            // place as if it were complete -- precisely what this enum's
+            // own doc comment says `finish` exists to prevent). `and_then`
+            // reaches the inner writer's own checked `flush` instead, so
+            // that error surfaces here like any other I/O failure.
+            OutputWriter::Gz(w) => w.finish().and_then(|mut inner| inner.flush()),
         }
     }
 }
@@ -361,6 +384,48 @@ pub fn filter_records<S: RecordSource, W: Write>(
     Ok(stats)
 }
 
+/// Rejects an `--output` that would overwrite the reference table or any
+/// input file a filtering run still needs to read.
+///
+/// This lives here, in `run_filter` itself, rather than only in the CLI
+/// (`main.rs::run_filter`'s own pre-check, kept for a fast, pre-header
+/// rejection there): `ffi.rs::filter_reads` -- the Python binding -- calls
+/// straight into this function with no CLI layer in between, so before this
+/// guard existed here, `KmerTable.filter_reads(output=<its own input>)` from
+/// Python silently destroyed the caller's file (`tests/review_findings.rs`/
+/// `python/tests/test_review_findings.py` pin exactly this). Putting the
+/// check here means the CLI, the Python binding, and any future
+/// `fastdna_core` consumer all inherit it from one place, instead of each
+/// needing its own copy.
+///
+/// A truncated output landing on top of a live input would corrupt the very
+/// read still in progress; a truncated output landing on top of the
+/// reference table would destroy it after it has already been fully
+/// consumed into a resident `ReferenceIndex` (so the run itself would
+/// "succeed", and only the next attempt to reopen the table would notice).
+fn guard_against_output_overwrite(inputs: &[InputSpec], index: &ReferenceIndex, output: &Path) -> Result<()> {
+    if crate::atomic::same_file(index.table_path(), output) {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "output",
+            reason: format!(
+                "points at the reference table {} and would overwrite it",
+                index.table_path().display()
+            ),
+        });
+    }
+    for input in inputs {
+        if let InputSpec::File(path) = input {
+            if crate::atomic::same_file(path, output) {
+                return Err(FastDnaError::InvalidConfig {
+                    parameter: "output",
+                    reason: format!("points at the input file {} and would overwrite it", path.display()),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The full filtering run: opens `inputs` as one concatenated stream (see
 /// the module doc comment's single-end scope note), filters it against
 /// `index` under `mode`/`min_fraction`, and writes the kept reads to
@@ -376,6 +441,7 @@ pub fn run_filter(
     output: &Path,
 ) -> Result<FilterStats> {
     validate_min_fraction(min_fraction)?;
+    guard_against_output_overwrite(&inputs, index, output)?;
 
     let source = MultiSourceReader::new(inputs);
     source.validate()?;

@@ -278,9 +278,35 @@ where
     let chunk_size = 131_072;
     let mut total_written = 0;
     let mut chunk = ChunkBuffers::with_capacity(chunk_size, k, false);
+    // The footer metadata written above claims `fastdna.sorted_by=kmer_u64`
+    // unconditionally -- true for every in-crate caller (`setops::union`/
+    // `intersect`/`diff`'s own merge is provably ascending), but `pairs` is
+    // a bare `IntoIterator`, reachable from outside the crate with no such
+    // guarantee. Writing the claim onto a stream that does not hold it would
+    // make the resulting file `KmerTable::open`-valid while silently lying
+    // about its own order -- exactly the failure `ktab::RangeIter`'s own
+    // cross-batch order check exists to catch on read, so it is caught here
+    // on write instead, before a single row leaves this function. Returning
+    // early (without calling `pending.commit()`) leaves the destination
+    // untouched and the temp file cleaned up by `AtomicFile`'s `Drop`, the
+    // same abandoned-write path every other error in this loop already
+    // takes via `?`.
+    let mut last_kmer: Option<u64> = None;
 
     for pair in pairs {
         let (kmer_bits, count) = pair?;
+        if let Some(prev) = last_kmer {
+            if kmer_bits < prev {
+                return Err(FastDnaError::InvalidConfig {
+                    parameter: "pairs",
+                    reason: format!(
+                        "k-mer {kmer_bits} was written after k-mer {prev}: pairs must be ascending \
+                         by kmer_u64, since this function always records fastdna.sorted_by=kmer_u64"
+                    ),
+                });
+            }
+        }
+        last_kmer = Some(kmer_bits);
         chunk.push(kmer_bits, k, count);
 
         if chunk.len() >= chunk_size {
@@ -390,6 +416,28 @@ pub fn export_cohort_matrix_parquet<P: AsRef<Path>>(
                 sample_ids.len()
             ),
         });
+    }
+    // The long/COO schema this function writes carries no sample key other
+    // than `sample_id` itself (see this function's own doc comment): two
+    // samples sharing one id would be unrecoverably merged into a single
+    // group of rows on read-back, while `fastdna.n_samples` in the footer
+    // still claims the original, higher count. Rejected here, before a
+    // single row is written, rather than left to silently corrupt the
+    // caller's cohort.
+    {
+        let mut seen = rustc_hash::FxHashMap::default();
+        for (row, id) in sample_ids.iter().enumerate() {
+            if let Some(&first_row) = seen.get(id.as_str()) {
+                return Err(FastDnaError::InvalidConfig {
+                    parameter: "sample_ids",
+                    reason: format!(
+                        "sample id {id:?} is used for both sample {first_row} and sample {row}; \
+                         every sample must have a distinct id"
+                    ),
+                });
+            }
+            seen.insert(id.as_str(), row);
+        }
     }
 
     let (file, pending) = AtomicFile::create(path)?;

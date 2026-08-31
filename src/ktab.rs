@@ -176,24 +176,40 @@ impl KmerTable {
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| load_err(&path, e))?;
 
         let schema = builder.schema();
+        // Both columns must be declared non-nullable, not merely the right
+        // type: `counts_schema`/`counts_schema`-shaped writers never emit a
+        // null in either column (every row is a real, counted k-mer), and
+        // `get`/`RangeIter` below decode with `Array::value(i)`, which
+        // silently returns the *other* row's payload for a null slot rather
+        // than erroring (Arrow's null-safe `value` contract is "the bit
+        // pattern is unspecified for a null index", not "zero" or "panic").
+        // A table with `kmer_u64=[null, 10, 20]`, `frequency=[5, null, 7]`
+        // would otherwise open as `len=3` and answer `get(10) == Some(5)` --
+        // another row's count entirely. Rejecting a nullable schema here is
+        // the one check that closes that door, before a single row is ever
+        // decoded.
         let kmer_col = schema
             .index_of("kmer_u64")
             .ok()
-            .filter(|&i| schema.field(i).data_type() == &DataType::UInt64)
+            .filter(|&i| schema.field(i).data_type() == &DataType::UInt64 && !schema.field(i).is_nullable())
             .ok_or_else(|| {
                 load_reason(
                     &path,
-                    "missing a kmer_u64: uint64 column -- this is not a FastDNA k-mer table \
-                     (or --with-sequence encoded k-mer_u64 under a different type)"
+                    "missing a non-nullable kmer_u64: uint64 column -- this is not a FastDNA k-mer \
+                     table (or --with-sequence encoded k-mer_u64 under a different type)"
                         .to_string(),
                 )
             })?;
         let freq_col = schema
             .index_of("frequency")
             .ok()
-            .filter(|&i| schema.field(i).data_type() == &DataType::UInt32)
+            .filter(|&i| schema.field(i).data_type() == &DataType::UInt32 && !schema.field(i).is_nullable())
             .ok_or_else(|| {
-                load_reason(&path, "missing a frequency: uint32 column -- this is not a FastDNA k-mer table".to_string())
+                load_reason(
+                    &path,
+                    "missing a non-nullable frequency: uint32 column -- this is not a FastDNA k-mer table"
+                        .to_string(),
+                )
             })?;
 
         let metadata = builder.metadata().clone();
@@ -293,6 +309,16 @@ impl KmerTable {
         self.k
     }
 
+    /// The file this table was opened from. Needed by any caller that must
+    /// check a *destination* path against a table's own source before
+    /// writing to it (`read_filter::run_filter`'s reference-table guard,
+    /// `setops`'s "don't let a set operation's output overwrite one of its
+    /// own inputs" guard) -- both need the path a `KmerTable` was built
+    /// from, not just its decoded rows.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Total row count, read from Parquet row-group metadata at `open` time
     /// (no row decoded) -- the table's distinct-k-mer count.
     pub fn len(&self) -> u64 {
@@ -348,6 +374,7 @@ impl KmerTable {
             kmer_col: self.kmer_col,
             freq_col: self.freq_col,
             buffer: VecDeque::new(),
+            last_yielded: None,
         })
     }
 
@@ -371,6 +398,26 @@ pub struct RangeIter {
     kmer_col: usize,
     freq_col: usize,
     buffer: VecDeque<(u64, u32)>,
+    /// The last `kmer_u64` this iterator has actually handed back, across
+    /// every Arrow batch decoded so far (not just the current one) --
+    /// `None` before the first row is yielded.
+    ///
+    /// `KmerTable::open` only verifies order at row-group *boundaries*
+    /// (cheap, footer-statistics-only -- see its own doc comment for why);
+    /// a single-row-group table that carries the right `fastdna.sorted_by`
+    /// metadata but whose rows are not actually ascending is accepted by
+    /// `open` by design. Both of this iterator's real consumers --
+    /// `setops::MultiTableMerge`'s binary-heap merge and `read_filter::
+    /// ReferenceIndex`'s `binary_search` -- silently assume this iterator's
+    /// own order guarantee holds, so a corrupt or hand-built (e.g. plain
+    /// pyarrow) file that violates it must not be allowed to propagate
+    /// silently wrong results (a merge-join miscounting an intersection, a
+    /// binary search finding the wrong row's frequency). This field lets
+    /// `next` compare across batch boundaries and refuse to continue
+    /// (`Err`) the moment true disorder is found, rather than only within
+    /// one small Arrow batch (see the per-batch sort in `next` below for
+    /// what that narrower, cheaper repair already covers on its own).
+    last_yielded: Option<u64>,
 }
 
 impl Iterator for RangeIter {
@@ -378,8 +425,23 @@ impl Iterator for RangeIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(pair) = self.buffer.pop_front() {
-                return Some(Ok(pair));
+            if let Some((kmer, freq)) = self.buffer.pop_front() {
+                if let Some(prev) = self.last_yielded {
+                    if kmer < prev {
+                        return Some(Err(load_reason(
+                            &self.path,
+                            format!(
+                                "k-mer {kmer} was read after k-mer {prev}: this table's rows are not \
+                                 actually sorted ascending by kmer_u64, even though its footer metadata \
+                                 claims `fastdna.sorted_by=kmer_u64` -- refusing to read further rather \
+                                 than silently returning results computed over an assumed order that \
+                                 does not hold"
+                            ),
+                        )));
+                    }
+                }
+                self.last_yielded = Some(kmer);
+                return Some(Ok((kmer, freq)));
             }
 
             match self.reader.next() {
@@ -400,13 +462,28 @@ impl Iterator for RangeIter {
                             }))
                         }
                     };
+                    let mut pending: Vec<(u64, u32)> = Vec::with_capacity(batch.num_rows());
                     for i in 0..batch.num_rows() {
                         let kmer = kmers.value(i);
                         if kmer < self.low || kmer > self.high {
                             continue;
                         }
-                        self.buffer.push_back((kmer, freqs.value(i)));
+                        pending.push((kmer, freqs.value(i)));
                     }
+                    // A Parquet reader hands back one Arrow batch at a time
+                    // (far smaller than a whole row group), and every batch
+                    // this crate's own writers (`export.rs`) ever produce is
+                    // already ascending -- so for well-formed input, this
+                    // sort is a single no-swap comparison pass, not real
+                    // work. It only does anything against a batch built
+                    // outside this crate whose actual row order does not
+                    // match its declared order: repairing *within* one
+                    // batch this cheaply is worth doing before falling back
+                    // to the harder, cross-batch check above (which cannot
+                    // repair anything -- rows from an earlier batch have
+                    // already been handed to the caller).
+                    pending.sort_unstable_by_key(|&(kmer, _)| kmer);
+                    self.buffer.extend(pending);
                     // An empty (fully filtered-out) batch loops back around
                     // rather than returning `None` early -- more batches may
                     // still hold matching rows.
