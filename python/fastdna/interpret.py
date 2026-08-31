@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING, Any, Sequence, Union
 
 import pyarrow as pa
 
+from . import _core
+
 # Deliberately no top-level `numpy` import: like scikit-learn/scipy/UMAP/
 # Biopython elsewhere in this package's convention, anything not needed by
 # every caller of this module stays out of its hard import cost.
@@ -62,7 +64,7 @@ def _validate_lengths(importances, feature_names):
     importances = list(importances)
     feature_names = list(feature_names)
     if any(hasattr(x, "__len__") for x in importances):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"importances must be a 1-D array-like (one value per feature), "
             f"got what looks like a 2-D/nested structure instead. If this "
             f"came from LogisticRegression.coef_ on a multi-class problem, "
@@ -70,7 +72,7 @@ def _validate_lengths(importances, feature_names):
         )
     importances = [float(x) for x in importances]
     if len(importances) != len(feature_names):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"importances and feature_names must have the same length -- "
             f"got {len(importances)} importances but {len(feature_names)} "
             f"feature names. A silent mismatch here would map an importance "

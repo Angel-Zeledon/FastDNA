@@ -89,6 +89,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from . import _core
+
 __all__ = ["CalibratedEstimator", "calibrate"]
 
 _METHODS = ("venn_abers", "platt")
@@ -107,18 +109,24 @@ def _decision_scores(estimator, X, caller):
     elif hasattr(estimator, "predict_proba"):
         scores = np.asarray(estimator.predict_proba(X))[:, 1]
     else:
+        # No leaf in the fastdna._core exception hierarchy inherits from
+        # TypeError (every leaf is a ValueError/OSError/FileNotFoundError/
+        # MemoryError/RuntimeError subclass), so this stays a bare TypeError
+        # rather than losing isinstance(e, TypeError) compatibility for
+        # existing callers (see python/tests/test_calibration.py's
+        # pytest.raises(TypeError, ...) on this exact call).
         raise TypeError(
             f"{caller} needs an estimator exposing decision_function() or "
             f"predict_proba(), but {type(estimator).__name__} has neither."
         )
     scores = np.asarray(scores, dtype=np.float64).reshape(-1)
     if scores.shape[0] != len(X):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller}: the estimator's scores have {scores.shape[0]} entries but X has "
             f"{len(X)} rows -- decision_function()/predict_proba() returned the wrong shape."
         )
     if not np.all(np.isfinite(scores)):
-        raise ValueError(f"{caller}: the estimator produced non-finite scores (NaN/inf).")
+        raise _core.InvalidConfigError(f"{caller}: the estimator produced non-finite scores (NaN/inf).")
     return scores
 
 
@@ -246,7 +254,7 @@ class CalibratedEstimator:
         single sigmoid-fit probability with no analogous interval.
         """
         if self.method != "venn_abers":
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"predict_interval() is only defined for method='venn_abers', but this "
                 f"CalibratedEstimator was fit with method={self.method!r}. Platt scaling "
                 "produces a single probability with no interval to report."
@@ -298,26 +306,26 @@ def calibrate(
     CalibratedEstimator
     """
     if method not in _METHODS:
-        raise ValueError(f"method must be one of {_METHODS}, got {method!r}")
+        raise _core.InvalidConfigError(f"method must be one of {_METHODS}, got {method!r}")
 
     y_calib = np.asarray(y_calib)
     if y_calib.ndim != 1:
-        raise ValueError(f"calibrate() needs a 1-D y_calib, got shape {y_calib.shape}")
+        raise _core.InvalidConfigError(f"calibrate() needs a 1-D y_calib, got shape {y_calib.shape}")
     classes = np.unique(y_calib)
     if len(classes) != 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"calibrate() needs binary y_calib (exactly two classes), got {len(classes)} "
             f"class{'es' if len(classes) != 1 else ''}: {classes.tolist()[:5]}"
         )
 
     scores = _decision_scores(estimator, X_calib, "calibrate()")
     if scores.shape[0] != len(y_calib):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"calibrate() needs one label per calibration sample: X_calib scored "
             f"{scores.shape[0]} rows but y_calib has {len(y_calib)} labels."
         )
     if scores.shape[0] < 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"calibrate() needs at least 2 calibration samples to fit anything, got "
             f"{scores.shape[0]}."
         )

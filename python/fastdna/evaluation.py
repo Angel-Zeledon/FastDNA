@@ -90,6 +90,8 @@ from typing import Any, NamedTuple, Optional, Sequence, Union
 import numpy as np
 import pyarrow as pa
 
+from . import _core
+
 __all__ = [
     "UncalibratedScoresWarning",
     "PrecisionRecallReport",
@@ -164,10 +166,10 @@ class CalibrationReport(NamedTuple):
 def _validate_binary_y_true(y_true, caller):
     y_true = np.asarray(y_true)
     if y_true.ndim != 1:
-        raise ValueError(f"{caller} needs a 1-D y_true, got shape {y_true.shape}")
+        raise _core.InvalidConfigError(f"{caller} needs a 1-D y_true, got shape {y_true.shape}")
     classes = np.unique(y_true)
     if len(classes) != 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller} needs binary labels (exactly two classes) in y_true, got "
             f"{len(classes)} class{'es' if len(classes) != 1 else ''}: "
             f"{classes.tolist()[:5]}{', ...' if len(classes) > 5 else ''}."
@@ -178,9 +180,9 @@ def _validate_binary_y_true(y_true, caller):
 def _validate_matching_length(y_true, scores, score_name, caller):
     scores = np.asarray(scores, dtype=np.float64)
     if scores.ndim != 1:
-        raise ValueError(f"{caller} needs a 1-D {score_name}, got shape {scores.shape}")
+        raise _core.InvalidConfigError(f"{caller} needs a 1-D {score_name}, got shape {scores.shape}")
     if len(scores) != len(y_true):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller} needs one {score_name} per label: y_true has {len(y_true)} entries "
             f"but {score_name} has {len(scores)}."
         )
@@ -238,7 +240,7 @@ def precision_recall_report(
     y_true, classes = _validate_binary_y_true(y_true, "precision_recall_report()")
     y_score = _validate_matching_length(y_true, y_score, "y_score", "precision_recall_report()")
     if not np.all(np.isfinite(y_score)):
-        raise ValueError("precision_recall_report() requires finite y_score values (no NaN/inf).")
+        raise _core.InvalidConfigError("precision_recall_report() requires finite y_score values (no NaN/inf).")
 
     label = classes[1] if pos_label is None else pos_label
 
@@ -334,10 +336,10 @@ def calibration_report(
     y_true, classes = _validate_binary_y_true(y_true, "calibration_report()")
     y_prob = _validate_matching_length(y_true, y_prob, "y_prob", "calibration_report()")
     if not np.all(np.isfinite(y_prob)):
-        raise ValueError("calibration_report() requires finite y_prob values (no NaN/inf).")
+        raise _core.InvalidConfigError("calibration_report() requires finite y_prob values (no NaN/inf).")
     if np.any((y_prob < 0.0) | (y_prob > 1.0)):
         bad = y_prob[(y_prob < 0.0) | (y_prob > 1.0)]
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"calibration_report() requires y_prob values in [0, 1] (a probability), got "
             f"values outside that range, e.g. {bad[:5].tolist()}. Raw scores that are not "
             "probabilities (e.g. a decision_function() output) belong in "

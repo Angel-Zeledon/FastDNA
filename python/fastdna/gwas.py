@@ -163,6 +163,12 @@ def _resolve_cohort(paths, *, caller):
     exactly the population-structure artifact this module warns about.
     """
     if isinstance(paths, (str, os.PathLike)):
+        # No leaf in the fastdna._core exception hierarchy inherits from
+        # TypeError (every leaf is a ValueError/OSError/FileNotFoundError/
+        # MemoryError/RuntimeError subclass), so this stays a bare TypeError
+        # rather than losing isinstance(e, TypeError) compatibility for
+        # existing callers (see python/tests/test_gwas.py's
+        # pytest.raises(TypeError, ...) on this exact call).
         raise TypeError(
             f"{caller}() expects a list of paths (or a {{sample_id: path}} mapping), got a "
             f"single path {str(paths)!r} -- wrap it in a list: [{str(paths)!r}]"
@@ -174,7 +180,7 @@ def _resolve_cohort(paths, *, caller):
         items = [(_sample_id_from_path(path), str(path)) for path in paths]
 
     if len(items) < 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller}() needs at least 2 samples to compare, got {len(items)}. "
             "A cohort of one has no contrast to measure and no population structure "
             "to correct for."
@@ -188,7 +194,7 @@ def _resolve_cohort(paths, *, caller):
         detail = "; ".join(
             f"{sample_id!r} <- " + ", ".join(repr(p) for p in found) for sample_id, found in sorted(collisions.items())
         )
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller}(): duplicate sample id(s) derived from the given file names: {detail}. "
             "Sample ids must be unique -- pass an explicit {sample_id: path} mapping to name "
             "them yourself (files from different runs or directories routinely share a name)."
@@ -200,7 +206,7 @@ def _resolve_cohort(paths, *, caller):
     repeated = {path: ids for path, ids in by_path.items() if len(ids) > 1}
     if repeated:
         detail = "; ".join(f"{path!r} as " + ", ".join(repr(i) for i in ids) for path, ids in sorted(repeated.items()))
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller}(): the same file appears more than once in the cohort: {detail}. "
             "Counting one sample twice inflates its lineage's weight in every prevalence "
             "count and every association test -- remove the duplicate entry."
@@ -213,7 +219,7 @@ def _positive_int_or_none(value, name):
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
-        raise ValueError(f"{name} must be a positive int or None, got {value!r}")
+        raise _core.InvalidConfigError(f"{name} must be a positive int or None, got {value!r}")
     return int(value)
 
 
@@ -324,10 +330,10 @@ def cohort_presence_matrix(
 
     max_kmers = _positive_int_or_none(max_kmers, "max_kmers")
     if isinstance(min_samples, bool) or not isinstance(min_samples, (int, np.integer)) or min_samples < 1:
-        raise ValueError(f"min_samples must be a positive int, got {min_samples!r}")
+        raise _core.InvalidConfigError(f"min_samples must be a positive int, got {min_samples!r}")
     min_samples = int(min_samples)
     if min_samples > n_samples:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"min_samples={min_samples} exceeds the cohort size ({n_samples} samples): no k-mer "
             f"can be present in more samples than exist, so the matrix would come back empty. "
             f"Use min_samples <= {n_samples}."
@@ -607,7 +613,7 @@ def export_pyseer_kmers(
         if any(ch.isspace() for ch in sample_id):
             offending.append("whitespace")
         if offending:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"sample id {sample_id!r} contains {', '.join(repr(o) for o in offending)}, which the "
                 "pyseer/fsm-lite k-mer line format reserves: pyseer splits each line on '|' and then "
                 "each entry on ':', so this id would be silently mis-parsed as a different sample. "
@@ -1055,28 +1061,28 @@ def prefilter_association(
     from scipy import stats
 
     if test not in _BINARY_TESTS + _CONTINUOUS_TESTS:
-        raise ValueError(f"test must be one of {_BINARY_TESTS + _CONTINUOUS_TESTS!r}, got {test!r}")
+        raise _core.InvalidConfigError(f"test must be one of {_BINARY_TESTS + _CONTINUOUS_TESTS!r}, got {test!r}")
     is_continuous = test in _CONTINUOUS_TESTS
     top_n = _positive_int_or_none(top_n, "top_n")
 
     n_samples, n_kmers = matrix.shape
     if n_samples < 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"prefilter_association() needs at least 2 samples, got a matrix with {n_samples} row(s). "
             "A single sample has no case/control contrast to test."
         )
 
     phenotype_array = np.asarray(phenotype)
     if phenotype_array.ndim != 1:
-        raise ValueError(f"phenotype must be 1-dimensional, got shape {phenotype_array.shape}")
+        raise _core.InvalidConfigError(f"phenotype must be 1-dimensional, got shape {phenotype_array.shape}")
     if phenotype_array.size != n_samples:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"phenotype has {phenotype_array.size} entries but the matrix has {n_samples} samples (rows). "
             "They must line up element by element: phenotype[i] is the phenotype of the sample in "
             "row i, in the same order cohort_presence_matrix() returned its sample_ids."
         )
     if len(kmer_sequences) != n_kmers:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"kmer_sequences has {len(kmer_sequences)} entries but the matrix has {n_kmers} columns. "
             "Pass the kmer_sequences that cohort_presence_matrix() returned alongside this matrix -- "
             "a mismatched list would label every result with the wrong k-mer."
@@ -1090,7 +1096,7 @@ def prefilter_association(
         # `number`-like in numpy, so a `[True, False, ...]` phenotype is
         # also rejected -- it belongs in binary mode.
         if not np.issubdtype(phenotype_array.dtype, np.number):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype must be numeric for a continuous test (test={test!r}), got dtype "
                 f"{phenotype_array.dtype}. Encode it as int/float, or use test='fisher'/'chi2' for a "
                 "genuinely binary (two-class) phenotype instead."
@@ -1098,27 +1104,27 @@ def prefilter_association(
         phenotype_array = phenotype_array.astype(np.float64)
         finite = np.isfinite(phenotype_array)
         if not finite.all():
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype contains {int((~finite).sum())} NaN/inf value(s), which test={test!r} "
                 "cannot use -- a t/F statistic computed against a NaN or infinite phenotype value is "
                 "meaningless for every k-mer, not just the affected sample(s). Drop or impute those "
                 "samples before calling prefilter_association()."
             )
         if np.unique(phenotype_array).size < 2:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype has zero variance (every value is {float(phenotype_array[0])!r}): there is "
                 "nothing to associate against. Check that the phenotype column was read correctly."
             )
     else:
         classes = np.unique(phenotype_array)
         if classes.size < 2:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype has a single class ({classes.tolist()!r}): there is nothing to associate against. "
                 "Check that the phenotype column was read correctly and that both cases and controls "
                 "are present in this cohort."
             )
         if classes.size > 2:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype has {classes.size} distinct values, but test={test!r} only supports a "
                 "binary phenotype. Encode it as 0/1 (or False/True) yourself if it really is binary; "
                 "for a genuinely continuous phenotype pass test='welch' (or test='anova') instead of "

@@ -124,6 +124,7 @@ import pyarrow as pa
 from sklearn.base import clone
 from sklearn.model_selection import cross_val_predict
 
+from . import _core
 from .annotate import annotate_rule, load_annotation
 from .cv import LineageKFold, lineage_groups, permutation_importance_pvalues
 from .equivalence import EquivalenceClasses, collapse_equivalence_classes
@@ -298,7 +299,7 @@ def _align_phenotype(phenotype, sample_ids):
                 parts.append(f"missing a value for {missing}")
             if extra:
                 parts.append(f"has unexpected id(s) {extra}")
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype mapping does not match the cohort's sample ids: "
                 f"{' and '.join(parts)}. Every sample id cohort_presence_matrix() derived "
                 f"({sample_ids}) needs exactly one phenotype value, and vice versa."
@@ -308,7 +309,7 @@ def _align_phenotype(phenotype, sample_ids):
     arr = np.asarray(phenotype)
     if arr.ndim != 1 or len(arr) != len(sample_ids):
         shape = arr.shape if arr.ndim != 1 else (len(arr),)
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"phenotype has shape {shape} but the cohort has {len(sample_ids)} samples. Pass "
             "phenotype as a {sample_id: value} mapping to avoid depending on row order, or a "
             "1-D array/list with exactly one entry per sample, in the same order as `paths` "
@@ -488,7 +489,7 @@ class AssociationWorkflow:
         annotate_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         if (reference_fasta is None) != (annotation_path is None):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "reference_fasta and annotation_path must be given together, or not at all -- "
                 f"got reference_fasta={reference_fasta!r}, annotation_path={annotation_path!r}. "
                 "Gene-annotation lookup needs both the reference sequence and its annotation."
@@ -548,7 +549,7 @@ class AssociationWorkflow:
         if self.groups is not None:
             groups = np.asarray(self.groups)
             if len(groups) != len(sample_ids):
-                raise ValueError(
+                raise _core.InvalidConfigError(
                     f"groups has {len(groups)} entries but the cohort has {len(sample_ids)} samples "
                     f"({sample_ids}). Pass one lineage label per sample, in the same order as `paths`, "
                     "or omit groups= to derive them automatically with cv.lineage_groups()."
@@ -616,7 +617,7 @@ class AssociationWorkflow:
         annotations = None
         if self.reference_fasta is not None:
             if not hasattr(fitted_classifier, "rules_"):
-                raise ValueError(
+                raise _core.InvalidConfigError(
                     "reference_fasta/annotation_path were given, but the fitted classifier "
                     f"({type(fitted_classifier).__name__}) exposes no `.rules_` to annotate -- "
                     "gene-annotation lookup is only meaningful for a rule-based model like "
@@ -654,9 +655,9 @@ class AssociationWorkflow:
         `plotting.plot_significance` (e.g. `x`, `positions`, `ax`).
         """
         if self.result_ is None:
-            raise ValueError("plot_significance() needs run() to have been called first.")
+            raise _core.InvalidConfigError("plot_significance() needs run() to have been called first.")
         if self.result_.screening is None:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "plot_significance() needs a screening table, but this workflow was run with "
                 "screen=False, so result_.screening is None. Re-run with screen=True (the "
                 "default) to produce one."
@@ -680,7 +681,7 @@ class AssociationWorkflow:
         `groups=` here overrides the cached lineage groups.
         """
         if self.result_ is None:
-            raise ValueError("plot_population_structure() needs run() to have been called first.")
+            raise _core.InvalidConfigError("plot_population_structure() needs run() to have been called first.")
 
         if self._distance_matrix is None:
             similarity, kinship_sample_ids = kinship_matrix(self._cohort_mapping)

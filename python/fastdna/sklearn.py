@@ -51,7 +51,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
 import fastdna
-from fastdna import _column_as_array, _decode_kmers
+from fastdna import _column_as_array, _core, _decode_kmers
 
 __all__ = ["KmerVectorizer", "DepthConfoundingWarning"]
 
@@ -99,6 +99,13 @@ def _validate_paths(X, method_name):
     `FileNotFoundError` deep inside the counting loop.
     """
     if isinstance(X, (str, os.PathLike)):
+        # No leaf in the fastdna._core exception hierarchy inherits from
+        # TypeError (every leaf is a ValueError/OSError/FileNotFoundError/
+        # MemoryError/RuntimeError subclass), so this stays a bare TypeError
+        # rather than losing isinstance(e, TypeError) compatibility for
+        # existing callers (see python/tests/test_sklearn.py's
+        # pytest.raises(TypeError, ...) on fit()/transform() with a bare
+        # string).
         raise TypeError(
             f"KmerVectorizer.{method_name}() expects a list of paths, got a single "
             f"path {str(X)!r} -- wrap it in a list: [{str(X)!r}]"
@@ -314,11 +321,11 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         """
         paths = _validate_paths(X, "fit")
         if not paths:
-            raise ValueError("KmerVectorizer.fit() requires at least one sample path, got an empty X")
+            raise _core.InvalidConfigError("KmerVectorizer.fit() requires at least one sample path, got an empty X")
         seen: set[str] = set()
         for path in paths:
             if path in seen:
-                raise ValueError(
+                raise _core.InvalidConfigError(
                     f"X contains a duplicate path: {path!r}. Each training sample may "
                     "appear only once -- a duplicated path would double-count its "
                     "k-mers' prevalence, the vocabulary ranking's primary criterion."
@@ -327,11 +334,11 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         if self.top_features is not None and (
             not isinstance(self.top_features, (int, np.integer)) or isinstance(self.top_features, bool) or self.top_features <= 0
         ):
-            raise ValueError(f"top_features must be a positive int or None, got {self.top_features!r}")
+            raise _core.InvalidConfigError(f"top_features must be a positive int or None, got {self.top_features!r}")
         if self.chunk_size is not None and (
             not isinstance(self.chunk_size, (int, np.integer)) or isinstance(self.chunk_size, bool) or self.chunk_size <= 0
         ):
-            raise ValueError(f"chunk_size must be a positive int or None, got {self.chunk_size!r}")
+            raise _core.InvalidConfigError(f"chunk_size must be a positive int or None, got {self.chunk_size!r}")
         return paths
 
     def _count_cohort(self, keys):

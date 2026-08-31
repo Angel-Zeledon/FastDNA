@@ -63,6 +63,7 @@ import numpy as np
 import pyarrow as pa
 
 import fastdna
+from . import _core
 
 __all__ = ["lineage_groups", "LineageKFold", "permutation_importance_pvalues"]
 
@@ -82,14 +83,14 @@ def _validate_paths(paths, caller):
     """
     paths = [str(p) for p in paths]
     if len(paths) < 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller} needs at least 2 paths to compute pairwise distances, got {len(paths)}"
         )
 
     seen = set()
     for path in paths:
         if path in seen:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"paths contains a duplicate entry: {path!r}. Each sample may appear "
                 "only once; a duplicated path would collapse two rows of the distance "
                 "matrix onto one index and silently leave the earlier one all zeros."
@@ -201,7 +202,7 @@ def lineage_groups(
     """
     paths = _validate_paths(paths, "lineage_groups()")
     if not distance_threshold > 0:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"distance_threshold must be a positive Mash distance, got {distance_threshold!r}. "
             "At or below 0 every sample becomes its own lineage, which defeats the point."
         )
@@ -289,13 +290,13 @@ class LineageKFold:
         distance_threshold: float = 0.01,
     ) -> None:
         if (paths is None) == (groups is None):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "LineageKFold requires exactly one of paths= or groups=: pass paths= to "
                 "derive lineages from the genomes with lineage_groups(), or groups= to "
                 "supply labels you already have."
             )
         if not isinstance(n_splits, (int, np.integer)) or isinstance(n_splits, bool) or n_splits < 2:
-            raise ValueError(f"n_splits must be an integer >= 2, got {n_splits!r}")
+            raise _core.InvalidConfigError(f"n_splits must be an integer >= 2, got {n_splits!r}")
 
         self.n_splits = int(n_splits)
         self.paths = None if paths is None else [str(p) for p in paths]
@@ -315,7 +316,7 @@ class LineageKFold:
     def _check_n_splits(self, groups):
         n_groups = len(np.unique(groups))
         if self.n_splits > n_groups:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"n_splits={self.n_splits} exceeds the number of distinct lineages "
                 f"({n_groups}) found in this cohort. A fold boundary can only fall "
                 "between lineages, so more folds than lineages is impossible without "
@@ -382,7 +383,7 @@ class LineageKFold:
         lineages = self.groups_
         n = _n_samples(X)
         if n != len(lineages):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"X has {n} samples but this splitter was built from {len(lineages)} "
                 "lineage labels. X must have one entry per sample, in the same order as "
                 "the paths= or groups= given at construction."
@@ -419,7 +420,7 @@ def _model_importances(fitted, n_features, model_repr):
     if importances is None:
         coef = getattr(fitted, "coef_", None)
         if coef is None:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"permutation_importance_pvalues() needs a model exposing per-feature "
                 f"importances, but {model_repr} has neither `coef_` nor "
                 "`feature_importances_` after fitting. Linear models (LogisticRegression, "
@@ -433,7 +434,7 @@ def _model_importances(fitted, n_features, model_repr):
     importances = np.asarray(importances, dtype=np.float64).ravel()
 
     if importances.shape[0] != n_features:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"the fitted model reports {importances.shape[0]} importances but X has "
             f"{n_features} columns"
         )
@@ -545,7 +546,7 @@ def permutation_importance_pvalues(
     it" is not evidence that no draw ever could.
     """
     if not isinstance(n_permutations, (int, np.integer)) or isinstance(n_permutations, bool) or n_permutations < 1:
-        raise ValueError(f"n_permutations must be a positive integer, got {n_permutations!r}")
+        raise _core.InvalidConfigError(f"n_permutations must be a positive integer, got {n_permutations!r}")
 
     try:
         from sklearn.base import clone
@@ -557,7 +558,7 @@ def permutation_importance_pvalues(
     n_features = int(getattr(X, "shape", (n_samples, len(feature_names)))[1])
 
     if len(feature_names) != n_features:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"feature_names has {len(feature_names)} entries but X has {n_features} "
             "columns. A silent mismatch would attach a p-value to the WRONG feature, so "
             "this is refused rather than truncated. feature_names should be exactly "
@@ -566,12 +567,12 @@ def permutation_importance_pvalues(
 
     y = np.asarray(y)
     if len(y) != n_samples:
-        raise ValueError(f"y has {len(y)} entries but X has {n_samples} samples")
+        raise _core.InvalidConfigError(f"y has {len(y)} entries but X has {n_samples} samples")
 
     if groups is not None:
         groups = np.asarray(groups)
         if len(groups) != n_samples:
-            raise ValueError(f"groups has {len(groups)} entries but X has {n_samples} samples")
+            raise _core.InvalidConfigError(f"groups has {len(groups)} entries but X has {n_samples} samples")
 
     model_repr = type(model).__name__
     observed = _model_importances(clone(model).fit(X, y), n_features, model_repr)
