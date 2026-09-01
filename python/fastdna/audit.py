@@ -312,6 +312,7 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 import numpy as np
 import pyarrow as pa
 
+from . import _core
 from .cv import LineageKFold, lineage_groups, lineage_groups_at_thresholds
 
 __all__ = [
@@ -504,15 +505,21 @@ class LeakageCurvePoint:
     score_lineage : float
         Mean `cross_val_score` under `cv.LineageKFold(groups=...)` at this
         threshold's grouping -- the same quantity `AuditReport.score_lineage`
-        is, at this point's threshold instead of the primary one.
+        is, at this point's threshold instead of the primary one. `nan` if
+        this threshold's grouping has fewer lineages than `n_splits` (see
+        `n_lineages` on this same point for why) -- a wide sweep routinely
+        includes thresholds too coarse to block on, and that must not
+        discard the rest of the curve or of `audit()`'s report.
     score_lineage_std : float
-        Standard deviation across that splitter's folds.
+        Standard deviation across that splitter's folds. `nan` under the
+        same condition as `score_lineage`.
     gap : float
         `AuditReport.score_random` (the single, threshold-independent
         random-CV baseline) minus this point's `score_lineage`. Directly
         comparable across points, and to `AuditReport.gap` itself, because
         `score_random` is the same number everywhere on the curve -- only
-        the lineage-blocked side changes with `threshold`.
+        the lineage-blocked side changes with `threshold`. `nan` under the
+        same condition as `score_lineage`.
     confounding : Confounding
         `AuditReport.confounding`, recomputed at this threshold's grouping
         -- see `Confounding` and the module docstring's "Phenotype-vs-
@@ -1422,18 +1429,39 @@ def audit(
             threshold_n_lineages = int(np.unique(threshold_groups).size)
             _warn_if_degenerate(threshold_n_lineages, f"the grouping at threshold {threshold:g}")
 
-            threshold_cv = LineageKFold(n_splits=n_splits, groups=threshold_groups)
-            threshold_scores = np.asarray(
-                cross_val_score(clone(estimator), paths, phenotype, cv=threshold_cv, scoring=resolved_scoring),
-                dtype=np.float64,
-            )
-            threshold_score = _nan_aware_mean(threshold_scores)
+            # A curve deliberately sweeps a wide threshold range, and a
+            # coarse-enough threshold can collapse the lineage count below
+            # n_splits (LineageKFold's own requirement) even when the
+            # primary threshold's grouping is fine. That must fail THIS
+            # point only, not the whole curve -- and not the rest of
+            # audit()'s report, which was already computed above -- so
+            # this point is reported with NaN scores/gap rather than
+            # raising, and n_lineages on the point itself is the reason
+            # why. confounding is model-free and never depends on
+            # n_splits, so it is still computed even when the CV
+            # comparison could not be.
+            try:
+                threshold_cv = LineageKFold(n_splits=n_splits, groups=threshold_groups)
+                threshold_scores = np.asarray(
+                    cross_val_score(
+                        clone(estimator), paths, phenotype, cv=threshold_cv, scoring=resolved_scoring
+                    ),
+                    dtype=np.float64,
+                )
+                threshold_score = _nan_aware_mean(threshold_scores)
+                threshold_score_std = _nan_aware_std(threshold_scores)
+                threshold_gap = float(mean_random - threshold_score)
+            except _core.InvalidConfigError:
+                threshold_score = float("nan")
+                threshold_score_std = float("nan")
+                threshold_gap = float("nan")
+
             points_by_threshold[threshold] = LeakageCurvePoint(
                 threshold=threshold,
                 n_lineages=threshold_n_lineages,
                 score_lineage=threshold_score,
-                score_lineage_std=_nan_aware_std(threshold_scores),
-                gap=float(mean_random - threshold_score),
+                score_lineage_std=threshold_score_std,
+                gap=threshold_gap,
                 confounding=_confounding(estimator, threshold_groups, phenotype),
             )
 

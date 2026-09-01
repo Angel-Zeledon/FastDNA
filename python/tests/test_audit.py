@@ -560,6 +560,48 @@ def test_lineage_threshold_curve_warns_only_at_the_degenerate_point(tmp_path):
     assert coarse_point.n_lineages / report.n_samples < 0.9
 
 
+def test_lineage_threshold_curve_a_too_coarse_point_is_nan_not_a_crash(tmp_path):
+    """The opposite failure mode from the degenerate-warning test above: a
+    threshold coarse enough to merge the whole cohort into fewer lineages
+    than n_splits used to raise InvalidConfigError from inside the curve
+    loop, uncaught -- discarding not just that one point but the entire
+    audit() call, including the primary result computed before the curve
+    loop ever ran. A wide sweep routinely includes a threshold this coarse
+    on purpose (finding where the collapse happens is part of the point of
+    a curve), so this must degrade to one NaN point, not blow up the whole
+    call.
+    """
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=53)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+
+    # 2.0 is far past any real Mash distance (bounded in [0, 1]) and merges
+    # this fixture into a single lineage -- well below n_splits=3.
+    report = audit(
+        _pipeline(top_features=50),
+        paths,
+        phenotype,
+        n_splits=3,
+        sketch_size=200,
+        lineage_threshold=0.02,
+        lineage_threshold_curve=[0.02, 2.0],
+        random_state=0,
+    )
+
+    assert report is not None, "the whole audit() call must survive, not just the curve"
+    fine_point, collapsed_point = report.leakage_curve
+    assert fine_point.threshold == pytest.approx(0.02)
+    assert not np.isnan(fine_point.score_lineage), "an unaffected point must not be collateral damage"
+
+    assert collapsed_point.threshold == pytest.approx(2.0)
+    assert collapsed_point.n_lineages < 3, "fixture no longer collapses below n_splits at this threshold"
+    assert np.isnan(collapsed_point.score_lineage)
+    assert np.isnan(collapsed_point.score_lineage_std)
+    assert np.isnan(collapsed_point.gap)
+    # confounding is model-free and needs no CV splits, so it must still be
+    # computed even though the CV comparison could not be.
+    assert collapsed_point.confounding is not None
+
+
 # ---------------------------------------------------------------------------
 # Input validation.
 # ---------------------------------------------------------------------------
