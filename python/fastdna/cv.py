@@ -57,7 +57,7 @@ never requires either package, only calling into it does.
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Iterator, Optional, Tuple, Union
+from typing import Any, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -65,7 +65,12 @@ import pyarrow as pa
 import fastdna
 from . import _core
 
-__all__ = ["lineage_groups", "LineageKFold", "permutation_importance_pvalues"]
+__all__ = [
+    "lineage_groups",
+    "lineage_groups_at_thresholds",
+    "LineageKFold",
+    "permutation_importance_pvalues",
+]
 
 
 def _missing_dependency(caller, package, hint=None):
@@ -181,6 +186,132 @@ def _relabel_by_first_appearance(labels):
     return out
 
 
+def _validate_distance_threshold(distance_threshold, caller):
+    """The one check `lineage_groups()` and `lineage_groups_at_thresholds()`
+    both apply to every threshold they are given: it must be a positive
+    Mash distance. At or below 0 every sample becomes its own lineage,
+    which defeats the point of clustering at all.
+
+    Parameters
+    ----------
+    distance_threshold : float
+    caller : str
+        Name of the calling function, used only to name it in raised error
+        messages.
+
+    Raises
+    ------
+    ValueError
+        If `distance_threshold` is not strictly positive.
+    """
+    if not distance_threshold > 0:
+        raise _core.InvalidConfigError(
+            f"distance_threshold must be a positive Mash distance, got {distance_threshold!r}. "
+            "At or below 0 every sample becomes its own lineage, which defeats the point."
+        )
+
+
+def lineage_groups_at_thresholds(
+    paths: Iterable[Union[str, os.PathLike]],
+    thresholds: Sequence[float],
+    *,
+    k: int = 21,
+    sketch_size: int = 1000,
+) -> List[np.ndarray]:
+    """`lineage_groups()`, evaluated at every threshold in `thresholds`, from
+    a single all-pairs Mash distance matrix and a single dendrogram.
+
+    See `lineage_groups()`'s own docstring for what a lineage label means,
+    why single linkage is the right merge rule for this purpose, and what
+    `distance_threshold` (here, each entry of `thresholds`) trades off --
+    none of that is repeated here, because it does not change: this
+    function computes exactly the same clustering `lineage_groups()` does,
+    for each threshold given, and nothing about the *meaning* of a cut
+    differs between the two.
+
+    What is different, and the entire reason this function exists as its
+    own entry point rather than as a documented idiom ("just call
+    `lineage_groups()` in a loop"), is the cost model. `lineage_groups()`
+    does two things: (1) sketch every sample and compute the `n x n`
+    all-pairs Mash distance matrix -- the expensive part, dominated by
+    `fastdna.compare_all()`'s `O(n^2)` sketch comparisons -- and (2) build a
+    single-linkage dendrogram from that matrix and cut it once at
+    `distance_threshold` -- both cheap, since `scipy.cluster.hierarchy.
+    fcluster` cutting an already-built dendrogram is linear in the number of
+    samples. Calling `lineage_groups()` once per threshold redoes step (1)
+    every time even though it does not depend on the threshold at all, so
+    sweeping `m` thresholds over a cohort costs `m` times the sketching and
+    distance work for zero additional information. This function does step
+    (1) exactly once, then reuses the same matrix and the same dendrogram
+    for every cut in step (2) -- so sweeping `m` thresholds costs one
+    sketching/distance pass plus `m` cheap cuts, not `m` of each. That
+    difference is what makes it practical to report a leakage-vs-threshold
+    curve (`fastdna.audit`'s `lineage_threshold_curve=`) instead of a single
+    number at one threshold nobody has strong a priori grounds to pick.
+
+    Parameters
+    ----------
+    paths : iterable of str or pathlib.Path
+        FASTQ(.gz) files, at least two, no duplicates. Each is sketched
+        exactly once, regardless of how many thresholds are given.
+    thresholds : sequence of float
+        The Mash-distance cut points to evaluate, each validated exactly as
+        `lineage_groups()`'s own `distance_threshold` is (must be strictly
+        positive). At least one threshold is required. Thresholds may
+        repeat; a repeated value is cut (cheaply) more than once rather than
+        deduplicated, since deduplicating here would desynchronize the
+        output from `thresholds`' own order and length.
+    k, sketch_size : int
+        Forwarded to the sketching inside `fastdna.compare_all()`, exactly
+        as in `lineage_groups()`.
+
+    Returns
+    -------
+    list of numpy.ndarray of int
+        One `groups` array per entry of `thresholds`, in the same order,
+        each exactly what `lineage_groups(paths, k=k, sketch_size=
+        sketch_size, distance_threshold=thresholds[i])` would return on its
+        own -- 0-based, contiguous, first-appearance-ordered labels (see
+        `lineage_groups()`'s `Returns` section).
+
+    Raises
+    ------
+    ValueError
+        Via `_validate_paths()`: fewer than 2 paths, or a duplicate path.
+        Via the per-threshold check above: `thresholds` is empty, or any
+        entry is not strictly positive.
+    """
+    paths = _validate_paths(paths, "lineage_groups_at_thresholds()")
+    thresholds = list(thresholds)
+    if len(thresholds) == 0:
+        raise _core.InvalidConfigError(
+            "lineage_groups_at_thresholds() needs at least 1 threshold, got 0"
+        )
+    for threshold in thresholds:
+        _validate_distance_threshold(threshold, "lineage_groups_at_thresholds()")
+
+    try:
+        from scipy.cluster.hierarchy import fcluster, linkage
+        from scipy.spatial.distance import squareform
+    except ImportError:
+        raise _missing_dependency("lineage_groups_at_thresholds()", "scipy") from None
+
+    matrix = _mash_distance_matrix(paths, k, sketch_size)
+    # checks=False: see lineage_groups()'s identical comment -- the matrix
+    # is symmetric with a zero diagonal by construction, and squareform's
+    # own validation is strict about floating-point symmetry in a way that
+    # would reject it spuriously.
+    condensed = squareform(matrix, checks=False)
+    dendrogram = linkage(condensed, method="single")
+
+    return [
+        _relabel_by_first_appearance(
+            fcluster(dendrogram, t=threshold, criterion="distance")
+        )
+        for threshold in thresholds
+    ]
+
+
 def lineage_groups(
     paths: Iterable[Union[str, os.PathLike]],
     *,
@@ -237,27 +368,16 @@ def lineage_groups(
     0-based and contiguous, numbered by first appearance, so `groups[0]`
     is always 0 and repeated calls on the same input give the identical
     array.
+
+    Implemented as the single-threshold case of `lineage_groups_at_
+    thresholds()` -- see that function's docstring if you need this same
+    clustering at more than one threshold, since calling this function in a
+    loop redoes the expensive all-pairs sketching/distance pass once per
+    call for no reason.
     """
-    paths = _validate_paths(paths, "lineage_groups()")
-    if not distance_threshold > 0:
-        raise _core.InvalidConfigError(
-            f"distance_threshold must be a positive Mash distance, got {distance_threshold!r}. "
-            "At or below 0 every sample becomes its own lineage, which defeats the point."
-        )
-
-    try:
-        from scipy.cluster.hierarchy import fcluster, linkage
-        from scipy.spatial.distance import squareform
-    except ImportError:
-        raise _missing_dependency("lineage_groups()", "scipy") from None
-
-    matrix = _mash_distance_matrix(paths, k, sketch_size)
-    # checks=False: the matrix is symmetric with a zero diagonal by
-    # construction above, and squareform's own validation is strict about
-    # floating-point symmetry in a way that would reject it spuriously.
-    condensed = squareform(matrix, checks=False)
-    labels = fcluster(linkage(condensed, method="single"), t=distance_threshold, criterion="distance")
-    return _relabel_by_first_appearance(labels)
+    return lineage_groups_at_thresholds(
+        paths, [distance_threshold], k=k, sketch_size=sketch_size
+    )[0]
 
 
 def _n_samples(X):

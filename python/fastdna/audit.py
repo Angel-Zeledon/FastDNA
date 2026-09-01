@@ -312,9 +312,16 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 import numpy as np
 import pyarrow as pa
 
-from .cv import LineageKFold, lineage_groups
+from .cv import LineageKFold, lineage_groups, lineage_groups_at_thresholds
 
-__all__ = ["audit", "AuditReport", "Confounding", "CovariateAudit", "DegenerateLineagesWarning"]
+__all__ = [
+    "audit",
+    "AuditReport",
+    "Confounding",
+    "CovariateAudit",
+    "LeakageCurvePoint",
+    "DegenerateLineagesWarning",
+]
 
 # Below this fraction of samples-that-are-their-own-lineage, `LineageKFold`
 # barely differs from an ordinary random splitter: with e.g. 149 lineages
@@ -462,6 +469,72 @@ class CovariateAudit:
 
 
 @dataclass(frozen=True)
+class LeakageCurvePoint:
+    """One point on the leakage-vs-granularity curve `audit()` builds when
+    `lineage_threshold_curve=` is given: the same lineage-blocked-CV
+    comparison `AuditReport`'s top-level `score_lineage`/`gap`/`n_lineages`/
+    `confounding` fields report at `lineage_threshold`, computed instead at
+    one other Mash-distance threshold.
+
+    This exists because a single `gap` at a single threshold is not a
+    robust finding on its own -- see this module's motivating case (a real
+    bacterial AMR cohort read `gap=-0.018` at the library's default
+    threshold, where 149/150 genomes were each their own lineage, and
+    `gap=+0.148` at a coarser, data-driven threshold on the *same* cohort).
+    A curve across thresholds turns that single, contestable number into a
+    result: where leakage appears as the blocking granularity coarsens, not
+    a single figure that depends on a constant nobody had strong grounds to
+    pick. `n_lineages` is reported alongside every point for the same
+    reason `AuditReport.n_lineages` is reported alongside `gap` itself --
+    the same `gap` value means something different at 3 lineages than at
+    150.
+
+    Attributes
+    ----------
+    threshold : float
+        The Mash-distance threshold this point was cut at -- one entry of
+        the `lineage_threshold_curve` sequence given to `audit()`.
+    n_lineages : int
+        Distinct lineage labels found at this threshold. Coarser (larger)
+        thresholds merge more samples into fewer, larger lineages, so this
+        is monotonically non-increasing as `threshold` increases, for a
+        fixed cohort and dendrogram (`cv.lineage_groups_at_thresholds`'s
+        "one dendrogram, many cuts" property: every cut comes from the same
+        underlying clustering).
+    score_lineage : float
+        Mean `cross_val_score` under `cv.LineageKFold(groups=...)` at this
+        threshold's grouping -- the same quantity `AuditReport.score_lineage`
+        is, at this point's threshold instead of the primary one.
+    score_lineage_std : float
+        Standard deviation across that splitter's folds.
+    gap : float
+        `AuditReport.score_random` (the single, threshold-independent
+        random-CV baseline) minus this point's `score_lineage`. Directly
+        comparable across points, and to `AuditReport.gap` itself, because
+        `score_random` is the same number everywhere on the curve -- only
+        the lineage-blocked side changes with `threshold`.
+    confounding : Confounding
+        `AuditReport.confounding`, recomputed at this threshold's grouping
+        -- see `Confounding` and the module docstring's "Phenotype-vs-
+        lineage confounding" section for what this measures.
+
+    The point whose `threshold` equals `AuditReport.lineage_threshold`
+    itself is not recomputed: `audit()` reuses the primary point's already-
+    computed `score_lineage`/`score_lineage_std`/`gap`/`confounding`
+    (and `n_lineages`) rather than refitting the same splitter a second
+    time, exactly the reuse `cv.lineage_groups_at_thresholds`'s single-
+    dendrogram cost model exists to make possible.
+    """
+
+    threshold: float
+    n_lineages: int
+    score_lineage: float
+    score_lineage_std: float
+    gap: float
+    confounding: Confounding
+
+
+@dataclass(frozen=True)
 class AuditReport:
     """What :func:`audit` computed. See the module docstring for what each
     number means, how it was computed, and -- for `covariates` -- what it
@@ -530,6 +603,19 @@ class AuditReport:
         cohort.
     covariates : tuple of CovariateAudit
         Empty when `covariates=` was not given to :func:`audit`.
+    leakage_curve : tuple of LeakageCurvePoint, or None
+        `None` unless `lineage_threshold_curve=` was given to :func:`audit`
+        *and* `groups=` was not supplied directly (there is no dendrogram to
+        sweep when the caller hands in labels instead of letting `audit()`
+        derive them -- see `LeakageCurvePoint` and the `lineage_threshold_
+        curve` parameter below). When present, one `LeakageCurvePoint` per
+        entry of `lineage_threshold_curve`, in the same order, each the same
+        random-vs-lineage-blocked comparison this report's own top-level
+        fields make at `lineage_threshold`, made instead at that point's own
+        threshold, from the same single dendrogram (see
+        `cv.lineage_groups_at_thresholds`). This field is purely additive:
+        every caller that does not pass `lineage_threshold_curve=` sees it
+        as `None` and every other field unchanged.
     """
 
     n_samples: int
@@ -545,6 +631,7 @@ class AuditReport:
     confounding: Confounding
     per_fold: pa.Table
     covariates: Tuple[CovariateAudit, ...]
+    leakage_curve: Optional[Tuple[LeakageCurvePoint, ...]] = None
 
     def to_markdown(self) -> str:
         scoring_label = self.scoring if self.scoring is not None else "estimator default"
@@ -578,6 +665,25 @@ class AuditReport:
                 "Each covariate's gap is independent of the lineage gap above and of every "
                 "other covariate's -- they are not shares of one total and do not sum to "
                 "anything meaningful (see the module docstring)."
+            )
+        if self.leakage_curve is not None:
+            lines += [
+                "",
+                "## Leakage curve",
+                "",
+                "| threshold | lineages | score_lineage | gap | confounding |",
+                "|---:|---:|---:|---:|---:|",
+            ]
+            for point in self.leakage_curve:
+                lines.append(
+                    f"| {point.threshold:g} | {point.n_lineages} | {point.score_lineage:.4g} | "
+                    f"{point.gap:+.4g} | {point.confounding.value:.4g} |"
+                )
+            lines.append(
+                "The gap is not a single number but a curve across blocking granularity: "
+                "each row cuts the same dendrogram at a different Mash-distance threshold, so "
+                "a threshold is not a free parameter chosen to make the gap read one way or "
+                "the other -- see where it changes, not just its value at one point."
             )
         lines += [
             "",
@@ -1016,6 +1122,7 @@ def audit(
     k: int = 21,
     sketch_size: int = 1000,
     lineage_threshold: float = 0.01,
+    lineage_threshold_curve: Optional[Sequence[float]] = None,
     random_state: Optional[int] = 0,
 ) -> AuditReport:
     """Fits and scores `estimator` under ordinary (random) cross-validation
@@ -1079,6 +1186,33 @@ def audit(
         ignored otherwise. Defaults match `cv.lineage_groups`'s own
         (`k=21`, `distance_threshold=0.01`) except `sketch_size`, which
         matches `fastdna.sketch()`'s default of 1000.
+    lineage_threshold_curve : sequence of float, optional
+        Additional Mash-distance thresholds at which to repeat the
+        lineage-blocked comparison, producing `AuditReport.leakage_curve` --
+        see `LeakageCurvePoint`. `None` (the default) leaves `leakage_curve`
+        as `None` and changes nothing else about this function's behavior
+        or return shape: this parameter is purely additive. Silently
+        ignored (matching how `lineage_threshold` itself is already
+        documented as ignored) whenever `groups=` is supplied directly --
+        there is no dendrogram to cut at other thresholds when the lineage
+        labels did not come from one.
+
+        When honoured, `[lineage_threshold] + <the distinct entries of
+        lineage_threshold_curve>` is swept in a single call to
+        `cv.lineage_groups_at_thresholds`, so the grouping this function
+        already needs at `lineage_threshold` (for every top-level
+        `score_lineage`/`gap`/`n_lineages`/`confounding` field) and every
+        point on the curve all come from one sketching pass and one
+        dendrogram, not one per threshold -- see that function's own
+        docstring for why that matters. A curve entry equal to
+        `lineage_threshold` reuses that grouping's already-computed
+        `LeakageCurvePoint` rather than recomputing it a second time with a
+        fresh `cross_val_score` call. `DegenerateLineagesWarning` is
+        evaluated per distinct threshold on the curve, not only at
+        `lineage_threshold` -- a curve is exactly the tool for showing
+        *where* a grouping degenerates into (almost) one lineage per
+        sample, so that warning firing partway along the curve is itself
+        part of the result, not noise to suppress.
     random_state : int or None, default 0
         Seeds the random-CV splitter's shuffle (and every covariate's
         `StratifiedKFold`/`KFold`, when applicable through
@@ -1092,7 +1226,10 @@ def audit(
         Whose `confounding` field is the one number in it that is computed
         from `phenotype` and the lineage labels alone -- no fit, no fold,
         no dependence on `estimator` beyond asking it whether the phenotype
-        is categorical or continuous. See `Confounding`.
+        is categorical or continuous (see `Confounding`), and whose
+        `leakage_curve` field is `None` unless `lineage_threshold_curve=`
+        was given and `groups=` was not (see `LeakageCurvePoint` and the
+        `lineage_threshold_curve` parameter above).
     """
     from sklearn.base import clone
     from sklearn.model_selection import cross_val_score
@@ -1112,7 +1249,15 @@ def audit(
             "Pass one phenotype value per path, in the same order."
         )
 
-    if groups is not None:
+    groups_supplied_directly = groups is not None
+    # Populated only when a curve is actually being swept (groups was not
+    # supplied directly, and lineage_threshold_curve was given); used below
+    # to build AuditReport.leakage_curve from the SAME dendrogram the
+    # primary `groups` grouping already came from.
+    curve_thresholds = None
+    threshold_to_groups = None
+
+    if groups_supplied_directly:
         groups = np.asarray(groups)
         if groups.shape[0] != n_samples:
             raise ValueError(
@@ -1121,21 +1266,49 @@ def audit(
                 "derive them automatically with cv.lineage_groups()."
             )
         resolved_lineage_threshold = float("nan")
+        # lineage_threshold_curve is a no-op here: there is no dendrogram to
+        # sweep when the caller handed in labels directly (see this
+        # function's own docstring).
+    elif lineage_threshold_curve is not None:
+        curve_thresholds = [float(t) for t in lineage_threshold_curve]
+        primary_threshold = float(lineage_threshold)
+        # One dendrogram, cut at the primary threshold plus every DISTINCT
+        # threshold the curve asks for -- duplicates (including a curve
+        # entry equal to lineage_threshold itself) are cut once and shared,
+        # not recomputed, per cv.lineage_groups_at_thresholds's cost model.
+        batch_thresholds = [primary_threshold]
+        seen_thresholds = {primary_threshold}
+        for t in curve_thresholds:
+            if t not in seen_thresholds:
+                batch_thresholds.append(t)
+                seen_thresholds.add(t)
+        batch_groups = lineage_groups_at_thresholds(
+            paths, batch_thresholds, k=k, sketch_size=sketch_size
+        )
+        threshold_to_groups = dict(zip(batch_thresholds, batch_groups))
+        groups = threshold_to_groups[primary_threshold]
+        resolved_lineage_threshold = primary_threshold
     else:
         groups = lineage_groups(paths, k=k, sketch_size=sketch_size, distance_threshold=lineage_threshold)
         resolved_lineage_threshold = float(lineage_threshold)
 
+    def _warn_if_degenerate(n_lineages_here, grouping_label):
+        if n_samples > 0 and n_lineages_here / n_samples >= _DEGENERATE_LINEAGE_FRACTION:
+            warnings.warn(
+                f"{n_lineages_here} of {n_samples} samples are each their own lineage (or "
+                f"nearly so) under {grouping_label} -- LineageKFold has little to block on, and "
+                "the gap computed from it may read near zero even when real, coarser-scale "
+                "leakage exists. If groups= was not supplied directly, try a larger threshold; "
+                "see DegenerateLineagesWarning's own docstring.",
+                DegenerateLineagesWarning,
+                stacklevel=3,
+            )
+
     n_lineages = int(np.unique(groups).size)
-    if n_samples > 0 and n_lineages / n_samples >= _DEGENERATE_LINEAGE_FRACTION:
-        warnings.warn(
-            f"{n_lineages} of {n_samples} samples are each their own lineage (or nearly so) "
-            f"under the current grouping -- LineageKFold has little to block on, and `gap` may "
-            "read near zero even when real, coarser-scale leakage exists. If groups= was not "
-            "supplied directly, try a larger lineage_threshold; see DegenerateLineagesWarning's "
-            "own docstring.",
-            DegenerateLineagesWarning,
-            stacklevel=2,
-        )
+    _warn_if_degenerate(
+        n_lineages,
+        "the current grouping" if groups_supplied_directly else f"the grouping at threshold {resolved_lineage_threshold:g}",
+    )
     validated_covariates = _validate_covariates(covariates, n_samples)
 
     # Computed before any fitting: it needs no model, and a caller reading a
@@ -1194,6 +1367,48 @@ def audit(
         {"cv_kind": per_fold_cv_kind, "fold": per_fold_index, "score": per_fold_score}
     )
 
+    leakage_curve = None
+    if threshold_to_groups is not None:
+        # One LeakageCurvePoint per DISTINCT threshold in the sweep, keyed
+        # by threshold value; the primary threshold's point reuses the
+        # scores/confounding already computed above instead of refitting.
+        points_by_threshold = {}
+        for threshold in batch_thresholds:
+            threshold_groups = threshold_to_groups[threshold]
+            if threshold == resolved_lineage_threshold:
+                points_by_threshold[threshold] = LeakageCurvePoint(
+                    threshold=threshold,
+                    n_lineages=n_lineages,
+                    score_lineage=mean_lineage,
+                    score_lineage_std=_nan_aware_std(scores_lineage),
+                    gap=float(mean_random - mean_lineage),
+                    confounding=confounding,
+                )
+                continue
+
+            threshold_n_lineages = int(np.unique(threshold_groups).size)
+            _warn_if_degenerate(threshold_n_lineages, f"the grouping at threshold {threshold:g}")
+
+            threshold_cv = LineageKFold(n_splits=n_splits, groups=threshold_groups)
+            threshold_scores = np.asarray(
+                cross_val_score(clone(estimator), paths, phenotype, cv=threshold_cv, scoring=resolved_scoring),
+                dtype=np.float64,
+            )
+            threshold_score = _nan_aware_mean(threshold_scores)
+            points_by_threshold[threshold] = LeakageCurvePoint(
+                threshold=threshold,
+                n_lineages=threshold_n_lineages,
+                score_lineage=threshold_score,
+                score_lineage_std=_nan_aware_std(threshold_scores),
+                gap=float(mean_random - threshold_score),
+                confounding=_confounding(estimator, threshold_groups, phenotype),
+            )
+
+        # Re-expanded to curve_thresholds' own order/length -- a curve entry
+        # repeating a threshold (including the primary one) gets the SAME
+        # LeakageCurvePoint object, not a fresh recomputation.
+        leakage_curve = tuple(points_by_threshold[t] for t in curve_thresholds)
+
     return AuditReport(
         n_samples=n_samples,
         n_splits=int(n_splits),
@@ -1208,4 +1423,5 @@ def audit(
         confounding=confounding,
         per_fold=per_fold,
         covariates=tuple(covariate_reports),
+        leakage_curve=leakage_curve,
     )

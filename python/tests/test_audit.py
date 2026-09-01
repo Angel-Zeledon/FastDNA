@@ -35,6 +35,7 @@ from fastdna.audit import (  # noqa: E402
     Confounding,
     CovariateAudit,
     DegenerateLineagesWarning,
+    LeakageCurvePoint,
     audit,
 )
 from fastdna.explain import explain  # noqa: E402
@@ -309,6 +310,159 @@ def test_audit_rejects_a_mismatched_covariate_length():
     phenotype = np.array([g % 2 for g in groups])
     with pytest.raises(ValueError, match="covariates"):
         audit(LogisticRegression(), X, phenotype, groups=groups, covariates={"batch": [0, 1, 2]})
+
+
+# ---------------------------------------------------------------------------
+# Leakage curve (lineage_threshold_curve=).
+#
+# Needs real FASTQ/sketching (unlike most of this file's fast matrix+groups=
+# path) because the whole point is sweeping cv.lineage_groups_at_thresholds'
+# single dendrogram across several cuts -- there is no dendrogram to sweep
+# when groups= is supplied directly, which is exactly what the "no-op with
+# groups=" test below pins.
+# ---------------------------------------------------------------------------
+
+
+def test_lineage_threshold_curve_default_none_leaves_leakage_curve_none():
+    """The additive-only guarantee: a caller who never passes
+    lineage_threshold_curve= sees `leakage_curve is None` and nothing else
+    about the report changes shape. Every other test in this file already
+    exercises this implicitly (none of them pass the new parameter); this
+    test pins it explicitly.
+    """
+    X, groups = _synthetic_matrix_cohort(seed=30)
+    phenotype = np.array([1 if g in (0, 1) else 0 for g in groups])
+
+    report = audit(LogisticRegression(max_iter=1000), X, phenotype, groups=groups, n_splits=4, scoring="accuracy")
+
+    assert report.leakage_curve is None
+
+
+def test_lineage_threshold_curve_produces_one_point_per_threshold_in_order(tmp_path):
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=50)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+    # Measured on this fixture/seed: 1e-9 -> 23 lineages (nearly every sample
+    # its own), 0.005 -> 11, 0.02 -> 4 (the true lineage count) -- a real,
+    # strictly-decreasing range of granularities, each still with enough
+    # distinct lineages for n_splits=3 below.
+    thresholds = [1e-9, 0.005, 0.02]
+
+    report = audit(
+        _pipeline(top_features=50),
+        paths,
+        phenotype,
+        n_splits=3,
+        sketch_size=200,
+        lineage_threshold=0.02,
+        lineage_threshold_curve=thresholds,
+        random_state=0,
+    )
+
+    assert report.leakage_curve is not None
+    assert len(report.leakage_curve) == len(thresholds)
+    for point, expected_threshold in zip(report.leakage_curve, thresholds):
+        assert isinstance(point, LeakageCurvePoint)
+        assert point.threshold == pytest.approx(expected_threshold)
+
+    # Single linkage on one dendrogram: a coarser (larger) threshold can
+    # only merge lineages further, never split them -- n_lineages must be
+    # monotonically non-increasing as threshold increases, and the fixture
+    # has real lineage structure to make this a non-trivial check (not
+    # every point equal to every other).
+    by_threshold = sorted(zip(thresholds, report.leakage_curve), key=lambda pair: pair[0])
+    n_lineages_in_threshold_order = [point.n_lineages for _, point in by_threshold]
+    assert n_lineages_in_threshold_order == sorted(n_lineages_in_threshold_order, reverse=True)
+    assert n_lineages_in_threshold_order[0] > n_lineages_in_threshold_order[-1], (
+        "fixture/thresholds no longer span a real range of granularities"
+    )
+
+
+def test_lineage_threshold_curve_is_a_no_op_when_groups_supplied_directly():
+    X, groups = _synthetic_matrix_cohort(seed=31)
+    phenotype = np.array([1 if g in (0, 1) else 0 for g in groups])
+
+    report = audit(
+        LogisticRegression(max_iter=1000),
+        X,
+        phenotype,
+        groups=groups,
+        n_splits=4,
+        scoring="accuracy",
+        lineage_threshold_curve=[0.01, 0.02, 0.05],
+    )
+
+    assert report.leakage_curve is None
+
+
+def test_lineage_threshold_curve_point_matching_primary_threshold_reuses_it(tmp_path):
+    """A curve entry equal to `lineage_threshold` itself must be the exact
+    same computation as the report's own top-level score_lineage/gap/
+    confounding, not a fresh recomputation that merely happens to agree.
+    Checked by object identity on `confounding` (a frozen dataclass with no
+    __eq__ override beyond field-wise comparison, so identity is strictly
+    stronger than equality here) and exact equality on the floats, rather
+    than an approximate comparison that a second, independently-seeded
+    cross_val_score run could pass by chance.
+    """
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=51)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+
+    # 0.5 is coarser than the primary 0.02 but (measured on this
+    # fixture/seed) still resolves 4 lineages, comfortably above n_splits=3.
+    report = audit(
+        _pipeline(top_features=50),
+        paths,
+        phenotype,
+        n_splits=3,
+        sketch_size=200,
+        lineage_threshold=0.02,
+        lineage_threshold_curve=[0.02, 0.5],
+        random_state=0,
+    )
+
+    reused_point = report.leakage_curve[0]
+    assert reused_point.threshold == pytest.approx(0.02)
+    assert reused_point.confounding is report.confounding
+    assert reused_point.n_lineages == report.n_lineages
+    assert reused_point.score_lineage == report.score_lineage
+    assert reused_point.score_lineage_std == report.score_lineage_std
+    assert reused_point.gap == report.gap
+
+
+def test_lineage_threshold_curve_warns_only_at_the_degenerate_point(tmp_path):
+    """The degeneracy check runs per curve point, not only at the primary
+    threshold: an extremely tight threshold shatters this cohort into
+    (nearly) one lineage per sample, while the coarser threshold used
+    elsewhere in this file for the same fixture does not. Exactly one
+    DegenerateLineagesWarning must fire, and it must be attributable to the
+    tight point, not the coarse one.
+    """
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=52)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        report = audit(
+            _pipeline(top_features=50),
+            paths,
+            phenotype,
+            n_splits=3,
+            sketch_size=200,
+            lineage_threshold=0.02,
+            lineage_threshold_curve=[1e-9, 0.02],
+            random_state=0,
+        )
+
+    degenerate_warnings = [w for w in caught if issubclass(w.category, DegenerateLineagesWarning)]
+    assert len(degenerate_warnings) == 1, (
+        f"expected exactly one DegenerateLineagesWarning (from the 1e-9 point only), got "
+        f"{len(degenerate_warnings)}"
+    )
+    assert "1e-09" in str(degenerate_warnings[0].message) or "1e-9" in str(degenerate_warnings[0].message)
+
+    tight_point, coarse_point = report.leakage_curve
+    assert tight_point.n_lineages / report.n_samples >= 0.9
+    assert coarse_point.n_lineages / report.n_samples < 0.9
 
 
 # ---------------------------------------------------------------------------

@@ -28,7 +28,12 @@ np = pytest.importorskip("numpy")
 
 import pyarrow as pa
 
-from fastdna.cv import LineageKFold, lineage_groups, permutation_importance_pvalues
+from fastdna.cv import (
+    LineageKFold,
+    lineage_groups,
+    lineage_groups_at_thresholds,
+    permutation_importance_pvalues,
+)
 
 
 def write_fastq(tmp_path: pathlib.Path, name: str, reads: list[str]) -> pathlib.Path:
@@ -165,6 +170,73 @@ class TestLineageGroups:
 
         with pytest.raises(ValueError):
             lineage_groups(paths, k=_K, sketch_size=_SKETCH_SIZE, distance_threshold=0.0)
+
+
+class TestLineageGroupsAtThresholds:
+    def test_agrees_with_lineage_groups_called_per_threshold(self, lineage_cohort):
+        """The cross-check that makes this function trustworthy: cutting one
+        dendrogram at several thresholds must give exactly the same
+        groupings as calling `lineage_groups()` once per threshold.
+        """
+        paths, _ = lineage_cohort
+        thresholds = [1e-6, _THRESHOLD, 1.5]
+
+        batched = lineage_groups_at_thresholds(paths, thresholds, k=_K, sketch_size=_SKETCH_SIZE)
+
+        for threshold, groups in zip(thresholds, batched):
+            expected = lineage_groups(paths, k=_K, sketch_size=_SKETCH_SIZE, distance_threshold=threshold)
+            assert groups.tolist() == expected.tolist(), f"mismatch at threshold {threshold}"
+
+    def test_returns_results_in_thresholds_order(self, lineage_cohort):
+        paths, _ = lineage_cohort
+        # Deliberately out-of-order and including a very tight and a very
+        # loose threshold, so a naive implementation that sorted internally
+        # would be caught by this ordering check.
+        thresholds = [1.5, 1e-6, _THRESHOLD]
+
+        batched = lineage_groups_at_thresholds(paths, thresholds, k=_K, sketch_size=_SKETCH_SIZE)
+
+        assert len(set(batched[0].tolist())) == 1  # 1.5: everything merges
+        assert len(set(batched[1].tolist())) > 3  # 1e-6: shattered
+        assert len(set(batched[2].tolist())) == 3  # _THRESHOLD: the true lineages
+
+    def test_handles_a_single_element_thresholds_list(self, lineage_cohort):
+        paths, _ = lineage_cohort
+
+        batched = lineage_groups_at_thresholds(paths, [_THRESHOLD], k=_K, sketch_size=_SKETCH_SIZE)
+
+        assert len(batched) == 1
+        expected = lineage_groups(paths, k=_K, sketch_size=_SKETCH_SIZE, distance_threshold=_THRESHOLD)
+        assert batched[0].tolist() == expected.tolist()
+
+    def test_fewer_than_two_paths_raises(self, lineage_cohort):
+        paths, _ = lineage_cohort
+
+        with pytest.raises(ValueError) as exc_info:
+            lineage_groups_at_thresholds(paths[:1], [_THRESHOLD], k=_K, sketch_size=_SKETCH_SIZE)
+
+        assert "2" in str(exc_info.value)
+
+    def test_duplicate_paths_raise_naming_the_path(self, lineage_cohort):
+        paths, _ = lineage_cohort
+        duplicated = paths + [paths[0]]
+
+        with pytest.raises(ValueError) as exc_info:
+            lineage_groups_at_thresholds(duplicated, [_THRESHOLD], k=_K, sketch_size=_SKETCH_SIZE)
+
+        assert repr(paths[0]) in str(exc_info.value)
+
+    def test_non_positive_threshold_raises(self, lineage_cohort):
+        paths, _ = lineage_cohort
+
+        with pytest.raises(ValueError):
+            lineage_groups_at_thresholds(paths, [_THRESHOLD, 0.0], k=_K, sketch_size=_SKETCH_SIZE)
+
+    def test_empty_thresholds_raises(self, lineage_cohort):
+        paths, _ = lineage_cohort
+
+        with pytest.raises(ValueError):
+            lineage_groups_at_thresholds(paths, [], k=_K, sketch_size=_SKETCH_SIZE)
 
 
 class TestLineageKFold:
