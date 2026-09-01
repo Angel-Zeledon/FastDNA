@@ -304,6 +304,7 @@ specifically:
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Tuple, Union
@@ -313,7 +314,32 @@ import pyarrow as pa
 
 from .cv import LineageKFold, lineage_groups
 
-__all__ = ["audit", "AuditReport", "Confounding", "CovariateAudit"]
+__all__ = ["audit", "AuditReport", "Confounding", "CovariateAudit", "DegenerateLineagesWarning"]
+
+# Below this fraction of samples-that-are-their-own-lineage, `LineageKFold`
+# barely differs from an ordinary random splitter: with e.g. 149 lineages
+# over 150 samples, almost every fold's "held-out lineage" is a single
+# sample indistinguishable from a random one, so `gap` reads near zero not
+# because there is no leakage to find, but because the derived grouping
+# gave the splitter almost nothing to block on. Both real cohorts this
+# project has run through `audit()` so far hit exactly this: the library's
+# own default `lineage_threshold=0.01` produced 149/150 lineages on a real
+# E. coli cohort (`scratch/amr_repro/audit_report.json`) and a small,
+# easy-to-miss `gap` that a coarser, data-driven threshold on the *same*
+# cohort turned into a large one (`docs/audit/ml-gaps.md`'s "the unified
+# thesis" is only as trustworthy as this number is legible). `audit()`
+# warns rather than silently reporting a small `gap` as if it settled the
+# question.
+_DEGENERATE_LINEAGE_FRACTION = 0.9
+
+
+class DegenerateLineagesWarning(UserWarning):
+    """`groups` (derived or supplied to `audit()`) puts almost every sample
+    in its own lineage, so `LineageKFold` has little to block on and
+    `AuditReport.gap` may read near zero even when real, coarser-scale
+    leakage exists -- see `audit()`'s own module-level note above this
+    class for why, and its `lineage_threshold` parameter for the knob that
+    controls it when `groups` is derived rather than supplied directly."""
 
 
 @dataclass(frozen=True)
@@ -1100,6 +1126,16 @@ def audit(
         resolved_lineage_threshold = float(lineage_threshold)
 
     n_lineages = int(np.unique(groups).size)
+    if n_samples > 0 and n_lineages / n_samples >= _DEGENERATE_LINEAGE_FRACTION:
+        warnings.warn(
+            f"{n_lineages} of {n_samples} samples are each their own lineage (or nearly so) "
+            f"under the current grouping -- LineageKFold has little to block on, and `gap` may "
+            "read near zero even when real, coarser-scale leakage exists. If groups= was not "
+            "supplied directly, try a larger lineage_threshold; see DegenerateLineagesWarning's "
+            "own docstring.",
+            DegenerateLineagesWarning,
+            stacklevel=2,
+        )
     validated_covariates = _validate_covariates(covariates, n_samples)
 
     # Computed before any fitting: it needs no model, and a caller reading a

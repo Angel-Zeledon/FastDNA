@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pathlib
 import random
+import warnings
 
 import pytest
 
@@ -29,7 +30,13 @@ np = pytest.importorskip("numpy")
 from sklearn.linear_model import LogisticRegression  # noqa: E402
 from sklearn.pipeline import Pipeline  # noqa: E402
 
-from fastdna.audit import AuditReport, Confounding, CovariateAudit, audit  # noqa: E402
+from fastdna.audit import (  # noqa: E402
+    AuditReport,
+    Confounding,
+    CovariateAudit,
+    DegenerateLineagesWarning,
+    audit,
+)
 from fastdna.explain import explain  # noqa: E402
 from fastdna.sklearn import KmerVectorizer  # noqa: E402
 
@@ -224,6 +231,39 @@ def test_audit_accepts_a_precomputed_matrix_with_explicit_groups():
     assert report.n_lineages == 4
     assert np.isnan(report.lineage_threshold), "groups= was supplied directly; no threshold was used"
     assert report.score_random > report.score_lineage
+
+
+def test_audit_warns_when_almost_every_sample_is_its_own_lineage():
+    """Real motivation, not a hypothetical: this project's own bacterial
+    AMR reproduction (`scratch/amr_repro/audit_report.json`) hit exactly
+    this at the library's default `lineage_threshold` -- 149 of 150
+    genomes each their own lineage, `gap` near zero -- and a naive reading
+    of that report would have concluded "no leakage" when the real issue
+    was that the grouping gave LineageKFold almost nothing to block on.
+    """
+    n_samples = 20
+    X, groups = _synthetic_matrix_cohort(seed=2, n_per_group=1, n_groups=n_samples)
+    phenotype = np.array([i % 2 for i in range(n_samples)])
+
+    with pytest.warns(DegenerateLineagesWarning, match=r"20 of 20 samples"):
+        report = audit(
+            LogisticRegression(max_iter=1000),
+            X,
+            phenotype,
+            groups=groups,
+            n_splits=4,
+            scoring="accuracy",
+        )
+    assert report.n_lineages == n_samples
+
+
+def test_audit_does_not_warn_for_a_genuinely_clustered_cohort():
+    X, groups = _synthetic_matrix_cohort(seed=1)  # 4 groups of 8: 4/32, well under the threshold
+    phenotype = np.array([1 if g in (0, 1) else 0 for g in groups])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DegenerateLineagesWarning)
+        audit(LogisticRegression(max_iter=1000), X, phenotype, groups=groups, n_splits=4, scoring="accuracy")
 
 
 def test_audit_covariates_reports_an_independent_gap_per_covariate():
