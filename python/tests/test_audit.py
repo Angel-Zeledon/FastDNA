@@ -287,7 +287,7 @@ def test_audit_composes_with_a_duck_typed_regressor_shaped_like_micregressor():
     `MicRegressor`) does supply its own tags composes cleanly with
     `audit()` end to end.
     """
-    from sklearn.utils import RegressorTags, Tags, TargetTags
+    from sklearn.utils import InputTags, RegressorTags, Tags, TargetTags
 
     class DuckTypedRegressor:
         _estimator_type = "regressor"
@@ -303,7 +303,7 @@ def test_audit_composes_with_a_duck_typed_regressor_shaped_like_micregressor():
                 estimator_type="regressor",
                 target_tags=TargetTags(required=True),
                 regressor_tags=RegressorTags(),
-                input_tags=__import__("sklearn.utils", fromlist=["InputTags"]).InputTags(),
+                input_tags=InputTags(),
             )
 
         def fit(self, X, y):
