@@ -91,6 +91,18 @@ docs = [
     "mkdocstrings[python]>=0.25",
 ]
 
+# No `[tool.pytest.ini_options]` section existed before `fastdna.datasets`
+# (see `python/tests/test_datasets.py`): this project had no prior
+# convention for opt-in slow/network tests. Registering `network` here only
+# silences pytest's "unknown mark" warning for `@pytest.mark.network` -- it
+# does NOT add it to a default-deselect `addopts`, so a plain `pytest` run
+# still executes those two tests (they hit real BV-BRC/HIVDB endpoints).
+# Deselect them explicitly with `-m "not network"` when that is not wanted.
+[tool.pytest.ini_options]
+markers = [
+    "network: hits a real external endpoint (BV-BRC, Stanford HIVDB) end to end; not mocked",
+]
+
 [tool.maturin]
 features = ["python"]
 module-name = "fastdna._core"
