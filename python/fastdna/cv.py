@@ -67,6 +67,7 @@ import fastdna
 from . import _core
 
 __all__ = [
+    "default_threshold_curve",
     "lineage_groups",
     "lineage_groups_at_thresholds",
     "lineage_groups_from_distances",
@@ -313,6 +314,123 @@ def lineage_groups_at_thresholds(
         )
         for threshold in thresholds
     ]
+
+
+def default_threshold_curve(
+    paths: Iterable[Union[str, os.PathLike]],
+    *,
+    n_points: int = 5,
+    k: int = 21,
+    sketch_size: int = 1000,
+) -> List[float]:
+    """A data-driven set of Mash-distance thresholds spanning this cohort's
+    own range of clustering granularity, for `fastdna.audit()` to sweep by
+    default when a caller does not supply `lineage_threshold_curve=`
+    explicitly.
+
+    Why data-driven and not a fixed list of thresholds (e.g. `[0.001, 0.01,
+    0.1]`): Mash distance has no universal scale a threshold can be picked
+    against in the abstract -- what counts as "fine" or "coarse" clustering
+    depends entirely on how divergent this particular cohort's own samples
+    are from each other (see `lineage_groups()`'s own docstring on why
+    `distance_threshold` is a real, cohort-specific tuning parameter, not a
+    constant). A fixed threshold list picked without seeing the cohort can
+    land entirely on one side of its actual range -- either cutting nothing
+    (finer than every real divergence in the cohort, everyone their own
+    lineage) or cutting everything into one lineage -- which is exactly the
+    single-threshold fragility this function exists to route around.
+
+    Instead, this builds the same single-linkage dendrogram `lineage_groups
+    _at_thresholds()` does, reads off its merge heights (the Mash distance
+    at which each successive pair of clusters merged -- a direct summary of
+    this cohort's own divergence structure), and returns the thresholds at
+    `n_points` evenly spaced quantiles (10th to 90th percentile) of that
+    distribution. That spread is deliberately inside the two degenerate
+    extremes (merging nothing, merging everything) rather than pinned to
+    them: `fastdna.audit()`'s own per-point handling already reports (via
+    `DegenerateLineagesWarning` and a `nan`-scored `LeakageCurvePoint`, see
+    its own docstring) if the swept range still reaches one of those
+    extremes for a given cohort, which is itself useful information, not
+    something to engineer around by construction.
+
+    This builds its own Mash distance matrix and dendrogram independently
+    of any other call in the same `audit()` invocation (e.g. the primary
+    threshold's own `lineage_groups_at_thresholds()` call) -- an extra
+    `O(n^2)` sketching pass. That cost is real but is consistently small
+    next to what it is paired with: `audit()`'s dominant cost is the
+    `cross_val_score` fit/predict work per curve point (minutes, on a
+    realistic cohort and estimator), not the sketching (seconds). Sharing
+    one dendrogram across both would need this function and the primary
+    threshold's own cut to be fused into one call, which is a real
+    optimization but not one the cost model above makes worth the added
+    coupling between them today.
+
+    Parameters
+    ----------
+    paths : iterable of str or pathlib.Path
+        FASTQ(.gz) files, at least two, no duplicates.
+    n_points : int, default 5
+        How many thresholds to return. Reduced automatically (with no
+        error) if the cohort's dendrogram does not have `n_points` distinct
+        merge heights to draw quantiles from -- a small cohort simply has
+        less granularity to show a curve across.
+    k, sketch_size : int
+        Forwarded to the sketching inside `fastdna.compare_all()`, exactly
+        as in `lineage_groups()`.
+
+    Returns
+    -------
+    list of float
+        `n_points` (or fewer, see above) strictly positive, strictly
+        increasing Mash-distance thresholds, suitable to pass directly as
+        `fastdna.audit()`'s `lineage_threshold_curve=`.
+
+    Raises
+    ------
+    ValueError
+        Via `_validate_paths()`: fewer than 2 paths, or a duplicate path.
+    ValueError
+        If `n_points` is not a positive integer.
+    """
+    paths = _validate_paths(paths, "default_threshold_curve()")
+    if not isinstance(n_points, (int, np.integer)) or isinstance(n_points, bool) or n_points < 1:
+        raise _core.InvalidConfigError(f"n_points must be a positive integer, got {n_points!r}")
+
+    try:
+        from scipy.cluster.hierarchy import linkage
+        from scipy.spatial.distance import squareform
+    except ImportError:
+        raise _missing_dependency("default_threshold_curve()", "scipy") from None
+
+    matrix = _mash_distance_matrix(paths, k, sketch_size)
+    condensed = squareform(matrix, checks=False)
+    dendrogram = linkage(condensed, method="single")
+
+    # linkage()'s 3rd column is each merge's height (the Mash distance at
+    # which it happened), monotonically non-decreasing by construction for
+    # single linkage. Only strictly positive heights are valid thresholds
+    # (see _validate_distance_threshold); a height of exactly 0 (duplicate
+    # or near-duplicate samples) is dropped rather than clipped upward,
+    # since silently moving a caller's effective threshold would be worse
+    # than just having fewer points to draw from.
+    merge_heights = np.sort(dendrogram[:, 2])
+    merge_heights = merge_heights[merge_heights > 0]
+
+    if merge_heights.size == 0:
+        # Every merge happened at distance 0 (e.g. every sample identical
+        # under this k/sketch_size) -- there is no positive threshold this
+        # cohort's own dendrogram can offer at all.
+        return []
+
+    quantile_ranks = np.linspace(0.10, 0.90, num=min(n_points, merge_heights.size))
+    thresholds = np.quantile(merge_heights, quantile_ranks)
+    # Deduplicated rather than left as repeats: a small cohort's merge
+    # heights can collide at the sampled quantile ranks even after the
+    # min(n_points, ...) cap above (e.g. two ranks landing either side of
+    # the same repeated height), and a repeated threshold contributes no
+    # additional information to the curve.
+    thresholds = np.unique(thresholds)
+    return [float(t) for t in thresholds]
 
 
 def lineage_groups(

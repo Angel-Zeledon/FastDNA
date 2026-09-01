@@ -30,6 +30,7 @@ import pyarrow as pa
 
 from fastdna.cv import (
     LineageKFold,
+    default_threshold_curve,
     lineage_groups,
     lineage_groups_at_thresholds,
     lineage_groups_from_distances,
@@ -239,6 +240,67 @@ class TestLineageGroupsAtThresholds:
 
         with pytest.raises(ValueError):
             lineage_groups_at_thresholds(paths, [], k=_K, sketch_size=_SKETCH_SIZE)
+
+
+class TestDefaultThresholdCurve:
+    def test_returns_n_points_strictly_positive_increasing_thresholds(self, lineage_cohort):
+        paths, _ = lineage_cohort
+
+        thresholds = default_threshold_curve(paths, n_points=5, k=_K, sketch_size=_SKETCH_SIZE)
+
+        assert len(thresholds) == 5
+        assert all(t > 0 for t in thresholds)
+        assert thresholds == sorted(thresholds)
+        assert len(set(thresholds)) == len(thresholds), "quantiles collided but were not deduplicated"
+
+    def test_thresholds_span_a_real_range_of_this_cohort_own_granularity(self, lineage_cohort):
+        """The whole point: thresholds are drawn from this cohort's own
+        dendrogram, not fixed constants, so the finest and coarsest points
+        must land on opposite sides of the fixture's known true-lineage
+        threshold (0.03-0.9, see _THRESHOLD's own comment above) -- proof
+        this is reading real merge heights, not returning an arbitrary
+        fixed list independent of the data.
+        """
+        paths, _ = lineage_cohort
+
+        thresholds = default_threshold_curve(paths, n_points=5, k=_K, sketch_size=_SKETCH_SIZE)
+
+        finest_groups = lineage_groups(paths, k=_K, sketch_size=_SKETCH_SIZE, distance_threshold=thresholds[0])
+        coarsest_groups = lineage_groups(
+            paths, k=_K, sketch_size=_SKETCH_SIZE, distance_threshold=thresholds[-1]
+        )
+        assert len(set(finest_groups.tolist())) > len(set(coarsest_groups.tolist())), (
+            "the finest and coarsest default thresholds resolved the same grouping -- "
+            "the curve is not spanning this cohort's real granularity range"
+        )
+
+    def test_n_points_is_capped_to_available_distinct_merge_heights(self, tmp_path):
+        """Two samples have exactly one merge height in their dendrogram --
+        asking for more points than that must not raise or fabricate
+        duplicates, just return what the cohort's own dendrogram has.
+        """
+        rng = random.Random(20260901)
+        base = _random_seq(rng, 600)
+        paths = [
+            write_fastq(tmp_path, "a.fastq", [_mutate(rng, base, 0.01)] * 3).as_posix(),
+            write_fastq(tmp_path, "b.fastq", [_mutate(rng, base, 0.01)] * 3).as_posix(),
+        ]
+
+        thresholds = default_threshold_curve(paths, n_points=5, k=_K, sketch_size=_SKETCH_SIZE)
+
+        assert 1 <= len(thresholds) <= 5
+
+    def test_fewer_than_two_paths_raises(self, lineage_cohort):
+        paths, _ = lineage_cohort
+
+        with pytest.raises(ValueError):
+            default_threshold_curve(paths[:1], k=_K, sketch_size=_SKETCH_SIZE)
+
+    def test_non_positive_n_points_raises(self, lineage_cohort):
+        paths, _ = lineage_cohort
+
+        with pytest.raises(ValueError):
+            default_threshold_curve(paths, n_points=0, k=_K, sketch_size=_SKETCH_SIZE)
 
 
 class TestLineageGroupsFromDistances:

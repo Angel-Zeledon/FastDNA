@@ -419,11 +419,11 @@ def test_audit_rejects_a_mismatched_covariate_length():
 
 
 def test_lineage_threshold_curve_default_none_leaves_leakage_curve_none():
-    """The additive-only guarantee: a caller who never passes
-    lineage_threshold_curve= sees `leakage_curve is None` and nothing else
-    about the report changes shape. Every other test in this file already
-    exercises this implicitly (none of them pass the new parameter); this
-    test pins it explicitly.
+    """`groups=` supplied directly is a no-op for both `lineage_threshold_
+    curve` and `auto_leakage_curve` -- there is no dendrogram to sweep when
+    the caller hands in labels instead of letting `audit()` derive them.
+    Every precomputed-matrix test in this file already exercises this
+    implicitly (they all pass `groups=`); this test pins it explicitly.
     """
     X, groups = _synthetic_matrix_cohort(seed=30)
     phenotype = np.array([1 if g in (0, 1) else 0 for g in groups])
@@ -431,6 +431,109 @@ def test_lineage_threshold_curve_default_none_leaves_leakage_curve_none():
     report = audit(LogisticRegression(max_iter=1000), X, phenotype, groups=groups, n_splits=4, scoring="accuracy")
 
     assert report.leakage_curve is None
+
+
+def test_auto_leakage_curve_is_on_by_default(tmp_path):
+    """The actual behavior change this module's redesign is about: a
+    caller who derives groups from real FASTQ files (no `groups=`) and
+    passes neither `lineage_threshold_curve=` nor `auto_leakage_curve=`
+    still gets a populated `leakage_curve` -- a single gap at one arbitrary
+    threshold is not, by itself, a robust finding (see `auto_leakage_
+    curve`'s own docstring for the real cohort that motivates this).
+    """
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=54)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+
+    report = audit(
+        _pipeline(top_features=50),
+        paths,
+        phenotype,
+        n_splits=3,
+        sketch_size=200,
+        lineage_threshold=0.02,
+        random_state=0,
+    )
+
+    assert report.leakage_curve is not None
+    assert len(report.leakage_curve) > 0
+    for point in report.leakage_curve:
+        assert isinstance(point, LeakageCurvePoint)
+
+
+def test_auto_leakage_curve_false_restores_the_original_single_threshold_behavior(tmp_path):
+    """The explicit opt-out: a caller who passes `auto_leakage_curve=False`
+    and no `lineage_threshold_curve=` gets exactly this function's
+    original, single-`cross_val_score`-pair behavior -- `leakage_curve`
+    stays `None`, matching every call in this file before the default
+    changed.
+    """
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=55)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+
+    report = audit(
+        _pipeline(top_features=50),
+        paths,
+        phenotype,
+        n_splits=3,
+        sketch_size=200,
+        lineage_threshold=0.02,
+        auto_leakage_curve=False,
+        random_state=0,
+    )
+
+    assert report.leakage_curve is None
+
+
+def test_default_curve_points_controls_the_automatic_curve_length(tmp_path):
+    """`default_curve_points` is forwarded to `cv.default_threshold_curve`
+    only when the curve is automatic -- pinned here against a value small
+    enough to be unambiguous, distinct from the library-wide default of 5.
+    """
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=56)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+
+    report = audit(
+        _pipeline(top_features=50),
+        paths,
+        phenotype,
+        n_splits=3,
+        sketch_size=200,
+        lineage_threshold=0.02,
+        default_curve_points=2,
+        random_state=0,
+    )
+
+    assert report.leakage_curve is not None
+    assert len(report.leakage_curve) <= 2
+
+
+def test_explicit_lineage_threshold_curve_overrides_auto_leakage_curve(tmp_path):
+    """An explicit `lineage_threshold_curve=` wins regardless of
+    `auto_leakage_curve` -- passing both is not a conflict, the explicit
+    one is simply what gets swept (see the parameter's own docstring:
+    `auto_leakage_curve` is only consulted when `lineage_threshold_curve`
+    is `None`).
+    """
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=57)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+    explicit_thresholds = [0.005, 0.02]
+
+    report = audit(
+        _pipeline(top_features=50),
+        paths,
+        phenotype,
+        n_splits=3,
+        sketch_size=200,
+        lineage_threshold=0.02,
+        lineage_threshold_curve=explicit_thresholds,
+        auto_leakage_curve=True,
+        random_state=0,
+    )
+
+    assert report.leakage_curve is not None
+    assert len(report.leakage_curve) == len(explicit_thresholds)
+    for point, expected_threshold in zip(report.leakage_curve, explicit_thresholds):
+        assert point.threshold == pytest.approx(expected_threshold)
 
 
 def test_lineage_threshold_curve_produces_one_point_per_threshold_in_order(tmp_path):

@@ -313,7 +313,7 @@ import numpy as np
 import pyarrow as pa
 
 from . import _core
-from .cv import LineageKFold, lineage_groups, lineage_groups_at_thresholds
+from .cv import LineageKFold, default_threshold_curve, lineage_groups, lineage_groups_at_thresholds
 
 __all__ = [
     "audit",
@@ -611,18 +611,20 @@ class AuditReport:
     covariates : tuple of CovariateAudit
         Empty when `covariates=` was not given to :func:`audit`.
     leakage_curve : tuple of LeakageCurvePoint, or None
-        `None` unless `lineage_threshold_curve=` was given to :func:`audit`
-        *and* `groups=` was not supplied directly (there is no dendrogram to
-        sweep when the caller hands in labels instead of letting `audit()`
-        derive them -- see `LeakageCurvePoint` and the `lineage_threshold_
-        curve` parameter below). When present, one `LeakageCurvePoint` per
-        entry of `lineage_threshold_curve`, in the same order, each the same
-        random-vs-lineage-blocked comparison this report's own top-level
-        fields make at `lineage_threshold`, made instead at that point's own
-        threshold, from the same single dendrogram (see
-        `cv.lineage_groups_at_thresholds`). This field is purely additive:
-        every caller that does not pass `lineage_threshold_curve=` sees it
-        as `None` and every other field unchanged.
+        By default (`groups=` omitted, `auto_leakage_curve=True`, the
+        default), always populated with a data-driven curve -- see
+        `auto_leakage_curve`'s own docstring for why a single-threshold
+        `gap` is not, by itself, a robust finding. `None` only when
+        `groups=` was supplied directly (there is no dendrogram to sweep
+        when the caller hands in labels instead of letting `audit()`
+        derive them), or when a caller explicitly passed
+        `auto_leakage_curve=False` and no `lineage_threshold_curve=`. When
+        present, one `LeakageCurvePoint` per swept threshold (explicit
+        `lineage_threshold_curve`, or the automatic curve's own points), in
+        the same order, each the same random-vs-lineage-blocked comparison
+        this report's own top-level fields make at `lineage_threshold`,
+        made instead at that point's own threshold, from the same single
+        dendrogram (see `cv.lineage_groups_at_thresholds`).
     """
 
     n_samples: int
@@ -1163,6 +1165,8 @@ def audit(
     sketch_size: int = 1000,
     lineage_threshold: float = 0.01,
     lineage_threshold_curve: Optional[Sequence[float]] = None,
+    auto_leakage_curve: bool = True,
+    default_curve_points: int = 5,
     random_state: Optional[int] = 0,
 ) -> AuditReport:
     """Fits and scores `estimator` under ordinary (random) cross-validation
@@ -1229,21 +1233,18 @@ def audit(
     lineage_threshold_curve : sequence of float, optional
         Additional Mash-distance thresholds at which to repeat the
         lineage-blocked comparison, producing `AuditReport.leakage_curve` --
-        see `LeakageCurvePoint`. `None` (the default) leaves `leakage_curve`
-        as `None` and changes nothing else about this function's behavior
-        or return shape: this parameter is purely additive. Silently
-        ignored (matching how `lineage_threshold` itself is already
-        documented as ignored) whenever `groups=` is supplied directly --
-        there is no dendrogram to cut at other thresholds when the lineage
-        labels did not come from one.
+        see `LeakageCurvePoint`. Given explicitly, exactly those thresholds
+        are swept and `auto_leakage_curve` is not consulted. `None` (the
+        default) does NOT mean "no curve" -- see `auto_leakage_curve`
+        below, which is what actually controls that.
 
-        When honoured, `[lineage_threshold] + <the distinct entries of
-        lineage_threshold_curve>` is swept in a single call to
-        `cv.lineage_groups_at_thresholds`, so the grouping this function
-        already needs at `lineage_threshold` (for every top-level
-        `score_lineage`/`gap`/`n_lineages`/`confounding` field) and every
-        point on the curve all come from one sketching pass and one
-        dendrogram, not one per threshold -- see that function's own
+        When a curve is computed (explicit or automatic), `[lineage_
+        threshold] + <the distinct entries of the curve>` is swept in a
+        single call to `cv.lineage_groups_at_thresholds`, so the grouping
+        this function already needs at `lineage_threshold` (for every
+        top-level `score_lineage`/`gap`/`n_lineages`/`confounding` field)
+        and every point on the curve all come from one sketching pass and
+        one dendrogram, not one per threshold -- see that function's own
         docstring for why that matters. A curve entry equal to
         `lineage_threshold` reuses that grouping's already-computed
         `LeakageCurvePoint` rather than recomputing it a second time with a
@@ -1252,7 +1253,49 @@ def audit(
         `lineage_threshold` -- a curve is exactly the tool for showing
         *where* a grouping degenerates into (almost) one lineage per
         sample, so that warning firing partway along the curve is itself
-        part of the result, not noise to suppress.
+        part of the result, not noise to suppress. Silently ignored
+        (matching how `lineage_threshold` itself is already documented as
+        ignored) whenever `groups=` is supplied directly -- there is no
+        dendrogram to cut at other thresholds when the lineage labels did
+        not come from one.
+    auto_leakage_curve : bool, default True
+        Whether `lineage_threshold_curve=None` means "sweep a data-driven
+        default curve" (`True`, the default) or "no curve" (`False`, this
+        function's original behaviour, before `leakage_curve` existed).
+
+        This defaults to `True` on purpose, not as a convenience: a single
+        `gap` at one arbitrary `lineage_threshold` is not a robust finding
+        by itself -- see this module's own motivating case (a real
+        bacterial AMR cohort read `gap=-0.018` at this function's default
+        threshold, where 149/150 genomes were each their own lineage, and
+        `gap=+0.148` at a coarser, data-driven threshold on the *same*
+        cohort) -- so reporting one number as if it settled the question,
+        merely because a caller did not think to ask for a curve, silently
+        exports exactly the fragility this module exists to catch. When
+        `True` and `lineage_threshold_curve` is `None` and `groups=` was
+        not supplied directly, the default curve comes from `cv.
+        default_threshold_curve(paths, n_points=default_curve_points, k=k,
+        sketch_size=sketch_size)` -- thresholds drawn from THIS cohort's
+        own dendrogram (see that function's own docstring for why a fixed,
+        cohort-independent threshold list would not do), not arbitrary
+        constants.
+
+        This makes every default call to `audit()` cost roughly `1 +
+        default_curve_points` lineage-blocked `cross_val_score` runs
+        instead of 1 -- real, and dominant, wall-clock on a realistic
+        cohort and estimator (minutes per run, not seconds; the extra
+        dendrogram sketch this also costs is comparatively negligible).
+        Pass `auto_leakage_curve=False` to keep the original single-
+        threshold, single-`cross_val_score`-pair behaviour when that cost
+        is not worth paying for a given call -- e.g. a quick sanity check
+        during development, or a caller that already knows, from its own
+        prior curve, that this cohort's gap is stable across granularity.
+    default_curve_points : int, default 5
+        `n_points` forwarded to `cv.default_threshold_curve()` when the
+        curve is automatic (`auto_leakage_curve=True` and `lineage_
+        threshold_curve=None`). Ignored otherwise -- including when
+        `lineage_threshold_curve` is given explicitly, which controls its
+        own point count directly via how many thresholds it contains.
     random_state : int or None, default 0
         Seeds the random-CV splitter's shuffle (and every covariate's
         `StratifiedKFold`/`KFold`, when applicable through
@@ -1267,9 +1310,12 @@ def audit(
         from `phenotype` and the lineage labels alone -- no fit, no fold,
         no dependence on `estimator` beyond asking it whether the phenotype
         is categorical or continuous (see `Confounding`), and whose
-        `leakage_curve` field is `None` unless `lineage_threshold_curve=`
-        was given and `groups=` was not (see `LeakageCurvePoint` and the
-        `lineage_threshold_curve` parameter above).
+        `leakage_curve` field is `None` only when `groups=` was supplied
+        directly, or when `auto_leakage_curve=False` and `lineage_
+        threshold_curve` was not given -- by default (`groups=` omitted,
+        `auto_leakage_curve=True`) it is always populated (see
+        `LeakageCurvePoint` and the `lineage_threshold_curve`/`auto_
+        leakage_curve` parameters above).
     """
     from sklearn.base import clone
     from sklearn.model_selection import cross_val_score
@@ -1290,10 +1336,11 @@ def audit(
         )
 
     groups_supplied_directly = groups is not None
-    # Populated only when a curve is actually being swept (groups was not
-    # supplied directly, and lineage_threshold_curve was given); used below
-    # to build AuditReport.leakage_curve from the SAME dendrogram the
-    # primary `groups` grouping already came from.
+    # Populated only when a curve is actually being swept -- groups was not
+    # supplied directly, and either lineage_threshold_curve was given
+    # explicitly or auto_leakage_curve derived one (the default; see its
+    # own docstring). Used below to build AuditReport.leakage_curve from
+    # the SAME dendrogram the primary `groups` grouping already came from.
     curve_thresholds = None
     threshold_to_groups = None
 
@@ -1306,31 +1353,54 @@ def audit(
                 "derive them automatically with cv.lineage_groups()."
             )
         resolved_lineage_threshold = float("nan")
-        # lineage_threshold_curve is a no-op here: there is no dendrogram to
-        # sweep when the caller handed in labels directly (see this
-        # function's own docstring).
-    elif lineage_threshold_curve is not None:
-        curve_thresholds = [float(t) for t in lineage_threshold_curve]
-        primary_threshold = float(lineage_threshold)
-        # One dendrogram, cut at the primary threshold plus every DISTINCT
-        # threshold the curve asks for -- duplicates (including a curve
-        # entry equal to lineage_threshold itself) are cut once and shared,
-        # not recomputed, per cv.lineage_groups_at_thresholds's cost model.
-        batch_thresholds = [primary_threshold]
-        seen_thresholds = {primary_threshold}
-        for t in curve_thresholds:
-            if t not in seen_thresholds:
-                batch_thresholds.append(t)
-                seen_thresholds.add(t)
-        batch_groups = lineage_groups_at_thresholds(
-            paths, batch_thresholds, k=k, sketch_size=sketch_size
-        )
-        threshold_to_groups = dict(zip(batch_thresholds, batch_groups))
-        groups = threshold_to_groups[primary_threshold]
-        resolved_lineage_threshold = primary_threshold
+        # lineage_threshold_curve/auto_leakage_curve are both no-ops here:
+        # there is no dendrogram to sweep when the caller handed in labels
+        # directly (see this function's own docstring).
     else:
-        groups = lineage_groups(paths, k=k, sketch_size=sketch_size, distance_threshold=lineage_threshold)
-        resolved_lineage_threshold = float(lineage_threshold)
+        if lineage_threshold_curve is not None:
+            resolved_curve_thresholds = [float(t) for t in lineage_threshold_curve]
+        elif auto_leakage_curve:
+            # lineage_threshold_curve=None no longer means "no curve" --
+            # see auto_leakage_curve's own docstring for why a data-driven
+            # default curve is what this function reports unless a caller
+            # opts out. This is a SEPARATE sketching/dendrogram pass from
+            # the one below (see default_threshold_curve's own docstring
+            # for why that tradeoff was made); an empty result (every
+            # merge height was exactly 0) falls through to the plain,
+            # curve-free path rather than erroring, since there is
+            # genuinely no positive threshold this cohort's own dendrogram
+            # can offer.
+            resolved_curve_thresholds = default_threshold_curve(
+                paths, n_points=default_curve_points, k=k, sketch_size=sketch_size
+            ) or None
+        else:
+            resolved_curve_thresholds = None
+
+        if resolved_curve_thresholds is not None:
+            curve_thresholds = resolved_curve_thresholds
+            primary_threshold = float(lineage_threshold)
+            # One dendrogram, cut at the primary threshold plus every
+            # DISTINCT threshold the curve asks for -- duplicates
+            # (including a curve entry equal to lineage_threshold itself)
+            # are cut once and shared, not recomputed, per cv.
+            # lineage_groups_at_thresholds's cost model.
+            batch_thresholds = [primary_threshold]
+            seen_thresholds = {primary_threshold}
+            for t in curve_thresholds:
+                if t not in seen_thresholds:
+                    batch_thresholds.append(t)
+                    seen_thresholds.add(t)
+            batch_groups = lineage_groups_at_thresholds(
+                paths, batch_thresholds, k=k, sketch_size=sketch_size
+            )
+            threshold_to_groups = dict(zip(batch_thresholds, batch_groups))
+            groups = threshold_to_groups[primary_threshold]
+            resolved_lineage_threshold = primary_threshold
+        else:
+            groups = lineage_groups(
+                paths, k=k, sketch_size=sketch_size, distance_threshold=lineage_threshold
+            )
+            resolved_lineage_threshold = float(lineage_threshold)
 
     def _warn_if_degenerate(n_lineages_here, grouping_label):
         if n_samples > 0 and n_lineages_here / n_samples >= _DEGENERATE_LINEAGE_FRACTION:
