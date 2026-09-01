@@ -28,9 +28,15 @@ features beating k-mers for AMR). The defensible differentiators are:
    24k+ genomes): random CV splits leak clonal relatives across train/test
    and inflate every published number; phylogeny-aware CV is the field's
    named missing tool (arXiv 2502.07749; BiB 2024 benchmark used three split
-   methods for this reason). No mainstream library derives leakage-safe
-   splits from the genomes themselves. FastDNA can, because it already
-   computes Mash distances (`compare_all`).
+   methods for this reason). This is not an unsolved problem in general --
+   homology-based splitting already exists for protein ML (CD-HIT,
+   MMseqs2), and population-structure correction already exists for GWAS
+   specifically (pyseer, mixed models over a precomputed kinship matrix).
+   What is missing is a general-purpose, sklearn-native `cv=` splitter that
+   derives the grouping directly from raw genomic sequence -- no separate
+   tool, no precomputed matrix -- and composes with *any* estimator, not
+   just an association test. FastDNA can, because it already computes Mash
+   distances (`compare_all`).
 2. **Interpretability.** gLM embeddings underperform supervised baselines on
    regulatory tasks (Koo lab, Genome Biology 2025); Evo 2 has documented
    blind spots and H100-class inference costs. A SHAP value on an exact
