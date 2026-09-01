@@ -185,6 +185,24 @@ def fake_downloads(monkeypatch):
     return calls
 
 
+@pytest.fixture
+def write_calls(monkeypatch):
+    """Records every destination path `_write_cache_file` is asked to
+    (re)write, without changing its behavior -- lets a test assert a given
+    cache entry was written at most once across two loader calls, not just
+    that no *download* happened a second time.
+    """
+    calls: list[str] = []
+    original = datasets_module._write_cache_file
+
+    def wrapper(dest, data):
+        calls.append(str(dest))
+        return original(dest, data)
+
+    monkeypatch.setattr(datasets_module, "_write_cache_file", wrapper)
+    return calls
+
+
 # ---------------------------------------------------------------------------
 # load_amr
 # ---------------------------------------------------------------------------
@@ -356,7 +374,7 @@ def test_load_hiv_resistance_second_call_is_cached_no_redownload(tmp_path, fake_
     )
 
 
-def test_load_hiv_resistance_samples_shared_across_drugs_are_not_rewritten(tmp_path, fake_downloads):
+def test_load_hiv_resistance_samples_shared_across_drugs_are_not_rewritten(tmp_path, fake_downloads, write_calls):
     """H1..H13's DNA FASTA depends only on the protein reconstruction, not
     on which drug selected the row -- a second loader call for a
     *different* drug that happens to select an already-cached sample
@@ -365,6 +383,8 @@ def test_load_hiv_resistance_samples_shared_across_drugs_are_not_rewritten(tmp_p
     """
     load_hiv_resistance("NFV", cache_dir=tmp_path)
     dataset_calls = list(fake_downloads)
+    h1_fasta = str(tmp_path / "hiv" / "samples" / "H1.fasta")
+    assert write_calls.count(h1_fasta) == 1
 
     with pytest.raises(ValueError):
         # ATV has clean rows too (same P-column data), but no documented
@@ -375,6 +395,11 @@ def test_load_hiv_resistance_samples_shared_across_drugs_are_not_rewritten(tmp_p
 
     # PI_DataSet.txt must not have been downloaded a second time.
     assert fake_downloads.count(dataset_calls[0]) == 1
+    # H1 (fold 24.7 under ATV too, since the fixture mirrors NFV's values
+    # onto every drug column) is resistant under fold_cutoff=2.0 as well,
+    # so it is selected again -- but its already-cached FASTA must not be
+    # rewritten.
+    assert write_calls.count(h1_fasta) == 1
 
 
 # ---------------------------------------------------------------------------

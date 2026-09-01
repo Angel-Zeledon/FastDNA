@@ -16,6 +16,26 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- Python: new module `fastdna.datasets` with `load_amr()` and
+  `load_hiv_resistance()` -- real, labeled genomic cohorts (BV-BRC
+  antimicrobial-resistance metadata; Stanford HIVDB HIV-1 protease
+  drug-resistance genotype/phenotype pairs) in one function call, turning
+  the manual real-data reproductions this project already did by hand
+  (`scratch/amr_repro/`, `scratch/hiv_repro/`) into reusable, cached,
+  idempotent loaders. Each returns a small frozen dataclass (`AmrCohort`/
+  `HivResistanceCohort`) with `paths` ready for `fastdna.count()`/
+  `fastdna.sklearn.KmerVectorizer`, a binary `phenotype` array, and a
+  continuous regression target (`mic`/`fold_resistance`) for
+  `fastdna.mic.MicRegressor`. Downloads are cached under
+  `~/.fastdna/datasets` by default (override via `cache_dir=` or the
+  `FASTDNA_DATA_CACHE` env var); a bad `species`/`antibiotic`/`drug` fails
+  loudly, listing what is actually available. Not re-exported from
+  `fastdna.__init__` (an onboarding/convenience module, not a
+  differentiator-level one) -- reachable via `from fastdna.datasets import
+  load_amr, load_hiv_resistance`. See `python/fastdna/datasets.py`'s
+  module docstring for the full design rationale (cache location,
+  supported species, and why HIV back-translation stays private to this
+  module rather than living in `fastdna.translate`).
 - Rust/Python/CLI: ntCard-style streaming k-mer frequency-spectrum
   estimator (`docs/feature-gap-analysis.md`'s S7(a); Mohamadi, Khan &
   Birol, *Bioinformatics* 2017) -- `src/ntcard.rs`'s `NtCardSketch`, the
