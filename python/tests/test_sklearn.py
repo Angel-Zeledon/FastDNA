@@ -22,6 +22,7 @@ pytest.importorskip("scipy")
 np = pytest.importorskip("numpy")
 
 import scipy.sparse
+from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -778,6 +779,76 @@ def test_chunk_size_interoperates_with_precomputed_cohort_counts(tmp_path):
     unchunked.fit(list(cohort.sample_ids))
 
     assert list(chunked.vocabulary_) == list(unchunked.vocabulary_)
+
+
+def test_clone_shares_counts_by_reference_instead_of_deep_copying(tmp_path):
+    """`sklearn.base.clone()`'s default behaviour deep-copies every
+    constructor parameter, including `counts=` -- a `fastdna.CohortCounts`
+    that can be hundreds of MB to multiple GB. `cross_val_score`/
+    `GridSearchCV`/`fastdna.audit()` all clone the estimator once per fold
+    internally, so without `KmerVectorizer.__sklearn_clone__` (see its own
+    docstring) a single `counts=`-based cross-validation run deep-copies the
+    whole cohort roughly `2 * n_splits` times over -- confirmed directly, at
+    real cohort scale, to cost tens of seconds and multiple GB PER CLONE,
+    and to be capable of exhausting a real machine's RAM when two such
+    cross-validations run concurrently (see
+    `scratch/amr_repro_scaled/`'s own report). `counts` is `frozen=True`
+    specifically so nothing can mutate it, which is what makes sharing it
+    by reference across every clone safe.
+    """
+    paths = _chunk_size_test_cohort(tmp_path)
+    cohort = fastdna.count_cohort(paths, k=6)
+
+    vec = KmerVectorizer(k=6, top_features=None, counts=cohort, representation="count")
+    cloned = clone(vec)
+
+    assert cloned is not vec
+    assert cloned.counts is vec.counts, "counts must be shared by reference, not deep-copied"
+    assert cloned.k == vec.k
+    assert cloned.representation == vec.representation
+
+    # Functional correctness, not just identity: a cloned counts=-based
+    # vectorizer must fit/transform exactly like the original.
+    fitted_original = KmerVectorizer(k=6, top_features=None, counts=cohort).fit(list(cohort.sample_ids))
+    fitted_clone = clone(fitted_original).fit(list(cohort.sample_ids))
+    assert list(fitted_original.vocabulary_) == list(fitted_clone.vocabulary_)
+
+
+def test_cross_val_score_with_counts_completes_quickly(tmp_path):
+    """A regression guard for the same bug `test_clone_shares_counts_by_
+    reference_instead_of_deep_copying` targets, from the cross_val_score
+    side: before `__sklearn_clone__` existed, every one of `cross_val_
+    score`'s per-fold clones deep-copied the whole `counts=` cohort, so
+    wall-clock scaled with cohort size x n_splits instead of being
+    dominated by the (tiny, here) actual fit/transform work. This cohort is
+    intentionally small so the assertion is about the *shape* of the cost
+    (clone must not re-copy the cohort) rather than a specific duration.
+    """
+    import time
+
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import cross_val_score
+    from sklearn.pipeline import Pipeline
+
+    paths = _chunk_size_test_cohort(tmp_path) * 3  # a few more samples for 3-fold CV
+    sample_ids = [f"s{i}" for i in range(len(paths))]
+    cohort = fastdna.count_cohort(dict(zip(sample_ids, paths)), k=6)
+    y = [i % 2 for i in range(len(paths))]
+
+    pipe = Pipeline(
+        [
+            ("kmers", KmerVectorizer(k=6, top_features=50, counts=cohort)),
+            ("clf", LogisticRegression()),
+        ]
+    )
+    t0 = time.time()
+    cross_val_score(pipe, sample_ids, y, cv=3)
+    elapsed = time.time() - t0
+    # Generous ceiling: this tiny cohort's actual fit/transform work is
+    # milliseconds; the old deep-copy-per-clone bug would still be
+    # comfortably over this on a cohort this small, but the real value of
+    # this test is the two assertions above it, not the ceiling itself.
+    assert elapsed < 10.0, f"cross_val_score with counts= took {elapsed:.2f}s -- clone() may be deep-copying counts again"
 
 
 @pytest.mark.parametrize("bad_value", [0, -1, -100])

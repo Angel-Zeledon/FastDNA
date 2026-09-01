@@ -92,6 +92,16 @@ class CohortCounts:
     def __len__(self) -> int:
         return len(self.sample_ids)
 
+    def __deepcopy__(self, memo: dict) -> "CohortCounts":
+        # Frozen and meant to be shared across every CV fold (see the module
+        # docstring). Without this, scikit-learn's clone() -- which reaches
+        # this object via KmerVectorizer(counts=...) and falls back to
+        # copy.deepcopy() for any constructor param that isn't itself an
+        # estimator -- duplicates the whole k-mer table on every single
+        # clone (one per fold per CV scheme per model), which for a
+        # real-sized cohort is enough to exhaust memory outright.
+        return self
+
     @property
     def offsets(self) -> np.ndarray:
         """The start index of each sample's rows within `kmers`, plus one

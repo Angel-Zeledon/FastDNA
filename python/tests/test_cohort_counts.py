@@ -157,6 +157,40 @@ def test_counts_artifact_is_immutable(tmp_path):
         counts.k = 21
 
 
+def test_deepcopy_of_the_artifact_returns_the_same_object(tmp_path):
+    """sklearn's clone() falls back to copy.deepcopy() for any constructor
+    param that is not itself an estimator -- KmerVectorizer(counts=...)
+    hits exactly that path on every cross_val_score/GridSearchCV fold.
+    Deep-copying the whole k-mer table on every fold would duplicate a
+    real cohort's multi-hundred-million-row table 5-10+ times over and can
+    exhaust memory outright; since the artifact is frozen and meant to be
+    shared (see the module docstring), deepcopy must be a no-op identity.
+    """
+    import copy
+
+    paths = _cohort(tmp_path, n=2)
+    counts = fastdna.count_cohort(paths, k=11)
+    assert copy.deepcopy(counts) is counts
+
+
+def test_cloning_a_pipeline_with_the_artifact_does_not_duplicate_it(tmp_path):
+    """The actual failure mode this guards against: cloning a Pipeline
+    holding KmerVectorizer(counts=...), as every cross_val_score fold
+    does, must not deep-copy the shared artifact."""
+    from sklearn.base import clone
+
+    paths = _cohort(tmp_path, n=2)
+    counts = fastdna.count_cohort(paths, k=11)
+    pipe = make_pipeline(
+        KmerVectorizer(k=11, top_features=50, representation="count", counts=counts),
+        LogisticRegression(max_iter=200),
+    )
+
+    cloned = clone(pipe)
+
+    assert cloned.steps[0][1].counts is counts
+
+
 def test_vectorizer_with_artifact_matches_vectorizer_with_paths(tmp_path):
     """The equivalence check: the fast path cannot change the answer."""
     paths = _cohort(tmp_path, n=8)
