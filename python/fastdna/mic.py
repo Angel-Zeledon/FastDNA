@@ -200,6 +200,13 @@ class MicRegressor:
     hard-to-notice bug (predictions off by a power of two look plausible at
     a glance).
 
+    A caller who scores this through generic sklearn machinery (a bare
+    `scoring="r2"` passed to `cross_val_score`/`GridSearchCV`/`fastdna.
+    audit()`) gets R^2 computed against raw-MIC `predict()` output, not the
+    log2-space R^2 the MIC-regression literature reports -- see
+    `predict()`'s own docstring for why, and `predict_log2()`/
+    `mic_regression_report()` for the field-standard metric.
+
     Parameters
     ----------
     estimator : a scikit-learn-compatible regressor, or None
@@ -388,6 +395,19 @@ class MicRegressor:
 
     def predict(self, X: Any) -> np.ndarray:  # X is array-like or scipy sparse matrix
         """Predicted MIC in original (linear) units: `2 ** predict_log2(X)`.
+
+        A generic `scoring=` string or callable (`sklearn.metrics.
+        get_scorer`, and therefore `cross_val_score`/`GridSearchCV`/
+        `fastdna.audit()`, all of which score through `estimator.predict()`
+        by default) is evaluated against THIS method's output -- raw,
+        linear-scale MIC -- not `predict_log2()`. `scoring="r2"` there is
+        silently not the R^2 the MIC-regression literature reports (that
+        one is computed in log2 space; see `MicRegressionReport.r2`'s own
+        docstring for why raw-MIC R^2 is dominated by whichever samples
+        happen to have the largest concentrations, a two-fold-dilution
+        artifact, not a fit-quality signal). Score against
+        `predict_log2(X)` directly, or use `mic_regression_report()`, for
+        the field-standard metric.
 
         Returns
         -------

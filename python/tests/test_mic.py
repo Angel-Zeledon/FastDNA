@@ -230,6 +230,43 @@ def test_mic_regressor_composes_with_cross_val_score():
     assert np.all(np.isfinite(scores))
 
 
+def test_generic_r2_scoring_differs_from_mic_regression_report_r2():
+    """Pins the pitfall `MicRegressor.predict()`'s own docstring warns
+    about: a generic `scoring="r2"` (what `cross_val_score`/`GridSearchCV`/
+    `fastdna.audit()` compute by default, via `predict()`) is `r2_score`
+    over RAW-MIC predictions, not the log2-space R^2 the MIC-regression
+    literature reports and `mic_regression_report()` returns. Over a
+    dilution-series-realistic MIC range (multiple octaves) with real fit
+    noise, the two must not agree -- exp2's convexity means the same
+    log2-space residual is a small raw-MIC error for a low-MIC sample and a
+    huge one for a high-MIC sample, which raw-space R^2 punishes
+    unevenly and log2-space R^2 does not.
+    """
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import r2_score
+
+    rng = np.random.default_rng(7)
+    n = 60
+    X = rng.normal(size=(n, 5))
+    true_log2 = X @ np.array([1.0, -0.5, 0.3, 0.25, -0.2]) + 3.0  # spans several octaves
+    noisy_log2 = true_log2 + rng.normal(scale=0.4, size=n)  # realistic, imperfect fit
+    mic_true = np.exp2(noisy_log2)
+
+    model = MicRegressor(Ridge(alpha=0.5)).fit(X, mic_true)
+
+    generic_r2 = r2_score(mic_true, model.predict(X))
+    report = mic_regression_report(mic_true, model.predict(X))
+
+    assert not generic_r2 == pytest.approx(report.r2, abs=1e-6), (
+        f"raw-space R^2 ({generic_r2}) unexpectedly matched log2-space R^2 ({report.r2}) -- "
+        "the fixture no longer demonstrates the pitfall this test pins"
+    )
+    # The log2-space number is the one predict_log2() itself reproduces
+    # directly, confirming report.r2 is scoring the space the model was
+    # actually fit in, not an independent third computation.
+    assert report.r2 == pytest.approx(r2_score(noisy_log2, model.predict_log2(X)), abs=1e-9)
+
+
 # ---------------------------------------------------------------------------
 # mic_regression_report
 # ---------------------------------------------------------------------------
