@@ -218,6 +218,12 @@ class MicRegressor:
         `X.shape[1]` at fit time, scikit-learn's own convention.
     """
 
+    # The legacy (pre-1.6) scikit-learn estimator-type marker, kept
+    # alongside `__sklearn_tags__` below for any code (scikit-learn's own
+    # older minor versions, or a third-party library) that still reads this
+    # attribute directly instead of going through `sklearn.utils.get_tags`.
+    _estimator_type = "regressor"
+
     def __init__(
         self,
         estimator: Optional[Any] = None,  # scikit-learn-compatible regressor; sklearn is imported lazily
@@ -226,6 +232,94 @@ class MicRegressor:
         # validation and no side effects, matching fastdna.sklearn.KmerVectorizer
         # and fastdna.calibration.calibrate's own estimator-parameter handling.
         self.estimator = estimator
+
+    def get_params(self, deep: bool = True) -> dict:
+        """scikit-learn's estimator-introspection contract, implemented by
+        hand rather than by inheriting `sklearn.base.BaseEstimator`: this
+        module imports scikit-learn lazily (see the module docstring's
+        "Optional dependencies" section), and subclassing `BaseEstimator`
+        would make a bare `import fastdna.mic` require scikit-learn to be
+        installed just to define the class.
+
+        Without this method (and `set_params` below), `sklearn.base.clone`
+        raises `TypeError: ... does not seem to be a scikit-learn
+        estimator` on any `MicRegressor` instance -- which breaks every
+        piece of scikit-learn's own cross-validation machinery this module's
+        "Population structure" section recommends using it with
+        (`sklearn.model_selection.cross_val_score`/`GridSearchCV` with
+        `cv=fastdna.cv.LineageKFold(...)`, and `fastdna.audit()`, all of
+        which clone the estimator before every fold). This was a real gap:
+        the module docstring's own usage example never exercises `clone()`
+        because it calls `.fit()`/`.predict()` directly, so the break was
+        invisible until `MicRegressor` was placed inside a cross-validated
+        pipeline.
+
+        Mirrors `BaseEstimator.get_params`'s own behaviour for a single-
+        parameter estimator: `deep=True` (the default) additionally exposes
+        the wrapped `estimator`'s own parameters as `estimator__<name>`
+        when `estimator` itself exposes `get_params` (true of any
+        scikit-learn estimator), so `GridSearchCV` can be pointed at
+        `estimator__alpha` etc. through a `MicRegressor` step exactly as it
+        would through a bare `Ridge()`.
+        """
+        params: dict = {"estimator": self.estimator}
+        if deep and hasattr(self.estimator, "get_params"):
+            for name, value in self.estimator.get_params(deep=True).items():
+                params[f"estimator__{name}"] = value
+        return params
+
+    def set_params(self, **params: Any) -> "MicRegressor":
+        """The mirror of `get_params()` above, needed for the same reason:
+        `sklearn.base.clone()` calls `set_params()` on the freshly
+        constructed copy, and `GridSearchCV`/`Pipeline.set_params()` call it
+        directly to apply `estimator__<name>=value` overrides.
+        """
+        if "estimator" in params:
+            self.estimator = params.pop("estimator")
+        nested: dict = {}
+        for name in list(params):
+            if name.startswith("estimator__"):
+                nested[name[len("estimator__"):]] = params.pop(name)
+        if nested:
+            if self.estimator is None:
+                raise _core.InvalidConfigError(
+                    "MicRegressor.set_params(): cannot set estimator__* parameters while "
+                    "estimator is None (the default Ridge() is only constructed inside "
+                    "fit()). Pass an explicit estimator=... first."
+                )
+            self.estimator.set_params(**nested)
+        if params:
+            raise _core.InvalidConfigError(
+                f"MicRegressor.set_params() got unexpected parameter(s): {sorted(params)}. "
+                "The only top-level parameter is 'estimator' (or 'estimator__<name>' for "
+                "one of its own parameters)."
+            )
+        return self
+
+    def __sklearn_tags__(self):
+        """scikit-learn >= 1.6's estimator-tags contract, needed for the
+        same reason `get_params`/`set_params` above are: `sklearn.base.
+        is_regressor()`, `sklearn.metrics.check_scoring()` (which
+        `cross_val_score`/`GridSearchCV`/`fastdna.audit()` all call
+        internally), and `sklearn.base.clone()`'s own validation all read
+        `estimator.__sklearn_tags__()` in current scikit-learn, and raise
+        `AttributeError` when it is missing entirely -- not just on a class
+        that predates the tags API, but on any plain object, which
+        `MicRegressor` is (see `get_params`'s docstring for why it does not
+        inherit `BaseEstimator`). Declaring `estimator_type="regressor"`
+        here also makes `is_regressor(MicRegressor())` correctly `True`,
+        which `fastdna.audit()`'s own `_phenotype_is_categorical`/
+        `_default_scoring` helpers use to decide how to treat the
+        phenotype and which scorer to default to.
+        """
+        from sklearn.utils import InputTags, RegressorTags, Tags, TargetTags
+
+        return Tags(
+            estimator_type="regressor",
+            target_tags=TargetTags(required=True),
+            regressor_tags=RegressorTags(),
+            input_tags=InputTags(sparse=True),
+        )
 
     def fit(
         self,

@@ -151,6 +151,85 @@ def test_mic_regressor_accepts_a_custom_estimator():
     assert np.all(preds > 0)
 
 
+def test_mic_regressor_is_clonable():
+    """Regression test for a real bug found while scaling up
+    scratch/hiv_repro_scaled: `sklearn.base.clone()` (which every
+    `cross_val_score`/`GridSearchCV`/`fastdna.audit()` call makes once per
+    fold) raised `TypeError: ... does not seem to be a scikit-learn
+    estimator` on any `MicRegressor`, because the class defined neither
+    `get_params()` nor `set_params()`. The module's own docstring example
+    never exercises `clone()` (it calls `.fit()`/`.predict()` directly), so
+    the break was invisible until `MicRegressor` was placed inside a
+    cross-validated pipeline -- exactly the "compose with sklearn's own
+    model-selection tools" use case `fastdna.cv`/`fastdna.audit` exist for.
+    """
+    from sklearn.base import clone
+    from sklearn.linear_model import Ridge
+
+    model = MicRegressor(Ridge(alpha=2.0))
+    cloned = clone(model)
+
+    assert cloned is not model
+    assert isinstance(cloned.estimator, Ridge)
+    assert cloned.estimator.alpha == pytest.approx(2.0)
+    assert cloned.estimator is not model.estimator  # clone() deep-copies nested estimators too
+
+
+def test_mic_regressor_get_params_exposes_nested_estimator_params():
+    from sklearn.linear_model import Ridge
+
+    model = MicRegressor(Ridge(alpha=3.0))
+    params = model.get_params(deep=True)
+
+    assert params["estimator"] is model.estimator
+    assert params["estimator__alpha"] == pytest.approx(3.0)
+    assert model.get_params(deep=False) == {"estimator": model.estimator}
+
+
+def test_mic_regressor_set_params_supports_nested_syntax():
+    from sklearn.linear_model import Ridge
+
+    model = MicRegressor(Ridge(alpha=1.0))
+    model.set_params(estimator__alpha=9.0)
+    assert model.estimator.alpha == pytest.approx(9.0)
+
+    other = Ridge(alpha=0.5)
+    model.set_params(estimator=other)
+    assert model.estimator is other
+
+
+def test_mic_regressor_set_params_rejects_unknown_parameter():
+    with pytest.raises(ValueError, match="unexpected parameter"):
+        MicRegressor().set_params(not_a_real_param=1)
+
+
+def test_mic_regressor_composes_with_cross_val_score():
+    """The concrete composability check: `MicRegressor` wrapped in
+    `sklearn.model_selection.cross_val_score` with an explicit `scoring=`
+    (it has no default `.score()` -- see this test's own scoring= choice)
+    runs end to end across multiple folds, each of which clones the
+    estimator. Before the get_params()/set_params() fix above this raised
+    on the very first fold.
+    """
+    from sklearn.linear_model import Ridge
+    from sklearn.model_selection import KFold, cross_val_score
+
+    rng = np.random.default_rng(6)
+    X = rng.normal(size=(30, 5))
+    true_log2 = X @ np.array([1.0, -0.5, 0.0, 0.25, 0.0]) + 2.0
+    y = np.exp2(true_log2)
+
+    scores = cross_val_score(
+        MicRegressor(Ridge(alpha=0.5)),
+        X,
+        y,
+        cv=KFold(n_splits=3, shuffle=True, random_state=0),
+        scoring="r2",
+    )
+    assert scores.shape == (3,)
+    assert np.all(np.isfinite(scores))
+
+
 # ---------------------------------------------------------------------------
 # mic_regression_report
 # ---------------------------------------------------------------------------
