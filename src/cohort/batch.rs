@@ -119,6 +119,7 @@ pub fn count_paired_samples(
     pipeline_config: &PipelineConfig,
     min_count: u32,
     max_count: Option<u32>,
+    with_sequence: bool,
 ) -> Result<Vec<SampleRunResult>> {
     let samples = discover_paired_samples(dir)?;
 
@@ -151,11 +152,15 @@ pub fn count_paired_samples(
         counter.prune(min_count, max_count);
 
         let records_written = match format {
-            PairedOutputFormat::Parquet => {
-                export::export_parquet(&counter, &output_path, pipeline_config.k, min_count)?
-            }
+            PairedOutputFormat::Parquet => export::export_parquet(
+                &counter,
+                &output_path,
+                pipeline_config.k,
+                min_count,
+                with_sequence,
+            )?,
             PairedOutputFormat::Csv => {
-                export::export_csv(&counter, &output_path, pipeline_config.k, min_count)?
+                export::export_csv(&counter, &output_path, pipeline_config.k, min_count, with_sequence)?
             }
         };
 
@@ -215,6 +220,7 @@ mod tests {
             &config(5),
             1,
             None,
+            false,
         )
         .expect("a cleanly paired sample must succeed");
 
@@ -242,6 +248,7 @@ mod tests {
             &config(5),
             1,
             None,
+            false,
         )
         .expect("two cleanly paired samples must succeed");
 
@@ -264,7 +271,7 @@ mod tests {
         let out = fixture();
 
         let result =
-            count_paired_samples(src.path(), out.path(), PairedOutputFormat::Csv, &config(5), 1, None);
+            count_paired_samples(src.path(), out.path(), PairedOutputFormat::Csv, &config(5), 1, None, false);
 
         match result {
             Err(FastDnaError::InvalidConfig { parameter, reason }) => {
@@ -285,7 +292,7 @@ mod tests {
         let out = fixture();
 
         let result =
-            count_paired_samples(src.path(), out.path(), PairedOutputFormat::Csv, &config(5), 1, None);
+            count_paired_samples(src.path(), out.path(), PairedOutputFormat::Csv, &config(5), 1, None, false);
 
         assert!(
             matches!(result, Err(FastDnaError::NoSamplesFound { .. })),
@@ -302,7 +309,7 @@ mod tests {
         let out = out_parent.path().join("does_not_exist_yet");
         assert!(!out.exists());
 
-        count_paired_samples(src.path(), &out, PairedOutputFormat::Csv, &config(5), 1, None)
+        count_paired_samples(src.path(), &out, PairedOutputFormat::Csv, &config(5), 1, None, false)
             .expect("a missing output directory must be created, not rejected");
 
         assert!(out.join("pat_001.csv").exists());

@@ -77,6 +77,12 @@ fn max_count_flag_is_wired_through_to_prune() {
     write_fastq(&fastq_path, 10, 2); // AAAA x10, CCCC x2
 
     // Run 1: no --max-count. Both k-mers must survive.
+    //
+    // `--with-sequence` is passed explicitly: the decoded `kmer_sequence`
+    // column this test reads ("AAAA"/"CCCC") is off by default (see
+    // `export::counts_schema`), and this test is about `--max-count`
+    // wiring, not about that column, so it keeps asking for it rather than
+    // switching to asserting on raw `kmer_u64` values.
     let out_uncapped = scratch.path("uncapped.csv");
     let qc_uncapped = scratch.path("uncapped_qc.json");
     run_fastdna(&[
@@ -92,6 +98,7 @@ fn max_count_flag_is_wired_through_to_prune() {
         qc_uncapped.to_str().unwrap(),
         "--threads",
         "2",
+        "--with-sequence",
     ]);
     let uncapped_csv = std::fs::read_to_string(&out_uncapped).expect("read uncapped csv");
     assert!(uncapped_csv.contains("AAAA"), "without --max-count, AAAA (count 10) must survive:\n{uncapped_csv}");
@@ -117,6 +124,7 @@ fn max_count_flag_is_wired_through_to_prune() {
         qc_capped.to_str().unwrap(),
         "--threads",
         "2",
+        "--with-sequence",
     ]);
     let capped_csv = std::fs::read_to_string(&out_capped).expect("read capped csv");
     assert!(

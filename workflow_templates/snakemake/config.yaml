@@ -1,0 +1,37 @@
+# Example configuration for FastDNA's cohort k-mer counting Snakemake
+# workflow (workflow/Snakefile). Copy this file, edit the paths/parameters
+# below, and pass it on the command line:
+#
+#   snakemake --cores 4 --configfile config.yaml
+#
+# Nothing in workflow/Snakefile needs to change for a typical run -- every
+# value the pipeline needs is read from here.
+
+# Directory holding one paired-end FASTQ(.gz) file pair per sample, named
+# "<sample>_R1.fastq.gz" / "<sample>_R2.fastq.gz". This is the same R1/R2
+# convention FastDNA's own `--paired-dir` mode recognizes (see README.md's
+# "Paired-end batch counting"); this Snakemake template globs on it directly
+# with `glob_wildcards` so each sample becomes its own wildcard-addressable
+# rule instance in the DAG, rather than one opaque whole-directory CLI call.
+# `_1`/`_2` and Illumina's `_R1_001`/`_R2_001` naming (both of which
+# `--paired-dir` also accepts) are not matched by this template's glob --
+# rename or symlink those to the `_R1`/`_R2` form first, or adjust the glob
+# pattern in workflow/Snakefile to your own convention.
+fastq_dir: "data/"
+
+# Where per-sample Parquet counts, per-sample QC JSON, and the final
+# cohort-combined k-mer table are written. Created automatically.
+output_dir: "results/"
+
+# fastdna count's own flags -- see README.md's "Flags" table (in the
+# FastDNA repository root) for exactly what each one does.
+k: 31
+min_quality: 20.0
+min_count: 1
+threads: 4
+
+# How `fastdna union` folds several samples' counts for the same k-mer into
+# the cohort table's single `frequency` column: "sum" (the natural
+# "combine this cohort" reading), "min", or "max" -- see README.md's
+# `fastdna union --combine` documentation for what each means.
+combine: "sum"

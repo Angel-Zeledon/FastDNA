@@ -55,6 +55,16 @@ import base64
 import datetime
 import html
 import io
+import os
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Union
+
+if TYPE_CHECKING:
+    # `fastdna.evaluation` is not imported at module load time (this module
+    # does not otherwise need it); this import only runs for static type
+    # checkers, so `to_report`'s annotation can name the real class without
+    # requiring an extra runtime import, matching `fastdna/__init__.py`'s own
+    # `TYPE_CHECKING`-guarded `pandas`/`polars` imports.
+    from .evaluation import CalibrationReport
 
 __all__ = ["to_report"]
 
@@ -221,14 +231,14 @@ what it is.</p>
 
 
 def to_report(
-    path,
+    path: Union[str, os.PathLike],
     *,
-    classifier=None,
-    calibration=None,
-    calibration_interval=None,
-    metadata=None,
-    title="FastDNA run report",
-):
+    classifier: Optional[Any] = None,  # duck-typed fitted estimator: any object exposing explain()/rules_
+    calibration: Optional["CalibrationReport"] = None,
+    calibration_interval: Optional[tuple[Any, Any]] = None,  # (p0, p1), each array-like -- see docstring
+    metadata: Optional[Mapping[str, Any]] = None,
+    title: str = "FastDNA run report",
+) -> None:
     """Writes a single self-contained HTML file at `path` bundling a
     classifier's rules, a calibration reliability diagram and descriptive
     run metadata.

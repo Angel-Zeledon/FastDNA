@@ -54,13 +54,23 @@ inside `LineageKFold`/`permutation_importance_pvalues()`, in the same
 optional-dependency pattern `fastdna.embed` uses: importing this module
 never requires either package, only calling into it does.
 """
+from __future__ import annotations
+
+import os
+from typing import Any, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
 
 import fastdna
+from . import _core
 
-__all__ = ["lineage_groups", "LineageKFold", "permutation_importance_pvalues"]
+__all__ = [
+    "lineage_groups",
+    "lineage_groups_at_thresholds",
+    "LineageKFold",
+    "permutation_importance_pvalues",
+]
 
 
 def _missing_dependency(caller, package, hint=None):
@@ -71,21 +81,39 @@ def _missing_dependency(caller, package, hint=None):
 
 
 def _validate_paths(paths, caller):
-    """The two ways a path list silently corrupts a distance matrix, refused
-    up front rather than after the sketching work is done: too few paths for
-    a pairwise structure to exist at all, and a duplicate entry, which would
-    map two rows to one index and leave the earlier one all zeros.
+    """Refuses the two ways a path list silently corrupts a distance matrix.
+
+    Checked up front rather than after the sketching work is done: too few
+    paths for a pairwise structure to exist at all, and a duplicate entry,
+    which would map two rows to one index and leave the earlier one all
+    zeros.
+
+    Parameters
+    ----------
+    paths : iterable of str or pathlib.Path
+    caller : str
+        Name of the calling function, used only to name it in raised error
+        messages.
+
+    Returns
+    -------
+    list of str
+
+    Raises
+    ------
+    ValueError
+        If fewer than 2 paths are given, or a path is duplicated.
     """
     paths = [str(p) for p in paths]
     if len(paths) < 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller} needs at least 2 paths to compute pairwise distances, got {len(paths)}"
         )
 
     seen = set()
     for path in paths:
         if path in seen:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"paths contains a duplicate entry: {path!r}. Each sample may appear "
                 "only once; a duplicated path would collapse two rows of the distance "
                 "matrix onto one index and silently leave the earlier one all zeros."
@@ -105,6 +133,17 @@ def _mash_distance_matrix(paths, k, sketch_size):
     is on an interpretable per-base-divergence scale, which is what makes a
     `distance_threshold` something a caller can reason about rather than
     tune blindly.
+
+    Parameters
+    ----------
+    paths : list of str
+        Sample paths, already validated by `_validate_paths()`.
+    k, sketch_size : int
+        Forwarded to `fastdna.compare_all()`.
+
+    Returns
+    -------
+    numpy.ndarray of float64, shape (len(paths), len(paths))
     """
     table = fastdna.compare_all(paths, k=k, sketch_size=sketch_size, metric="mash_distance")
 
@@ -128,6 +167,15 @@ def _relabel_by_first_appearance(labels):
     """Renumbers arbitrary cluster labels to `0, 1, 2, ...` in order of
     first appearance, so `groups[0]` is always `0` and the labelling is
     reproducible regardless of what `fcluster` happened to number things.
+
+    Parameters
+    ----------
+    labels : array-like of int
+        Arbitrary cluster labels, e.g. from `scipy.cluster.hierarchy.fcluster`.
+
+    Returns
+    -------
+    numpy.ndarray of int64, same shape as `labels`
     """
     mapping = {}
     out = np.empty(len(labels), dtype=np.int64)
@@ -138,7 +186,139 @@ def _relabel_by_first_appearance(labels):
     return out
 
 
-def lineage_groups(paths, *, k=21, sketch_size=1000, distance_threshold=0.01):
+def _validate_distance_threshold(distance_threshold, caller):
+    """The one check `lineage_groups()` and `lineage_groups_at_thresholds()`
+    both apply to every threshold they are given: it must be a positive
+    Mash distance. At or below 0 every sample becomes its own lineage,
+    which defeats the point of clustering at all.
+
+    Parameters
+    ----------
+    distance_threshold : float
+    caller : str
+        Name of the calling function, used only to name it in raised error
+        messages.
+
+    Raises
+    ------
+    ValueError
+        If `distance_threshold` is not strictly positive.
+    """
+    if not distance_threshold > 0:
+        raise _core.InvalidConfigError(
+            f"distance_threshold must be a positive Mash distance, got {distance_threshold!r}. "
+            "At or below 0 every sample becomes its own lineage, which defeats the point."
+        )
+
+
+def lineage_groups_at_thresholds(
+    paths: Iterable[Union[str, os.PathLike]],
+    thresholds: Sequence[float],
+    *,
+    k: int = 21,
+    sketch_size: int = 1000,
+) -> List[np.ndarray]:
+    """`lineage_groups()`, evaluated at every threshold in `thresholds`, from
+    a single all-pairs Mash distance matrix and a single dendrogram.
+
+    See `lineage_groups()`'s own docstring for what a lineage label means,
+    why single linkage is the right merge rule for this purpose, and what
+    `distance_threshold` (here, each entry of `thresholds`) trades off --
+    none of that is repeated here, because it does not change: this
+    function computes exactly the same clustering `lineage_groups()` does,
+    for each threshold given, and nothing about the *meaning* of a cut
+    differs between the two.
+
+    What is different, and the entire reason this function exists as its
+    own entry point rather than as a documented idiom ("just call
+    `lineage_groups()` in a loop"), is the cost model. `lineage_groups()`
+    does two things: (1) sketch every sample and compute the `n x n`
+    all-pairs Mash distance matrix -- the expensive part, dominated by
+    `fastdna.compare_all()`'s `O(n^2)` sketch comparisons -- and (2) build a
+    single-linkage dendrogram from that matrix and cut it once at
+    `distance_threshold` -- both cheap, since `scipy.cluster.hierarchy.
+    fcluster` cutting an already-built dendrogram is linear in the number of
+    samples. Calling `lineage_groups()` once per threshold redoes step (1)
+    every time even though it does not depend on the threshold at all, so
+    sweeping `m` thresholds over a cohort costs `m` times the sketching and
+    distance work for zero additional information. This function does step
+    (1) exactly once, then reuses the same matrix and the same dendrogram
+    for every cut in step (2) -- so sweeping `m` thresholds costs one
+    sketching/distance pass plus `m` cheap cuts, not `m` of each. That
+    difference is what makes it practical to report a leakage-vs-threshold
+    curve (`fastdna.audit`'s `lineage_threshold_curve=`) instead of a single
+    number at one threshold nobody has strong a priori grounds to pick.
+
+    Parameters
+    ----------
+    paths : iterable of str or pathlib.Path
+        FASTQ(.gz) files, at least two, no duplicates. Each is sketched
+        exactly once, regardless of how many thresholds are given.
+    thresholds : sequence of float
+        The Mash-distance cut points to evaluate, each validated exactly as
+        `lineage_groups()`'s own `distance_threshold` is (must be strictly
+        positive). At least one threshold is required. Thresholds may
+        repeat; a repeated value is cut (cheaply) more than once rather than
+        deduplicated, since deduplicating here would desynchronize the
+        output from `thresholds`' own order and length.
+    k, sketch_size : int
+        Forwarded to the sketching inside `fastdna.compare_all()`, exactly
+        as in `lineage_groups()`.
+
+    Returns
+    -------
+    list of numpy.ndarray of int
+        One `groups` array per entry of `thresholds`, in the same order,
+        each exactly what `lineage_groups(paths, k=k, sketch_size=
+        sketch_size, distance_threshold=thresholds[i])` would return on its
+        own -- 0-based, contiguous, first-appearance-ordered labels (see
+        `lineage_groups()`'s `Returns` section).
+
+    Raises
+    ------
+    ValueError
+        Via `_validate_paths()`: fewer than 2 paths, or a duplicate path.
+        Via the per-threshold check above: `thresholds` is empty, or any
+        entry is not strictly positive.
+    """
+    paths = _validate_paths(paths, "lineage_groups_at_thresholds()")
+    thresholds = list(thresholds)
+    if len(thresholds) == 0:
+        raise _core.InvalidConfigError(
+            "lineage_groups_at_thresholds() needs at least 1 threshold, got 0"
+        )
+    for threshold in thresholds:
+        _validate_distance_threshold(threshold, "lineage_groups_at_thresholds()")
+
+    try:
+        from scipy.cluster.hierarchy import fcluster, linkage
+        from scipy.spatial.distance import squareform
+    except ImportError:
+        raise _missing_dependency("lineage_groups_at_thresholds()", "scipy") from None
+
+    matrix = _mash_distance_matrix(paths, k, sketch_size)
+    # checks=False: see lineage_groups()'s identical comment -- the matrix
+    # is symmetric with a zero diagonal by construction, and squareform's
+    # own validation is strict about floating-point symmetry in a way that
+    # would reject it spuriously.
+    condensed = squareform(matrix, checks=False)
+    dendrogram = linkage(condensed, method="single")
+
+    return [
+        _relabel_by_first_appearance(
+            fcluster(dendrogram, t=threshold, criterion="distance")
+        )
+        for threshold in thresholds
+    ]
+
+
+def lineage_groups(
+    paths: Iterable[Union[str, os.PathLike]],
+    *,
+    k: int = 21,
+    sketch_size: int = 1000,
+    distance_threshold: float = 0.01,
+) -> np.ndarray:
     """Assigns each of `paths` an integer lineage label, by single-linkage
     agglomerative clustering of the cohort's all-pairs Mash distances at
     `distance_threshold`.
@@ -188,32 +368,29 @@ def lineage_groups(paths, *, k=21, sketch_size=1000, distance_threshold=0.01):
     0-based and contiguous, numbered by first appearance, so `groups[0]`
     is always 0 and repeated calls on the same input give the identical
     array.
+
+    Implemented as the single-threshold case of `lineage_groups_at_
+    thresholds()` -- see that function's docstring if you need this same
+    clustering at more than one threshold, since calling this function in a
+    loop redoes the expensive all-pairs sketching/distance pass once per
+    call for no reason.
     """
-    paths = _validate_paths(paths, "lineage_groups()")
-    if not distance_threshold > 0:
-        raise ValueError(
-            f"distance_threshold must be a positive Mash distance, got {distance_threshold!r}. "
-            "At or below 0 every sample becomes its own lineage, which defeats the point."
-        )
-
-    try:
-        from scipy.cluster.hierarchy import fcluster, linkage
-        from scipy.spatial.distance import squareform
-    except ImportError:
-        raise _missing_dependency("lineage_groups()", "scipy") from None
-
-    matrix = _mash_distance_matrix(paths, k, sketch_size)
-    # checks=False: the matrix is symmetric with a zero diagonal by
-    # construction above, and squareform's own validation is strict about
-    # floating-point symmetry in a way that would reject it spuriously.
-    condensed = squareform(matrix, checks=False)
-    labels = fcluster(linkage(condensed, method="single"), t=distance_threshold, criterion="distance")
-    return _relabel_by_first_appearance(labels)
+    return lineage_groups_at_thresholds(
+        paths, [distance_threshold], k=k, sketch_size=sketch_size
+    )[0]
 
 
 def _n_samples(X):
     """`X`'s sample count, whether it is a list of paths, a NumPy array, or
     a sparse matrix (as `KmerVectorizer.transform()` returns).
+
+    Parameters
+    ----------
+    X : array-like, sparse matrix, or list
+
+    Returns
+    -------
+    int
     """
     shape = getattr(X, "shape", None)
     if shape is not None:
@@ -268,15 +445,24 @@ class LineageKFold:
         once.
     """
 
-    def __init__(self, n_splits=5, *, paths=None, groups=None, k=21, sketch_size=1000, distance_threshold=0.01):
+    def __init__(
+        self,
+        n_splits: int = 5,
+        *,
+        paths: Optional[Iterable[Union[str, os.PathLike]]] = None,
+        groups: Optional[np.ndarray] = None,  # array-like of int, one lineage label per sample
+        k: int = 21,
+        sketch_size: int = 1000,
+        distance_threshold: float = 0.01,
+    ) -> None:
         if (paths is None) == (groups is None):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "LineageKFold requires exactly one of paths= or groups=: pass paths= to "
                 "derive lineages from the genomes with lineage_groups(), or groups= to "
                 "supply labels you already have."
             )
         if not isinstance(n_splits, (int, np.integer)) or isinstance(n_splits, bool) or n_splits < 2:
-            raise ValueError(f"n_splits must be an integer >= 2, got {n_splits!r}")
+            raise _core.InvalidConfigError(f"n_splits must be an integer >= 2, got {n_splits!r}")
 
         self.n_splits = int(n_splits)
         self.paths = None if paths is None else [str(p) for p in paths]
@@ -296,7 +482,7 @@ class LineageKFold:
     def _check_n_splits(self, groups):
         n_groups = len(np.unique(groups))
         if self.n_splits > n_groups:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"n_splits={self.n_splits} exceeds the number of distinct lineages "
                 f"({n_groups}) found in this cohort. A fold boundary can only fall "
                 "between lineages, so more folds than lineages is impossible without "
@@ -310,7 +496,7 @@ class LineageKFold:
             )
 
     @property
-    def groups_(self):
+    def groups_(self) -> np.ndarray:
         if self._groups is None:
             self._groups = lineage_groups(
                 self.paths,
@@ -321,16 +507,35 @@ class LineageKFold:
             self._check_n_splits(self._groups)
         return self._groups
 
-    def get_n_splits(self, X=None, y=None, groups=None):
+    def get_n_splits(
+        self,
+        X: Any = None,  # array-like, sparse matrix, or list; accepted and ignored (scikit-learn splitter API)
+        y: Any = None,  # ignored; accepted for scikit-learn API compatibility
+        groups: Any = None,  # ignored; accepted for scikit-learn API compatibility
+    ) -> int:
         """The number of folds `split()` will produce -- `self.n_splits`.
 
         `X`/`y`/`groups` are accepted and ignored, matching scikit-learn's
         splitter signature; `cross_val_score` and `GridSearchCV` call this
         with all three.
+
+        Parameters
+        ----------
+        X, y, groups : ignored
+
+        Returns
+        -------
+        int
+            `self.n_splits`.
         """
         return self.n_splits
 
-    def split(self, X, y=None, groups=None):
+    def split(
+        self,
+        X: Any,  # array-like, sparse matrix, or list; only its length is used
+        y: Any = None,  # ignored; accepted for scikit-learn API compatibility
+        groups: Any = None,  # ignored; accepted for scikit-learn API compatibility
+    ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         """Yields `(train_indices, test_indices)` pairs, `n_splits` of them.
 
         Parameters
@@ -353,7 +558,7 @@ class LineageKFold:
         lineages = self.groups_
         n = _n_samples(X)
         if n != len(lineages):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"X has {n} samples but this splitter was built from {len(lineages)} "
                 "lineage labels. X must have one entry per sample, in the same order as "
                 "the paths= or groups= given at construction."
@@ -370,7 +575,7 @@ class LineageKFold:
         placeholder = np.zeros((n, 1))
         yield from GroupKFold(n_splits=self.n_splits).split(placeholder, y, lineages)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         source = "paths" if self.paths is not None else "groups"
         return f"LineageKFold(n_splits={self.n_splits}, from={source!r})"
 
@@ -385,12 +590,33 @@ def _model_importances(fitted, n_features, model_repr):
     cancel and averaging them before taking magnitude would report noise as
     importance (the same defect `fastdna.interpret` had to fix in its SHAP
     reduction).
+
+    Parameters
+    ----------
+    fitted : fitted scikit-learn estimator
+        Must expose `coef_` or `feature_importances_`.
+    n_features : int
+        Expected width of the importances vector, checked against what
+        `fitted` actually reports.
+    model_repr : str
+        `type(model).__name__`, used only to name the model in raised
+        error messages.
+
+    Returns
+    -------
+    numpy.ndarray of float64, shape (n_features,)
+
+    Raises
+    ------
+    ValueError
+        If `fitted` exposes neither `coef_` nor `feature_importances_`, or
+        the importances it reports do not have `n_features` entries.
     """
     importances = getattr(fitted, "feature_importances_", None)
     if importances is None:
         coef = getattr(fitted, "coef_", None)
         if coef is None:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"permutation_importance_pvalues() needs a model exposing per-feature "
                 f"importances, but {model_repr} has neither `coef_` nor "
                 "`feature_importances_` after fitting. Linear models (LogisticRegression, "
@@ -404,7 +630,7 @@ def _model_importances(fitted, n_features, model_repr):
     importances = np.asarray(importances, dtype=np.float64).ravel()
 
     if importances.shape[0] != n_features:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"the fitted model reports {importances.shape[0]} importances but X has "
             f"{n_features} columns"
         )
@@ -425,6 +651,19 @@ def _permute(y, groups, rng):
     destroy that association too, and a feature that merely tags a lineage
     would then look highly significant: the very confounding this module
     exists to control.
+
+    Parameters
+    ----------
+    y : array-like
+        Labels to permute.
+    groups : array-like of int or None
+        Lineage labels restricting the permutation, or `None` for a free
+        permutation.
+    rng : numpy.random.Generator
+
+    Returns
+    -------
+    numpy.ndarray, same shape as `y`
     """
     permuted = np.array(y, copy=True)
     if groups is None:
@@ -437,8 +676,15 @@ def _permute(y, groups, rng):
 
 
 def permutation_importance_pvalues(
-    model, X, y, feature_names, *, n_permutations=100, random_state=None, groups=None
-):
+    model: Any,  # unfitted scikit-learn estimator exposing coef_ or feature_importances_ once fitted
+    X: Any,  # array-like or sparse matrix, shape (n_samples, n_features)
+    y: np.ndarray,  # array-like, shape (n_samples,)
+    feature_names: Iterable[str],
+    *,
+    n_permutations: int = 100,
+    random_state: Optional[int] = None,
+    groups: Optional[np.ndarray] = None,  # array-like, lineage labels; see _permute
+) -> pa.Table:
     """Attaches an empirical p-value to each feature's importance, by
     refitting `model` on repeatedly permuted labels.
 
@@ -509,7 +755,7 @@ def permutation_importance_pvalues(
     it" is not evidence that no draw ever could.
     """
     if not isinstance(n_permutations, (int, np.integer)) or isinstance(n_permutations, bool) or n_permutations < 1:
-        raise ValueError(f"n_permutations must be a positive integer, got {n_permutations!r}")
+        raise _core.InvalidConfigError(f"n_permutations must be a positive integer, got {n_permutations!r}")
 
     try:
         from sklearn.base import clone
@@ -521,7 +767,7 @@ def permutation_importance_pvalues(
     n_features = int(getattr(X, "shape", (n_samples, len(feature_names)))[1])
 
     if len(feature_names) != n_features:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"feature_names has {len(feature_names)} entries but X has {n_features} "
             "columns. A silent mismatch would attach a p-value to the WRONG feature, so "
             "this is refused rather than truncated. feature_names should be exactly "
@@ -530,12 +776,12 @@ def permutation_importance_pvalues(
 
     y = np.asarray(y)
     if len(y) != n_samples:
-        raise ValueError(f"y has {len(y)} entries but X has {n_samples} samples")
+        raise _core.InvalidConfigError(f"y has {len(y)} entries but X has {n_samples} samples")
 
     if groups is not None:
         groups = np.asarray(groups)
         if len(groups) != n_samples:
-            raise ValueError(f"groups has {len(groups)} entries but X has {n_samples} samples")
+            raise _core.InvalidConfigError(f"groups has {len(groups)} entries but X has {n_samples} samples")
 
     model_repr = type(model).__name__
     observed = _model_importances(clone(model).fit(X, y), n_features, model_repr)

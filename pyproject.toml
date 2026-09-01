@@ -6,6 +6,22 @@ build-backend = "maturin"
 name = "fastdna"
 requires-python = ">=3.8"
 license = { text = "MIT OR Apache-2.0" }
+# `license.text` above (freeform Core Metadata `License:`) does not, by
+# itself, become a filterable "License ::" trove classifier on PyPI --
+# confirmed against this project's own build: `maturin build` (1.14.1, the
+# version pinned by `[build-system] requires` below) renders
+# `License: MIT OR Apache-2.0` and no `Classifier:` line for it at all
+# without these two entries. Without them, PyPI's license filter/badge
+# shows nothing, even though the correct text is present elsewhere on the
+# page. Matches Cargo.toml's `license = "MIT OR Apache-2.0"` and both
+# LICENSE-MIT/LICENSE-APACHE files in this repo (which maturin already
+# bundles into the wheel as `License-File` entries on its own, from their
+# presence at the repository root -- no configuration needed for that
+# part).
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+]
 description = "Fast canonical k-mer counting from FASTQ, with a zero-copy Arrow bridge to Python"
 readme = "README.md"
 keywords = ["bioinformatics", "genomics", "kmer", "fastq", "arrow"]
@@ -39,6 +55,11 @@ dynamic = ["version"]
 # clean CI environment. `matplotlib` backs `python/fastdna/plotting.py` and
 # `genomescope.plot_spectrum_fit`'s own tests, both of which otherwise skip
 # via `pytest.importorskip` rather than genuinely exercising the drawing code.
+# `tqdm` backs `python/fastdna/_progress.py`'s `progress=True` path (a live
+# bar during `count()`, see `make_progress_adapter`/`_tqdm_sink`) -- without
+# it declared here, that path is a soft dependency with no extra that
+# actually installs it, so it is only ever exercised on a machine where some
+# unrelated extra (e.g. `shap`) happened to pull tqdm in transitively.
 [project.optional-dependencies]
 test = [
     "biopython",
@@ -52,7 +73,22 @@ test = [
     "scikit-learn>=1.3",
     "scipy>=1.10",
     "shap",
+    "tqdm",
     "umap-learn>=0.5",
+]
+# Docs-only: builds the MkDocs site (`mkdocs.yml`, pages under `docs/site/`).
+# None of these is a runtime dependency of the `fastdna` package.
+# `mkdocstrings[python]` generates the API reference from the docstrings in
+# `python/fastdna/` rather than from hand-copied prose. Its Python handler
+# reads the package *statically* (griffe), so building the site needs neither
+# a compiled `fastdna._core` nor any of the `test` extra's scientific stack
+# installed -- which is what lets .github/workflows/docs.yml skip maturin and
+# the Rust toolchain entirely. Do not switch the handler to dynamic analysis
+# without giving that workflow a real build.
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.25",
 ]
 
 # No `[tool.pytest.ini_options]` section existed before `fastdna.datasets`
@@ -71,3 +107,23 @@ markers = [
 features = ["python"]
 module-name = "fastdna._core"
 python-source = "python"
+# maturin copies `python-source` whole into the wheel and does not consult
+# .gitignore to do it. Without these patterns, a `python -c "import
+# fastdna"` or a pytest run before `maturin build` leaves
+# `python/fastdna/__pycache__/` in the tree, and that bytecode ends up
+# inside the published artifact: measured at 30 entries and 715,837
+# bytes, 34% of extra wheel size. Worse than the size is that it is
+# bytecode from one specific CPython version inside an abi3 wheel that
+# declares 3.8-3.13+ coverage, and that the wheel's contents end up
+# depending on which interpreters touched the directory before building.
+# CI does a clean checkout, so this only manifests in manual builds --
+# exactly the case of a hand-done release upload.
+exclude = ["**/__pycache__/**", "**/*.pyc"]
+# `python/fastdna/py.typed` (the empty PEP 561 marker) is already included:
+# it lives inside `python-source` above, and neither exclude pattern above
+# matches it (only `__pycache__/` directories and `.pyc` files do). It is
+# named here anyway because `exclude` is the one place that could silently
+# start dropping it if its patterns are ever broadened -- without the
+# marker actually shipping in the wheel, mypy/pyright treat an installed
+# `fastdna` as untyped and every annotation in this package (H-05) is
+# invisible to a consuming project, regardless of how complete it is.

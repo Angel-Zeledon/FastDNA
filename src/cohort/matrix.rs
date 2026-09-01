@@ -43,17 +43,35 @@
 //! sorting them the way `gwas.py`'s docstring promises `kmer_sequences` are
 //! ordered, with no separate string sort required.
 //!
-//! # What this module does not do
+//! # What `build_cohort_matrix` itself does not do
 //!
-//! It does not run the counting pipeline itself (`process_stream_parallel`
-//! and friends do that, unchanged) and it does not decide per-sample ids,
-//! path validation, or FASTQ I/O -- callers (`ffi.rs::cohort_presence_matrix`)
-//! hand it already-built `KmerCounter`s, one per sample, in row order.
+//! The core function does not run the counting pipeline itself
+//! (`process_stream_parallel` and friends do that, unchanged) and it does
+//! not decide per-sample ids, path validation, or FASTQ I/O -- callers
+//! (`ffi.rs::cohort_presence_matrix`) hand it already-built `KmerCounter`s,
+//! one per sample, in row order.
+//!
+//! `build_cohort_matrix_from_directory`/`build_cohort_matrix_from_files`,
+//! further down in this module, are the exception: they exist for
+//! `cli::MatrixArgs`/`main.rs::run_matrix` (`fastdna matrix`,
+//! `docs/feature-gap-analysis.md`'s S6) and do own sample
+//! discovery/counting, wiring `cohort::discovery`/`pipeline::
+//! process_stream_parallel` into `build_cohort_matrix` the same way
+//! `cohort::batch::count_paired_samples` already wires discovery into
+//! per-sample counting for `--paired-dir`. `build_cohort_matrix` itself is
+//! unchanged by their existence -- they are callers of it, not a
+//! replacement for the pure, already-counted-samples-in path above.
+
+use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashMap;
 
+use crate::cohort::discovery::{discover_samples, SampleFiles};
 use crate::counter::KmerCounter;
+use crate::error::{FastDnaError, Result};
+use crate::fastq::MultiSourceReader;
 use crate::kmer::decode_kmer;
+use crate::pipeline::{process_stream_parallel, PipelineConfig};
 
 /// A cohort-wide k-mer matrix in COO (row, col, value) form, plus enough
 /// bookkeeping for the caller to reproduce `gwas.py`'s truncation warning
@@ -84,6 +102,16 @@ pub struct CohortMatrix {
     /// Decoded canonical k-mer of every column, ascending -- see the module
     /// doc comment for why this is already lexicographic.
     pub kmer_sequences: Vec<String>,
+    /// The raw 2-bit-packed encoding of every column's k-mer, parallel to
+    /// `kmer_sequences` (`kmer_u64[col]` is what `kmer_sequences[col]`
+    /// decodes from). Kept alongside the already-decoded sequence rather
+    /// than making a caller re-encode it from ASCII: it is exactly the
+    /// compact column `export.rs`'s own default (`kmer_u64`, sequence
+    /// opt-in) already prefers for on-disk storage, and every candidate's
+    /// `u64` value is already in hand when `kmer_sequences` is built --
+    /// keeping it costs one more `Vec` of values already computed, not a
+    /// second pass.
+    pub kmer_u64: Vec<u64>,
 }
 
 /// Builds a `CohortMatrix` from `counters` (one per sample, in row order).
@@ -194,6 +222,7 @@ pub fn build_cohort_matrix(
 
     let kmer_sequences: Vec<String> =
         candidates.iter().map(|&(kmer, _, _)| decode_kmer(kmer, k)).collect();
+    let kmer_u64: Vec<u64> = candidates.iter().map(|&(kmer, _, _)| kmer).collect();
 
     CohortMatrix {
         n_samples,
@@ -204,10 +233,172 @@ pub fn build_cohort_matrix(
         col,
         value,
         kmer_sequences,
+        kmer_u64,
     }
 }
 
+/// Counts every sample in `samples` independently, returning each sample's
+/// finalized `KmerCounter` in the same order as `samples` -- the shared
+/// counting loop behind both `build_cohort_matrix_from_directory` and
+/// `build_cohort_matrix_from_files`.
+///
+/// Mirrors `cohort::batch::count_paired_samples`'s own per-sample counting
+/// loop, minus that function's per-sample export step: this loop only needs
+/// each sample's counter in memory long enough to hand the whole set to
+/// `build_cohort_matrix`. `pipeline_config` is a template, cloned once per
+/// sample -- see `count_paired_samples`'s doc comment for why (every sample
+/// gets the same `k`, quality cutoff, thread count, ...). `min_count` is
+/// applied to each sample's counter before it is returned, the same
+/// per-sample depth filter `gwas.py::cohort_presence_matrix` forwards to
+/// `fastdna.count()` for every sample: at realistic coverage a depth-1
+/// k-mer is overwhelmingly likely a sequencing error, and left unfiltered
+/// each one becomes a private, cohort-meaningless column that the
+/// cohort-level `min_samples` filter cannot see coming (it only ever
+/// observes counts, not their reliability).
+fn count_samples(
+    samples: &[SampleFiles],
+    pipeline_config: &PipelineConfig,
+    min_count: u32,
+) -> Result<Vec<KmerCounter>> {
+    let mut counters = Vec::with_capacity(samples.len());
+    for sample in samples {
+        let reader = MultiSourceReader::from_paths(sample.files.clone());
+        // `sample.files` is never empty for a `SampleFiles` built by
+        // `discover_samples` (it only creates an entry once it has seen a
+        // file), and the `--sample` path below always supplies exactly one
+        // file per entry -- but `unwrap_or_default` (an empty path used only
+        // as an error-message label) is used instead of `.expect(...)` to
+        // keep this function panic-free regardless of how a `SampleFiles`
+        // was constructed, per this crate's "no unwrap/expect in src/"
+        // convention (`Cargo.toml`'s `[lints.clippy]`).
+        let source_label = sample.files.first().cloned().unwrap_or_default();
+
+        let (mut counter, _qc, _total_reads) =
+            process_stream_parallel(reader, pipeline_config.clone(), &source_label, None, None)?;
+        counter.prune(min_count, None);
+        counters.push(counter);
+    }
+    Ok(counters)
+}
+
+/// Builds a `CohortMatrix` from every FASTQ sample discovered in `dir` --
+/// the library half of `fastdna matrix --input DIR` (`cli::MatrixArgs`).
+///
+/// Reuses `discover_samples`'s ad hoc R1/R2 pairing (the lenient variant,
+/// not `cohort::batch::discover_paired_samples`'s strict unattended-pipeline
+/// one): an orphaned mate still becomes a usable, single-end sample instead
+/// of aborting the whole cohort, and every such sample's warning is
+/// returned in `orphan_warnings` for the caller to print, exactly as ad hoc
+/// cohort listing is documented to behave (`discovery.rs`'s module doc
+/// comment). A directory-of-samples matrix build is closer to that use case
+/// than to `--paired-dir`'s unattended-pipeline one: a human is looking at
+/// the matrix this produces, and a warning they can read is more useful
+/// here than a hard stop over one imperfectly-paired sample in an otherwise
+/// large cohort.
+///
+/// `min_samples` is validated against the discovered sample count up front,
+/// before any counting happens -- the same "fails fast, before any file is
+/// touched" discipline `cli::CountArgs::validate` already follows, and the
+/// same check `gwas.py::cohort_presence_matrix` makes in Python: a
+/// `min_samples` above the cohort size can never be satisfied by any k-mer,
+/// so the matrix would silently come back empty rather than erroring.
+///
+/// Returns `(matrix, sample_ids, orphan_warnings)`: `sample_ids[i]` names
+/// row `i` of `matrix` (`discover_samples` already returns samples in
+/// lexicographic, reproducible order).
+pub fn build_cohort_matrix_from_directory(
+    dir: &Path,
+    pipeline_config: &PipelineConfig,
+    min_count: u32,
+    min_samples: u32,
+    max_kmers: Option<usize>,
+) -> Result<(CohortMatrix, Vec<String>, Vec<String>)> {
+    let samples = discover_samples(dir)?;
+    if min_samples as usize > samples.len() {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "--min-samples",
+            reason: format!(
+                "min_samples={min_samples} exceeds the cohort size ({} samples discovered in {}): \
+                 no k-mer can be present in more samples than exist, so the matrix would come back \
+                 empty. Use --min-samples <= {}.",
+                samples.len(),
+                dir.display(),
+                samples.len()
+            ),
+        });
+    }
+
+    let orphan_warnings: Vec<String> = samples
+        .iter()
+        .filter(|s| !s.orphan_warning.is_empty())
+        .map(|s| s.orphan_warning.clone())
+        .collect();
+    let sample_ids: Vec<String> = samples.iter().map(|s| s.sample_id.clone()).collect();
+
+    let counters = count_samples(&samples, pipeline_config, min_count)?;
+    let matrix = build_cohort_matrix(&counters, min_samples, max_kmers, pipeline_config.k);
+
+    Ok((matrix, sample_ids, orphan_warnings))
+}
+
+/// Builds a `CohortMatrix` from an explicit, caller-named list of sample
+/// files (`fastdna matrix --sample FILE...`) -- one whole file per sample,
+/// with no automatic R1/R2 pairing, for cohorts whose files are not laid
+/// out in one directory or do not follow a naming convention
+/// `discover_samples` recognizes. `sample_ids[i]` names `sample_files[i]`
+/// and becomes row `i` of the returned matrix; the two must be the same
+/// length.
+///
+/// Same `min_samples` upfront validation as `build_cohort_matrix_from_
+/// directory`, for the same reason.
+pub fn build_cohort_matrix_from_files(
+    sample_ids: &[String],
+    sample_files: &[PathBuf],
+    pipeline_config: &PipelineConfig,
+    min_count: u32,
+    min_samples: u32,
+    max_kmers: Option<usize>,
+) -> Result<CohortMatrix> {
+    if sample_ids.len() != sample_files.len() {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "sample_ids",
+            reason: format!(
+                "sample_ids has {} entries but sample_files has {}: they must be the same length, \
+                 one id per file",
+                sample_ids.len(),
+                sample_files.len()
+            ),
+        });
+    }
+    if min_samples as usize > sample_files.len() {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "--min-samples",
+            reason: format!(
+                "min_samples={min_samples} exceeds the cohort size ({} samples given): no k-mer can \
+                 be present in more samples than exist, so the matrix would come back empty. Use \
+                 --min-samples <= {}.",
+                sample_files.len(),
+                sample_files.len()
+            ),
+        });
+    }
+
+    let samples: Vec<SampleFiles> = sample_ids
+        .iter()
+        .cloned()
+        .zip(sample_files.iter().cloned())
+        .map(|(sample_id, path)| SampleFiles { sample_id, files: vec![path], orphan_warning: String::new() })
+        .collect();
+
+    let counters = count_samples(&samples, pipeline_config, min_count)?;
+    Ok(build_cohort_matrix(&counters, min_samples, max_kmers, pipeline_config.k))
+}
+
 #[cfg(test)]
+// `unwrap`/`expect` are denied under `src/` for production code (`Cargo.
+// toml`'s `[lints.clippy]`), not for test assertions -- same rationale
+// `discovery.rs`/`batch.rs` already state on their own test modules.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -340,5 +531,139 @@ mod tests {
         let m = build_cohort_matrix(&[], 1, None, 4);
         assert_eq!(m.n_samples, 0);
         assert_eq!(m.n_kmers, 0);
+    }
+
+    /// `kmer_u64` must stay parallel to `kmer_sequences` -- same column
+    /// order, and `kmer_u64[col]` must decode to exactly `kmer_sequences
+    /// [col]` -- since `export_cohort_matrix_parquet` (`export.rs`) writes
+    /// the former without re-deriving it from the latter.
+    #[test]
+    fn kmer_u64_is_parallel_to_kmer_sequences_and_decodes_to_match() {
+        let counters =
+            vec![counter_from(&[(9, 1), (1, 1), (5, 1)]), counter_from(&[(9, 1), (1, 1), (5, 1)])];
+
+        let m = build_cohort_matrix(&counters, 1, None, 4);
+
+        assert_eq!(m.kmer_u64.len(), m.kmer_sequences.len());
+        assert_eq!(m.kmer_u64, vec![1, 5, 9], "ascending, same order as kmer_sequences");
+        for (bits, seq) in m.kmer_u64.iter().zip(&m.kmer_sequences) {
+            assert_eq!(&decode_kmer(*bits, 4), seq);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // build_cohort_matrix_from_directory / build_cohort_matrix_from_files
+    // ---------------------------------------------------------------------
+
+    fn config(k: usize) -> PipelineConfig {
+        PipelineConfig {
+            k,
+            min_quality: 0.0,
+            quality_window: 4,
+            batch_size: 4,
+            num_threads: 2,
+            progress_interval: 100_000,
+            hpc: false,
+        }
+    }
+
+    fn write_fixture(dir: &Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).expect("failed to write fixture file");
+    }
+
+    // k=4 fixtures: "AACG" (canonical: its reverse complement "CGTT" sorts
+    // higher) appears in both files below; "TTTT" (its own reverse
+    // complement -- a palindrome, canonical by construction) only in one.
+    const SAMPLE_A: &str = "@r1\nAACGAACG\n+\nIIIIIIII\n";
+    const SAMPLE_B: &str = "@r1\nAACGTTTT\n+\nIIIIIIII\n";
+
+    #[test]
+    fn from_directory_discovers_counts_and_builds_a_matrix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_fixture(dir.path(), "pat_a.fastq", SAMPLE_A);
+        write_fixture(dir.path(), "pat_b.fastq", SAMPLE_B);
+
+        let (matrix, sample_ids, orphan_warnings) =
+            build_cohort_matrix_from_directory(dir.path(), &config(4), 1, 1, None)
+                .expect("a clean two-sample directory must succeed");
+
+        assert_eq!(sample_ids, vec!["pat_a", "pat_b"]);
+        assert!(orphan_warnings.is_empty(), "no pair-suffixed files here, nothing to warn about");
+        assert_eq!(matrix.n_samples, 2);
+        assert!(matrix.kmer_sequences.contains(&"AACG".to_string()));
+    }
+
+    #[test]
+    fn from_directory_rejects_min_samples_above_the_cohort_size_before_counting() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_fixture(dir.path(), "pat_a.fastq", SAMPLE_A);
+
+        let result = build_cohort_matrix_from_directory(dir.path(), &config(4), 1, 2, None);
+        match result {
+            Err(FastDnaError::InvalidConfig { parameter, reason }) => {
+                assert_eq!(parameter, "--min-samples");
+                assert!(reason.contains("2") && reason.contains('1'), "{reason}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_directory_surfaces_an_orphan_warning_rather_than_erroring() {
+        // Directory discovery (unlike `--paired-dir`) is the lenient path:
+        // an orphaned R1 becomes a single-end sample plus a warning the
+        // caller can print, not a hard failure.
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_fixture(dir.path(), "pat_a_R1.fastq", SAMPLE_A);
+
+        let (matrix, sample_ids, orphan_warnings) =
+            build_cohort_matrix_from_directory(dir.path(), &config(4), 1, 1, None)
+                .expect("an orphaned mate must still succeed, as single-end");
+
+        assert_eq!(sample_ids, vec!["pat_a"]);
+        assert_eq!(matrix.n_samples, 1);
+        assert_eq!(orphan_warnings.len(), 1, "the orphan must be reported, not silently dropped");
+    }
+
+    #[test]
+    fn from_files_builds_the_same_shape_matrix_as_from_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path_a = dir.path().join("a.fastq");
+        let path_b = dir.path().join("b.fastq");
+        std::fs::write(&path_a, SAMPLE_A).expect("write fixture");
+        std::fs::write(&path_b, SAMPLE_B).expect("write fixture");
+
+        let sample_ids = vec!["sample_a".to_string(), "sample_b".to_string()];
+        let matrix =
+            build_cohort_matrix_from_files(&sample_ids, &[path_a, path_b], &config(4), 1, 1, None)
+                .expect("two explicitly named files must succeed");
+
+        assert_eq!(matrix.n_samples, 2);
+        assert!(matrix.kmer_sequences.contains(&"AACG".to_string()));
+    }
+
+    #[test]
+    fn from_files_rejects_mismatched_id_and_file_counts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path_a = dir.path().join("a.fastq");
+        std::fs::write(&path_a, SAMPLE_A).expect("write fixture");
+
+        let sample_ids = vec!["a".to_string(), "b".to_string()];
+        let result = build_cohort_matrix_from_files(&sample_ids, &[path_a], &config(4), 1, 1, None);
+        match result {
+            Err(FastDnaError::InvalidConfig { parameter, .. }) => assert_eq!(parameter, "sample_ids"),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_files_rejects_min_samples_above_the_cohort_size() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path_a = dir.path().join("a.fastq");
+        std::fs::write(&path_a, SAMPLE_A).expect("write fixture");
+
+        let sample_ids = vec!["a".to_string()];
+        let result = build_cohort_matrix_from_files(&sample_ids, &[path_a], &config(4), 1, 5, None);
+        assert!(matches!(result, Err(FastDnaError::InvalidConfig { parameter: "--min-samples", .. })));
     }
 }

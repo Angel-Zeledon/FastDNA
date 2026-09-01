@@ -1,0 +1,458 @@
+# The workflow that runs the test suites and the linter (audit finding
+# H-26, plan task 08). Before it, no workflow in this repo ran `cargo test`,
+# `cargo clippy`, or a plain `pytest` at all. `wheels.yml` looks like it
+# covers the ground and does not: it is a *packaging* check, building five
+# abi3 wheels, installing each into a clean venv and running pytest against
+# the installed artifact. Worth having, but it never runs `cargo test`,
+# never runs `cargo clippy`, and only ever exercises the Python surface of a
+# `--release` build. A Rust-only regression -- a broken `cargo test`, a new
+# lint, a change that only the 17 integration suites in `tests/` would
+# catch -- could land on `master` completely unobserved.
+#
+# HARD CONSTRAINT INHERITED FROM `wheels.yml` (its header, lines 16-27,
+# states it at length; it is repeated here because this is the file most
+# likely to be tempted into violating it). The Rust job below uses BARE
+# `cargo build` / `cargo test` / `cargo clippy` with NO features, and must
+# keep doing so, on every OS. `pyo3`'s `extension-module` feature
+# (`Cargo.toml` line 46) tells the crate not to link `libpython`, which is
+# correct for the cdylib maturin produces and fatal for anything that links
+# the rlib: a plain `cargo build --features python` outside maturin fails on
+# Linux and macOS with undefined `Py_*` symbols. `--all-features` is the
+# same trap under a different name and is likewise never used here.
+#
+# One tempting piece of counter-evidence, disposed of up front:
+# `docs/audit/00-inventario.md` records `cargo check --all-features` as
+# passing. It does -- `check` never links -- so it says nothing whatsoever
+# about whether *building* with that feature works, and must not be cited
+# as a reason to relax the rule above.
+#
+# The Python job therefore reaches the `python` feature the only safe way:
+# through maturin (`maturin develop --features python`), which builds
+# `--lib` as a cdylib and never enables the feature for the `[[bin]]`.
+
+name: CI
+
+# `push` and `pull_request` both, deliberately, matching `wheels.yml`. The
+# known cost is that a PR opened from a branch in this same repository runs
+# each job twice (once for the branch push, once for the PR). That is
+# accepted rather than fixed with a `branches:` filter: this project's
+# history is long-lived agent worktree branches that are never PR'd, and a
+# filter that only tested `master` would leave exactly those branches
+# untested. Duplicate runs are cheap; untested branches are not.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Two jobs rather than one, so that "the Rust side broke" and "the Python
+  # side broke" are distinguishable at a glance from the checks list without
+  # opening a log, and so the ~5 minute Rust compile and the ~5 minute
+  # maturin build happen in parallel instead of in series.
+  #
+  # Both are ubuntu-only. macOS and Windows coverage is not missing by
+  # oversight: `wheels.yml` already builds and pytest-tests a real wheel on
+  # macos-15-intel, macos-latest and windows-latest on every push, so the
+  # cross-platform question is answered there. Duplicating a 3-OS matrix
+  # here would triple the cost of this workflow to re-answer it, and the
+  # things this file adds that `wheels.yml` lacks -- `cargo test`, clippy --
+  # are the parts least likely to be OS-dependent in this crate.
+  rust:
+    name: Rust (build, test, clippy)
+    runs-on: ubuntu-latest
+    # The repo has a documented history of a zero-threads hang (the reason
+    # `python/tests/test_api.py` carries a `@pytest.mark.timeout`). A hung
+    # job would otherwise sit on the default 360-minute limit.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Printed, not decorative. The clippy step below compares the warning
+      # count against a hardcoded baseline, and that count is a property of
+      # the *toolchain*, not only of the source: a new stable Rust can add a
+      # lint and move the number without anyone touching this repository.
+      # When that happens, this output is what tells you which toolchain
+      # produced the new count.
+      #
+      # The toolchain itself is whatever the runner image ships, not a
+      # pinned one installed via a third-party action. Pinning would make
+      # the baseline stable, at the cost of never noticing new lints until
+      # someone bumps the pin, and of adding an action whose version is not
+      # already vetted anywhere else in this repo (`wheels.yml` uses exactly
+      # three: actions/checkout@v7, actions/setup-python@v6,
+      # PyO3/maturin-action@v1). Floating was chosen; the failure mode is a
+      # loud, explained warning-count failure, not a silent gap.
+      - name: Record toolchain versions
+        shell: bash
+        run: |
+          rustup show active-toolchain || true
+          cargo --version
+          rustc --version
+          # `rustup component add clippy` is a no-op on the current GitHub
+          # ubuntu image (clippy ships preinstalled). It is here so that an
+          # image that ever stops shipping it produces a working job rather
+          # than "cargo: no such subcommand: clippy" three steps later.
+          rustup component add clippy
+          cargo clippy --version
+
+      # `--all-targets` = lib + bin + the 17 integration suites in `tests/`
+      # + examples + benches. Building before testing is not redundant: it
+      # separates "this does not compile" from "this compiles and a test
+      # fails", which are different problems with different owners.
+      #
+      # No `--features` and no `--all-features`, per the header.
+      - name: cargo build --all-targets
+        shell: bash
+        run: cargo build --all-targets
+
+      # NOTE, so it is not mistaken for coverage it does not provide:
+      # `--all-targets` deliberately EXCLUDES doctests. Every `///` example
+      # in `src/` is therefore compiled by nobody in this workflow. That is
+      # a real gap, left open on purpose here because task 08 scoped this
+      # file to build/test/clippy/pytest; closing it is one extra step
+      # (`cargo test --doc`, which cannot be merged into the line below --
+      # `--all-targets` and `--doc` are mutually exclusive in one
+      # invocation) and should be a deliberate follow-up, not a silent
+      # addition here.
+      - name: cargo test --all-targets
+        shell: bash
+        run: cargo test --all-targets
+
+      # THE 8 PREEXISTING CLIPPY WARNINGS -- what this step does and why.
+      #
+      # `cargo clippy --all-targets` on this tree warns at exactly 8
+      # locations, all preexisting, all recorded in
+      # `docs/audit/00-inventario.md` and `docs/CHECKPOINT-2026-08-26.md`:
+      # src/metagenomics.rs:1118, src/binned.rs:553, src/counter.rs:905,
+      # src/minimizer.rs:682, src/superkmer.rs:388, src/superkmer.rs:480,
+      # src/translate.rs:424 (which carries two), tests/dual_strategy.rs:75.
+      # None is `deny`-level; the four lints `Cargo.toml` actually denies
+      # (`unwrap_used`, `expect_used`, `print_stdout`, `print_stderr`) are
+      # already clean and already fail the build on their own, without help
+      # from this file.
+      #
+      # Two obvious approaches were rejected:
+      #
+      #   * `-D warnings`. This makes the job red on its very first run, for
+      #     8 problems that predate it. A CI job that is red on day one gets
+      #     ignored by day three, and then it is worse than no job at all,
+      #     because the red is now background noise hiding the next real
+      #     failure.
+      #
+      #   * Plain `cargo clippy` with the output left in the log and no
+      #     check at all. Honest, but toothless: the whole point of H-26 is
+      #     that nothing was watching, and "the warnings scroll past in a
+      #     log nobody opens" is barely distinguishable from that.
+      #
+      # What is done instead is a ratchet: every warning is printed in full
+      # (nothing is suppressed, no `#[allow]` is added anywhere, the source
+      # is untouched) AND listed on the run summary page, and the job fails
+      # only if the count goes ABOVE the recorded baseline. Preexisting
+      # debt stays visible and does not block; new debt does block.
+      #
+      # WHAT "8" COUNTS, precisely, because the source of that number is
+      # ambiguous by one and getting it wrong is the one way this design
+      # could still be red on day one. `docs/audit/00-inventario.md` says
+      # "8 avisos" and then lists eight locations, one of them annotated
+      # `src/translate.rs:424:27 (x2)`. Read one way that is 8 diagnostics
+      # at 8 places; read the other it is 9, because that one span carries
+      # two. The two readings agree on exactly one number: eight distinct
+      # source locations. So that is what this step ratchets -- unique
+      # (file, line, column) sites -- and the baseline is 8 under either
+      # reading.
+      #
+      # The raw diagnostic total is printed next to the site count on every
+      # run, so the ambiguity resolves itself in the log the first time this
+      # executes on a real runner instead of staying a guess.
+      #
+      # Counting reads `--message-format=json`, not the human output,
+      # because `cargo ... --all-targets` checks the library twice (as lib
+      # and as the lib's test target) and the same source line can be
+      # reported once per unit. Keying on the span, and on the lint code
+      # within a span, makes the number a property of the source rather
+      # than of cargo's rendering.
+      #
+      # KNOWN WEAKNESSES, stated rather than discovered later:
+      #   1. A site ratchet cannot see a swap -- fix one warning, introduce
+      #      another, and the total is unchanged -- nor a second lint firing
+      #      at a span that already warns. The full list, with every lint
+      #      code at every site, is printed on each run and written to the
+      #      run summary precisely so a reviewer sees the contents change
+      #      even when the number does not.
+      #   2. A new stable Rust that adds a lint will fail this step for a
+      #      reason unrelated to the change under test. The error message
+      #      below says exactly that and exactly what to do about it, and
+      #      the toolchain version is in the log from the first step.
+      #   3. If the count comes back *below* the baseline, that is reported
+      #      as a notice and does NOT fail, because a drop can mean either
+      #      real progress or an artefact of the deduplication above; the
+      #      notice asks for it to be confirmed before the baseline moves.
+      #
+      # No `actions/cache` for `~/.cargo` or `target/` anywhere in this job.
+      # It would cut minutes off the build, and it is deliberately not used:
+      # a warm `target/` means cargo can consider a unit fresh and not
+      # re-emit its diagnostics, which would silently drive this count
+      # toward 0 -- a false "improvement" that reads as success. A clean
+      # checkout every run is what makes the number below mean anything.
+      - name: cargo clippy --all-targets (warning ratchet)
+        shell: bash
+        env:
+          # Written under RUNNER_TEMP, not into the checkout, so this step
+          # cannot leave a stray file in the working tree.
+          CLIPPY_JSON: ${{ runner.temp }}/clippy.json
+        run: |
+          set -uo pipefail
+
+          # No `-D warnings`: clippy is expected to exit 0 with warnings
+          # present. A non-zero exit here therefore means clippy genuinely
+          # failed to run (compile error, missing component) -- a different
+          # failure from a warning-count regression, and reported as one.
+          if ! cargo clippy --all-targets --message-format=json > "$CLIPPY_JSON"; then
+            echo "::error::cargo clippy failed to run. This is a clippy or" \
+                 "compilation failure, not a warning-count regression --" \
+                 "read the log above, not the baseline below."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          # The number of distinct source locations at which this tree is
+          # known to warn. Lower it whenever warnings are fixed -- that is
+          # the point of a ratchet. Raise it only together with a comment
+          # here naming the new warning and why it is being accepted.
+          BASELINE = 8
+
+          sites = {}
+          with open(os.environ["CLIPPY_JSON"], encoding="utf-8", errors="replace") as fh:
+              for raw in fh:
+                  raw = raw.strip()
+                  if not raw.startswith("{"):
+                      continue
+                  try:
+                      record = json.loads(raw)
+                  except json.JSONDecodeError:
+                      continue
+                  if record.get("reason") != "compiler-message":
+                      continue
+                  message = record.get("message") or {}
+                  if message.get("level") != "warning":
+                      continue
+                  code = (message.get("code") or {}).get("code")
+                  if not code:
+                      # cargo's own "generated N warnings" roll-up lines
+                      # carry no lint code; they are a restatement of the
+                      # diagnostics above them, not extra diagnostics.
+                      continue
+                  primary = next(
+                      (s for s in message.get("spans") or [] if s.get("is_primary")),
+                      None,
+                  )
+                  if primary:
+                      site = (
+                          primary.get("file_name", "?"),
+                          primary.get("line_start", 0),
+                          primary.get("column_start", 0),
+                      )
+                  else:
+                      # Crate-level lints have no span.
+                      site = ("<crate-level>", 0, 0)
+                  # Keyed by site, then by lint code within the site: the
+                  # same lint at the same span arriving twice is one
+                  # problem reported for two compilation units (lib and
+                  # lib-test), not two problems.
+                  sites.setdefault(site, {})[code] = message.get("rendered") or code
+
+          count = len(sites)
+          diagnostics = sum(len(codes) for codes in sites.values())
+          listing = [
+              "{}:{}:{}: {}".format(f, line, col, ", ".join(sorted(sites[(f, line, col)])))
+              for (f, line, col) in sorted(sites)
+          ]
+
+          # Every warning, rendered in full, into the job log: they are
+          # reported, never hidden. `--message-format=json` means cargo
+          # prints nothing human-readable of its own, so this is the only
+          # place they appear.
+          for site in sorted(sites):
+              for code in sorted(sites[site]):
+                  print(sites[site][code])
+
+          print("clippy: {} warning site(s), {} diagnostic(s); baseline is {} site(s)".format(
+              count, diagnostics, BASELINE))
+          for entry in listing:
+              print("  " + entry)
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as out:
+                  out.write("### clippy: {} warning site(s), {} diagnostic(s) (baseline {})\n\n".format(
+                      count, diagnostics, BASELINE))
+                  out.write("```\n")
+                  out.write("\n".join(listing) if listing else "(none)")
+                  out.write("\n```\n")
+
+          if count > BASELINE:
+              print(
+                  "::error::clippy warns at {} distinct locations; the recorded "
+                  "baseline is {}. Either fix the new warning(s) listed above, or "
+                  "-- if the count moved because the Rust toolchain changed (its "
+                  "version is in the 'Record toolchain versions' step) rather than "
+                  "because this change introduced them -- raise BASELINE in "
+                  ".github/workflows/ci.yml with a comment saying which warning was "
+                  "accepted and why.".format(count, BASELINE)
+              )
+              raise SystemExit(1)
+
+          if count < BASELINE:
+              print(
+                  "::notice::clippy warns at {} distinct locations, below the "
+                  "baseline of {}. If those warnings were genuinely fixed, lower "
+                  "BASELINE in .github/workflows/ci.yml to {} so the improvement "
+                  "cannot be undone silently. Confirm first: a drop can also mean "
+                  "clippy reported fewer diagnostics for an unrelated reason.".format(
+                      count, BASELINE, count
+                  )
+              )
+          PY
+
+  python:
+    name: Python (maturin develop + pytest)
+    runs-on: ubuntu-latest
+    # maturin's debug build plus ~700 tests plus the `[test]` extra (which
+    # drags in numba/llvmlite via shap) is the long pole of this workflow.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # 3.11, for the same reason `wheels.yml` pins 3.11: `requires-python`
+      # in pyproject.toml says ">=3.8", but `python/tests/test_api.py`
+      # annotates a helper with `list[str]`, which is a TypeError at `def`
+      # time before 3.9 -- a 3.8 runner cannot even import that module. The
+      # claimed 3.8 support remains unverified by CI; that is a known,
+      # recorded gap, not an assumption.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # A venv, not the runner's interpreter: `maturin develop` installs
+      # into the active environment and refuses to run without one, and
+      # this repo has already been bitten by the variant of that failure
+      # where the venv is on PATH but `VIRTUAL_ENV` is unset ("Couldn't
+      # find a virtualenv"). Exporting VIRTUAL_ENV and prepending the venv's
+      # bin/ via GITHUB_PATH makes every later step in this job use it,
+      # which is what lets those steps be separate steps at all -- each
+      # `run:` gets a fresh shell, so `source .venv/bin/activate` would not
+      # survive past the step that ran it.
+      #
+      # Separate steps are worth that small amount of setup here: "the
+      # extension failed to build" and "the tests failed" are the two
+      # outcomes this job exists to tell apart.
+      - name: Create venv and install maturin
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          echo "VIRTUAL_ENV=${PWD}/.venv" >> "$GITHUB_ENV"
+          echo "${PWD}/.venv/bin" >> "$GITHUB_PATH"
+          ./.venv/bin/python -m pip install --upgrade pip
+          # Same bound as pyproject.toml's `[build-system] requires`, so CI
+          # builds with the maturin the project declares rather than with
+          # whatever is newest on PyPI on any given morning.
+          ./.venv/bin/python -m pip install "maturin>=1.5,<2.0"
+
+      # This is the ONLY place in this workflow where the `python` feature
+      # is enabled, and it goes through maturin -- see the file header for
+      # why a bare `cargo build --features python` is not an option.
+      # `--features python` is redundant with `[tool.maturin] features` in
+      # pyproject.toml and is passed explicitly anyway, so that reading this
+      # step tells you which feature is in play without a second file.
+      #
+      # A debug build, not `--release`. `[profile.release]` in Cargo.toml
+      # sets `lto = "fat"` and `codegen-units = 1`, which Cargo.toml itself
+      # notes costs a lot of build time; paying that on every push to run a
+      # test suite that is not measuring performance is a poor trade. The
+      # consequence, stated plainly: the release profile's `panic =
+      # "unwind"` setting -- load-bearing, because `catch_unwind` is a no-op
+      # under `panic = "abort"` and the FFI layer relies on it -- is NOT
+      # exercised by this job. `wheels.yml` builds `--release` on five
+      # platforms and runs the same suite against it, which is where that
+      # property is actually covered.
+      #
+      # WHICH PYTHON EXTRAS ARE INSTALLED, and why it matters:
+      # `--extras test` installs the full `[project.optional-dependencies]
+      # test` list from pyproject.toml -- biopython, duckdb, matplotlib,
+      # numpy, pandas, polars, pytest, pytest-timeout, scikit-learn, scipy,
+      # shap, umap-learn -- which is the same set `wheels.yml` gets via
+      # `pip install "<wheel>[test]"`. That list covers every module the
+      # suite reaches for with `pytest.importorskip`; the only other name
+      # skipped on is `pyarrow`, which is a real runtime dependency and
+      # arrives with the package itself.
+      #
+      # Installing the full set rather than a lean subset is the deliberate
+      # choice. `docs/CHECKPOINT-2026-08-26.md` records what the lean
+      # option actually costs: with only pyarrow/pandas/scikit-learn/scipy
+      # present, the suite reports "652 passed, 40 skipped" -- about 40
+      # tests, including essentially all of test_plotting.py and the
+      # biopython, polars, duckdb, umap and shap paths, quietly not running.
+      # A green CI run that silently skipped 40 tests is the failure mode
+      # this workflow exists to prevent, so it pays the install time. The
+      # same session measured 699 passed with full extras.
+      #
+      # NOT installed, on purpose: the `docs` extra (mkdocs, mkdocs-material,
+      # mkdocstrings), which belongs to the documentation build and pulls in
+      # nothing this suite imports; and any type-checker or formatter --
+      # mypy, pyright and ruff are in no extra at all, so nothing in this
+      # workflow verifies the `py.typed` marker's claim (H-05) or any
+      # annotation in the package. That is a separate finding, and would be
+      # a separate job.
+      #
+      # If a future maturin ever drops `--extras`, replace it with an
+      # explicit `pip install` of that same list. Do not respond by
+      # dropping the extras -- that silently reintroduces the 40 skips.
+      - name: maturin develop --features python
+        shell: bash
+        run: maturin develop --features python --extras test
+
+      # A guard, not a smoke test, and the reason it exists is specific:
+      # `python/tests/conftest.py` registers a stub `fastdna._core` when the
+      # real extension is missing, so that the pure-Python
+      # `active_learning` tests can run without a Rust build. That is
+      # reasonable locally and dangerous in CI -- if `maturin develop` ever
+      # produced no importable extension, pytest would still collect and
+      # still run, and a subset of the suite would still pass. This asserts
+      # the compiled module is the real one (`__version__` comes from
+      # `env!("CARGO_PKG_VERSION")` in src/ffi.rs) before a single test
+      # runs, so the job cannot report green against the stand-in.
+      - name: Assert the real compiled extension is importable
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import fastdna
+          import fastdna._core as core
+
+          version = getattr(core, "__version__", None)
+          print("fastdna._core.__version__ =", version)
+          print("fastdna package         =", fastdna.__file__)
+          if version is None or "no-rust-extension-built" in version:
+              raise SystemExit(
+                  "fastdna._core is the conftest.py stand-in, not the compiled "
+                  "extension -- `maturin develop` did not produce an importable "
+                  "module. Any pytest run from here would be testing a stub."
+              )
+          PY
+
+      # `-rs` prints the reason for every skipped test in the summary. With
+      # the full `[test]` extra installed the expected skip count is near
+      # zero, so this doubles as a check on the paragraph above: if skips
+      # reappear, the log names the missing import instead of leaving a
+      # green tick over 40 tests that never ran.
+      - name: pytest
+        shell: bash
+        run: python -m pytest python/tests -q -rs

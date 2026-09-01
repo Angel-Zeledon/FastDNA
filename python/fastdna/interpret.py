@@ -35,7 +35,14 @@ on its `.transform()` output, and runs `top_features`/
 `get_feature_names_out()` ordering matches what this module assumes.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Sequence, Union
+
 import pyarrow as pa
+
+from fastdna import _PathLike
+from . import _core
 
 # Deliberately no top-level `numpy` import: like scikit-learn/scipy/UMAP/
 # Biopython elsewhere in this package's convention, anything not needed by
@@ -45,13 +52,19 @@ import pyarrow as pa
 # and indexing (including numpy arrays, without numpy itself needing to be
 # installed just to call them). Only `explain_with_shap` needs numpy, and
 # it imports it lazily, alongside `shap` itself, inside that one function.
+# `numpy` is imported here only under TYPE_CHECKING, purely for annotating
+# the "array-like" parameters below without adding a runtime import.
+if TYPE_CHECKING:
+    import numpy as np
+
+__all__ = ["top_features", "export_top_features_fasta", "explain_with_shap"]
 
 
 def _validate_lengths(importances, feature_names):
     importances = list(importances)
     feature_names = list(feature_names)
     if any(hasattr(x, "__len__") for x in importances):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"importances must be a 1-D array-like (one value per feature), "
             f"got what looks like a 2-D/nested structure instead. If this "
             f"came from LogisticRegression.coef_ on a multi-class problem, "
@@ -59,7 +72,7 @@ def _validate_lengths(importances, feature_names):
         )
     importances = [float(x) for x in importances]
     if len(importances) != len(feature_names):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"importances and feature_names must have the same length -- "
             f"got {len(importances)} importances but {len(feature_names)} "
             f"feature names. A silent mismatch here would map an importance "
@@ -71,7 +84,13 @@ def _validate_lengths(importances, feature_names):
     return importances, feature_names
 
 
-def top_features(importances, feature_names, *, n=20, ascending=False):
+def top_features(
+    importances: Union[Sequence[float], "np.ndarray"],
+    feature_names: Sequence[str],
+    *,
+    n: int = 20,
+    ascending: bool = False,
+) -> pa.Table:
     """The `n` most important `(kmer_sequence, importance)` pairs, as a
     `pyarrow.Table` with columns `rank` (1-based, 1 = most important),
     `kmer`, and `importance` -- consistent with this package's convention
@@ -138,7 +157,13 @@ def top_features(importances, feature_names, *, n=20, ascending=False):
     )
 
 
-def export_top_features_fasta(importances, feature_names, path, *, n=20):
+def export_top_features_fasta(
+    importances: Union[Sequence[float], "np.ndarray"],
+    feature_names: Sequence[str],
+    path: _PathLike,
+    *,
+    n: int = 20,
+) -> pa.Table:
     """Writes the top `n` important k-mers (by the same "most important"
     rule `top_features` uses, i.e. magnitude-ranked by default) as a FASTA
     file at `path`, ready to paste directly into NCBI BLAST or a local
@@ -170,7 +195,13 @@ def export_top_features_fasta(importances, feature_names, path, *, n=20):
     return table
 
 
-def explain_with_shap(model, X_transformed, feature_names, *, n=20):
+def explain_with_shap(
+    model: Any,  # any fitted estimator supported by shap.Explainer
+    X_transformed: Any,  # dense array or scipy.sparse matrix, e.g. KmerVectorizer.transform() output
+    feature_names: Sequence[str],
+    *,
+    n: int = 20,
+) -> pa.Table:
     """Convenience wrapper around the optional `shap` package: computes
     SHAP values for `model` over already-vectorized data `X_transformed`
     (e.g. `KmerVectorizer.transform()`'s output), reduces them to one

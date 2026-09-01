@@ -26,9 +26,14 @@ def write_fastq(tmp_path: pathlib.Path, reads: list[str]) -> pathlib.Path:
 def counts(tmp_path):
     # A handful of distinct 5-mers with varied frequencies, enough to give
     # the partitioning test below more than one bucket to actually split.
+    #
+    # with_sequence=True: this whole module is about interop with the
+    # table FastDNA hands back, including the decoded kmer_sequence column
+    # (off by default -- see count()'s own docstring), which
+    # test_polars_from_arrow_preserves_schema_and_values below asserts on.
     reads = ["ACGTACGTAC"] * 6 + ["TTTTTGGGGG"] * 2 + ["AAACCCGGGT"] * 1
     path = write_fastq(tmp_path, reads)
-    return fastdna.count(str(path), k=5)
+    return fastdna.count(str(path), k=5, with_sequence=True)
 
 
 def test_polars_from_arrow_preserves_schema_and_values(counts):
@@ -76,8 +81,10 @@ def test_duckdb_can_join_against_a_second_kmer_count(tmp_path):
 
     path_a = write_fastq(tmp_path, ["ACGTACGTAC"] * 6)
     path_b = write_fastq(tmp_path, ["ACGTACGTAC"] * 3 + ["TTTTTGGGGG"] * 2)
-    table_a = fastdna.count(str(path_a), k=5).table  # noqa: F841
-    table_b = fastdna.count(str(path_b), k=5).table  # noqa: F841
+    # with_sequence=True: the join below is on kmer_sequence, off by
+    # default (see count()'s own docstring).
+    table_a = fastdna.count(str(path_a), k=5, with_sequence=True).table  # noqa: F841
+    table_b = fastdna.count(str(path_b), k=5, with_sequence=True).table  # noqa: F841
 
     # A realistic two-sample comparison: k-mers present in both, by sequence.
     row = duckdb.sql(

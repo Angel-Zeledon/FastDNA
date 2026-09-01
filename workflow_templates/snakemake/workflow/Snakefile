@@ -1,0 +1,129 @@
+# workflow/Snakefile -- cohort k-mer counting pipeline for a directory of
+# paired-end FASTQ samples.
+#
+# End to end, this pipeline:
+#   1. Discovers every sample under config["fastq_dir"] by globbing the
+#      "<sample>_R1.fastq.gz" / "<sample>_R2.fastq.gz" convention -- the
+#      config is the only thing that needs to change between cohorts, not
+#      this file (see config.yaml's own comments for the naming convention
+#      this glob expects).
+#   2. Counts each sample's canonical k-mers with `fastdna count`, feeding
+#      both mates in as two `--input` files in one run. FastDNA already
+#      aggregates multiple `--input` files into a single counting pass
+#      (README.md's "Paired-end batch counting": "Doing that for one sample
+#      is just `--input r1.fastq.gz --input r2.fastq.gz`"), so this rule
+#      gets the exact same per-sample result FastDNA's own `--paired-dir`
+#      batch mode would produce for one sample -- just reached through an
+#      explicit per-sample Snakemake rule instead of one whole-directory CLI
+#      call, so each sample is its own DAG node (independently re-run,
+#      retried, or resumed by Snakemake -- `--paired-dir` processes a whole
+#      cohort as a single opaque subprocess with no per-sample checkpoints).
+#   3. Combines every sample's Parquet table into one cohort-level k-mer
+#      table with `fastdna union` -- the real subcommand FastDNA ships today
+#      for "fold several k-mer tables into one" (see README.md's Subcommands
+#      table and `src/setops.rs`). This is the pipeline's "combined/summary
+#      output" deliverable: one table any downstream tool (fastdna query,
+#      pandas, DuckDB) can read as the whole cohort's k-mer profile.
+#
+# Run with (from this directory, workflow_templates/snakemake/):
+#   snakemake --cores 4 --configfile config.yaml
+#
+# See README.md in this same directory for the full walkthrough, including
+# why --configfile is required explicitly rather than an implicit
+# `configfile:` directive here (path-resolution rules for that directive
+# differ across Snakemake versions; requiring --configfile on the command
+# line sidesteps the ambiguity entirely).
+
+import os
+import shutil
+
+
+# --- Sample discovery -------------------------------------------------------
+#
+# glob_wildcards, not a hardcoded sample list: this is what makes the
+# pipeline config-driven. Point config["fastq_dir"] at any directory that
+# follows the "<sample>_R1.fastq.gz"/"<sample>_R2.fastq.gz" convention and
+# the sample set -- and therefore the whole DAG below -- updates
+# automatically; no Snakefile edits needed for a new cohort.
+SAMPLES = glob_wildcards(os.path.join(config["fastq_dir"], "{sample}_R1.fastq.gz")).sample
+
+if not SAMPLES:
+    raise ValueError(
+        f"No '<sample>_R1.fastq.gz' / '<sample>_R2.fastq.gz' pairs found "
+        f"under fastq_dir={config['fastq_dir']!r}. Check config.yaml, or "
+        f"see this directory's README.md for the expected layout."
+    )
+
+
+rule all:
+    # The cohort union table is this pipeline's real end product; naming it
+    # (rather than the per-sample files) as rule all's sole input is what
+    # makes Snakemake build the whole per-sample DAG needed to produce it --
+    # every fastdna_count instance below runs as a side effect of this one
+    # target, in parallel up to --cores.
+    input:
+        os.path.join(config["output_dir"], "cohort_union.parquet"),
+
+
+rule fastdna_count:
+    # One counting run per sample, both mates fed in as two --input files --
+    # see this file's header comment for why that is the paired-end
+    # convention to use here rather than --paired-dir.
+    input:
+        r1=os.path.join(config["fastq_dir"], "{sample}_R1.fastq.gz"),
+        r2=os.path.join(config["fastq_dir"], "{sample}_R2.fastq.gz"),
+    output:
+        counts=os.path.join(config["output_dir"], "{sample}.counts.parquet"),
+        qc=os.path.join(config["output_dir"], "{sample}.qc.json"),
+    params:
+        k=config["k"],
+        min_quality=config["min_quality"],
+        min_count=config["min_count"],
+    threads: config["threads"]
+    log:
+        os.path.join(config["output_dir"], "logs", "{sample}.fastdna_count.log"),
+    shell:
+        # `count` named explicitly (rather than relying on the no-subcommand
+        # default) so this line reads unambiguously in a pipeline log --
+        # identical behavior either way (README.md's Subcommands table).
+        "fastdna count "
+        "--input {input.r1} --input {input.r2} "
+        "--output {output.counts} "
+        "--kmer-size {params.k} "
+        "--min-quality {params.min_quality} "
+        "--min-count {params.min_count} "
+        "--threads {threads} "
+        "--qc {output.qc} "
+        "> {log} 2>&1"
+
+
+rule fastdna_union:
+    # Folds every sample's independently-produced Parquet table into one
+    # cohort-level k-mer table. `fastdna union` requires sorted k-mer tables
+    # as input, which is exactly what `fastdna count`'s own Parquet output
+    # already is -- no intermediate conversion step, and set operations
+    # compose (a union's own output is a valid union/intersect/diff input
+    # again).
+    input:
+        expand(
+            os.path.join(config["output_dir"], "{sample}.counts.parquet"),
+            sample=SAMPLES,
+        ),
+    output:
+        os.path.join(config["output_dir"], "cohort_union.parquet"),
+    params:
+        combine=config["combine"],
+    run:
+        # `fastdna union --input` requires at least two tables (`num_args =
+        # 2..`, "a union of fewer than two tables is not a combination of
+        # anything" -- src/cli.rs's UnionArgs doc comment): a single-sample
+        # cohort has nothing to union against, so this branch just carries
+        # that one sample's own table forward as the "cohort" output instead
+        # of calling a CLI command that would reject it. Everything with two
+        # or more samples takes the real `fastdna union` path.
+        if len(input) == 1:
+            shutil.copyfile(input[0], output[0])
+        else:
+            shell(
+                "fastdna union --input {input} --output {output} --combine {params.combine}"
+            )

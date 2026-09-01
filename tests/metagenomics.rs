@@ -236,7 +236,7 @@ fn a_reference_sequence_missing_from_the_taxonomy_names_it() {
     let taxonomy = fx.write("taxonomy.tsv", TAXONOMY);
 
     match KmerDatabase::build(&reference, &taxonomy, K) {
-        Err(FastDnaError::Load { path, reason }) => {
+        Err(FastDnaError::Load { path, reason, .. }) => {
             assert_eq!(path, reference);
             assert!(reason.contains("surprise"), "reason: {reason}");
             assert!(reason.contains("taxonomy.tsv"), "reason must point at the fix: {reason}");

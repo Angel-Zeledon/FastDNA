@@ -158,8 +158,9 @@ pub struct Taxon {
 /// one node is the root, and no node is its own ancestor.
 ///
 /// Those three properties are established once, by [`TaxonomyFile::parse`]
-/// or by [`Taxonomy::from_taxa`], and then assumed by every walk in this
-/// module. That is deliberate: `is_ancestor_or_self` runs once per pair of
+/// or by `from_taxa` (private: [`KmerDatabase::build`] and
+/// [`KmerDatabase::load`] both call it), and then assumed by every walk in
+/// this module. That is deliberate: `is_ancestor_or_self` runs once per pair of
 /// hit taxa per read, and a cycle check on every one of those walks would
 /// be paid millions of times to catch a problem that can only be introduced
 /// at the file boundary.
@@ -519,7 +520,8 @@ impl TaxonomyFile {
     /// you cared about still classifies reads -- to the wrong node, with
     /// full confidence, and no error anywhere.
     pub fn parse(text: &str, path: &Path) -> Result<Self> {
-        let load_err = |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason };
+        let load_err =
+            |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason, source: None };
 
         let mut lines = text
             .lines()
@@ -657,46 +659,12 @@ fn record_id_of(header: &[u8]) -> String {
     trimmed.split_whitespace().next().unwrap_or("").to_string()
 }
 
-/// `kmer::extract_canonical_kmers`, writing into a caller-owned buffer
-/// instead of returning a fresh `Vec`.
-///
-/// This exists purely to remove one allocation and one free per sequence.
-/// Both the builder and the classifier call it once per record, so on a
-/// 7-million-read file it is 14 million heap operations that simply do not
-/// happen; the buffer instead reaches the longest read's length within the
-/// first few reads and never grows again.
-///
-/// TODO: delete this and call `kmer::extract_canonical_kmers_into` once
-/// that lands in `src/kmer.rs` -- it is being added concurrently in the
-/// main tree, and duplicating it here rather than adding a second copy to
-/// `kmer.rs` is what keeps that merge trivial.
-/// `the_local_kmer_extractor_matches_the_shared_one` pins the two together
-/// so this copy cannot drift in the meantime.
-fn extract_canonical_kmers_into(seq: &[u8], k: usize, out: &mut Vec<u64>) {
-    out.clear();
-    if seq.len() < k || k == 0 || k > 32 {
-        return;
-    }
-
-    let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
-    let mut current_kmer: u64 = 0;
-    let mut valid_len = 0;
-
-    for &base in seq {
-        if let Some(bits) = crate::kmer::base_to_bits(base) {
-            current_kmer = ((current_kmer << 2) | bits) & mask;
-            valid_len += 1;
-            if valid_len >= k {
-                out.push(crate::kmer::canonical_kmer_u64(current_kmer, k));
-            }
-        } else {
-            // An ambiguous base resets the window rather than producing a
-            // corrupt k-mer -- the same rule the shared extractor applies.
-            current_kmer = 0;
-            valid_len = 0;
-        }
-    }
-}
+// The local copy of this extractor was deleted: `kmer.rs` already exposes
+// the shared version, and the copy called `canonical_kmer_u64` once per
+// k-mer, recomputing the whole reverse complement (13 ALU operations)
+// where the shared one rolls it alongside the forward strand (4 operations
+// per base). The TODO asking for this deletion lived in the copy itself.
+use crate::kmer::extract_canonical_kmers_into;
 
 // -- the database ---------------------------------------------------------
 
@@ -819,6 +787,7 @@ impl KmerDatabase {
                                  it to a {SEQUENCE_IDS_COLUMN} cell in {}",
                                 taxonomy_path.display()
                             ),
+                            source: None,
                         });
                     };
                     seen.insert(id);
@@ -863,6 +832,7 @@ impl KmerDatabase {
                      reference must name the same sequences",
                     reference_path.display()
                 ),
+                source: None,
             });
         }
 
@@ -1006,6 +976,7 @@ impl KmerDatabase {
         let taxonomy_json = serde_json::to_vec(&self.taxonomy).map_err(|e| FastDnaError::Export {
             path: path.to_path_buf(),
             reason: format!("could not serialize the taxonomy: {e}"),
+            source: Some(Box::new(e)),
         })?;
 
         let (file, pending) = crate::atomic::AtomicFile::create(path)?;
@@ -1046,7 +1017,8 @@ impl KmerDatabase {
     /// table makes `binary_search` return confident nonsense.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let load_err = |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason };
+        let load_err =
+            |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason, source: None };
 
         let bytes = std::fs::read(path)
             .map_err(|e| FastDnaError::Io { path: path.to_path_buf(), source: e })?;
@@ -1103,7 +1075,11 @@ impl KmerDatabase {
 
         let taxonomy_end = DB_HEADER_BYTES + taxonomy_len;
         let taxonomy: Taxonomy = serde_json::from_slice(&bytes[DB_HEADER_BYTES..taxonomy_end])
-            .map_err(|e| load_err(format!("the embedded taxonomy is not readable: {e}")))?;
+            .map_err(|e| FastDnaError::Load {
+                path: path.to_path_buf(),
+                reason: format!("the embedded taxonomy is not readable: {e}"),
+                source: Some(Box::new(e)),
+            })?;
         // `index` and `lineages` are `#[serde(skip)]`, so what came back is
         // a shell. Re-running the constructor rebuilds both *and* re-runs
         // every structural check, which is the point: a hand-edited file
@@ -1502,6 +1478,7 @@ impl KmerDatabase {
             FastDnaError::Export {
                 path: std::path::PathBuf::from("<in-memory Arrow table>"),
                 reason: e.to_string(),
+                source: Some(Box::new(e)),
             }
         })
     }
@@ -1581,6 +1558,7 @@ pub fn classification_batch(rows: &[ReadClassification]) -> Result<arrow::record
         FastDnaError::Export {
             path: std::path::PathBuf::from("<in-memory Arrow table>"),
             reason: e.to_string(),
+            source: Some(Box::new(e)),
         }
     })
 }
@@ -1688,7 +1666,7 @@ tax_id\tparent_tax_id\trank\tname\tsequence_ids
     fn reject(text: &str, must_mention: &[&str]) -> String {
         match TaxonomyFile::parse(text, std::path::Path::new("bad_taxonomy.tsv")) {
             Ok(_) => panic!("expected this taxonomy to be rejected:\n{text}"),
-            Err(FastDnaError::Load { path, reason }) => {
+            Err(FastDnaError::Load { path, reason, .. }) => {
                 assert_eq!(path, std::path::PathBuf::from("bad_taxonomy.tsv"));
                 for needle in must_mention {
                     assert!(reason.contains(needle), "message must mention {needle:?}: {reason}");
@@ -1831,12 +1809,14 @@ tax_id\tparent_tax_id\trank\tname\tsequence_ids
         .expect("the toy reference and taxonomy agree")
     }
 
-    /// The local buffer-reusing extractor must agree with the shared one on
-    /// every input, or the classifier and the rest of the crate would be
-    /// counting different k-mers. Pins the duplication until
-    /// `kmer::extract_canonical_kmers_into` lands and this copy goes away.
+    /// Replaces `the_local_kmer_extractor_matches_the_shared_one`, which
+    /// pinned a duplication that is now gone. What is left to check is not
+    /// that two implementations agree -- there is only one -- but that
+    /// this module still produces the same k-mer set as the rest of the
+    /// crate for the inputs it actually receives, including ones
+    /// containing ambiguous bases.
     #[test]
-    fn the_local_kmer_extractor_matches_the_shared_one() {
+    fn the_module_uses_the_shared_extractor() {
         let cases: [&[u8]; 8] = [
             b"",
             b"ACG",

@@ -101,11 +101,14 @@ annotation file is one of:
 """
 from __future__ import annotations
 
+import os
 import pathlib
 from collections import defaultdict
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional, Union
 
 import pyarrow as pa
+
+from . import _core
 
 __all__ = [
     "Annotation",
@@ -181,7 +184,7 @@ def _read_fasta(path: str) -> dict:
     try:
         fh = open(path, "r", encoding="utf-8")
     except FileNotFoundError as e:
-        raise FileNotFoundError(
+        raise _core.IoNotFoundError(
             f"load_annotation() could not find the reference FASTA file {path!r}."
         ) from e
 
@@ -205,7 +208,7 @@ def _read_fasta(path: str) -> dict:
             sequences[current_id] = "".join(chunks).upper()
 
     if not sequences:
-        raise ValueError(f"reference FASTA file {path!r} contains no sequences.")
+        raise _core.InvalidConfigError(f"reference FASTA file {path!r} contains no sequences.")
     return sequences
 
 
@@ -245,7 +248,7 @@ def _parse_gff3(path: str) -> list:
     try:
         fh = open(path, "r", encoding="utf-8")
     except FileNotFoundError as e:
-        raise FileNotFoundError(
+        raise _core.IoNotFoundError(
             f"load_annotation() could not find the GFF3 annotation file {path!r}."
         ) from e
 
@@ -260,7 +263,7 @@ def _parse_gff3(path: str) -> list:
 
             fields = line.split("\t")
             if len(fields) != 9:
-                raise ValueError(
+                raise _core.InvalidConfigError(
                     f"malformed GFF3 file {path!r} at line {line_no}: expected 9 "
                     f"tab-separated columns (GFF3 spec v1.26), got {len(fields)}: {line!r}"
                 )
@@ -268,7 +271,7 @@ def _parse_gff3(path: str) -> list:
             try:
                 start_i, end_i = int(start), int(end)
             except ValueError:
-                raise ValueError(
+                raise _core.InvalidConfigError(
                     f"malformed GFF3 file {path!r} at line {line_no}: start/end must be "
                     f"integers, got {start!r}/{end!r}"
                 )
@@ -306,12 +309,12 @@ def _parse_genbank(path: str) -> list:
     try:
         records = list(SeqIO.parse(path, "genbank"))
     except FileNotFoundError as e:
-        raise FileNotFoundError(
+        raise _core.IoNotFoundError(
             f"load_annotation() could not find the GenBank annotation file {path!r}."
         ) from e
 
     if not records:
-        raise ValueError(f"GenBank annotation file {path!r} contains no records.")
+        raise _core.InvalidConfigError(f"GenBank annotation file {path!r} contains no records.")
 
     features = []
     for record in records:
@@ -338,7 +341,7 @@ class Annotation:
     structure, at this scale, is the right tradeoff.
     """
 
-    def __init__(self, sequences: dict, features: list):
+    def __init__(self, sequences: dict[str, str], features: list[Feature]) -> None:
         self.sequences = sequences
         self.features = list(features)
         self._exact_index_cache: dict[int, dict] = {}
@@ -357,7 +360,7 @@ class Annotation:
         self._exact_index_cache[k] = index
         return index
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         total_length = sum(len(s) for s in self.sequences.values())
         return (
             f"Annotation(sequences={len(self.sequences)}, "
@@ -365,7 +368,9 @@ class Annotation:
         )
 
 
-def load_annotation(reference_fasta_path, annotation_path) -> Annotation:
+def load_annotation(
+    reference_fasta_path: Union[str, os.PathLike], annotation_path: Union[str, os.PathLike]
+) -> Annotation:
     """Loads a reference FASTA plus its GFF3 or GenBank annotation into an
     `Annotation`, ready for repeated `locate_kmer()`/`annotate_rule()` calls.
 
@@ -385,11 +390,19 @@ def load_annotation(reference_fasta_path, annotation_path) -> Annotation:
         unrecognized one raises `ValueError` naming the supported ones
         rather than guessing.
 
-    Raises `ValueError` if none of the annotation's `seqid`s match any
-    record id in the reference FASTA -- almost always a sign the two files
-    describe different assemblies, or that one uses accession numbers where
-    the other uses plain contig names, and finding that out from a
-    silent all-intergenic result later would be a far worse experience.
+    Returns
+    -------
+    Annotation
+
+    Raises
+    ------
+    ValueError
+        `annotation_path`'s extension is not recognized, or none of the
+        annotation's `seqid`s match any record id in the reference FASTA
+        -- almost always a sign the two files describe different
+        assemblies, or that one uses accession numbers where the other
+        uses plain contig names, and finding that out from a silent
+        all-intergenic result later would be a far worse experience.
     """
     reference_fasta_path = str(reference_fasta_path)
     annotation_path = str(annotation_path)
@@ -402,7 +415,7 @@ def load_annotation(reference_fasta_path, annotation_path) -> Annotation:
     elif suffix in _GENBANK_EXTENSIONS:
         features = _parse_genbank(annotation_path)
     else:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"load_annotation() does not recognize the annotation file extension "
             f"{suffix!r} of {annotation_path!r}. Supported formats: GFF3 "
             f"({', '.join(_GFF_EXTENSIONS)}) or GenBank ({', '.join(_GENBANK_EXTENSIONS)})."
@@ -410,7 +423,7 @@ def load_annotation(reference_fasta_path, annotation_path) -> Annotation:
 
     feature_seqids = {f.seqid for f in features}
     if features and not (feature_seqids & set(sequences)):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"none of the annotation's sequence ids ({sorted(feature_seqids)}) match any "
             f"sequence id in the reference FASTA ({sorted(sequences)}). Check that the "
             "annotation file and the reference FASTA describe the same assembly, and that "
@@ -423,10 +436,10 @@ def load_annotation(reference_fasta_path, annotation_path) -> Annotation:
 def _validate_kmer_sequence(kmer_sequence: str) -> str:
     kmer_sequence = str(kmer_sequence).upper()
     if not kmer_sequence:
-        raise ValueError("kmer_sequence must be a non-empty DNA sequence.")
+        raise _core.InvalidConfigError("kmer_sequence must be a non-empty DNA sequence.")
     invalid = sorted(set(kmer_sequence) - _VALID_BASES)
     if invalid:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"kmer_sequence {kmer_sequence!r} contains characters that are not valid DNA "
             f"bases (A/C/G/T/N): {invalid}."
         )
@@ -435,7 +448,7 @@ def _validate_kmer_sequence(kmer_sequence: str) -> str:
 
 def _validate_max_mismatches(max_mismatches) -> int:
     if isinstance(max_mismatches, bool) or not isinstance(max_mismatches, int) or max_mismatches < 0:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"max_mismatches must be a non-negative integer, got {max_mismatches!r}."
         )
     return max_mismatches
@@ -493,7 +506,7 @@ def _approximate_hits(
     return raw
 
 
-def locate_kmer(annotation: Annotation, kmer_sequence: str, *, max_mismatches: int = 0) -> list:
+def locate_kmer(annotation: Annotation, kmer_sequence: str, *, max_mismatches: int = 0) -> list[Hit]:
     """Every occurrence of `kmer_sequence` (or its reverse complement) in
     `annotation`'s reference sequence(s), exactly or within
     `max_mismatches` substitutions, with the annotated feature(s) each
@@ -502,18 +515,39 @@ def locate_kmer(annotation: Annotation, kmer_sequence: str, *, max_mismatches: i
     suffix-array-caliber index) and `Hit`'s docstring for exactly what one
     returned entry means.
 
-    Returns **every** hit, in both orientations independently -- zero hits
-    (an empty list) is itself a real, meaningful answer ("not present in
-    this reference"), not an error; a repeated/multi-copy k-mer returns one
-    entry per occurrence rather than picking one.
-
     `max_mismatches=0` (the default) uses an exact hash-index lookup;
     `max_mismatches>0` uses a direct Hamming-distance scan of the whole
     reference. Both are substitution-only: no insertion or deletion is ever
     matched, at any `max_mismatches` (see module docstring).
 
-    Results are sorted by `(seqid, start, strand, feature_type, gene_name)`
-    for deterministic output across calls.
+    Parameters
+    ----------
+    annotation : Annotation
+        As returned by `load_annotation()`.
+    kmer_sequence : str
+        The DNA sequence to search for, A/C/G/T/N only (case-insensitive).
+    max_mismatches : int, default 0
+        Maximum Hamming distance (substitutions only, see above) a match
+        may have. `0` uses the exact hash-index path; anything greater
+        uses the direct Hamming-distance scan.
+
+    Returns
+    -------
+    list of Hit
+        **Every** hit, in both orientations independently, sorted by
+        `(seqid, start, strand, feature_type, gene_name)` for
+        deterministic output across calls -- zero hits (an empty list) is
+        itself a real, meaningful answer ("not present in this
+        reference"), not an error; a repeated/multi-copy k-mer returns
+        one entry per occurrence rather than picking one.
+
+    Raises
+    ------
+    TypeError
+        `annotation` is not an `Annotation` built by `load_annotation()`.
+    ValueError
+        `kmer_sequence` is empty or contains non-DNA characters, or
+        `max_mismatches` is not a non-negative integer.
     """
     if not isinstance(annotation, Annotation):
         raise TypeError(
@@ -563,33 +597,54 @@ def locate_kmer(annotation: Annotation, kmer_sequence: str, *, max_mismatches: i
     return hits
 
 
-def annotate_rule(rule, annotation: Annotation, *, max_mismatches: int = 0) -> pa.Table:
+def annotate_rule(
+    rule: Any,  # fastdna.rules.Rule (duck-typed, not imported here) or a plain k-mer sequence str
+    annotation: Annotation,
+    *,
+    max_mismatches: int = 0,
+) -> pa.Table:
     """Convenience wrapper: `locate_kmer()` for a `fastdna.rules.Rule` (or a
     plain k-mer sequence string), returned as a `pyarrow.Table` -- one row
     per `Hit`, ready to attach to `SetCoveringClassifier.explain()` output
     or write out alongside it.
 
-    `rule` may be:
+    Parameters
+    ----------
+    rule : fastdna.rules.Rule or str
+        One of:
 
-    - a `fastdna.rules.Rule` (duck-typed via `.feature_name`/`.presence`/
-      `.feature_index` -- this module does not import `fastdna.rules`, the
-      same "no hard dependency on the producing module" stance
-      `fastdna.interpret` takes towards `fastdna.sklearn`): its
-      `feature_name` is used as the k-mer sequence, and `presence`/
-      `feature_index` are carried into the output table as extra columns.
-    - a plain string: used directly as the k-mer sequence; the output
-      table's `presence`/`feature_index` columns are all-null.
+        - a `fastdna.rules.Rule` (duck-typed via `.feature_name`/
+          `.presence`/`.feature_index` -- this module does not import
+          `fastdna.rules`, the same "no hard dependency on the producing
+          module" stance `fastdna.interpret` takes towards
+          `fastdna.sklearn`): its `feature_name` is used as the k-mer
+          sequence, and `presence`/`feature_index` are carried into the
+          output table as extra columns.
+        - a plain string: used directly as the k-mer sequence; the output
+          table's `presence`/`feature_index` columns are all-null.
+    annotation : Annotation
+        As returned by `load_annotation()`.
+    max_mismatches : int, default 0
+        Forwarded to `locate_kmer()`.
 
-    Raises `ValueError` if the resulting sequence is not valid DNA -- the
-    most common cause is a `Rule` whose classifier was fitted without
-    `feature_names`, so `feature_name` is a positional placeholder like
-    `"feature_2"` rather than a real k-mer (see
-    `SetCoveringClassifier.export_rules_fasta`, which refuses the same
-    input for the same reason).
+    Returns
+    -------
+    pyarrow.Table
+        A fixed schema, zero rows for a zero-hit k-mer -- so a caller can
+        `pa.concat_tables()` results across several rules without
+        special-casing "this one had no hits".
 
-    Always returns a `pyarrow.Table` with a fixed schema, zero rows for a
-    zero-hit k-mer -- so a caller can `pa.concat_tables()` results across
-    several rules without special-casing "this one had no hits".
+    Raises
+    ------
+    TypeError
+        `rule` is not a `fastdna.rules.Rule` (duck-typed) or a string.
+    ValueError
+        The resulting sequence is not valid DNA -- the most common cause
+        is a `Rule` whose classifier was fitted without `feature_names`,
+        so `feature_name` is a positional placeholder like `"feature_2"`
+        rather than a real k-mer (see
+        `SetCoveringClassifier.export_rules_fasta`, which refuses the
+        same input for the same reason).
     """
     if isinstance(rule, str):
         kmer_sequence = rule
@@ -607,7 +662,7 @@ def annotate_rule(rule, annotation: Annotation, *, max_mismatches: int = 0) -> p
 
     invalid = sorted(set(str(kmer_sequence).upper()) - _VALID_BASES)
     if invalid:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"annotate_rule() needs a real DNA sequence but rule.feature_name is "
             f"{kmer_sequence!r}, which contains non-DNA characters {invalid}. If this Rule "
             "came from a SetCoveringClassifier fitted without feature_names, feature_name is "
@@ -637,7 +692,9 @@ def annotate_rule(rule, annotation: Annotation, *, max_mismatches: int = 0) -> p
     )
 
 
-def export_bed(table: pa.Table, path, *, name_column: str = "kmer_sequence") -> None:
+def export_bed(
+    table: pa.Table, path: Union[str, os.PathLike], *, name_column: str = "kmer_sequence"
+) -> None:
     """Writes `table` -- `annotate_rule()`'s output, or `pa.concat_tables()`
     of several such tables -- as a standard BED6 file, for loading a rule's
     genomic hit positions into IGV, the UCSC Genome Browser, or any other
@@ -660,6 +717,12 @@ def export_bed(table: pa.Table, path, *, name_column: str = "kmer_sequence") -> 
     1`, `chromEnd = end` (the 1-based inclusive end and the 0-based
     half-open end are numerically identical, so only `start` shifts).
 
+    BED's `score` field (column 5) is always written as `0`: nothing in
+    `table` is a score in BED's `0-1000` sense, and inventing one here
+    would be exactly the kind of fabricated threshold this project's other
+    modules (`gwas.prefilter_association`, `plotting.plot_significance`)
+    are written to avoid.
+
     Parameters
     ----------
     table : pyarrow.Table
@@ -679,12 +742,6 @@ def export_bed(table: pa.Table, path, *, name_column: str = "kmer_sequence") -> 
         hits) fall back to the literal string `"intergenic"` rather than
         writing an empty BED field, which is not valid BED.
 
-    BED's `score` field (column 5) is always written as `0`: nothing in
-    `table` is a score in BED's `0-1000` sense, and inventing one here
-    would be exactly the kind of fabricated threshold this project's other
-    modules (`gwas.prefilter_association`, `plotting.plot_significance`)
-    are written to avoid.
-
     Raises
     ------
     ValueError
@@ -694,13 +751,13 @@ def export_bed(table: pa.Table, path, *, name_column: str = "kmer_sequence") -> 
     required = ("seqid", "start", "end", "strand")
     missing = [c for c in required if c not in table.column_names]
     if missing:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"export_bed() needs column(s) {missing}, but table only has "
             f"{list(table.column_names)}. Pass the pyarrow.Table annotate_rule() returns "
             "(or pa.concat_tables() of several)."
         )
     if name_column not in table.column_names:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"export_bed() name_column={name_column!r} is not a column of table "
             f"({list(table.column_names)})."
         )

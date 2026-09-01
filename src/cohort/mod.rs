@@ -9,4 +9,6 @@ pub mod matrix;
 
 pub use batch::{count_paired_samples, discover_paired_samples, sample_output_path, PairedOutputFormat, SampleRunResult};
 pub use discovery::{discover_samples, SampleFiles};
-pub use matrix::{build_cohort_matrix, CohortMatrix};
+pub use matrix::{
+    build_cohort_matrix, build_cohort_matrix_from_directory, build_cohort_matrix_from_files, CohortMatrix,
+};

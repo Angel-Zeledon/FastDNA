@@ -1,5 +1,12 @@
 """fastdna.mic -- log2(MIC) regression for antimicrobial resistance.
 
+## Status: frozen
+
+Per `docs/audit/PLAN.md` §2 ("Qué se poda"), this module is frozen: stable,
+not accepting new features, and a candidate for extraction into a separate
+`fastdna-contrib` package in a future release. Freezing is not deleting --
+see that section for the full reasoning behind the boundary.
+
 ## Why this module exists
 
 Minimum inhibitory concentration (MIC) is the standard antimicrobial
@@ -110,10 +117,12 @@ never requires scikit-learn to be installed.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Any, NamedTuple, Optional
 
 import numpy as np
 import pyarrow as pa
+
+from . import _core
 
 __all__ = [
     "log2_mic",
@@ -123,7 +132,7 @@ __all__ = [
 ]
 
 
-def log2_mic(mic_values):
+def log2_mic(mic_values: np.ndarray) -> np.ndarray:  # mic_values is array-like, coerced via np.asarray
     """Validates raw MIC values and returns their log2 transform.
 
     MIC values come from a two-fold dilution series, so log2 turns them
@@ -157,18 +166,18 @@ def log2_mic(mic_values):
     """
     values = np.asarray(mic_values, dtype=np.float64)
     if values.ndim != 1:
-        raise ValueError(f"log2_mic() needs a 1-D array of MIC values, got shape {values.shape}")
+        raise _core.InvalidConfigError(f"log2_mic() needs a 1-D array of MIC values, got shape {values.shape}")
     if values.size == 0:
-        raise ValueError("log2_mic() received an empty array of MIC values.")
+        raise _core.InvalidConfigError("log2_mic() received an empty array of MIC values.")
     if not np.all(np.isfinite(values)):
         bad_count = int((~np.isfinite(values)).sum())
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"log2_mic() requires finite MIC values (no NaN/inf), got {bad_count} non-finite "
             "value(s)."
         )
     if np.any(values <= 0):
         bad = values[values <= 0]
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"log2_mic() requires strictly positive MIC values (log2 of zero or a negative value "
             f"is undefined), got {bad[:5].tolist()}{', ...' if bad.size > 5 else ''}. A MIC of 0 "
             "usually means 'no growth at the lowest tested dilution' -- encode it as that dilution's "
@@ -209,13 +218,20 @@ class MicRegressor:
         `X.shape[1]` at fit time, scikit-learn's own convention.
     """
 
-    def __init__(self, estimator=None):
+    def __init__(
+        self,
+        estimator: Optional[Any] = None,  # scikit-learn-compatible regressor; sklearn is imported lazily
+    ) -> None:
         # scikit-learn convention: __init__ only assigns parameters, no
         # validation and no side effects, matching fastdna.sklearn.KmerVectorizer
         # and fastdna.calibration.calibrate's own estimator-parameter handling.
         self.estimator = estimator
 
-    def fit(self, X, y):
+    def fit(
+        self,
+        X: Any,  # array-like or scipy sparse matrix, shape (n_samples, n_features)
+        y: np.ndarray,  # array-like of shape (n_samples,), raw MIC values; coerced via log2_mic()
+    ) -> MicRegressor:
         """Fits `estimator` (or the default `Ridge()`) on `(X, log2_mic(y))`.
 
         Parameters
@@ -245,7 +261,7 @@ class MicRegressor:
         n_samples = X.shape[0]
         y_log2 = log2_mic(y)
         if y_log2.shape[0] != n_samples:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"MicRegressor.fit(): X has {n_samples} rows but y has {y_log2.shape[0]} entries -- "
                 "they must line up one MIC value per sample (row) of X."
             )
@@ -263,7 +279,7 @@ class MicRegressor:
                 "predict_log2()."
             )
 
-    def predict_log2(self, X):
+    def predict_log2(self, X: Any) -> np.ndarray:  # X is array-like or scipy sparse matrix
         """Predicted `log2(MIC)`, i.e. the wrapped estimator's raw output --
         the space the model was actually fit in, and the one
         `mean_absolute_error` and R^2 are conventionally reported in for
@@ -276,7 +292,7 @@ class MicRegressor:
         self._check_fitted()
         return np.asarray(self.estimator_.predict(X), dtype=np.float64).reshape(-1)
 
-    def predict(self, X):
+    def predict(self, X: Any) -> np.ndarray:  # X is array-like or scipy sparse matrix
         """Predicted MIC in original (linear) units: `2 ** predict_log2(X)`.
 
         Returns
@@ -324,7 +340,12 @@ class MicRegressionReport(NamedTuple):
     essential_agreement: float
 
 
-def mic_regression_report(mic_true, mic_pred, *, tolerance_log2=1.0):
+def mic_regression_report(
+    mic_true: np.ndarray,  # array-like of shape (n_samples,), coerced via log2_mic()
+    mic_pred: np.ndarray,  # array-like of shape (n_samples,), coerced via log2_mic()
+    *,
+    tolerance_log2: float = 1.0,
+) -> MicRegressionReport:
     """R^2, MAE and essential agreement for predicted vs. true MIC values.
 
     Does no fitting -- like `fastdna.evaluation.precision_recall_report`
@@ -370,17 +391,17 @@ def mic_regression_report(mic_true, mic_pred, *, tolerance_log2=1.0):
     pred_log2 = log2_mic(mic_pred)
 
     if true_log2.shape[0] != pred_log2.shape[0]:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"mic_regression_report() needs one prediction per true value: mic_true has "
             f"{true_log2.shape[0]} entries but mic_pred has {pred_log2.shape[0]}."
         )
     if true_log2.shape[0] < 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"mic_regression_report() needs at least 2 samples to compute R^2, got "
             f"{true_log2.shape[0]}."
         )
     if not isinstance(tolerance_log2, (int, float)) or isinstance(tolerance_log2, bool) or tolerance_log2 <= 0:
-        raise ValueError(f"tolerance_log2 must be a positive number, got {tolerance_log2!r}")
+        raise _core.InvalidConfigError(f"tolerance_log2 must be a positive number, got {tolerance_log2!r}")
 
     r2 = float(r2_score(true_log2, pred_log2))
     mae = float(mean_absolute_error(true_log2, pred_log2))

@@ -97,12 +97,15 @@ fn run_with_file(fx: &Fixture, name: &str, bytes: &[u8]) -> String {
 }
 
 /// The counts CSV a run produced, as rows, with a sanity check that it is
-/// the schema every exporter writes.
+/// the schema every exporter writes by default. `kmer_sequence` is off
+/// unless `--with-sequence` is passed (see `export::counts_schema`'s doc
+/// comment), and this test's own `args_for` does not pass it -- the point
+/// here is stdin-vs-file equivalence, which holds either way.
 fn rows(csv: &str) -> Vec<String> {
     let mut lines = csv.lines();
     assert_eq!(
         lines.next(),
-        Some("kmer_u64,kmer_sequence,frequency"),
+        Some("kmer_u64,frequency"),
         "the exporter schema must be untouched"
     );
     let rows: Vec<String> = lines.filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();

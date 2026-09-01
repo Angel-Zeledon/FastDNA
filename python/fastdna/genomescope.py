@@ -42,8 +42,17 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Union
 
+from . import _PathLike, _core
 from .spectrum import suggest_min_count
+
+if TYPE_CHECKING:
+    # Only for static type checkers -- see `profile_genome`'s `source`
+    # parameter. `fastdna.KmerCounts` is not imported at runtime here (this
+    # module is imported *by* the package; see `_spectrum_and_k`'s own
+    # deferred `import fastdna`).
+    from . import KmerCounts
 
 __all__ = ["GenomeProfile", "profile_genome", "plot_spectrum_fit"]
 
@@ -142,7 +151,7 @@ def _clean_spectrum(spectrum):
     try:
         items = list(spectrum.items())
     except AttributeError:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"spectrum must be a mapping of {{depth: distinct k-mers}} (e.g. "
             f"KmerCounts.spectrum()), got {type(spectrum).__name__}"
         ) from None
@@ -153,18 +162,18 @@ def _clean_spectrum(spectrum):
             depth = int(depth)
             n_kmers = int(n_kmers)
         except (TypeError, ValueError):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"spectrum keys and values must be integers, got "
                 f"{depth!r}: {n_kmers!r}"
             ) from None
         if depth < 1:
-            raise ValueError(f"spectrum depths must be >= 1, got {depth}")
+            raise _core.InvalidConfigError(f"spectrum depths must be >= 1, got {depth}")
         if n_kmers < 0:
-            raise ValueError(f"spectrum counts must be >= 0, got {n_kmers} at depth {depth}")
+            raise _core.InvalidConfigError(f"spectrum counts must be >= 0, got {n_kmers} at depth {depth}")
         cleaned[depth] = n_kmers
 
     if not cleaned:
-        raise ValueError("spectrum is empty: there is nothing to profile")
+        raise _core.InvalidConfigError("spectrum is empty: there is nothing to profile")
     return cleaned
 
 
@@ -188,7 +197,7 @@ def _spectrum_and_k(source, k):
     """
     if hasattr(source, "items"):
         if k is None:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "k must be given when profiling a bare spectrum mapping: it "
                 "cannot be recovered from the spectrum itself, and both the "
                 "heterozygosity and error-rate estimates depend on it. Pass "
@@ -200,7 +209,7 @@ def _spectrum_and_k(source, k):
     if hasattr(source, "spectrum") and hasattr(source, "k"):
         source_k = int(source.k)
         if k is not None and int(k) != source_k:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"k={k} conflicts with the k-mer size these counts were "
                 f"actually built with (k={source_k}); omit k to use the "
                 f"counts' own value."
@@ -450,34 +459,22 @@ class GenomeProfile:
 # ---------------------------------------------------------------------------
 
 
-def profile_genome(source, *, k=None, ploidy=2, max_coverage=None):
+def profile_genome(
+    source: Union["KmerCounts", Mapping[int, int], _PathLike],
+    *,
+    k: Optional[int] = None,
+    ploidy: int = 2,
+    max_coverage: Optional[int] = None,
+) -> GenomeProfile:
     """Fits a GenomeScope-style negative-binomial mixture to a k-mer
     frequency spectrum and reports what the fit implies about the genome:
     size, heterozygosity, repeat content, haploid coverage and sequencing
     error rate -- with no reference and no assembly.
 
-    `source` is one of:
-      * a `fastdna.KmerCounts` (its `.spectrum()` and `.k` are used);
-      * a `{depth: distinct k-mers}` mapping, in which case `k` is
-        required (it cannot be recovered from the spectrum, and two of the
-        outputs depend on it);
-      * a path to a FASTQ(.gz) file, counted here via `fastdna.count()`
-        with an unfiltered `min_count=1` -- the error component at depth 1
-        is *data* for this model, not noise to be filtered away first.
-
     `ploidy` must be 2. Polyploid profiling (GenomeScope 2.0's own headline
     feature) raises `NotImplementedError`; see roadmap item A2. Fitting a
     diploid model to a tetraploid and relabeling the result would be worse
     than refusing.
-
-    `max_coverage` caps the depth range the fit runs over; it defaults to
-    `DEFAULT_MAX_COVERAGE_MULTIPLE` times the observed coverage peak's
-    depth (bounded by the deepest observed k-mer). The cap is load-bearing
-    twice over: a single k-mer at depth 10^7 (adapter dimer, rDNA array,
-    contaminant) would otherwise both dominate a least-squares fit and
-    force a dense array with one bin per depth. k-mers above the cap are
-    excluded from every estimate and their total mass is reported as
-    `model_fit["kmers_above_max_coverage"]`.
 
     How the fit works: `spectrum.suggest_min_count` locates the valley
     between the error component and the coverage peak; depths at or above
@@ -487,18 +484,59 @@ def profile_genome(source, *, k=None, ploidy=2, max_coverage=None):
     with `scipy.optimize.least_squares` from two starting points (see
     `_fit`).
 
-    Raises `ValueError` when the spectrum has no coverage peak above the
-    error component -- typically data too shallow to profile, below roughly
-    10x, where the genome's own k-mers never rise clear of the error
-    component. That is a refusal by design: a mixture fitted to a pure
-    error decay produces a confident, meaningless genome size.
+    Parameters
+    ----------
+    source : KmerCounts, mapping of int to int, or path-like
+        One of:
 
-    Returns a :class:`GenomeProfile`. **Check `.converged` first**: a
-    profile whose fit failed is still returned (populated, inspectable,
-    plottable) rather than raised, with the optimizer's status in
-    `.model_fit`, but its numbers describe a curve that did not match the
-    spectrum. Nothing here is a measurement; it is what one model, fitted
-    to one spectrum, implies.
+        * a `fastdna.KmerCounts` (its `.spectrum()` and `.k` are used);
+        * a `{depth: distinct k-mers}` mapping, in which case `k` is
+          required (it cannot be recovered from the spectrum, and two of
+          the outputs depend on it);
+        * a path to a FASTQ(.gz) file, counted here via `fastdna.count()`
+          with an unfiltered `min_count=1` -- the error component at
+          depth 1 is *data* for this model, not noise to be filtered away
+          first.
+    k : int, optional
+        K-mer size. Required (and used as-is) when `source` is a bare
+        mapping; must agree with `source.k` when `source` is a
+        `KmerCounts`; ignored (and passed to `fastdna.count()`) when
+        `source` is a path.
+    ploidy : int, default 2
+        Must be 2 -- see above.
+    max_coverage : int, optional
+        Caps the depth range the fit runs over; defaults to
+        `DEFAULT_MAX_COVERAGE_MULTIPLE` times the observed coverage
+        peak's depth (bounded by the deepest observed k-mer). The cap is
+        load-bearing twice over: a single k-mer at depth 10^7 (adapter
+        dimer, rDNA array, contaminant) would otherwise both dominate a
+        least-squares fit and force a dense array with one bin per depth.
+        k-mers above the cap are excluded from every estimate and their
+        total mass is reported as `model_fit["kmers_above_max_coverage"]`.
+
+    Returns
+    -------
+    GenomeProfile
+        **Check `.converged` first**: a profile whose fit failed is still
+        returned (populated, inspectable, plottable) rather than raised,
+        with the optimizer's status in `.model_fit`, but its numbers
+        describe a curve that did not match the spectrum. Nothing here is
+        a measurement; it is what one model, fitted to one spectrum,
+        implies.
+
+    Raises
+    ------
+    NotImplementedError
+        `ploidy` is not 2.
+    ValueError
+        `k` is missing or conflicts with `source`'s own k, or the
+        spectrum has no coverage peak above the error component --
+        typically data too shallow to profile, below roughly 10x, where
+        the genome's own k-mers never rise clear of the error component.
+        That is a refusal by design: a mixture fitted to a pure error
+        decay produces a confident, meaningless genome size.
+    TypeError
+        `source` is not a `KmerCounts`, a mapping, or a path.
     """
     if ploidy != 2:
         raise NotImplementedError(
@@ -515,7 +553,7 @@ def profile_genome(source, *, k=None, ploidy=2, max_coverage=None):
 
     spectrum, k = _spectrum_and_k(source, k)
     if k < 1:
-        raise ValueError(f"k must be >= 1, got {k}")
+        raise _core.InvalidKError(f"k must be >= 1, got {k}")
 
     # The error/signal boundary. `suggest_min_count` returns `default` when
     # the spectrum's shape is not unambiguous -- passing `None` as that
@@ -523,11 +561,11 @@ def profile_genome(source, *, k=None, ploidy=2, max_coverage=None):
     # rather than into a silently-assumed cutoff of 2.
     fit_min_depth = suggest_min_count(spectrum, default=None)
     if fit_min_depth is None:
-        raise ValueError(_NO_PEAK_MESSAGE)
+        raise _core.InvalidConfigError(_NO_PEAK_MESSAGE)
 
     peak_depth, peak_count = _highest_peak(spectrum, above=fit_min_depth)
     if peak_depth is None:
-        raise ValueError(_NO_PEAK_MESSAGE)
+        raise _core.InvalidConfigError(_NO_PEAK_MESSAGE)
 
     observed_max_depth = max(spectrum)
     if max_coverage is None:
@@ -535,7 +573,7 @@ def profile_genome(source, *, k=None, ploidy=2, max_coverage=None):
     else:
         max_coverage = int(max_coverage)
         if max_coverage <= peak_depth:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"max_coverage={max_coverage} is at or below the coverage "
                 f"peak (depth {peak_depth}); the fitted range would exclude "
                 "the peak the model is built around. Pass a larger value, or "
@@ -650,7 +688,11 @@ def profile_genome(source, *, k=None, ploidy=2, max_coverage=None):
     )
 
 
-def plot_spectrum_fit(profile, spectrum, ax=None):
+def plot_spectrum_fit(
+    profile: GenomeProfile,
+    spectrum: Any,  # {depth: distinct k-mers} mapping or KmerCounts
+    ax: Any = None,  # matplotlib.axes.Axes; matplotlib is an optional, lazily imported dependency
+) -> Any:  # matplotlib.axes.Axes; matplotlib is optional and lazily imported, not a module-level dependency
     """Plots an observed spectrum against the model :func:`profile_genome`
     fitted to it -- the standard GenomeScope figure, and the fastest way to
     see whether a profile is trustworthy.
@@ -665,14 +707,31 @@ def plot_spectrum_fit(profile, spectrum, ax=None):
     but the curve is drawn either way: an unconverged fit is exactly the
     one worth looking at.
 
-    `spectrum` is the same `{depth: distinct k-mers}` mapping (or
-    `KmerCounts`) the profile was fitted from. `ax` is an optional
-    `matplotlib.axes.Axes` to draw onto; without one a new figure is
-    created. Returns the axes, so a caller can keep styling it.
+    Parameters
+    ----------
+    profile : GenomeProfile
+        The fit result to plot, as returned by :func:`profile_genome`.
+    spectrum : mapping of int to int, or KmerCounts
+        The same `{depth: distinct k-mers}` mapping (or `KmerCounts`) the
+        profile was fitted from.
+    ax : matplotlib.axes.Axes, optional
+        Axes to draw onto. A new figure/axes is created if omitted.
+        Typed `Any` here (rather than `matplotlib.axes.Axes`) because
+        `matplotlib` is imported lazily inside this function and is not a
+        module-level dependency of this file -- a precise type hint would
+        force an eager `matplotlib` import at type-checking time.
 
-    `matplotlib` is imported lazily here and is not a dependency of
-    `fastdna`; a missing install raises an `ImportError` naming the package
-    and the install command.
+    Returns
+    -------
+    Any
+        The `matplotlib.axes.Axes` drawn onto (see the `ax` parameter for
+        why this is typed `Any`), so a caller can keep styling it.
+
+    Raises
+    ------
+    ImportError
+        `matplotlib` is not installed. Named explicitly, with the install
+        command, rather than a raw `ModuleNotFoundError`.
     """
     try:
         import matplotlib.pyplot as plt

@@ -79,23 +79,37 @@ import pathlib
 import warnings
 from collections.abc import Mapping
 from functools import partial
-from typing import NamedTuple
+from typing import Any, Iterable, NamedTuple, Optional, Sequence, Union
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 from scipy import sparse
 
-from . import _column_as_array, _core, _pair_positions, compare_all as _compare_all, count as _count
+from . import _PathLike, _column_as_array, _core, _pair_positions, compare_all as _compare_all, count as _count
 
 __all__ = [
     "ScreeningOnlyWarning",
+    "CohortPresenceMatrix",
     "PyseerExport",
+    "KinshipMatrix",
     "cohort_presence_matrix",
     "export_pyseer_kmers",
     "kinship_matrix",
     "prefilter_association",
 ]
+
+# A path accepted anywhere in this module: a `str`, or anything implementing
+# `os.PathLike` (e.g. `pathlib.Path`) -- every such parameter is converted
+# with `str(path)` before use, matching `fastdna/__init__.py`'s own
+# `_PathLike` convention.
+_PathLike = Union[str, os.PathLike]
+
+# The cohort input accepted by `cohort_presence_matrix`, `export_pyseer_kmers`
+# and `kinship_matrix`: an iterable of paths (sample ids derived from each
+# file name) or an explicit `{sample_id: path}` mapping -- see
+# `_resolve_cohort`.
+_CohortPaths = Union[Iterable[_PathLike], Mapping[str, _PathLike]]
 
 
 class ScreeningOnlyWarning(UserWarning):
@@ -151,6 +165,12 @@ def _resolve_cohort(paths, *, caller):
     exactly the population-structure artifact this module warns about.
     """
     if isinstance(paths, (str, os.PathLike)):
+        # No leaf in the fastdna._core exception hierarchy inherits from
+        # TypeError (every leaf is a ValueError/OSError/FileNotFoundError/
+        # MemoryError/RuntimeError subclass), so this stays a bare TypeError
+        # rather than losing isinstance(e, TypeError) compatibility for
+        # existing callers (see python/tests/test_gwas.py's
+        # pytest.raises(TypeError, ...) on this exact call).
         raise TypeError(
             f"{caller}() expects a list of paths (or a {{sample_id: path}} mapping), got a "
             f"single path {str(paths)!r} -- wrap it in a list: [{str(paths)!r}]"
@@ -162,7 +182,7 @@ def _resolve_cohort(paths, *, caller):
         items = [(_sample_id_from_path(path), str(path)) for path in paths]
 
     if len(items) < 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller}() needs at least 2 samples to compare, got {len(items)}. "
             "A cohort of one has no contrast to measure and no population structure "
             "to correct for."
@@ -176,7 +196,7 @@ def _resolve_cohort(paths, *, caller):
         detail = "; ".join(
             f"{sample_id!r} <- " + ", ".join(repr(p) for p in found) for sample_id, found in sorted(collisions.items())
         )
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller}(): duplicate sample id(s) derived from the given file names: {detail}. "
             "Sample ids must be unique -- pass an explicit {sample_id: path} mapping to name "
             "them yourself (files from different runs or directories routinely share a name)."
@@ -188,7 +208,7 @@ def _resolve_cohort(paths, *, caller):
     repeated = {path: ids for path, ids in by_path.items() if len(ids) > 1}
     if repeated:
         detail = "; ".join(f"{path!r} as " + ", ".join(repr(i) for i in ids) for path, ids in sorted(repeated.items()))
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"{caller}(): the same file appears more than once in the cohort: {detail}. "
             "Counting one sample twice inflates its lineage's weight in every prevalence "
             "count and every association test -- remove the duplicate entry."
@@ -201,11 +221,45 @@ def _positive_int_or_none(value, name):
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
-        raise ValueError(f"{name} must be a positive int or None, got {value!r}")
+        raise _core.InvalidConfigError(f"{name} must be a positive int or None, got {value!r}")
     return int(value)
 
 
-def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers=None):
+class CohortPresenceMatrix(NamedTuple):
+    """What :func:`cohort_presence_matrix` returns -- a plain, named tuple
+    so `result.matrix`/`result.sample_ids`/`result.kmer_sequences` read as
+    clearly as unpacking (`matrix, sample_ids, kmer_sequences = ...`, still
+    supported since this is a `NamedTuple`).
+
+    Attributes
+    ----------
+    matrix : scipy.sparse.csr_matrix
+        `uint32`, shape `(len(sample_ids), len(kmer_sequences))`. Despite
+        the function's name the stored values are *counts*, not booleans --
+        presence is `matrix > 0` (or `matrix.astype(bool)`), which is the
+        variant model k-mer GWAS actually uses, while the counts are kept
+        because they are free here and cost a re-count to recover.
+        "Presence" is in the name because presence/absence is the question
+        the matrix exists to answer.
+    sample_ids : list of str
+        In the caller's order, indexing rows.
+    kmer_sequences : list of str
+        Decoded canonical k-mers, indexing columns, sorted lexicographically.
+    """
+
+    matrix: object
+    sample_ids: list
+    kmer_sequences: list
+
+
+def cohort_presence_matrix(
+    paths: _CohortPaths,
+    *,
+    k: int = 31,
+    min_count: int = 2,
+    min_samples: int = 2,
+    max_kmers: Optional[int] = None,
+) -> CohortPresenceMatrix:
     """Counts every sample once and returns the cohort as one sparse matrix.
 
     This is the substrate a k-mer GWAS (and any other cohort-level model)
@@ -241,18 +295,9 @@ def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers
 
     Returns
     -------
-    (matrix, sample_ids, kmer_sequences)
-        `matrix` : `scipy.sparse.csr_matrix` of `uint32`, shape
-        `(len(sample_ids), len(kmer_sequences))`. Despite the function's
-        name the stored values are *counts*, not booleans -- presence is
-        `matrix > 0` (or `matrix.astype(bool)`), which is the variant model
-        k-mer GWAS actually uses, while the counts are kept because they
-        are free here and cost a re-count to recover. "Presence" is in the
-        name because presence/absence is the question the matrix exists to
-        answer.
-        `sample_ids` : `list[str]`, in the caller's order, indexing rows.
-        `kmer_sequences` : `list[str]` of decoded canonical k-mers,
-        indexing columns, sorted lexicographically.
+    CohortPresenceMatrix
+        `(matrix, sample_ids, kmer_sequences)` -- see that class for what
+        each field holds.
 
     Column selection and `max_kmers`
     --------------------------------
@@ -298,17 +343,17 @@ def cohort_presence_matrix(paths, *, k=31, min_count=2, min_samples=2, max_kmers
     per-file Arrow `RecordBatch` first. `_cohort_presence_matrix_fallback`
     below -- the pure-Python/pyarrow implementation this replaced -- is kept
     as the path for an older compiled extension that predates the native
-    function; both produce the same `(matrix, sample_ids, kmer_sequences)`.
+    function; both produce the same `CohortPresenceMatrix`.
     """
     sample_ids, path_strings = _resolve_cohort(paths, caller="cohort_presence_matrix")
     n_samples = len(sample_ids)
 
     max_kmers = _positive_int_or_none(max_kmers, "max_kmers")
     if isinstance(min_samples, bool) or not isinstance(min_samples, (int, np.integer)) or min_samples < 1:
-        raise ValueError(f"min_samples must be a positive int, got {min_samples!r}")
+        raise _core.InvalidConfigError(f"min_samples must be a positive int, got {min_samples!r}")
     min_samples = int(min_samples)
     if min_samples > n_samples:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"min_samples={min_samples} exceeds the cohort size ({n_samples} samples): no k-mer "
             f"can be present in more samples than exist, so the matrix would come back empty. "
             f"Use min_samples <= {n_samples}."
@@ -380,7 +425,7 @@ def _cohort_presence_matrix_native(path_strings, sample_ids, *, k, min_count, mi
         shape=(n_samples, n_kmers),
         dtype=np.uint32,
     )
-    return matrix, sample_ids, kmer_sequences
+    return CohortPresenceMatrix(matrix, sample_ids, kmer_sequences)
 
 
 def _cohort_presence_matrix_fallback(path_strings, sample_ids, *, k, min_count, min_samples, max_kmers, n_samples):
@@ -493,7 +538,7 @@ def _cohort_presence_matrix_fallback(path_strings, sample_ids, *, k, min_count, 
         shape=(n_samples, selected.size),
         dtype=np.uint32,
     )
-    return matrix, sample_ids, kmer_sequences
+    return CohortPresenceMatrix(matrix, sample_ids, kmer_sequences)
 
 
 class PyseerExport(NamedTuple):
@@ -508,7 +553,14 @@ class PyseerExport(NamedTuple):
     gzipped: bool
 
 
-def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2):
+def export_pyseer_kmers(
+    paths: _CohortPaths,
+    output: _PathLike,
+    *,
+    k: int = 31,
+    min_count: int = 2,
+    min_samples: int = 2,
+) -> PyseerExport:
     """Writes the cohort as a pyseer `--kmers` input file.
 
     Format targeted
@@ -538,8 +590,8 @@ def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2):
 
     Compression
     -----------
-    pyseer assumes this file is gzipped (`--uncompressed` opts out), so a
-    `out_path` ending in `.gz` (case-insensitive) is gzip-compressed and
+    pyseer assumes this file is gzipped (`--uncompressed` opts out), so an
+    `output` path ending in `.gz` (case-insensitive) is gzip-compressed and
     anything else is written as plain text. Prefer the `.gz` form: it is
     both pyseer's default and, for a real cohort, several-fold smaller.
 
@@ -551,6 +603,11 @@ def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2):
         sample names in the phenotype file passed to pyseer's
         `--phenotypes` -- pyseer intersects the two and will report an
         empty overlap rather than guessing.
+    output : str or os.PathLike
+        Where to write the pyseer `--kmers` file. Required: this function's
+        entire purpose is the write, so there is no in-memory-only form to
+        fall back to (contrast an `output: Optional[...] = None` parameter
+        elsewhere in the package, which does have one).
     k, min_count, min_samples
         Forwarded to :func:`cohort_presence_matrix`; see there. `max_kmers`
         is deliberately not exposed: a truncated k-mer file handed to
@@ -561,7 +618,8 @@ def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2):
     Returns
     -------
     PyseerExport
-        `(path, n_kmers, n_samples, sample_ids, gzipped)`.
+        `(path, n_kmers, n_samples, sample_ids, gzipped)` -- `path` is
+        `output`, resolved to a `pathlib.Path`.
 
     Raises
     ------
@@ -581,21 +639,21 @@ def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2):
         if any(ch.isspace() for ch in sample_id):
             offending.append("whitespace")
         if offending:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"sample id {sample_id!r} contains {', '.join(repr(o) for o in offending)}, which the "
                 "pyseer/fsm-lite k-mer line format reserves: pyseer splits each line on '|' and then "
                 "each entry on ':', so this id would be silently mis-parsed as a different sample. "
                 "Rename it by passing an explicit {sample_id: path} mapping."
             )
 
-    out_path = pathlib.Path(str(out_path))
-    gzipped = out_path.name.lower().endswith(".gz")
+    output = pathlib.Path(str(output))
+    gzipped = output.name.lower().endswith(".gz")
 
     # Binary mode throughout, not text mode: on Windows a text-mode write
     # would translate every '\n' into '\r\n', and pyseer's parser would
     # then carry a trailing '\r' into the last sample id of every line.
     csc = matrix.tocsc()
-    opener = (lambda: gzip.open(out_path, "wb")) if gzipped else (lambda: open(out_path, "wb"))
+    opener = (lambda: gzip.open(output, "wb")) if gzipped else (lambda: open(output, "wb"))
     with opener() as handle:
         for column, sequence in enumerate(kmer_sequences):
             start, end = csc.indptr[column], csc.indptr[column + 1]
@@ -606,7 +664,7 @@ def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2):
             handle.write(f"{sequence} | {entries}\n".encode("ascii"))
 
     return PyseerExport(
-        path=out_path,
+        path=output,
         n_kmers=len(kmer_sequences),
         n_samples=len(sample_ids),
         sample_ids=sample_ids,
@@ -614,7 +672,26 @@ def export_pyseer_kmers(paths, out_path, *, k=31, min_count=2, min_samples=2):
     )
 
 
-def kinship_matrix(paths, *, k=21, sketch_size=10_000):
+class KinshipMatrix(NamedTuple):
+    """What :func:`kinship_matrix` returns -- a plain, named tuple so
+    `result.matrix`/`result.sample_ids` read as clearly as unpacking
+    (`matrix, sample_ids = ...`, still supported since this is a
+    `NamedTuple`).
+
+    Attributes
+    ----------
+    matrix : numpy.ndarray
+        Shape `(n, n)`, symmetric, with an exact 1.0 diagonal (a sample is
+        identical to itself by definition; it is not estimated).
+    sample_ids : list of str
+        Indexes both axes, in the caller's order.
+    """
+
+    matrix: object
+    sample_ids: list
+
+
+def kinship_matrix(paths: _CohortPaths, *, k: int = 21, sketch_size: int = 10_000) -> KinshipMatrix:
     """A sample-by-sample similarity matrix derived from FastDNA's Mash
     distances -- the population-structure covariance a mixed-model GWAS
     needs as its random effect.
@@ -644,11 +721,8 @@ def kinship_matrix(paths, *, k=21, sketch_size=10_000):
 
     Returns
     -------
-    (matrix, sample_ids)
-        `matrix` : `numpy.ndarray` of shape `(n, n)`, symmetric, with an
-        exact 1.0 diagonal (a sample is identical to itself by definition;
-        it is not estimated). `sample_ids` : `list[str]` indexing both
-        axes, in the caller's order.
+    KinshipMatrix
+        `(matrix, sample_ids)` -- see that class for what each field holds.
 
     Feeding it to pyseer
     --------------------
@@ -696,7 +770,7 @@ def kinship_matrix(paths, *, k=21, sketch_size=10_000):
     similarity[i, j] = value
     similarity[j, i] = value
 
-    return similarity, sample_ids
+    return KinshipMatrix(similarity, sample_ids)
 
 
 def _benjamini_hochberg(sorted_pvalues):
@@ -871,7 +945,14 @@ _SCREENING_METADATA = {
 }
 
 
-def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", top_n=None):
+def prefilter_association(
+    matrix: Union[sparse.spmatrix, np.ndarray],
+    phenotype: Union[Sequence[Any], np.ndarray],  # array-like; converted with np.asarray() below
+    kmer_sequences: Sequence[str],
+    *,
+    test: str = "fisher",
+    top_n: Optional[int] = None,
+) -> pa.Table:
     """A fast, **unadjusted** per-k-mer screen of a binary or continuous
     phenotype.
 
@@ -1020,28 +1101,28 @@ def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", t
     from scipy import stats
 
     if test not in _BINARY_TESTS + _CONTINUOUS_TESTS:
-        raise ValueError(f"test must be one of {_BINARY_TESTS + _CONTINUOUS_TESTS!r}, got {test!r}")
+        raise _core.InvalidConfigError(f"test must be one of {_BINARY_TESTS + _CONTINUOUS_TESTS!r}, got {test!r}")
     is_continuous = test in _CONTINUOUS_TESTS
     top_n = _positive_int_or_none(top_n, "top_n")
 
     n_samples, n_kmers = matrix.shape
     if n_samples < 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"prefilter_association() needs at least 2 samples, got a matrix with {n_samples} row(s). "
             "A single sample has no case/control contrast to test."
         )
 
     phenotype_array = np.asarray(phenotype)
     if phenotype_array.ndim != 1:
-        raise ValueError(f"phenotype must be 1-dimensional, got shape {phenotype_array.shape}")
+        raise _core.InvalidConfigError(f"phenotype must be 1-dimensional, got shape {phenotype_array.shape}")
     if phenotype_array.size != n_samples:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"phenotype has {phenotype_array.size} entries but the matrix has {n_samples} samples (rows). "
             "They must line up element by element: phenotype[i] is the phenotype of the sample in "
             "row i, in the same order cohort_presence_matrix() returned its sample_ids."
         )
     if len(kmer_sequences) != n_kmers:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"kmer_sequences has {len(kmer_sequences)} entries but the matrix has {n_kmers} columns. "
             "Pass the kmer_sequences that cohort_presence_matrix() returned alongside this matrix -- "
             "a mismatched list would label every result with the wrong k-mer."
@@ -1055,7 +1136,7 @@ def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", t
         # `number`-like in numpy, so a `[True, False, ...]` phenotype is
         # also rejected -- it belongs in binary mode.
         if not np.issubdtype(phenotype_array.dtype, np.number):
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype must be numeric for a continuous test (test={test!r}), got dtype "
                 f"{phenotype_array.dtype}. Encode it as int/float, or use test='fisher'/'chi2' for a "
                 "genuinely binary (two-class) phenotype instead."
@@ -1063,27 +1144,27 @@ def prefilter_association(matrix, phenotype, kmer_sequences, *, test="fisher", t
         phenotype_array = phenotype_array.astype(np.float64)
         finite = np.isfinite(phenotype_array)
         if not finite.all():
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype contains {int((~finite).sum())} NaN/inf value(s), which test={test!r} "
                 "cannot use -- a t/F statistic computed against a NaN or infinite phenotype value is "
                 "meaningless for every k-mer, not just the affected sample(s). Drop or impute those "
                 "samples before calling prefilter_association()."
             )
         if np.unique(phenotype_array).size < 2:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype has zero variance (every value is {float(phenotype_array[0])!r}): there is "
                 "nothing to associate against. Check that the phenotype column was read correctly."
             )
     else:
         classes = np.unique(phenotype_array)
         if classes.size < 2:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype has a single class ({classes.tolist()!r}): there is nothing to associate against. "
                 "Check that the phenotype column was read correctly and that both cases and controls "
                 "are present in this cohort."
             )
         if classes.size > 2:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"phenotype has {classes.size} distinct values, but test={test!r} only supports a "
                 "binary phenotype. Encode it as 0/1 (or False/True) yourself if it really is binary; "
                 "for a genuinely continuous phenotype pass test='welch' (or test='anova') instead of "

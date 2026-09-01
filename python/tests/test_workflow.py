@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import pathlib
 import random
+import warnings
 
 import pytest
 
@@ -36,10 +37,11 @@ np = pytest.importorskip("numpy")
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from fastdna.cv import LineageKFold
 from fastdna.equivalence import EquivalenceClasses
 from fastdna.evaluation import CalibrationReport, PrecisionRecallReport
 from fastdna.gwas import ScreeningOnlyWarning, cohort_presence_matrix
-from fastdna.workflow import AssociationResult, AssociationWorkflow
+from fastdna.workflow import AssociationResult, AssociationWorkflow, NaiveCrossValidationWarning
 
 K = 21
 SKETCH_SIZE = 200
@@ -231,6 +233,85 @@ class TestSkippableStages:
         paths, phenotype, _, _ = cohort
         with pytest.raises(ValueError, match="groups has"):
             _workflow(paths, phenotype, groups=[0, 1, 2]).run()
+
+
+# ---------------------------------------------------------------------------
+# cv= overriding the leakage-safe default
+# ---------------------------------------------------------------------------
+
+
+class TestNaiveCrossValidationWarning:
+    """`cv=` may replace the default `cv.LineageKFold` with any other
+    scikit-learn splitter (see `AssociationWorkflow`'s own `cv` parameter
+    docstring) -- but doing so must never look, from the returned
+    `AssociationResult` alone, indistinguishable from the honest default.
+    See `fastdna.workflow`'s module docstring, "One deliberate exception".
+    """
+
+    def test_default_lineage_kfold_does_not_warn_and_is_marked_lineage_blocked(self, cohort):
+        paths, phenotype, _, _ = cohort
+        workflow = _workflow(paths, phenotype)  # cv=None -> this workflow's own LineageKFold
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = workflow.run()
+
+        assert not any(issubclass(w.category, NaiveCrossValidationWarning) for w in caught)
+        # screen=True by default, so ScreeningOnlyWarning still fires here -- this test is
+        # about the *absence* of the new warning specifically, not of every warning.
+        assert any(issubclass(w.category, ScreeningOnlyWarning) for w in caught)
+
+        metadata = {k.decode(): v.decode() for k, v in result.cv_predictions.schema.metadata.items()}
+        assert metadata["fastdna.cv_lineage_blocked"] == "true"
+        assert "LineageKFold" in metadata["fastdna.cv_splitter"]
+        assert "fastdna.leakage_risk" not in metadata
+
+    def test_explicit_lineagekfold_instance_does_not_warn_either(self, cohort):
+        paths, phenotype, _, lineage_of = cohort
+        # A caller-built LineageKFold (its own groups=) is a non-default but still
+        # leakage-safe choice -- it must not be treated as naive.
+        custom_cv = LineageKFold(n_splits=3, groups=lineage_of)
+        workflow = _workflow(paths, phenotype, cv=custom_cv, screen=False)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = workflow.run()
+
+        assert not any(issubclass(w.category, NaiveCrossValidationWarning) for w in caught)
+        metadata = {k.decode(): v.decode() for k, v in result.cv_predictions.schema.metadata.items()}
+        assert metadata["fastdna.cv_lineage_blocked"] == "true"
+        assert isinstance(result.precision_recall, PrecisionRecallReport)
+
+    def test_naive_splitter_warns_and_is_marked_not_lineage_blocked(self, cohort):
+        sklearn_model_selection = pytest.importorskip("sklearn.model_selection")
+        paths, phenotype, _, _ = cohort
+        naive_cv = sklearn_model_selection.StratifiedKFold(n_splits=3)
+        workflow = _workflow(paths, phenotype, cv=naive_cv, screen=False)
+
+        with pytest.warns(NaiveCrossValidationWarning, match="LineageKFold"):
+            result = workflow.run()
+
+        # The number is reported, never withheld -- only flagged, both as a warning
+        # and (durably) in the returned table's own schema metadata.
+        assert isinstance(result.cv_predictions, pa.Table)
+        assert isinstance(result.precision_recall, PrecisionRecallReport)
+        assert isinstance(result.calibration, CalibrationReport)
+
+        metadata = {k.decode(): v.decode() for k, v in result.cv_predictions.schema.metadata.items()}
+        assert metadata["fastdna.cv_lineage_blocked"] == "false"
+        assert "StratifiedKFold" in metadata["fastdna.cv_splitter"]
+        assert "fastdna.audit" in metadata["fastdna.leakage_risk"]
+
+    def test_cv_false_never_emits_the_naive_cv_warning(self, cohort):
+        paths, phenotype, _, _ = cohort
+        workflow = _workflow(paths, phenotype, cv=False, screen=False)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = workflow.run()
+
+        assert not any(issubclass(w.category, NaiveCrossValidationWarning) for w in caught)
+        assert result.cv_predictions is None
 
 
 # ---------------------------------------------------------------------------

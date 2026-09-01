@@ -27,9 +27,11 @@ READS = ["ACGTACGTAC"] * 6 + ["TTTTTGGGGG"] * 2 + ["AAACCCGGGT"] * 1
 
 def test_count_from_plain_strings_matches_direct_file_count(tmp_path):
     direct_path = write_fastq(tmp_path, READS)
-    direct = fastdna.count(str(direct_path), k=5)
+    # with_sequence=True: this test compares tables sorted and read back by
+    # kmer_sequence, which is off by default (see count()'s docstring).
+    direct = fastdna.count(str(direct_path), k=5, with_sequence=True)
 
-    via_interop = count_from_sequences(READS, k=5)
+    via_interop = count_from_sequences(READS, k=5, with_sequence=True)
 
     assert via_interop.distinct_kmers == direct.distinct_kmers
     assert via_interop.total_kmers == direct.total_kmers

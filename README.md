@@ -10,20 +10,47 @@ disk-partitioned counting strategy instead of failing -- see
 
 ## Installation
 
+**FastDNA has not been published yet.** There is no release on PyPI, no
+crate on crates.io, and no Bioconda package, so `pip install fastdna` fails
+today with `No matching distribution found`. Building from source is the
+only way to install it right now, and it is the first path below; the
+`pip install` route is documented as what will happen once the first release
+lands, not as something that works today. What is still ahead is tracked in
+[Roadmap](#roadmap).
+
+### From source (works today)
+
+```bash
+git clone https://github.com/Angel-Zeledon/FastDNA
+cd FastDNA
+pip install maturin
+maturin develop --release --features python
+```
+
+That produces exactly the extension module a wheel would install, so every
+example in this README runs against it. It does need a Rust toolchain, which
+a published wheel will not. For the `fastdna` CLI binary, and for running
+the test suite against the extension you just built, see
+[Building from source](#building-from-source).
+
+### From a wheel (once published)
+
 ```bash
 pip install fastdna
 ```
 
-No Rust toolchain, no compiler, no build step. `fastdna` ships as a prebuilt
-wheel using [PyO3's `abi3` stable ABI](https://pyo3.rs), so one wheel per
-platform covers CPython 3.8 through 3.13+. CI
-([`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)) builds and
-tests wheels for five platforms: manylinux x86_64, manylinux aarch64
-(cross-compiled, built but not test-executed in CI), macOS x86_64, macOS
-arm64, and Windows x86_64. The wheels are tagged `cp38-abi3`
-(`requires-python = ">=3.8"`), though the CI test matrix currently runs on
-Python 3.9+, so 3.8 support is declared but not exercised by CI. A Bioconda
-recipe is drafted but not yet submitted -- see [Roadmap](#roadmap).
+No Rust toolchain, no compiler, no build step. `fastdna` will ship as a
+prebuilt wheel using [PyO3's `abi3` stable ABI](https://pyo3.rs), so one
+wheel per platform covers CPython 3.8 through 3.13+. CI
+([`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)) already
+builds and tests wheels for five platforms: manylinux x86_64, manylinux
+aarch64 (cross-compiled, built but not test-executed in CI), macOS x86_64,
+macOS arm64, and Windows x86_64 -- it deliberately has no publish step yet,
+which is why there is nothing on PyPI to install. The wheels are tagged
+`cp38-abi3` (`requires-python = ">=3.8"`), though the CI test matrix
+currently runs on Python 3.11, so 3.8 support is declared but not exercised
+by CI. A Bioconda recipe is drafted but not yet submitted -- see
+[Roadmap](#roadmap).
 
 ## Quick start
 
@@ -212,8 +239,7 @@ benchmark file; the before/after numbers are in
 Counting is **exact** in both strategies: the key really is the k-mer, not
 a hash of it, so there is no probability of two different k-mers colliding
 into the same count -- unlike Bloom-filter or Count-Min-Sketch-based
-counters some tools use (the codebase has an unused `CountMinSketch` in
-`src/cms.rs`, but it isn't wired into the counting pipeline).
+counters some tools use.
 
 ### 5. Two counting strategies, and an estimator that chooses between them
 
@@ -352,8 +378,9 @@ already done.
 ## Command-line interface
 
 The `fastdna` CLI is installed separately from the Python package -- see
-[Building from source](#building-from-source). It counts k-mers in one
-FASTQ(.gz) file and writes the frequency table plus a QC report:
+[Building from source](#building-from-source). Its default mode counts
+k-mers in one or more FASTQ(.gz) file(s) and writes the frequency table plus
+a QC report:
 
 ```bash
 fastdna --input sample.fastq.gz --output counts.parquet -k 31
@@ -365,7 +392,52 @@ chosen by extension: `.parquet` writes Arrow/Snappy Parquet, anything else
 writes CSV. Every exporter writes the same three columns: `kmer_u64`
 (`uint64`), `kmer_sequence` (string), `frequency` (`uint32`).
 
+### Subcommands
+
+Counting is also reachable as an explicit `fastdna count ...` subcommand,
+identical in every way to giving no subcommand at all -- both forms are
+covered by this project's compatibility contract (see `CHANGELOG.md`'s "Qué
+cubre este contrato"), so existing scripts that call `fastdna --input ...`
+with no subcommand word keep working unchanged. Four more subcommands expose
+Rust-core functionality that, before this section, was reachable only from
+the Python binding (`fastdna.sketch()`, `.compare_all()`,
+`.estimate_cardinality()`, `.peek()`) -- pipeline users who never leave the
+shell can now sketch, compare, estimate cardinality, and preview a file
+without writing Python:
+
+| Subcommand | What it does | Equivalent Python call |
+|---|---|---|
+| `fastdna count ...` | Count k-mers (the default; see [Flags](#flags) below) | `fastdna.count(...)` |
+| `fastdna sketch --input FILE -k 21 --sketch-size 1000 -o out.json` | Build a MinHash sketch of one file and save it as JSON | `fastdna.sketch(...)` + `Sketch.save(...)` |
+| `fastdna dist --input FILE... [--metric jaccard\|containment\|mash]` | Pairwise comparison across two or more sketches and/or files | `fastdna.compare_all(...)` |
+| `fastdna card --input FILE -k 31 [--precision 14]` | HyperLogLog estimate of the number of distinct k-mers | `fastdna.estimate_cardinality(...)` |
+| `fastdna peek --input FILE [--n-reads 10000]` | Quick preview: read length stats, GC content, a suggested k | `fastdna.peek(...)` |
+
+`fastdna <subcommand> --help` prints each one's full flag list.
+
+`fastdna sketch` sketches a single file (multiple lanes of one sample should
+be concatenated first, e.g. via `cat`, the same expectation the Python
+binding's `GenomeSketch::from_path` already has). `fastdna dist` accepts any
+mix of previously saved sketches (`.json`, as written by `fastdna sketch`)
+and raw FASTQ/FASTA files, sketching the latter on the fly with its own
+`-k`/`--sketch-size`; `--metric containment` prints both directions of every
+pair (containment is asymmetric -- `A.containment(B) != B.containment(A)` in
+general), while `jaccard` and `mash` print one row per unordered pair. Without
+`--output`, `fastdna dist` prints its CSV table to stdout, so it composes
+directly with a shell pipe.
+
+```bash
+fastdna sketch --input sampleA.fastq.gz -k 21 --sketch-size 1000 -o a.json
+fastdna sketch --input sampleB.fastq.gz -k 21 --sketch-size 1000 -o b.json
+fastdna dist --input a.json b.json --metric mash
+```
+
 ### Flags
+
+`fastdna count`'s flags (identical whether or not the `count` word is given
+explicitly -- see [Subcommands](#subcommands) above). `sketch`/`dist`/
+`card`/`peek` each have their own, smaller flag set, listed in the
+[Subcommands](#subcommands) table and in `fastdna <subcommand> --help`.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -740,16 +812,19 @@ exact count will fit in memory before committing to a run -- see
 
 ## Building from source
 
-Installing via `pip install fastdna` gets you the prebuilt Python extension
-only. If you want the `fastdna` CLI binary, or you're working on the crate
-itself, clone the repository and build with Cargo:
+A wheel -- once there is one to install, see
+[Installation](#installation) -- gets you the prebuilt Python extension
+only, and so does `maturin develop`. If you want the `fastdna` CLI binary,
+or you're working on the crate itself, clone the repository and build with
+Cargo:
 
 ```bash
 cargo build --release
 ./target/release/fastdna --input sample.fastq.gz --output counts.parquet -k 31
 ```
 
-For the Python extension itself, from source:
+For the Python extension itself, the same two commands
+[Installation](#installation) gives, plus the test suite:
 
 ```bash
 pip install maturin

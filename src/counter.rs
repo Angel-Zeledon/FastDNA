@@ -14,6 +14,86 @@ pub struct PruneStats {
     pub kept: u64,
 }
 
+/// A sorted run of `(kmer, count)` entries, stored as two parallel arrays
+/// (`keys: Vec<u64>`, `counts: Vec<u32>`) instead of `Vec<(u64, u32)>`.
+///
+/// `size_of::<(u64, u32)>()` is 16, not 12: the `u64` forces 8-byte
+/// alignment, so the trailing `u32` is padded out to fill the rest of a
+/// second 8-byte word. That padding is real, resident memory for every
+/// entry `pending` and `finalized` hold -- on the 53.8-million-distinct-
+/// k-mer benchmark table it is 205 MiB of nothing -- and it is moved, not
+/// just held: every merge pass below reads and writes it again on every
+/// call. Two parallel arrays store the same information at 12 bytes/entry
+/// with no padding at all (`Vec<u64>` is 8-byte aligned and densely packed;
+/// `Vec<u32>` is 4-byte aligned and densely packed; neither has anything to
+/// pad against the other because they are separate allocations) -- a 25%
+/// reduction in the bytes `compact_raw`, `merge_tables` and
+/// `k_way_merge_tables` have to move.
+///
+/// Every entry at index `i` is `(keys[i], counts[i])`; the two arrays are
+/// kept the same length by construction (`push` is the only way to grow
+/// either, and it always grows both together), not by a runtime check on
+/// every access.
+///
+/// This is an internal representation only: nothing outside `counter.rs`
+/// sees a `CountTable`. `KmerCounter`'s public surface -- `from_sorted_entries`,
+/// `iter`, `top_kmers` -- and the one piece of this file `binned.rs` calls
+/// directly (`k_way_merge_sorted_counts`, deliberately untouched by this
+/// type) all still speak `(u64, u32)` tuples, built from or flattened into
+/// a `CountTable` at the boundary. See `k_way_merge_tables`'s doc comment
+/// for the measurement this representation change shipped on, and
+/// `KmerCounter`'s own doc comment for why the tuple boundary sits where it
+/// does.
+#[derive(Debug, Default, Clone)]
+struct CountTable {
+    keys: Vec<u64>,
+    counts: Vec<u32>,
+}
+
+impl CountTable {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self { keys: Vec::with_capacity(capacity), counts: Vec::with_capacity(capacity) }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    #[inline]
+    fn push(&mut self, kmer: u64, count: u32) {
+        self.keys.push(kmer);
+        self.counts.push(count);
+    }
+
+    /// Builds a `CountTable` from an already sorted, already deduplicated
+    /// `(kmer, count)` vector -- the boundary conversion `from_sorted_entries`
+    /// needs, since its callers (`pipeline.rs`, `binned.rs`'s test module)
+    /// hand it a tuple `Vec` built outside this type.
+    fn from_tuples(entries: Vec<(u64, u32)>) -> Self {
+        let mut keys = Vec::with_capacity(entries.len());
+        let mut counts = Vec::with_capacity(entries.len());
+        for (kmer, count) in entries {
+            keys.push(kmer);
+            counts.push(count);
+        }
+        Self { keys, counts }
+    }
+
+    /// Flattens back into `(kmer, count)` tuples -- the boundary conversion
+    /// every externally visible `(u64, u32)`-shaped return value needs.
+    fn to_tuples(&self) -> Vec<(u64, u32)> {
+        self.keys.iter().copied().zip(self.counts.iter().copied()).collect()
+    }
+}
+
 /// The mutable state behind `KmerCounter`, split out so it can live inside
 /// a single `Mutex` (see `KmerCounter`'s doc comment for why).
 #[derive(Debug, Default)]
@@ -31,17 +111,31 @@ struct Inner {
     /// *across* runs (the same k-mer compacted separately in two different
     /// eager passes). See `consolidate` for why these accumulate instead
     /// of being merged in immediately, and `MAX_PENDING_RUNS` for why that
-    /// accumulation is bounded rather than unbounded.
-    pending: Vec<Vec<(u64, u32)>>,
+    /// accumulation is bounded rather than unbounded. Stored as
+    /// `CountTable`s, not `Vec<(u64, u32)>`s -- see that type's doc comment.
+    pending: Vec<CountTable>,
     /// Sorted (ascending by k-mer), deduplicated `(kmer, count)` pairs.
     /// Only trustworthy when `valid` is `true`; rebuilt by `finalize_inner`
     /// otherwise (which folds `pending` -- and any leftover `raw` -- into
-    /// it via `consolidate`).
-    finalized: Vec<(u64, u32)>,
+    /// it via `consolidate`). Stored as a `CountTable`, not a
+    /// `Vec<(u64, u32)>` -- see that type's doc comment.
+    finalized: CountTable,
     /// Whether `finalized` currently reflects every instance in `raw` and
     /// every run in `pending` (both drained empty once it does). `false`
     /// after any insertion; set back to `true` by `finalize_inner`.
     valid: bool,
+    /// Destination buffer for `msd_partition`'s scatter pass, and `raw`'s
+    /// partner: the two are swapped rather than copied, so after a partition
+    /// this holds what `raw` held and vice versa. Kept on `Inner` rather
+    /// than allocated inside `compact_raw` so its allocation is paid once
+    /// per counter instead of once per eager compaction (~52 of those on a
+    /// benchmark-scale worker).
+    ///
+    /// This is the one cost the MSD partition adds that `sort_unstable`
+    /// alone did not have: `sort_unstable` sorts in place, so a worker now
+    /// holds two threshold-sized `Vec<u64>`s instead of one. That is
+    /// accounted for in `mem_estimate::PER_WORKER_RAW_TRANSIENT_BYTES`.
+    scratch: Vec<u64>,
 }
 
 /// Above this many buffered (unsorted, with duplicates) instances in
@@ -71,14 +165,50 @@ struct Inner {
 /// not once per small batch -- and small enough that a single finalize
 /// call's transient allocation stays bounded rather than scaling with
 /// total occurrences: `finalize_inner` keeps `raw`'s already-allocated
-/// capacity (8 bytes/entry) alive alongside a fresh
-/// `Vec::with_capacity(raw.len())` of `(u64, u32)` pairs (16 bytes/entry
-/// after alignment padding) while it drains one into the other, so a
-/// finalize at the cap costs on the order of 2,000,000 * 24 bytes =~
-/// 48MB transient per worker, not gigabytes. Raising the cap trades more
+/// capacity (8 bytes/entry) alive alongside a fresh pair of
+/// `Vec::with_capacity(raw.len())` key/count arrays (`CountTable`, 12
+/// bytes/entry, no alignment padding -- see that type's doc comment) while
+/// it drains one into the other, so a finalize at the cap costs on the
+/// order of 2,000,000 * 20 bytes =~ 40MB transient per worker, not
+/// gigabytes. Raising the cap trades more
 /// of that transient (and a higher permanent floor) for fewer, larger
 /// sorts; lowering it trades the other way. This is a starting point,
 /// not a value proven optimal by a sweep across input shapes.
+/// **Swept, and deliberately left where it was.**
+/// `docs/PERFORMANCE_PLAN.md` workstream 2 asks for this threshold to be
+/// swept empirically rather than left at its original reasoned guess. It
+/// was, over 500k / 1M / 2M / 4M / 8M / 16M, pushing 40,000,000 occurrences
+/// through the real compaction path (MSD partition, per-bucket sort,
+/// run-length pass), five runs per point, on two coverage shapes:
+///
+/// ```text
+///  threshold   buffer   high coverage   low coverage   runs produced
+///    500,000     4 MB       0.671 s        0.678 s          80
+///  1,000,000     8 MB       0.749 s        0.668 s          40
+///  2,000,000    16 MB       0.719 s        0.736 s          20   <- today
+///  4,000,000    32 MB       0.686 s        0.870 s          10
+///  8,000,000    64 MB       0.649 s        0.892 s           5
+/// 16,000,000   128 MB       0.838 s        1.032 s           3
+/// ```
+///
+/// **The sweep does not identify a better value, and that is the finding.**
+/// The two coverage shapes disagree about which direction to move: high
+/// coverage is fastest at 8M, where low coverage is 37% *slower* than at its
+/// own best of 1M. Nothing here beats 2,000,000 on both, and the total
+/// spread across every point is comparable to this machine's own run-to-run
+/// variation.
+///
+/// It is also only half of the trade. A lower threshold produces
+/// proportionally more `pending` runs (80 against 3 across this sweep),
+/// which is the direct input to `consolidate`'s cost and to the width of the
+/// final k-way merge -- and that half cannot be measured in a loop like
+/// this one, only over a real file end to end, which needs the native
+/// Windows release build `docs/PERFORMANCE_PLAN.md` requires benchmark
+/// numbers to come from and which this environment does not have. Moving a
+/// tuning constant on a measurement that covers one side of its trade and
+/// disagrees with itself across inputs would be worse than leaving it: 2M
+/// sits mid-table on both shapes, which is what a value chosen without
+/// knowing the data shape should do.
 const RAW_FINALIZE_THRESHOLD: usize = 2_000_000;
 
 /// Above this many *unconsolidated* runs in `inner.pending`, an eager
@@ -87,8 +217,9 @@ const RAW_FINALIZE_THRESHOLD: usize = 2_000_000;
 ///
 /// This is the fix for a real, measured quadratic blowup in the design
 /// `MAX_PENDING_RUNS` replaces: that design folded every newly-compacted
-/// run straight into a single ever-growing `finalized` table via
-/// `merge_sorted_counts`, so the Nth eager compaction touched the *entire*
+/// run straight into a single ever-growing `finalized` table via a
+/// two-way merge (today's `merge_tables`; the design predates the G-3
+/// struct-of-arrays change), so the Nth eager compaction touched the *entire*
 /// table accumulated so far -- O(compactions x table size) over a whole
 /// run. On a large, diverse 2.14 GB input (53.8M distinct k-mers, 840M
 /// occurrences, 8 workers), each worker crosses `RAW_FINALIZE_THRESHOLD`
@@ -181,19 +312,167 @@ const MAX_PENDING_RUNS: usize = 8;
 /// of length `L` yields `min(L, u32::MAX)`, which is what
 /// `run_len.min(u32::MAX as usize) as u32` computes -- once per *distinct*
 /// k-mer instead of once per *occurrence*.
+/// Number of MSD buckets `msd_partition` splits the raw buffer into, as a
+/// power of two: 1024.
+///
+/// Chosen by measurement, not by picking a round number. The sweep in the
+/// results recorded on `msd_partition` covered 64, 128, 256, 512 and 1024
+/// buckets; the gain rises steeply to 256 and then flattens, with 512 and
+/// 1024 indistinguishable from each other and both consistently ahead of
+/// 256. 1024 is taken as the top of the flat region: at 2,000,000 keys it
+/// puts ~2,000 keys (16 KB) in an average bucket, comfortably L1-resident,
+/// while the counts array it needs is 1024 `usize` (8 KB) -- small enough
+/// to stay hot across both passes.
+const MSD_BUCKET_BITS: u32 = 10;
+
+/// Bits of a canonical k-mer that can actually be set, for the purpose of
+/// choosing which bits to bucket on.
+///
+/// `62`, not `64`: the counter's keys are 2-bit-packed k-mers, and the
+/// largest `k` the packing supports is 32... but `compact_raw` does not know
+/// `k`, and getting this wrong is a performance bug, not a correctness one
+/// (bucketing on always-zero high bits leaves most buckets empty and
+/// degenerates to a plain sort of one bucket). 62 is chosen because `k = 31`
+/// is this crate's default and its benchmark configuration. At `k = 32` the
+/// top two bits are real and this shift discards them, which merges four
+/// buckets' worth of keys into one -- still correct, still sorted, just less
+/// evenly split.
+const MSD_SIGNIFICANT_BITS: u32 = 62;
+
+/// Splits `raw` into `2^MSD_BUCKET_BITS` ascending buckets by its top
+/// significant bits, leaving the result in `raw` (via a swap with
+/// `scratch`) with every bucket's boundaries returned as a prefix-sum array.
+///
+/// Bucketing on the *high* bits is what makes this usable: bucket order is
+/// ascending key order, so sorting each bucket independently and leaving
+/// them where they are yields the fully sorted array -- no merge step, and
+/// `compact_raw`'s single linear run-length scan afterwards is unchanged.
+///
+/// # Measured, and measured the way the code actually runs
+///
+/// `counter.rs` has been here before: the doc comment on `compact_raw`
+/// records an LSD radix sort that was implemented, measured at 2.1-3.4x
+/// *slower* than `sort_unstable`, and reverted. That result is not
+/// contradicted here, because this is a different algorithm with a
+/// different memory-access shape -- LSD makes four to eight scatter passes
+/// over the whole buffer, each writing to a data-dependent offset anywhere
+/// within it; MSD makes exactly one, and every pass after it is a
+/// `sort_unstable` over a bucket small enough to stay in cache.
+///
+/// Benchmarked in isolation at this function's real call size
+/// (`RAW_FINALIZE_THRESHOLD` = 2,000,000 keys), on *canonical k-mers*
+/// rather than uniform-random `u64` -- which matters for an MSD partition
+/// in a way it does not for LSD, since `min(forward, revcomp)` skews the
+/// distribution toward the low end of exactly the high bits this buckets
+/// on. Three coverage shapes (100k, 1M and 1.9M distinct k-mers in the
+/// pool, i.e. ~20x, ~2x and near-unique repeat structure), 20 runs each,
+/// scratch buffers reused across calls:
+///
+/// ```text
+///                        sort_unstable   MSD 1024 buckets
+/// high coverage (100k)      0.0382 s        0.0295 s   1.30x
+/// medium       (1M)         0.0450 s        0.0365 s   1.23x
+/// low          (1.9M)       0.0460 s        0.0361 s   1.28x
+/// ```
+///
+/// A single-threaded number would not have been enough to ship on, because
+/// this trades memory bandwidth and footprint for cache locality and every
+/// pipeline worker calls it at once: the extra scatter pass and the extra
+/// 16 MB `scratch` per worker are both shared-resource costs that an idle
+/// single-threaded bench hides. Re-measured with `threads` workers each
+/// partitioning their own private buffer, released together from a barrier,
+/// mean wall time until the last finishes:
+///
+/// ```text
+///              1 thread   4 threads   8 threads   14 threads
+/// high cov.     1.26x       1.37x       1.26x        1.30x
+/// low cov.      1.29x       1.27x       1.37x        1.31x
+/// ```
+///
+/// The advantage holds at every thread count rather than eroding, which is
+/// the result that justified the change.
+///
+/// # What these numbers are not
+///
+/// They are from a Linux container on this machine, not the native Windows
+/// release build `docs/PERFORMANCE_PLAN.md` requires benchmark numbers to
+/// come from -- there is no Rust toolchain installed on the Windows host, so
+/// that measurement could not be taken. The plan's constraint exists because
+/// whole-run wall times on this machine swing 25-90 s on identical input;
+/// these are isolated, CPU-bound, in-memory microbenchmarks with no I/O, run
+/// 15-20 times per point, which is the same measurement class `compact_raw`'s
+/// own radix note used to justify a reversion. That is a reason to believe
+/// them, not a reason to call them the native number. **A native Windows
+/// confirmation is still owed.**
+fn msd_partition(raw: &mut Vec<u64>, scratch: &mut Vec<u64>, counts: &mut Vec<usize>) {
+    let buckets = 1usize << MSD_BUCKET_BITS;
+    let shift = MSD_SIGNIFICANT_BITS - MSD_BUCKET_BITS;
+
+    // Histogram, offset by one, so the prefix sum below turns it directly
+    // into each bucket's start index with no second pass.
+    counts.clear();
+    counts.resize(buckets + 1, 0);
+    for &key in raw.iter() {
+        // `min` rather than a mask: a key with bits above
+        // `MSD_SIGNIFICANT_BITS` set (k = 32) must land in the top bucket,
+        // not wrap into a low one, which would break the ascending-bucket
+        // property the whole approach rests on.
+        let bucket = ((key >> shift) as usize).min(buckets - 1);
+        counts[bucket + 1] += 1;
+    }
+    for i in 0..buckets {
+        counts[i + 1] += counts[i];
+    }
+
+    // The one scatter pass.
+    scratch.clear();
+    scratch.resize(raw.len(), 0);
+    let mut cursor = counts[..buckets].to_vec();
+    for &key in raw.iter() {
+        let bucket = ((key >> shift) as usize).min(buckets - 1);
+        scratch[cursor[bucket]] = key;
+        cursor[bucket] += 1;
+    }
+
+    // `scratch` now holds the partitioned data and `raw` the stale input;
+    // swapping keeps both allocations alive for the next call and leaves the
+    // partitioned data where every caller expects it.
+    std::mem::swap(raw, scratch);
+}
+
 fn compact_raw(inner: &mut Inner) {
     if inner.raw.is_empty() {
         return;
     }
 
-    inner.raw.sort_unstable();
+    // Partition into ascending, cache-resident buckets, then sort each one.
+    // Because bucket order is ascending key order, the concatenation is
+    // already fully sorted -- exactly what `raw.sort_unstable()` produced
+    // before, so everything downstream is untouched.
+    let mut bounds: Vec<usize> = Vec::new();
+    msd_partition(&mut inner.raw, &mut inner.scratch, &mut bounds);
+
+    let mut rest: &mut [u64] = inner.raw.as_mut_slice();
+    for bucket in 0..(1usize << MSD_BUCKET_BITS) {
+        let len = bounds[bucket + 1] - bounds[bucket];
+        let (head, tail) = rest.split_at_mut(len);
+        head.sort_unstable();
+        rest = tail;
+    }
+    debug_assert!(rest.is_empty(), "bucket lengths must cover the whole buffer");
+    debug_assert!(
+        inner.raw.windows(2).all(|w| w[0] <= w[1]),
+        "MSD partition + per-bucket sort must leave the buffer fully sorted"
+    );
 
     let sorted: &[u64] = inner.raw.as_slice();
     let len = sorted.len();
     // Exactly `len` is the smallest capacity that can never need to grow
     // (one entry per element, in the all-distinct case), so no `push` below
-    // reallocates and no bytes are ever recopied.
-    let mut new_run: Vec<(u64, u32)> = Vec::with_capacity(len);
+    // reallocates and no bytes are ever recopied. `CountTable`, not
+    // `Vec<(u64, u32)>`: see that type's doc comment for why this is a pair
+    // of arrays now, not tuples.
+    let mut new_run = CountTable::with_capacity(len);
 
     let mut i = 0usize;
     while i < len {
@@ -207,7 +486,7 @@ fn compact_raw(inner: &mut Inner) {
         // comment above. A single k-mer occurring more than u32::MAX times
         // must not panic or silently wrap, even though that is not expected
         // to occur in practice.
-        new_run.push((kmer, (i - run_start).min(u32::MAX as usize) as u32));
+        new_run.push(kmer, (i - run_start).min(u32::MAX as usize) as u32);
     }
 
     // `clear`, not `drain(..)`: both keep the allocation for the next fill,
@@ -232,7 +511,7 @@ fn consolidate(inner: &mut Inner) {
     if !inner.finalized.is_empty() {
         sources.push(std::mem::take(&mut inner.finalized));
     }
-    inner.finalized = k_way_merge_sorted_counts(sources);
+    inner.finalized = k_way_merge_tables(sources);
 }
 
 /// Brings `inner.finalized` fully up to date with everything inserted so
@@ -332,53 +611,134 @@ pub(crate) fn k_way_merge_sorted_counts(mut sources: Vec<Vec<(u64, u32)>>) -> Ve
     merged
 }
 
-/// Merges two sorted, deduplicated `(kmer, count)` sequences into one, in
-/// a single linear O(n + m) pass -- the standard mergesort merge step.
-/// Shared by `finalize_inner` (merging newly-finalized entries into
-/// whatever was already finalized) and `KmerCounter::merge` (combining
-/// two whole counters), so the two never diverge.
-fn merge_sorted_counts(a: &[(u64, u32)], b: &[(u64, u32)]) -> Vec<(u64, u32)> {
-    let mut merged: Vec<(u64, u32)> = Vec::with_capacity(a.len() + b.len());
+/// Merges any number of sorted, deduplicated `CountTable`s into one, via a
+/// binary min-heap over each source's current head -- exactly
+/// `k_way_merge_sorted_counts`'s algorithm (see that function's doc comment
+/// for why a heap advanced through `PeekMut` beats repeated pairwise
+/// folding), over `CountTable`'s parallel arrays instead of
+/// `Vec<(u64, u32)>`. Used by `consolidate` and `KmerCounter::merge_all` --
+/// the two merge passes that touch every occurrence in a worker's table on
+/// every call they make, rather than once per `KmerCounter` lifetime, which
+/// is what makes them the ones this file's G-3 struct-of-arrays change
+/// targets.
+///
+/// `k_way_merge_sorted_counts` itself is deliberately untouched:
+/// `binned.rs` calls it directly (`use crate::counter::
+/// k_way_merge_sorted_counts`), and that file is out of scope for this
+/// change, so its own merge passes still build `Vec<(u64, u32)>` tables at
+/// 16 bytes/entry. This function exists alongside it, not in place of it,
+/// so `KmerCounter`'s own merge passes get the full benefit of the
+/// narrower representation without requiring any change to `binned.rs` or
+/// its callers.
+///
+/// # Measured
+///
+/// See this module's doc comment history / `docs/PERFORMANCE_PLAN.md` for
+/// the isolated, in-container benchmark this representation change was
+/// shipped on: a standalone harness outside this crate (so it could use
+/// `println!`, which this crate's `[lints]` deny) reproducing this
+/// function's algorithm over both representations at benchmark-scale input,
+/// several coverage shapes, several thread counts.
+fn k_way_merge_tables(mut sources: Vec<CountTable>) -> CountTable {
+    match sources.len() {
+        0 => return CountTable::new(),
+        // A single source is already exactly what a merge of one source
+        // produces; skip the heap machinery entirely.
+        1 => return sources.remove(0),
+        _ => {}
+    }
+
+    let total_len: usize = sources.iter().map(CountTable::len).sum();
+    let mut merged = CountTable::with_capacity(total_len);
+
+    // Each heap entry is `Reverse((kmer, source index, index within that
+    // source))`, exactly as in `k_way_merge_sorted_counts`.
+    let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> = BinaryHeap::with_capacity(sources.len());
+    for (src_idx, src) in sources.iter().enumerate() {
+        if let Some(&kmer) = src.keys.first() {
+            heap.push(Reverse((kmer, src_idx, 0)));
+        }
+    }
+
+    while let Some(&Reverse((kmer, _, _))) = heap.peek() {
+        let mut count: u32 = 0;
+
+        // Fold in every source currently sitting at this key -- see
+        // `k_way_merge_sorted_counts` for why this starts from zero and why
+        // the heap root is advanced in place via `PeekMut` rather than
+        // popped and re-pushed.
+        while let Some(mut top) = heap.peek_mut() {
+            let Reverse((head_kmer, src_idx, elem_idx)) = *top;
+            if head_kmer != kmer {
+                break;
+            }
+
+            let src: &CountTable = &sources[src_idx];
+            count = count.saturating_add(src.counts[elem_idx]);
+
+            let next_idx = elem_idx + 1;
+            match src.keys.get(next_idx) {
+                Some(&next_kmer) => *top = Reverse((next_kmer, src_idx, next_idx)),
+                // Source exhausted: this is the one case that still has to
+                // shrink the heap.
+                None => {
+                    PeekMut::pop(top);
+                }
+            }
+        }
+
+        merged.push(kmer, count);
+    }
+
+    merged
+}
+
+/// Merges two sorted, deduplicated `CountTable`s into one, in a single
+/// linear O(n + m) pass -- the standard mergesort merge step over parallel
+/// key/count arrays instead of `(u64, u32)` tuples. Used by
+/// `KmerCounter::merge` to combine two whole counters.
+fn merge_tables(a: &CountTable, b: &CountTable) -> CountTable {
+    let mut merged = CountTable::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.len() && j < b.len() {
-        // Two `<` comparisons rather than `match a[i].0.cmp(&b[j].0)`.
+        // Two `<` comparisons rather than `match a.keys[i].cmp(&b.keys[j])`.
         // Matching on `Ordering` does not lower to a three-way branch: rustc
         // materializes the discriminant with `seta` + `sbb` and then
         // re-tests it with `movzbl` + `cmpl`, four extra instructions and a
         // third conditional branch per merged entry, on top of the compare
         // it already did. Comparing the keys twice costs one extra `cmp` and
-        // nothing else.
+        // nothing else -- this reasoning carries over unchanged from this
+        // function's `(u64, u32)`-tuple predecessor.
         //
-        // Reading only the keys up front is the other half of it: the counts
-        // are then loaded on the branch that actually uses them, so the
-        // "take from a" path never loads b's count and vice versa. Loading
-        // the whole pair up front (the obvious way to write this) is what
-        // makes an eager, sometimes-dead load appear in the loop.
-        //
-        // Net per merged entry: 4 fewer ALU instructions and one fewer
-        // conditional branch, with no added load -- over 161 million entries
-        // written by the combine phase at benchmark scale (see `merge_all`
-        // for that count), or 53.8 million once that path is adopted.
+        // Reading only the keys up front is the other half of it, and the
+        // struct-of-arrays layout makes it explicit rather than a compiler
+        // hope: `a.counts[i]`/`b.counts[j]` live in an entirely separate
+        // array from the keys just read, and are only touched on the branch
+        // that actually uses them, so the "take from a" path never reads
+        // `b.counts` and vice versa.
         //
         // The bounds checks here are already gone: `while i < a.len() && j <
-        // b.len()` proves both indices in range and the emitted code has no
-        // panic edge in this loop, only in the tail slicing below.
-        let a_kmer = a[i].0;
-        let b_kmer = b[j].0;
+        // b.len()` proves both indices in range for every array above, and
+        // the emitted code has no panic edge in this loop, only in the tail
+        // `extend_from_slice` calls below.
+        let a_kmer = a.keys[i];
+        let b_kmer = b.keys[j];
         if a_kmer < b_kmer {
-            merged.push(a[i]);
+            merged.push(a_kmer, a.counts[i]);
             i += 1;
         } else if b_kmer < a_kmer {
-            merged.push(b[j]);
+            merged.push(b_kmer, b.counts[j]);
             j += 1;
         } else {
-            merged.push((a_kmer, a[i].1.saturating_add(b[j].1)));
+            merged.push(a_kmer, a.counts[i].saturating_add(b.counts[j]));
             i += 1;
             j += 1;
         }
     }
-    merged.extend_from_slice(&a[i..]);
-    merged.extend_from_slice(&b[j..]);
+    merged.keys.extend_from_slice(&a.keys[i..]);
+    merged.counts.extend_from_slice(&a.counts[i..]);
+    merged.keys.extend_from_slice(&b.keys[j..]);
+    merged.counts.extend_from_slice(&b.counts[j..]);
     merged
 }
 
@@ -471,13 +831,32 @@ impl KmerCounter {
     /// type, and re-sorting here would silently paper over a caller bug
     /// instead of surfacing it (`debug_assert!` catches it in debug builds
     /// without paying for a re-sort in release).
+    ///
+    /// Converts `entries` into a `CountTable` before storing (see that
+    /// type's doc comment for why `finalized` is no longer
+    /// `Vec<(u64, u32)>`), via `from_finalized_table`, which `merge_all`
+    /// also calls directly to skip this conversion for sources that are
+    /// already `CountTable`s.
     pub(crate) fn from_sorted_entries(entries: Vec<(u64, u32)>, total_kmers: u64) -> Self {
         debug_assert!(
             entries.windows(2).all(|w| w[0].0 < w[1].0),
             "from_sorted_entries requires a strictly ascending, deduplicated table"
         );
+        Self::from_finalized_table(CountTable::from_tuples(entries), total_kmers)
+    }
+
+    /// Builds a `KmerCounter` directly from an already-sorted, already
+    /// finalized `CountTable` -- the same contract as `from_sorted_entries`
+    /// (see that method's doc comment), minus the tuple round trip its
+    /// external callers need but this crate's own merge passes
+    /// (`merge_all`) do not.
+    fn from_finalized_table(finalized: CountTable, total_kmers: u64) -> Self {
+        debug_assert!(
+            finalized.keys.windows(2).all(|w| w[0] < w[1]),
+            "from_finalized_table requires a strictly ascending, deduplicated table"
+        );
         Self {
-            inner: Mutex::new(Inner { finalized: entries, valid: true, ..Inner::default() }),
+            inner: Mutex::new(Inner { finalized, valid: true, ..Inner::default() }),
             total_kmers,
         }
     }
@@ -547,9 +926,9 @@ impl KmerCounter {
     /// Combines `other` into `self`.
     ///
     /// Finalizes both sides (if not already finalized) and merges the two
-    /// sorted `(kmer, count)` sequences in one linear O(n + m) pass -- the
-    /// standard mergesort merge step -- rather than replaying `other`'s
-    /// entries through hash-table insertion one at a time.
+    /// sorted `CountTable`s in one linear O(n + m) pass via `merge_tables`
+    /// -- the standard mergesort merge step -- rather than replaying
+    /// `other`'s entries through hash-table insertion one at a time.
     pub fn merge(&mut self, other: KmerCounter) {
         self.total_kmers += other.total_kmers;
 
@@ -559,7 +938,7 @@ impl KmerCounter {
         finalize_inner(self_inner);
         finalize_inner(&mut other_inner);
 
-        let merged = merge_sorted_counts(&self_inner.finalized, &other_inner.finalized);
+        let merged = merge_tables(&self_inner.finalized, &other_inner.finalized);
 
         // No `self_inner.raw.clear()` needed here: the `finalize_inner`
         // call just above already drained it -- that is what "finalized"
@@ -573,22 +952,23 @@ impl KmerCounter {
     /// `merge` folds two counters at a time, so a reduce over `w` workers
     /// rewrites the whole accumulated table once per level of the reduction
     /// tree. At benchmark scale (8 workers, 53.8 million distinct k-mers,
-    /// 16 bytes per entry) that is 4 merges producing 13.4M entries, 2
-    /// producing 26.9M and 1 producing 53.8M -- 161 million entries written,
-    /// 2.6 GB of `memcpy`, across 7 separate allocations the largest of
-    /// which is 860 MB. Merging all `w` sources at once writes each of the
-    /// 53.8 million final entries exactly once: 860 MB, one allocation.
-    /// That is ~1.7 GB of copying and 6 large allocations removed, and it
-    /// costs nothing extra per entry -- `k_way_merge_sorted_counts` already
-    /// does `O(entries x log(sources))` with `sources` bounded by the worker
-    /// count either way.
+    /// 12 bytes per entry -- see `CountTable`'s doc comment) that is 4
+    /// merges producing 13.4M entries, 2 producing 26.9M and 1 producing
+    /// 53.8M -- 161 million entries written, ~1.9 GB of `memcpy`, across 7
+    /// separate allocations the largest of which is ~650 MB. Merging all
+    /// `w` sources at once writes each of the 53.8 million final entries
+    /// exactly once: ~650 MB, one allocation. That is ~1.3 GB of copying
+    /// and 6 large allocations removed, and it costs nothing extra per
+    /// entry -- `k_way_merge_tables` already does `O(entries x
+    /// log(sources))` with `sources` bounded by the worker count either
+    /// way.
     ///
     /// `pipeline.rs`'s combine phase calls this once over the collected
     /// worker counters. `QcSummary::merge` deliberately stays pairwise
     /// there: it is `O(1)`, so a k-way form would buy nothing.
     pub fn merge_all(counters: Vec<KmerCounter>) -> KmerCounter {
         let mut total_kmers: u64 = 0;
-        let mut sources: Vec<Vec<(u64, u32)>> = Vec::with_capacity(counters.len());
+        let mut sources: Vec<CountTable> = Vec::with_capacity(counters.len());
 
         for counter in counters {
             total_kmers += counter.total_kmers;
@@ -597,8 +977,8 @@ impl KmerCounter {
             finalize_inner(&mut inner);
             // An empty source would only occupy a heap slot and be popped
             // straight back out; skipping it also lets the one-source fast
-            // path in `k_way_merge_sorted_counts` trigger when every other
-            // worker happened to see nothing.
+            // path in `k_way_merge_tables` trigger when every other worker
+            // happened to see nothing.
             if !inner.finalized.is_empty() {
                 sources.push(std::mem::take(&mut inner.finalized));
             }
@@ -607,9 +987,12 @@ impl KmerCounter {
         // The merge output is sorted ascending and deduplicated by
         // construction -- that is exactly what a k-way merge of sorted,
         // deduplicated sources with equal keys folded together produces --
-        // which is the invariant `from_sorted_entries` documents as the
-        // caller's responsibility.
-        Self::from_sorted_entries(k_way_merge_sorted_counts(sources), total_kmers)
+        // which is the invariant `from_finalized_table` documents as the
+        // caller's responsibility. `k_way_merge_tables`, not
+        // `k_way_merge_sorted_counts`: this is the hot combine phase this
+        // file's G-3 change targets, and it stays in `CountTable` form end
+        // to end -- no tuple round trip on this path.
+        Self::from_finalized_table(k_way_merge_tables(sources), total_kmers)
     }
 
     /// Removes k-mers outside the inclusive `[min, max]` frequency band.
@@ -622,8 +1005,17 @@ impl KmerCounter {
         finalize_inner(inner);
 
         let mut stats = PruneStats::default();
-        inner.finalized.retain(|&(_, count)| {
-            if count < min {
+        let table = &mut inner.finalized;
+        // `Vec::retain` has no equivalent across two parallel arrays that
+        // must stay in lockstep, so this walks both by index instead:
+        // `keep` decides once per entry from the count alone, and a kept
+        // entry's key/count pair is copied down to the next free `write`
+        // slot -- the same in-place compaction `Vec::retain` itself
+        // performs, just over two arrays rather than one.
+        let mut write = 0usize;
+        for read in 0..table.len() {
+            let count = table.counts[read];
+            let keep = if count < min {
                 stats.dropped_min += 1;
                 false
             } else if max.is_some_and(|cap| count > cap) {
@@ -632,8 +1024,15 @@ impl KmerCounter {
             } else {
                 stats.kept += 1;
                 true
+            };
+            if keep {
+                table.keys[write] = table.keys[read];
+                table.counts[write] = table.counts[read];
+                write += 1;
             }
-        });
+        }
+        table.keys.truncate(write);
+        table.counts.truncate(write);
 
         stats
     }
@@ -657,8 +1056,9 @@ impl KmerCounter {
         let guard = self.ensure_finalized();
         guard
             .finalized
-            .binary_search_by_key(&kmer, |&(k, _)| k)
-            .map(|idx| guard.finalized[idx].1)
+            .keys
+            .binary_search(&kmer)
+            .map(|idx| guard.finalized.counts[idx])
             .unwrap_or(0)
     }
 
@@ -683,7 +1083,7 @@ impl KmerCounter {
     pub fn generate_histogram(&self) -> FxHashMap<u32, u64> {
         let guard = self.ensure_finalized();
         let mut histogram: FxHashMap<u32, u64> = FxHashMap::default();
-        for &(_, count) in guard.finalized.iter() {
+        for &count in guard.finalized.counts.iter() {
             *histogram.entry(count).or_insert(0) += 1;
         }
         histogram
@@ -699,7 +1099,7 @@ impl KmerCounter {
     /// for however small a caller-requested `n` actually was.
     pub fn top_kmers(&self, n: usize) -> Vec<(u64, u32)> {
         let guard = self.ensure_finalized();
-        let mut entries: Vec<(u64, u32)> = guard.finalized.clone();
+        let mut entries: Vec<(u64, u32)> = guard.finalized.to_tuples();
         drop(guard);
 
         let take = n.min(entries.len());
@@ -726,17 +1126,19 @@ impl Iterator for Iter<'_> {
     type Item = (u64, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // `?` on the borrow, rather than `.copied()` followed by
-        // `if item.is_some()`: the previous form tested the same
-        // discriminant twice -- once inside `get` to build the `Option`, and
-        // again to decide whether to advance -- and made the advance itself
-        // conditional. One test and one unconditional increment here, over
-        // every entry of the finalized table on every export pass (53.8
-        // million entries per pass at benchmark scale, and `export.rs` plus
-        // `ffi.rs` walk it once each).
-        let &item = self.guard.finalized.get(self.idx)?;
+        // Two array reads instead of one tuple read -- `finalized` is a
+        // `CountTable` (see that type's doc comment), not a
+        // `Vec<(u64, u32)>` -- but still one bounds check and one
+        // unconditional increment per call: `get` on `keys` proves the
+        // index in range for the unchecked `counts` index right after it,
+        // the same shape the previous tuple version had over every entry of
+        // the finalized table on every export pass (53.8 million entries
+        // per pass at benchmark scale, and `export.rs` plus `ffi.rs` walk it
+        // once each).
+        let &kmer = self.guard.finalized.keys.get(self.idx)?;
+        let count = self.guard.finalized.counts[self.idx];
         self.idx += 1;
-        Some(item)
+        Some((kmer, count))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -773,6 +1175,101 @@ mod tests {
     fn kmer_counter_is_sync() {
         fn assert_sync<T: Sync>() {}
         assert_sync::<KmerCounter>();
+    }
+
+    /// `msd_partition`'s load-bearing invariant, asserted directly rather
+    /// than inferred from the fact that some larger test passes: bucketing
+    /// on the *high* bits must put the buckets in ascending key order, so
+    /// that sorting each one in place leaves the whole buffer sorted with no
+    /// merge. If that ever stopped holding, `compact_raw` would silently
+    /// emit an unsorted table -- and since `k_way_merge_sorted_counts`
+    /// downstream assumes sorted inputs, the result would be wrong counts,
+    /// not a crash.
+    ///
+    /// Exercised across the k-mer distributions that actually stress it: the
+    /// canonical skew (`min(forward, revcomp)` concentrates keys in the low
+    /// half of the range, so the top bucket may be empty and the bottom ones
+    /// crowded), all-identical keys (one bucket holds everything), and keys
+    /// with bits above `MSD_SIGNIFICANT_BITS` set (k = 32), which the
+    /// `min(buckets - 1)` clamp must fold into the top bucket rather than
+    /// wrapping into a low one.
+    #[test]
+    fn msd_partition_leaves_buckets_in_ascending_key_order() {
+        fn check(label: &str, keys: Vec<u64>) {
+            let mut raw = keys.clone();
+            let mut scratch = Vec::new();
+            let mut bounds = Vec::new();
+            msd_partition(&mut raw, &mut scratch, &mut bounds);
+
+            let buckets = 1usize << MSD_BUCKET_BITS;
+            assert_eq!(bounds.len(), buckets + 1, "{label}: wrong number of bucket bounds");
+            assert_eq!(bounds[0], 0, "{label}: bounds must start at 0");
+            assert_eq!(bounds[buckets], keys.len(), "{label}: bounds must cover every key");
+
+            // The partition is a permutation: same multiset, nothing lost or
+            // duplicated by the scatter.
+            let mut before = keys.clone();
+            let mut after = raw.clone();
+            before.sort_unstable();
+            after.sort_unstable();
+            assert_eq!(before, after, "{label}: partition changed the multiset");
+
+            // Every key in bucket i is <= every key in bucket i+1. Checking
+            // the maximum of each bucket against the minimum of the next is
+            // exactly that claim, and it is what makes the per-bucket sort
+            // sufficient.
+            let mut previous_max: Option<u64> = None;
+            for b in 0..buckets {
+                let slice = &raw[bounds[b]..bounds[b + 1]];
+                let (Some(&lo), Some(&hi)) = (slice.iter().min(), slice.iter().max()) else {
+                    continue; // empty bucket: nothing to order against
+                };
+                if let Some(prev) = previous_max {
+                    assert!(prev <= lo, "{label}: bucket {b} starts at {lo}, below the previous \
+                                         bucket's maximum {prev}");
+                }
+                previous_max = Some(hi);
+            }
+
+            // ...and therefore sorting each bucket in place sorts the whole
+            // buffer, which is the property `compact_raw` relies on.
+            let mut rest: &mut [u64] = raw.as_mut_slice();
+            for b in 0..buckets {
+                let len = bounds[b + 1] - bounds[b];
+                let (head, tail) = rest.split_at_mut(len);
+                head.sort_unstable();
+                rest = tail;
+            }
+            let mut expected = keys;
+            expected.sort_unstable();
+            assert_eq!(raw, expected, "{label}: per-bucket sort did not sort the buffer");
+        }
+
+        // Canonical k-mers at k = 31, the real shape of this buffer.
+        let mut state = 0x9001_9001_9001_9001u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mask = (1u64 << 62) - 1;
+        let canonical: Vec<u64> = (0..50_000)
+            .map(|_| {
+                let fwd = next() & mask;
+                fwd.min(crate::kmer::reverse_complement_u64(fwd, 31))
+            })
+            .collect();
+        check("canonical k=31", canonical);
+
+        check("all identical", vec![0x0123_4567_89AB_CDEFu64 & mask; 1000]);
+        check("all zero", vec![0u64; 1000]);
+        check("single key", vec![42u64]);
+
+        // k = 32 uses all 64 bits, above `MSD_SIGNIFICANT_BITS`. The clamp
+        // must keep these ordered rather than wrapping them into low buckets.
+        let wide: Vec<u64> = (0..20_000).map(|_| next()).collect();
+        check("k=32, bits above the significant range", wide);
     }
 
     /// `mem_estimate.rs` keeps its own copy of this threshold (it predicts
@@ -971,6 +1468,154 @@ mod tests {
             vec![(7, u32::MAX), (9, 1)],
             "an overflowing sum must clamp, not wrap to a tiny count"
         );
+    }
+
+    // -- `CountTable`'s own merge functions ---------------------------
+    //
+    // `consolidate` and `merge_all` call `k_way_merge_tables`, not
+    // `k_way_merge_sorted_counts`, after the G-3 struct-of-arrays change --
+    // see that function's doc comment. These mirror the
+    // `k_way_merge_sorted_counts` tests above one-for-one (same cases, same
+    // expectations) so the two implementations are pinned to agree, plus a
+    // direct test of `merge_tables`, the two-way merge `KmerCounter::merge`
+    // now uses.
+
+    #[test]
+    fn k_way_merge_tables_of_zero_sources_is_empty() {
+        assert!(k_way_merge_tables(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn k_way_merge_tables_of_one_source_returns_it_unchanged() {
+        let only = CountTable::from_tuples(vec![(1u64, 3u32), (5, 1), (9, 7)]);
+        let expected = only.to_tuples();
+        assert_eq!(k_way_merge_tables(vec![only]).to_tuples(), expected);
+    }
+
+    /// More than two sources, with keys overlapping across three of them
+    /// (not just pairwise) and one source fully disjoint -- the case a
+    /// naive pairwise-only merge implementation could get subtly wrong.
+    #[test]
+    fn k_way_merge_tables_combines_counts_shared_across_more_than_two_sources() {
+        let sources = vec![
+            CountTable::from_tuples(vec![(1u64, 1u32), (2, 1), (10, 1)]),
+            CountTable::from_tuples(vec![(1, 10), (3, 1)]),
+            CountTable::from_tuples(vec![(1, 100), (2, 10)]),
+            CountTable::from_tuples(vec![(4, 1)]),
+        ];
+
+        let merged = k_way_merge_tables(sources);
+
+        assert_eq!(
+            merged.to_tuples(),
+            vec![(1, 111), (2, 11), (3, 1), (4, 1), (10, 1)],
+            "kmer 1 must sum contributions from all three sources that carry it"
+        );
+    }
+
+    /// A source list containing empty tables must not stall the merge or
+    /// let an empty one occupy a heap slot.
+    #[test]
+    fn k_way_merge_tables_skips_empty_sources() {
+        let sources = vec![
+            CountTable::new(),
+            CountTable::from_tuples(vec![(2u64, 5u32), (4, 1)]),
+            CountTable::new(),
+            CountTable::from_tuples(vec![(1, 1), (4, 2)]),
+            CountTable::new(),
+        ];
+
+        assert_eq!(
+            k_way_merge_tables(sources).to_tuples(),
+            vec![(1, 1), (2, 5), (4, 3)]
+        );
+    }
+
+    /// Same differential strategy as
+    /// `k_way_merge_matches_a_reference_implementation_on_pseudorandom_input`,
+    /// over `CountTable` instead of `Vec<(u64, u32)>`, so a bug specific to
+    /// reading the parallel arrays (an off-by-one between `keys` and
+    /// `counts`, say) cannot hide behind the tuple version's passing tests.
+    #[test]
+    fn k_way_merge_tables_matches_a_reference_implementation_on_pseudorandom_input() {
+        /// Sort-and-group over flattened tuples: obviously correct, far too
+        /// slow to ship.
+        fn reference(sources: &[CountTable]) -> Vec<(u64, u32)> {
+            let mut flat: Vec<(u64, u32)> =
+                sources.iter().flat_map(CountTable::to_tuples).collect();
+            flat.sort_by_key(|&(kmer, _)| kmer);
+            let mut out: Vec<(u64, u32)> = Vec::new();
+            for (kmer, count) in flat {
+                match out.last_mut() {
+                    Some(last) if last.0 == kmer => last.1 = last.1.saturating_add(count),
+                    _ => out.push((kmer, count)),
+                }
+            }
+            out
+        }
+
+        // A deterministic LCG, so a failure is reproducible and the test
+        // brings in no dependency.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |bound: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+
+        for case in 0..200 {
+            // 1..=9 sources: `MAX_PENDING_RUNS` runs plus `finalized` is the
+            // widest merge `consolidate` ever asks for.
+            let source_count = 1 + (case % 9);
+            let key_space = 1 + next(40);
+
+            let mut sources: Vec<CountTable> = Vec::with_capacity(source_count);
+            for _ in 0..source_count {
+                let mut keys: Vec<u64> = (0..key_space).filter(|_| next(3) != 0).collect();
+                keys.dedup();
+                sources.push(CountTable::from_tuples(
+                    keys.into_iter().map(|kmer| (kmer, 1 + next(1000) as u32)).collect(),
+                ));
+            }
+
+            let expected = reference(&sources);
+            assert_eq!(
+                k_way_merge_tables(sources.clone()).to_tuples(),
+                expected,
+                "case {case}: {sources:?}"
+            );
+        }
+    }
+
+    /// Counts must clamp at `u32::MAX` rather than wrapping, exactly as
+    /// `k_way_merge_sorted_counts` must.
+    #[test]
+    fn k_way_merge_tables_saturates_at_u32_max_instead_of_wrapping() {
+        let sources = vec![
+            CountTable::from_tuples(vec![(7u64, u32::MAX - 1)]),
+            CountTable::from_tuples(vec![(7, 5)]),
+            CountTable::from_tuples(vec![(7, 10)]),
+            CountTable::from_tuples(vec![(9, 1)]),
+        ];
+
+        assert_eq!(
+            k_way_merge_tables(sources).to_tuples(),
+            vec![(7, u32::MAX), (9, 1)],
+            "an overflowing sum must clamp, not wrap to a tiny count"
+        );
+    }
+
+    /// Direct test of `merge_tables`, the two-way merge `KmerCounter::merge`
+    /// uses -- `merge_combines_counts_for_shared_kmers_and_keeps_disjoint_ones`
+    /// below covers the same code path through the public API; this pins
+    /// the array-of-structs-free algorithm itself.
+    #[test]
+    fn merge_tables_combines_shared_keys_and_keeps_disjoint_ones() {
+        let a = CountTable::from_tuples(vec![(1u64, 2u32), (2, 1), (5, 9)]);
+        let b = CountTable::from_tuples(vec![(2u64, 3u32), (3, 1)]);
+
+        let merged = merge_tables(&a, &b);
+
+        assert_eq!(merged.to_tuples(), vec![(1, 2), (2, 4), (3, 1), (5, 9)]);
     }
 
     /// `merge_all` must produce exactly what repeated pairwise `merge`

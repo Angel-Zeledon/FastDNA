@@ -4,6 +4,13 @@ Roadmap item A4 (`docs/ml-differentiation-roadmap.md`, bucket A, rank #4):
 a rule-based binary classifier whose entire learned model is a handful of
 literal DNA sequences, each tagged "present" or "absent".
 
+## Status: frozen
+
+Per `docs/audit/PLAN.md` §2 ("Qué se poda"), this module is frozen: stable,
+not accepting new features, and a candidate for extraction into a separate
+`fastdna-contrib` package in a future release. Freezing is not deleting --
+see that section for the full reasoning behind the boundary.
+
 ## Scientific basis
 
 - Marchand & Shawe-Taylor, "The Set Covering Machine", JMLR 3 (2002)
@@ -62,11 +69,15 @@ imported here.
 from __future__ import annotations
 
 from itertools import repeat
-from typing import NamedTuple
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Union
 
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
+
+from . import _core, _PathLike
+
+__all__ = ["Rule", "SetCoveringClassifier"]
 
 _RULE_TYPES = ("conjunction", "disjunction")
 _TIEBREAKERS = ("max_coverage", "first")
@@ -90,7 +101,7 @@ class Rule(NamedTuple):
     feature_name: str
     presence: bool
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{'present' if self.presence else 'absent'}({self.feature_name})"
 
 
@@ -110,19 +121,19 @@ def _as_binary_matrix(X, method_name):
         X = X.toarray()
     arr = np.asarray(X)
     if arr.dtype == object:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"SetCoveringClassifier.{method_name}() got an X with dtype=object, which "
             "cannot be a binary presence matrix. Pass a numeric or boolean 2-D array "
             "(or a scipy sparse matrix) of shape (n_samples, n_features)."
         )
     if arr.ndim != 2:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"X must be a 2-D (n_samples, n_features) binary presence matrix, got a "
             f"{arr.ndim}-D array of shape {arr.shape}. A single sample must still be "
             "2-D -- reshape it with X.reshape(1, -1)."
         )
     if arr.shape[0] == 0 or arr.shape[1] == 0:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"X is empty: shape {arr.shape} has no "
             f"{'samples' if arr.shape[0] == 0 else 'features'}. "
             "SetCoveringClassifier needs at least one sample and one feature."
@@ -136,7 +147,7 @@ def _as_binary_matrix(X, method_name):
         if offending:
             shown = ", ".join(repr(v) for v in offending[:5])
             more = "" if len(offending) <= 5 else f", ... ({len(offending)} distinct values in total)"
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"X must be a binary presence matrix containing only 0/1 (or "
                 f"False/True); found other values: {shown}{more}. If these are raw "
                 "k-mer counts (e.g. from KmerVectorizer.transform()), binarize them "
@@ -164,7 +175,7 @@ def _resolve_sample_weights(class_weight, y, classes):
 
     if isinstance(class_weight, str):
         if class_weight != "balanced":
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"class_weight must be None, 'balanced', or a dict of {{label: weight}}; "
                 f"the only recognized string value is 'balanced', got {class_weight!r}."
             )
@@ -181,7 +192,7 @@ def _resolve_sample_weights(class_weight, y, classes):
                 parts.append(f"missing a weight for {missing!r}")
             if unknown:
                 parts.append(f"has weight(s) for unknown label(s) {unknown!r}")
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"class_weight dict must have exactly one weight per class in classes_ "
                 f"({labels!r}): {' and '.join(parts)}."
             )
@@ -192,14 +203,14 @@ def _resolve_sample_weights(class_weight, y, classes):
             or not (w > 0) or not np.isfinite(w)
         }
         if bad:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"class_weight values must be finite positive numbers, got {bad!r} -- a "
                 "weight must express how much this class's examples count, and zero, "
                 "negative, or non-numeric weights have no such meaning."
             )
         weight_by_class = {c: float(w) for c, w in class_weight.items()}
     else:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"class_weight must be None, 'balanced', or a dict of {{label: weight}}, got "
             f"{class_weight!r} ({type(class_weight).__name__})."
         )
@@ -326,7 +337,13 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         Column count of the training `X`; `predict()` requires the same.
     """
 
-    def __init__(self, max_rules=10, rule_type="conjunction", tiebreaker="max_coverage", class_weight=None):
+    def __init__(
+        self,
+        max_rules: int = 10,
+        rule_type: str = "conjunction",
+        tiebreaker: str = "max_coverage",
+        class_weight: Optional[Union[str, Dict[Any, float]]] = None,
+    ) -> None:
         # scikit-learn convention (the same one KmerVectorizer follows):
         # __init__ only assigns the parameters, unchanged and unvalidated,
         # so get_params()/set_params()/clone() can always rebuild an
@@ -338,7 +355,12 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
 
     # -- fitting ----------------------------------------------------------
 
-    def fit(self, X, y, feature_names=None):
+    def fit(
+        self,
+        X: Any,  # binary presence matrix: dense array-like or scipy sparse (duck-typed via .toarray(), scipy not imported here)
+        y: Union[Sequence[Any], np.ndarray],
+        feature_names: Optional[Sequence[str]] = None,
+    ) -> "SetCoveringClassifier":
         """Greedily learns the rule set.
 
         Parameters
@@ -391,11 +413,11 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         self, per the scikit-learn convention.
         """
         if self.rule_type not in _RULE_TYPES:
-            raise ValueError(f"rule_type must be one of {_RULE_TYPES}, got {self.rule_type!r}")
+            raise _core.InvalidConfigError(f"rule_type must be one of {_RULE_TYPES}, got {self.rule_type!r}")
         if self.tiebreaker not in _TIEBREAKERS:
-            raise ValueError(f"tiebreaker must be one of {_TIEBREAKERS}, got {self.tiebreaker!r}")
+            raise _core.InvalidConfigError(f"tiebreaker must be one of {_TIEBREAKERS}, got {self.tiebreaker!r}")
         if isinstance(self.max_rules, bool) or not isinstance(self.max_rules, (int, np.integer)) or self.max_rules < 1:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"max_rules must be an integer >= 1 (a model with zero rules classifies "
                 f"nothing), got {self.max_rules!r}"
             )
@@ -405,21 +427,21 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
 
         y = np.asarray(y)
         if y.ndim != 1:
-            raise ValueError(f"y must be a 1-D array of one label per sample, got shape {y.shape}")
+            raise _core.InvalidConfigError(f"y must be a 1-D array of one label per sample, got shape {y.shape}")
         if len(y) != n_samples:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"X and y must describe the same samples: X has {n_samples} rows but y has "
                 f"{len(y)} labels."
             )
 
         classes = np.unique(y)
         if len(classes) == 1:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"y contains a single class ({classes[0]!r}); a Set Covering Machine needs "
                 "both a positive and a negative class to have anything to separate."
             )
         if len(classes) > 2:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"The Set Covering Machine is a binary classifier; y has {len(classes)} "
                 f"classes ({', '.join(repr(c) for c in classes.tolist()[:5])}). Reduce the "
                 "problem to two classes, or wrap this estimator in "
@@ -432,7 +454,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         else:
             names = [str(name) for name in feature_names]
             if len(names) != n_features:
-                raise ValueError(
+                raise _core.InvalidConfigError(
                     f"feature_names has {len(names)} entries but X has {n_features} columns. "
                     "A silent mismatch here would label every rule with the WRONG k-mer, so "
                     "this is refused rather than truncated -- pass exactly the feature names "
@@ -629,7 +651,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         check_is_fitted(self, "classes_")
         binary = _as_binary_matrix(X, method_name)
         if binary.shape[1] != self.n_features_in_:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"X has {binary.shape[1]} features, but this SetCoveringClassifier was "
                 f"fitted on {self.n_features_in_}. Transform prediction samples with the "
                 "same vectorizer/vocabulary used for the training matrix."
@@ -648,9 +670,20 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
                 mask |= holds
         return mask
 
-    def predict(self, X):
+    def predict(self, X: Any) -> np.ndarray:  # X: same duck-typed dense/sparse matrix as fit()
         """The predicted label per sample, taken from `classes_` so the
         caller's own label dtype (strings included) round-trips.
+
+        Parameters
+        ----------
+        X : array-like or scipy sparse matrix of shape (n_samples, n_features)
+            Binary k-mer presence matrix, same convention as `fit()`'s `X`.
+
+        Returns
+        -------
+        numpy.ndarray of shape (n_samples,)
+            One entry per row of `X`, each equal to `classes_[0]` or
+            `classes_[1]`.
         """
         # _rule_mask() first, deliberately: it is what runs check_is_fitted,
         # and Python evaluates `self.classes_` before the subscript, so
@@ -659,7 +692,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         fired = self._rule_mask(X, "predict")
         return self.classes_[fired.astype(int)]
 
-    def predict_proba(self, X):
+    def predict_proba(self, X: Any) -> np.ndarray:  # X: same duck-typed dense/sparse matrix as fit()
         """The rule-consistent hard 0/1 decision, shaped like a probability:
         `(n_samples, 2)` columns ordered as `classes_`.
 
@@ -685,6 +718,18 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         attribute. Returning the honest hard decision, loudly documented,
         keeps `Pipeline`/`OneVsRestClassifier` working and puts the caveat
         where it can be read.
+
+        Parameters
+        ----------
+        X : array-like or scipy sparse matrix of shape (n_samples, n_features)
+            Binary k-mer presence matrix, same convention as `fit()`'s `X`.
+
+        Returns
+        -------
+        numpy.ndarray of shape (n_samples, 2)
+            Columns ordered as `classes_`; every row is `[1., 0.]` or
+            `[0., 1.]` -- see the caveat above before using this as a
+            score.
         """
         fired = self._rule_mask(X, "predict_proba").astype(np.float64)
         return np.column_stack((1.0 - fired, fired))
@@ -692,17 +737,21 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
     # -- interpretation ---------------------------------------------------
 
     @property
-    def rules_(self):
+    def rules_(self) -> list[Rule]:
         """The learned rules (see the class docstring); raises
         `NotFittedError` before `fit()`.
 
         A `list` copy is returned, not the internal list, so that mutating
         the result cannot silently change what `predict()` does.
+
+        Returns
+        -------
+        list of Rule
         """
         check_is_fitted(self, "classes_")
         return list(self._rules_)
 
-    def explain(self):
+    def explain(self) -> str:
         """The model as one line of human-readable text, e.g.
 
             resistant IF present(ACGTACGTA) AND absent(TTGCATTGC)
@@ -712,6 +761,16 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         `fit()` received `feature_names`, each literal is the actual k-mer
         sequence -- which is the whole point of the model: the explanation
         *is* the biology, not a proxy for it.
+
+        Naming note: this method predates, and collides in name with, the
+        top-level `fastdna.explain()` function -- both exist, both are
+        public, and nothing here renames either (see the review that added
+        this note for the reasoning: renaming a public method name is a
+        breaking change to flag for a human, not to decide unilaterally).
+
+        Returns
+        -------
+        str
         """
         check_is_fitted(self, "classes_")
         label = self.classes_[1]
@@ -722,7 +781,7 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         connective = " AND " if self.rule_type == "conjunction" else " OR "
         return f"{label} IF " + connective.join(str(rule) for rule in self._rules_)
 
-    def export_rules_fasta(self, path):
+    def export_rules_fasta(self, path: _PathLike) -> list[Rule]:
         """Writes the rule k-mers to `path` as FASTA, ready for BLAST.
 
         Each record is two lines, matching `fastdna.interpret`'s exporter:
@@ -737,11 +796,26 @@ class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
         `feature_2` is not a sequence file, it is a trap for whoever opens
         it next.
 
-        Returns the list of `Rule`s written.
+        Parameters
+        ----------
+        path : str or os.PathLike
+            Destination FASTA file. Required: writing it is this method's
+            entire purpose, so there is no in-memory-only form to fall
+            back to.
+
+        Returns
+        -------
+        list of Rule
+            The rules written, in the same order as `rules_`.
+
+        Raises
+        ------
+        ValueError
+            If `fit()` was called without `feature_names`.
         """
         check_is_fitted(self, "classes_")
         if not self._feature_names_given_:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "export_rules_fasta() needs real k-mer sequences, but fit() was called "
                 "without feature_names, so the rules only carry positional placeholders "
                 f"like {self._rules_[0].feature_name!r} if any were learned. Refit with "

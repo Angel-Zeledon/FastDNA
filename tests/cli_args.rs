@@ -1,5 +1,14 @@
 //! Argument-parsing contract. These run clap directly rather than spawning the
 //! binary, so they stay fast and need no extra dev-dependencies.
+//!
+//! Every access below goes through `cli.count.*`, not `cli.*`: `CountArgs`
+//! (the k-mer counting flags) now lives on its own flattened field so the
+//! same struct also backs the explicit `fastdna count` subcommand (see
+//! `cli::Cli::command`'s doc comment) -- these tests all exercise the
+//! no-subcommand-given path, which is `cli.command == None` and populates
+//! `cli.count` exactly as `Cli`'s own fields used to be populated directly
+//! before subcommands existed. `tests/cli_subcommands.rs` covers the
+//! subcommand dispatch itself.
 
 #![allow(clippy::expect_used)]
 
@@ -9,31 +18,31 @@ use fastdna_core::cli::{Cli, CliHistogramFormat};
 #[test]
 fn max_count_defaults_to_no_upper_bound() {
     let cli = Cli::parse_from(["fastdna", "--input", "sample.fastq"]);
-    assert_eq!(cli.max_count, None, "absence of the flag must mean no cap");
+    assert_eq!(cli.count.max_count, None, "absence of the flag must mean no cap");
 }
 
 #[test]
 fn max_count_is_parsed_when_supplied() {
     let cli = Cli::parse_from(["fastdna", "--input", "sample.fastq", "--max-count", "10000"]);
-    assert_eq!(cli.max_count, Some(10_000));
+    assert_eq!(cli.count.max_count, Some(10_000));
 }
 
 #[test]
 fn min_count_still_defaults_to_one() {
     let cli = Cli::parse_from(["fastdna", "--input", "sample.fastq"]);
-    assert_eq!(cli.min_count, 1);
+    assert_eq!(cli.count.min_count, 1);
 }
 
 #[test]
 fn hpc_defaults_to_off() {
     let cli = Cli::parse_from(["fastdna", "--input", "sample.fastq"]);
-    assert!(!cli.hpc, "homopolymer compression must be opt-in");
+    assert!(!cli.count.hpc, "homopolymer compression must be opt-in");
 }
 
 #[test]
 fn hpc_is_parsed_when_supplied() {
     let cli = Cli::parse_from(["fastdna", "--input", "sample.fastq", "--hpc"]);
-    assert!(cli.hpc);
+    assert!(cli.count.hpc);
 }
 
 #[test]
@@ -41,9 +50,9 @@ fn existing_short_flags_are_unchanged() {
     let cli = Cli::parse_from([
         "fastdna", "--input", "s.fastq", "-k", "21", "-q", "30", "-m", "5",
     ]);
-    assert_eq!(cli.kmer_size, 21);
-    assert_eq!(cli.min_quality, 30.0);
-    assert_eq!(cli.min_count, 5);
+    assert_eq!(cli.count.kmer_size, 21);
+    assert_eq!(cli.count.min_quality, 30.0);
+    assert_eq!(cli.count.min_count, 5);
 }
 
 #[test]
@@ -92,7 +101,7 @@ fn min_count_zero_is_rejected() {
 #[test]
 fn contradictory_count_band_is_rejected_by_validate() {
     let cli = Cli::parse_from(["fastdna", "--input", "s.fastq", "-m", "5", "-M", "2"]);
-    let err = cli.validate().expect_err("-M below -m keeps nothing and must be an error");
+    let err = cli.count.validate().expect_err("-M below -m keeps nothing and must be an error");
     assert!(err.contains("--max-count"), "message must name the flags: {err}");
     assert!(err.contains("--min-count"), "message must name the flags: {err}");
 }
@@ -100,32 +109,32 @@ fn contradictory_count_band_is_rejected_by_validate() {
 #[test]
 fn equal_and_ordered_count_bands_pass_validate() {
     let equal = Cli::parse_from(["fastdna", "--input", "s.fastq", "-m", "5", "-M", "5"]);
-    assert!(equal.validate().is_ok(), "-m 5 -M 5 keeps exactly frequency 5");
+    assert!(equal.count.validate().is_ok(), "-m 5 -M 5 keeps exactly frequency 5");
     let ordered = Cli::parse_from(["fastdna", "--input", "s.fastq", "-m", "2", "-M", "10"]);
-    assert!(ordered.validate().is_ok());
+    assert!(ordered.count.validate().is_ok());
     let unbounded = Cli::parse_from(["fastdna", "--input", "s.fastq", "-m", "5"]);
-    assert!(unbounded.validate().is_ok(), "no -M means no upper bound");
+    assert!(unbounded.count.validate().is_ok(), "no -M means no upper bound");
 }
 
 #[test]
 fn a_single_input_still_parses_into_a_one_element_list() {
     let cli = Cli::parse_from(["fastdna", "--input", "sample.fastq"]);
     assert_eq!(
-        cli.input.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        cli.count.input.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
         vec!["sample.fastq".to_string()],
         "-i single.fastq must keep working identically"
     );
-    assert!(cli.validate().is_ok());
+    assert!(cli.count.validate().is_ok());
 }
 
 #[test]
 fn several_inputs_are_collected_in_order_after_one_flag() {
     let cli = Cli::parse_from(["fastdna", "-i", "R1.fastq", "R2.fastq", "lane2.fastq.gz"]);
     assert_eq!(
-        cli.input.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+        cli.count.input.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
         vec!["R1.fastq".to_string(), "R2.fastq".to_string(), "lane2.fastq.gz".to_string()]
     );
-    assert!(cli.validate().is_ok());
+    assert!(cli.count.validate().is_ok());
 }
 
 /// A repeated flag must accumulate rather than replace: `-i a -i b` is how
@@ -133,7 +142,7 @@ fn several_inputs_are_collected_in_order_after_one_flag() {
 #[test]
 fn a_repeated_input_flag_accumulates() {
     let cli = Cli::parse_from(["fastdna", "-i", "a.fastq", "-i", "b.fastq"]);
-    assert_eq!(cli.input.len(), 2);
+    assert_eq!(cli.count.input.len(), 2);
 }
 
 /// Collecting several values must stop at the next flag, or `-o` and its
@@ -141,17 +150,17 @@ fn a_repeated_input_flag_accumulates() {
 #[test]
 fn multi_value_input_does_not_swallow_the_next_flag() {
     let cli = Cli::parse_from(["fastdna", "-i", "a.fastq", "b.fastq", "-o", "out.csv", "-k", "21"]);
-    assert_eq!(cli.input.len(), 2, "only the two files belong to --input");
-    assert_eq!(cli.output.to_string_lossy(), "out.csv");
-    assert_eq!(cli.kmer_size, 21);
+    assert_eq!(cli.count.input.len(), 2, "only the two files belong to --input");
+    assert_eq!(cli.count.output.to_string_lossy(), "out.csv");
+    assert_eq!(cli.count.kmer_size, 21);
 }
 
 #[test]
 fn a_bare_dash_is_accepted_as_the_stdin_input() {
     let cli = Cli::parse_from(["fastdna", "-i", "-"]);
-    assert_eq!(cli.input.len(), 1);
-    assert_eq!(cli.input[0].to_string_lossy(), "-");
-    assert!(cli.validate().is_ok(), "`-i -` alone is the documented stdin form");
+    assert_eq!(cli.count.input.len(), 1);
+    assert_eq!(cli.count.input[0].to_string_lossy(), "-");
+    assert!(cli.count.validate().is_ok(), "`-i -` alone is the documented stdin form");
 }
 
 /// stdin is a single unnamed stream: there is no way to read it "before" or
@@ -167,6 +176,7 @@ fn stdin_combined_with_a_file_is_rejected() {
     ] {
         let cli = Cli::parse_from(args.clone());
         let err = cli
+            .count
             .validate()
             .expect_err("`-` must be exclusive, but this was accepted: {args:?}");
         assert!(err.contains('-'), "message must mention the stdin form: {err}");
@@ -177,11 +187,11 @@ fn stdin_combined_with_a_file_is_rejected() {
 fn the_histogram_format_defaults_to_csv() {
     let cli = Cli::parse_from(["fastdna", "--input", "s.fastq", "--histogram", "h.csv"]);
     assert_eq!(
-        cli.histogram_format,
+        cli.count.histogram_format,
         CliHistogramFormat::Csv,
         "the format that already shipped must stay the default"
     );
-    assert_eq!(cli.histogram_max, None, "no cap unless asked for");
+    assert_eq!(cli.count.histogram_max, None, "no cap unless asked for");
 }
 
 #[test]
@@ -192,9 +202,9 @@ fn the_genomescope_histogram_format_is_selectable() {
         "--histogram-format", "genomescope",
         "--histogram-max", "10000",
     ]);
-    assert_eq!(cli.histogram_format, CliHistogramFormat::GenomeScope);
-    assert_eq!(cli.histogram_max, Some(10_000));
-    assert!(cli.validate().is_ok());
+    assert_eq!(cli.count.histogram_format, CliHistogramFormat::GenomeScope);
+    assert_eq!(cli.count.histogram_max, Some(10_000));
+    assert!(cli.count.validate().is_ok());
 }
 
 /// Depths start at 1, so a cap of 0 would keep nothing at all.
@@ -220,9 +230,9 @@ fn qc_and_histogram_paths_are_available_to_the_binary() {
         "--qc", "my_qc.json",
         "--histogram", "my_hist.csv",
     ]);
-    assert_eq!(cli.qc.to_string_lossy(), "my_qc.json");
+    assert_eq!(cli.count.qc.to_string_lossy(), "my_qc.json");
     assert_eq!(
-        cli.histogram.as_ref().map(|p| p.to_string_lossy().to_string()),
+        cli.count.histogram.as_ref().map(|p| p.to_string_lossy().to_string()),
         Some("my_hist.csv".to_string())
     );
 }

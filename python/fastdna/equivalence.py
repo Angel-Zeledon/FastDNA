@@ -183,12 +183,14 @@ the full column count.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 from scipy import sparse
+
+from fastdna import _core
 
 __all__ = ["EquivalenceClasses", "collapse_equivalence_classes"]
 
@@ -215,12 +217,12 @@ class EquivalenceClasses(NamedTuple):
         representative is always the first row of its group).
     """
 
-    matrix: object  # scipy.sparse.csr_matrix
-    representative: list
-    members: object  # pyarrow.Table
+    matrix: sparse.csr_matrix
+    representative: list[str]
+    members: pa.Table
 
 
-def collapse_equivalence_classes(matrix, kmer_sequences) -> EquivalenceClasses:
+def collapse_equivalence_classes(matrix: sparse.spmatrix, kmer_sequences: Sequence[str]) -> EquivalenceClasses:
     """Collapses columns of `matrix` that share an identical presence/
     absence profile into one equivalence class each.
 
@@ -270,7 +272,7 @@ def collapse_equivalence_classes(matrix, kmer_sequences) -> EquivalenceClasses:
 
     n_samples, n_kmers = matrix.shape
     if n_samples == 0 or n_kmers == 0:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"matrix is empty: shape {matrix.shape} has no "
             f"{'samples' if n_samples == 0 else 'k-mers'}. collapse_equivalence_classes() "
             "needs at least one sample and one k-mer column."
@@ -278,7 +280,7 @@ def collapse_equivalence_classes(matrix, kmer_sequences) -> EquivalenceClasses:
 
     kmer_sequences = list(kmer_sequences)
     if len(kmer_sequences) != n_kmers:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"kmer_sequences has {len(kmer_sequences)} entries but matrix has {n_kmers} "
             "columns. A silent mismatch here would label every class with the WRONG "
             "k-mer, so this is refused rather than truncated -- pass exactly the "

@@ -197,7 +197,11 @@ impl QcSummary {
             if e.is_io() {
                 FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
             } else {
-                FastDnaError::Export { path: path.to_path_buf(), reason: e.to_string() }
+                FastDnaError::Export {
+                    path: path.to_path_buf(),
+                    reason: e.to_string(),
+                    source: Some(Box::new(e)),
+                }
             }
         })?;
         writer.flush().map_err(to_err)?;

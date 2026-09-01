@@ -7,6 +7,13 @@ actionable causes are lab-side, not epidemiological: a swapped tube or
 mis-assigned barcode, a contaminated library, a failed prep, a sample
 that silently came from a different organism than the manifest says.
 
+Status: frozen
+--------------
+Per `docs/audit/PLAN.md` §2 ("Qué se poda"), this module is frozen: stable,
+not accepting new features, and a candidate for extraction into a separate
+`fastdna-contrib` package in a future release. Freezing is not deleting --
+see that section for the full reasoning behind the boundary.
+
 What this module is *not*
 -------------------------
 It is not pathogen surveillance, novelty detection, or an
@@ -120,10 +127,17 @@ sklearn's `"auto"`, which on a tight QC cohort flags roughly one in eight
 known-good samples.
 """
 
+from __future__ import annotations
+
+import os
+from typing import Any, Iterable, Sequence, Union
+
 import numpy as np
 import pyarrow as pa
 
+from . import _core
 from . import sketch as _sketch
+from fastdna import _PathLike
 
 __all__ = ["CohortOutlierFlagger", "flag_cohort"]
 
@@ -172,7 +186,7 @@ def _isolation_forest(detector_kwargs):
 def _validate_cohort_paths(paths):
     paths = [str(p) for p in paths]
     if len(paths) < _MIN_COHORT:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"a cohort of at least {_MIN_COHORT} samples is required to estimate a "
             f"robust reference distribution, got {len(paths)}. With fewer samples the "
             "median absolute deviation of the cohort's own distances is not an "
@@ -184,7 +198,7 @@ def _validate_cohort_paths(paths):
     seen = set()
     for path in paths:
         if path in seen:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"paths contains a duplicate entry: {path!r}. Each cohort member may "
                 "appear only once; a duplicated sample would contribute an exact 0.0 "
                 "distance to its own twin and pull that sample's statistic toward "
@@ -298,7 +312,14 @@ class CohortOutlierFlagger:
         reference distribution every later score is measured against.
     """
 
-    def __init__(self, k=21, sketch_size=1000, method="robust_zscore", threshold=3.5, **detector_kwargs):
+    def __init__(
+        self,
+        k: int = 21,
+        sketch_size: int = 1000,
+        method: str = "robust_zscore",
+        threshold: float = 3.5,
+        **detector_kwargs: Any,  # forwarded to the underlying detector; only robust_zscore's threshold is used here
+    ) -> None:
         """Validation happens here, at construction, rather than being
         deferred to `fit()`: an unrecognized `method`, an unusable
         `threshold`, or keyword arguments with nothing to forward them to
@@ -306,7 +327,7 @@ class CohortOutlierFlagger:
         nothing.
         """
         if method == "isolation_forest":
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "method='isolation_forest' is not available on CohortOutlierFlagger, "
                 "which scores NEW samples against an already-fitted cohort. An "
                 "isolation forest's splits come from the range its training data "
@@ -319,9 +340,9 @@ class CohortOutlierFlagger:
                 "meaningful past the cohort's own spread."
             )
         if method not in _METHODS:
-            raise ValueError(f"method must be one of {_METHODS!r}, got {method!r}")
+            raise _core.InvalidConfigError(f"method must be one of {_METHODS!r}, got {method!r}")
         if not threshold > 0:
-            raise ValueError(f"threshold must be a positive number of robust z units, got {threshold!r}")
+            raise _core.InvalidConfigError(f"threshold must be a positive number of robust z units, got {threshold!r}")
         if detector_kwargs:
             raise TypeError(
                 f"CohortOutlierFlagger got unexpected keyword arguments "
@@ -399,7 +420,7 @@ class CohortOutlierFlagger:
             stats[i] = float(np.median(X[i][members != path]))
         return stats
 
-    def fit(self, paths):
+    def fit(self, paths: Iterable[Union[str, os.PathLike]]) -> "CohortOutlierFlagger":
         """`paths`: the cohort defining "normal" (FASTQ(.gz) file paths).
 
         Sketches each once, computes every member's leave-one-out cohort
@@ -429,7 +450,7 @@ class CohortOutlierFlagger:
         paths = [str(p) for p in paths]
         return self._features([self._sketch_path(p) for p in paths])
 
-    def cohort_distance(self, paths):
+    def cohort_distance(self, paths: Iterable[Union[str, os.PathLike]]) -> np.ndarray:
         """Each path's cohort distance -- the median Mash distance to the
         fitted cohort, leave-one-out for cohort members themselves. This is
         the single scalar every score and label below is derived from, in
@@ -439,7 +460,7 @@ class CohortOutlierFlagger:
         paths = [str(p) for p in paths]
         return self._summarize(self._features([self._sketch_path(p) for p in paths]), paths)
 
-    def score_samples(self, paths):
+    def score_samples(self, paths: Iterable[Union[str, os.PathLike]]) -> np.ndarray:
         """The scikit-learn-convention anomaly score: **higher means more
         normal**, one entry per path, same order as `paths`.
 
@@ -451,7 +472,7 @@ class CohortOutlierFlagger:
         """
         return -self.outlier_scores(paths)
 
-    def outlier_scores(self, paths):
+    def outlier_scores(self, paths: Iterable[Union[str, os.PathLike]]) -> np.ndarray:
         """The same score with the sign a QC reader expects: **higher means
         more unusual**. Exactly `-score_samples(paths)`.
 
@@ -464,7 +485,7 @@ class CohortOutlierFlagger:
         distances = self.cohort_distance(paths)
         return _robust_z(distances, self.center_, self.scale_)
 
-    def predict(self, paths):
+    def predict(self, paths: Iterable[Union[str, os.PathLike]]) -> np.ndarray:
         """`1` (looks normal) or `-1` (flag for review) per path, in order --
         the same convention `IsolationForest.predict`/`OneClassSVM.predict`
         use, so this class does not invent a competing one.
@@ -478,7 +499,7 @@ class CohortOutlierFlagger:
         scores = self.outlier_scores(paths)
         return np.where(scores > self.threshold, -1, 1)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         fitted = "unfitted" if self._cohort_sketches is None else f"fitted on {len(self.cohort_paths_)} samples"
         return (
             f"CohortOutlierFlagger(k={self.k}, sketch_size={self.sketch_size}, "
@@ -486,7 +507,15 @@ class CohortOutlierFlagger:
         )
 
 
-def flag_cohort(paths, *, k=21, sketch_size=1000, method="robust_zscore", threshold=3.5, **detector_kwargs):
+def flag_cohort(
+    paths: Sequence[_PathLike],
+    *,
+    k: int = 21,
+    sketch_size: int = 1000,
+    method: str = "robust_zscore",
+    threshold: float = 3.5,
+    **detector_kwargs: Any,  # forwarded verbatim to IsolationForest when method="isolation_forest"
+) -> pa.Table:
     """Screens a cohort against itself: "these samples all arrived together
     and should be comparable -- which one is not?"
 
@@ -502,7 +531,7 @@ def flag_cohort(paths, *, k=21, sketch_size=1000, method="robust_zscore", thresh
 
     Parameters
     ----------
-    paths : iterable of str or pathlib.Path
+    paths : sequence of str or pathlib.Path
         The cohort, at least `4` samples (see `_MIN_COHORT`). Duplicates are
         refused.
     k, sketch_size : forwarded to `fastdna.sketch()` for every sample.
@@ -539,7 +568,7 @@ def flag_cohort(paths, *, k=21, sketch_size=1000, method="robust_zscore", thresh
     within one call).
     """
     if method not in _METHODS:
-        raise ValueError(f"method must be one of {_METHODS!r}, got {method!r}")
+        raise _core.InvalidConfigError(f"method must be one of {_METHODS!r}, got {method!r}")
 
     paths = _validate_cohort_paths(paths)
 

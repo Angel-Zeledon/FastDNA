@@ -759,7 +759,14 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
 
     let estimated_occurrences =
         policy.estimated_input_bytes.map(mem_estimate::estimate_occurrences_from_bytes).unwrap_or(0);
-    let estimated_peak_bytes = mem_estimate::estimate_peak_bytes(estimated_occurrences, config.num_threads);
+    // The in-memory strategy's predicted peak. This is the number the
+    // automatic chooser needs and the only one it may use, because the
+    // question it asks is precisely "would an in-memory run fit?" -- the
+    // fallback to `Disk` below is what happens when the answer is no. It is
+    // *not* necessarily the number reported, which is the peak of whichever
+    // strategy actually got chosen; see `estimated_peak_bytes` at the end.
+    let in_memory_peak_bytes =
+        mem_estimate::estimate_peak_bytes(estimated_occurrences, config.num_threads);
 
     let env_strategy = std::env::var("FASTDNA_STRATEGY").ok().and_then(|s| match s.trim() {
         "disk" => Some(CountStrategy::Disk),
@@ -777,7 +784,7 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
         None => match env_strategy {
             Some(s) => (s, true),
             None => {
-                let auto = if policy.estimated_input_bytes.is_some() && estimated_peak_bytes > budget_bytes {
+                let auto = if policy.estimated_input_bytes.is_some() && in_memory_peak_bytes > budget_bytes {
                     CountStrategy::Disk
                 } else {
                     CountStrategy::InMemory
@@ -789,6 +796,43 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
                 (auto, policy.max_ram_bytes.is_none() && env_max_ram.is_some())
             }
         },
+    };
+
+    // Report the predicted peak of the strategy that was actually chosen,
+    // not of the one the chooser happened to evaluate. Before
+    // `mem_estimate::estimate_binned_peak_bytes` existed there was only one
+    // model, so `--strategy binned` was reported with the in-memory
+    // strategy's prediction -- on the benchmark input that is 8.34 GB
+    // announced for a run the design says costs 2.36 GiB, i.e. an error
+    // larger than the entire footprint being predicted. A user picks
+    // `binned` precisely to fit a run into memory it otherwise would not,
+    // which makes that specific line the one they are most likely to be
+    // reading, and the worst one to leave wrong.
+    //
+    // The automatic decision above is deliberately untouched by this: it
+    // still branches on `in_memory_peak_bytes` alone, so which strategy
+    // `auto` picks is bit-identical to before. Only the reported figure
+    // moves, and only for a strategy `auto` cannot select.
+    //
+    // `Disk` keeps the in-memory model's figure. That is also not the right
+    // number for it -- the whole point of spilling is that peak RSS stops
+    // tracking `threads * distinct_kmers` -- but building and justifying a
+    // disk model is not this change's subject, and substituting a guess
+    // would be exactly the invented number `docs/PERFORMANCE_PLAN.md`
+    // forbids. It is left visibly as it was rather than quietly improved.
+    let estimated_peak_bytes = match strategy {
+        CountStrategy::Binned => {
+            // The same config `process_stream_parallel_binned` builds, so
+            // the prediction describes the run that will actually happen.
+            let binned = BinnedConfig::new(config.k).sanitized();
+            mem_estimate::estimate_binned_peak_bytes(
+                estimated_occurrences,
+                config.num_threads,
+                binned.num_bins,
+                binned.chunk_bytes,
+            )
+        }
+        CountStrategy::InMemory | CountStrategy::Disk => in_memory_peak_bytes,
     };
 
     StrategyDecision { strategy, estimated_occurrences, estimated_peak_bytes, budget_bytes, env_override_applied }
@@ -1508,5 +1552,78 @@ mod tests {
             !decision.env_override_applied,
             "the env var did not shape this decision and must not claim credit"
         );
+    }
+
+    /// A run forced onto `binned` must be reported with the *binned* memory
+    /// model's prediction. Reporting the in-memory model's figure -- what
+    /// this did before `mem_estimate::estimate_binned_peak_bytes` existed --
+    /// told a user who chose `binned` specifically to fit a constrained
+    /// machine that the run would cost several times what the design says it
+    /// costs.
+    ///
+    /// Asserted against `estimate_binned_peak_bytes` itself rather than a
+    /// hard-coded byte count, so re-calibrating that model (which is
+    /// structural today and explicitly wants replacing with a measured one)
+    /// does not require editing this test to keep it honest.
+    #[test]
+    fn a_binned_decision_reports_the_binned_memory_model_not_the_in_memory_one() {
+        let input_bytes = 2_299_666_912u64;
+        let threads = 8usize;
+        let policy = MemoryPolicy {
+            strategy: Some(CountStrategy::Binned),
+            max_ram_bytes: Some(64 << 30),
+            estimated_input_bytes: Some(input_bytes),
+        };
+        let config = PipelineConfig { num_threads: threads, ..PipelineConfig::default() };
+        let decision = resolve_strategy(&policy, &config);
+
+        let binned = BinnedConfig::new(config.k).sanitized();
+        let expected = mem_estimate::estimate_binned_peak_bytes(
+            decision.estimated_occurrences,
+            threads,
+            binned.num_bins,
+            binned.chunk_bytes,
+        );
+        assert_eq!(decision.estimated_peak_bytes, expected);
+
+        // And it must actually be the smaller number -- otherwise the whole
+        // reason to reach for this strategy would be missing, and the change
+        // above would be cosmetic.
+        let in_memory = mem_estimate::estimate_peak_bytes(decision.estimated_occurrences, threads);
+        assert!(
+            decision.estimated_peak_bytes < in_memory,
+            "binned predicted {} bytes against in-memory's {in_memory}",
+            decision.estimated_peak_bytes
+        );
+    }
+
+    /// The counterpart guarantee: introducing a second memory model must not
+    /// have moved the automatic chooser. For every strategy `auto` can
+    /// actually reach, the reported peak is still exactly
+    /// `mem_estimate::estimate_peak_bytes` -- the same value the branch that
+    /// picks between `InMemory` and `Disk` is computed from -- across the
+    /// same input/thread/budget grid
+    /// `the_automatic_chooser_never_selects_the_binned_strategy` sweeps.
+    #[test]
+    fn automatic_decisions_still_report_the_in_memory_model_unchanged() {
+        for input_bytes in [None, Some(0u64), Some(4096), Some(2_140_000_000), Some(100 << 30)] {
+            for threads in [1usize, 8, 64] {
+                for max_ram in [None, Some(0u64), Some(1 << 40)] {
+                    let policy = MemoryPolicy {
+                        strategy: None,
+                        max_ram_bytes: max_ram,
+                        estimated_input_bytes: input_bytes,
+                    };
+                    let config = PipelineConfig { num_threads: threads, ..PipelineConfig::default() };
+                    let decision = resolve_strategy(&policy, &config);
+                    assert_eq!(
+                        decision.estimated_peak_bytes,
+                        mem_estimate::estimate_peak_bytes(decision.estimated_occurrences, threads),
+                        "the reported peak drifted from the in-memory model at \
+                         {input_bytes:?} bytes, {threads} threads, budget {max_ram:?}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -430,7 +430,11 @@ impl GenomeSketch {
             if e.is_io() {
                 FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
             } else {
-                FastDnaError::Export { path: path.to_path_buf(), reason: e.to_string() }
+                FastDnaError::Export {
+                    path: path.to_path_buf(),
+                    reason: e.to_string(),
+                    source: Some(Box::new(e)),
+                }
             }
         })?;
         writer.flush().map_err(to_err)?;
@@ -455,7 +459,8 @@ impl GenomeSketch {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
-        let load_err = |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason };
+        let load_err =
+            |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason, source: None };
 
         let file = File::open(path).map_err(to_err)?;
         let reader = BufReader::new(file);
@@ -463,7 +468,11 @@ impl GenomeSketch {
             if e.is_io() {
                 FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
             } else {
-                load_err(e.to_string())
+                FastDnaError::Load {
+                    path: path.to_path_buf(),
+                    reason: e.to_string(),
+                    source: Some(Box::new(e)),
+                }
             }
         })?;
 
@@ -762,7 +771,11 @@ impl FracSketch {
             if e.is_io() {
                 FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
             } else {
-                FastDnaError::Export { path: path.to_path_buf(), reason: e.to_string() }
+                FastDnaError::Export {
+                    path: path.to_path_buf(),
+                    reason: e.to_string(),
+                    source: Some(Box::new(e)),
+                }
             }
         })?;
         writer.flush().map_err(to_err)?;
@@ -777,7 +790,8 @@ impl FracSketch {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let to_err = |e: std::io::Error| FastDnaError::Io { path: path.to_path_buf(), source: e };
-        let load_err = |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason };
+        let load_err =
+            |reason: String| FastDnaError::Load { path: path.to_path_buf(), reason, source: None };
 
         let file = File::open(path).map_err(to_err)?;
         let reader = BufReader::new(file);
@@ -785,7 +799,11 @@ impl FracSketch {
             if e.is_io() {
                 FastDnaError::Io { path: path.to_path_buf(), source: e.into() }
             } else {
-                load_err(e.to_string())
+                FastDnaError::Load {
+                    path: path.to_path_buf(),
+                    reason: e.to_string(),
+                    source: Some(Box::new(e)),
+                }
             }
         })?;
 

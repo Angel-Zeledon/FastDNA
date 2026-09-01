@@ -31,7 +31,18 @@ what that process actually decided.
 """
 from __future__ import annotations
 
-from . import _column_as_array
+from typing import TYPE_CHECKING, Any, Optional, Sequence
+
+from . import _column_as_array, _core
+
+if TYPE_CHECKING:
+    # matplotlib, numpy and scipy are soft dependencies of this module (imported
+    # lazily, inside the functions that need them); pyarrow is a hard dependency
+    # of the fastdna package but this module never needs the module itself, only
+    # Table instances passed in as arguments. Both imports here only run for
+    # static type checkers, so neither forces an eager import at module load time.
+    import matplotlib.axes
+    import pyarrow as pa
 
 __all__ = ["plot_significance", "plot_population_structure"]
 
@@ -80,7 +91,14 @@ def _scipy_hierarchy():
     return dendrogram, linkage, squareform
 
 
-def plot_significance(table, *, x="index", positions=None, threshold_lines=True, ax=None):
+def plot_significance(
+    table: "pa.Table",
+    *,
+    x: str = "index",
+    positions: Optional[Sequence[float]] = None,
+    threshold_lines: bool = True,
+    ax: Optional["matplotlib.axes.Axes"] = None,
+) -> "matplotlib.axes.Axes":
     """Plots a significance scatter, in the visual style of a Manhattan
     plot, over `table` -- the `pyarrow.Table` :func:`fastdna.gwas.
     prefilter_association` returns (or any table with the same
@@ -146,20 +164,20 @@ def plot_significance(table, *, x="index", positions=None, threshold_lines=True,
         `"position"`; `x="position"` without `positions`; `positions` given
         with `x="index"`; or `positions` does not have one entry per row of
         `table`.
-
-    `matplotlib` is imported lazily here and is not a dependency of
-    `fastdna`; a missing install raises an `ImportError` naming the package
-    and the install command.
+    ImportError
+        `matplotlib` is not installed. Named explicitly, with the install
+        command, rather than a raw `ModuleNotFoundError` -- `matplotlib`
+        is imported lazily here and is not a dependency of `fastdna`.
     """
     plt = _matplotlib_pyplot()
     np = _numpy()
 
     if x not in ("index", "position"):
-        raise ValueError(f"x must be 'index' or 'position', got {x!r}")
+        raise _core.InvalidConfigError(f"x must be 'index' or 'position', got {x!r}")
 
     missing = [c for c in _REQUIRED_SIGNIFICANCE_COLUMNS if c not in table.column_names]
     if missing:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"table is missing required column(s) {missing}. plot_significance() expects the "
             "shape gwas.prefilter_association() returns -- kmer_sequence, p_value, p_bonferroni "
             f"and q_value_bh at minimum -- but this table only has {list(table.column_names)}."
@@ -172,7 +190,7 @@ def plot_significance(table, *, x="index", positions=None, threshold_lines=True,
 
     if x == "position":
         if positions is None:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "x='position' requires a companion `positions` array of real genomic "
                 "coordinates (e.g. from a gene-annotation lookup step) -- pass "
                 "positions=[...], or omit x (or pass x='index') to plot k-mers in the "
@@ -181,7 +199,7 @@ def plot_significance(table, *, x="index", positions=None, threshold_lines=True,
             )
         positions = np.asarray(positions)
         if positions.shape[0] != n:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 f"positions has {positions.shape[0]} entries but table has {n} rows; they "
                 "must line up one-to-one, positions[i] for table row i."
             )
@@ -189,7 +207,7 @@ def plot_significance(table, *, x="index", positions=None, threshold_lines=True,
         x_label = "genomic position"
     else:
         if positions is not None:
-            raise ValueError(
+            raise _core.InvalidConfigError(
                 "positions was given but x='index' does not use it (it would be silently "
                 "ignored). Pass x='position' to plot against these coordinates."
             )
@@ -243,7 +261,14 @@ def _group_color_map(groups, cmap):
     return {label: cmap(i % cmap.N) for i, label in enumerate(seen)}
 
 
-def plot_population_structure(distance_matrix, sample_ids, *, groups=None, kind="dendrogram", ax=None):
+def plot_population_structure(
+    distance_matrix: Any,  # array-like (numpy.ndarray or nested sequence); numpy is a lazy/soft dependency here
+    sample_ids: Sequence[str],
+    *,
+    groups: Optional[Sequence[Any]] = None,
+    kind: str = "dendrogram",
+    ax: Optional["matplotlib.axes.Axes"] = None,
+) -> "matplotlib.axes.Axes":
     """Plots the cohort's Mash-distance population structure -- a
     dendrogram or a heatmap -- optionally colored by group labels so a
     caller can see which samples a leakage-safe CV split (or any other
@@ -303,31 +328,32 @@ def plot_population_structure(distance_matrix, sample_ids, *, groups=None, kind=
         Non-square `distance_matrix`; `sample_ids` length does not match
         it; the matrix is not symmetric; `groups` length does not match it;
         `kind` is not `"dendrogram"` or `"heatmap"`.
-
-    `matplotlib` and `scipy` are imported lazily here and are not
-    dependencies of `fastdna`; a missing install raises an `ImportError`
-    naming the package and the install command.
+    ImportError
+        `matplotlib` or `scipy` is not installed. Named explicitly, with
+        the install command, rather than a raw `ModuleNotFoundError` --
+        neither is a dependency of `fastdna`; both are imported lazily
+        here.
     """
     plt = _matplotlib_pyplot()
     np = _numpy()
     dendrogram, linkage, squareform = _scipy_hierarchy()
 
     if kind not in ("dendrogram", "heatmap"):
-        raise ValueError(f"kind must be 'dendrogram' or 'heatmap', got {kind!r}")
+        raise _core.InvalidConfigError(f"kind must be 'dendrogram' or 'heatmap', got {kind!r}")
 
     matrix = np.asarray(distance_matrix, dtype=np.float64)
     sample_ids = list(sample_ids)
     n = len(sample_ids)
 
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
-        raise ValueError(f"distance_matrix must be square, got shape {matrix.shape}")
+        raise _core.InvalidConfigError(f"distance_matrix must be square, got shape {matrix.shape}")
     if matrix.shape[0] != n:
-        raise ValueError(
+        raise _core.InvalidConfigError(
             f"sample_ids has {n} entries but distance_matrix is {matrix.shape[0]}x{matrix.shape[0]}; "
             "they must have the same length, one id per row/column."
         )
     if not np.allclose(matrix, matrix.T, atol=1e-8):
-        raise ValueError(
+        raise _core.InvalidConfigError(
             "distance_matrix is not symmetric: some (i, j) entry disagrees with (j, i) by more "
             "than floating-point tolerance. A genuine Mash-distance matrix (e.g. from "
             "gwas.kinship_matrix or compare_all) is symmetric by construction, so this usually "
@@ -339,7 +365,7 @@ def plot_population_structure(distance_matrix, sample_ids, *, groups=None, kind=
     if groups is not None:
         groups = np.asarray(groups)
         if groups.shape[0] != n:
-            raise ValueError(f"groups has {groups.shape[0]} entries but there are {n} samples")
+            raise _core.InvalidConfigError(f"groups has {groups.shape[0]} entries but there are {n} samples")
 
     # checks=False: the matrix is symmetric with a (near-)zero diagonal by
     # construction/validation above, and squareform's own strict

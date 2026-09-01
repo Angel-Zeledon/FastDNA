@@ -242,6 +242,70 @@ pub type BoxedStream = Box<dyn BufRead + Send + 'static>;
 /// The size of the read buffer every input stream gets, gzip or plain.
 const STREAM_BUFFER_BYTES: usize = 128 * 1024;
 
+// This crate's gzip handling -- sniffing (`looks_gzipped`), stream-wrapping
+// (`decode_sniffing_gzip`), and the two call sites below that build a
+// `MultiGzDecoder` directly (`from_path`, `InputSpec::open`) -- all go
+// through `flate2`. `Cargo.toml` pins `flate2 = "1.0"` with no backend
+// feature enabled by default, so `flate2` uses its default backend,
+// `miniz_oxide`: pure Rust, no C toolchain needed to build this crate, and
+// measurably slower at inflate than the C implementations `flate2` can
+// also use.
+//
+// Decompression happens on the pipeline's producer thread, in series with
+// reading -- see the comment inside `from_path` below -- so for real gzip
+// input this is on the critical path of every run. It does not show up in
+// `docs/BENCHMARKS.md` because that file's reference input is plain FASTQ;
+// real SRA/ENA downloads are gzip, so a real user pays this cost on every
+// run that number does not.
+//
+// `docs/audit/performance-v2.md` (G-4) proposed making flate2's `zlib-ng`
+// feature unconditional, citing a claimed 2-3x inflate speedup, but said
+// in its own words to measure before shipping it ("hay que medirlo antes
+// de darlo por bueno"). Measured, not assumed: built this crate twice in
+// the same `rust:1-slim-bookworm` container this project's Docker-only
+// verification already uses (there is no local Rust toolchain to measure
+// natively), once with default features and once with `--features
+// zlib-ng`, and ran a harness that calls `FastqReader::from_path` and
+// drains every record via `next_record_into` -- this crate's actual read
+// path, not a synthetic zlib microbenchmark -- against a realistic 348 MB
+// synthetic `.fastq.gz` (1,066,666 reads, 160M bases, generated with
+// `scripts/bench/generate_reads_large.py`, gzip level 6, ~75 MB
+// compressed). Three runs each, same container, same file, wall clock end
+// to end:
+//
+//                run 1     run 2     run 3    median
+//   miniz_oxide  8.24 s    8.25 s    6.64 s    8.24 s
+//   zlib-ng      2.05 s    2.16 s    4.38 s    2.16 s
+//
+// zlib-ng wins every single pairing, including the most adversarial one
+// (its slowest run, 4.38 s, against miniz_oxide's fastest, 6.64 s: still
+// 1.5x faster). Median-to-median is 3.8x; mean-to-mean, which does not
+// discard either backend's one noisy run, is 2.7x. Either way this clears
+// the plan's claimed 2-3x, on this machine, on this file.
+//
+// The cost the plan flagged is real: `flate2/zlib-ng` pulls in
+// `libz-ng-sys`, which needs a C compiler and `cmake` at build time --
+// both had to be `apt-get install`ed into the container above; neither is
+// there by default. Today this crate needs neither. `compile.bat`, the
+// documented native-Windows build path, is a bare `cargo build --release`
+// with no toolchain setup of its own, and this session has no way to
+// confirm a C toolchain and cmake are present wherever that script
+// actually gets run, nor to test the macOS legs of
+// `.github/workflows/wheels.yml` at all -- only Linux x86_64, in Docker,
+// was verified here. Making zlib-ng unconditional would trade a measured,
+// real speedup for an unmeasured, real risk of breaking a build this
+// session cannot see.
+//
+// So: opt-in, not default. `[features] zlib-ng = ["flate2/zlib-ng"]` in
+// `Cargo.toml` turns it on (`cargo build --release --features zlib-ng`,
+// or for the Python wheel `maturin build --release --features
+// python,zlib-ng`) on a machine known to have a C toolchain and cmake --
+// true of the manylinux containers and Bioconda that
+// `docs/audit/performance-v2.md` itself names. `default = []` leaves
+// every build that does not opt in -- `compile.bat`, plain `cargo
+// build`/`test`/`clippy`, and every leg of `wheels.yml` as it stands
+// today -- on miniz_oxide, unchanged.
+
 /// Whether a stream's first bytes are the gzip magic number (`1f 8b`).
 ///
 /// Extension-based detection is fine for a named file and impossible for a
@@ -259,7 +323,10 @@ pub fn looks_gzipped(prefix: &[u8]) -> bool {
 /// of it.
 ///
 /// `MultiGzDecoder`, not `GzDecoder`: see `FastqReader::from_path` for why
-/// multi-member support is required rather than merely nice.
+/// multi-member support is required rather than merely nice. Which
+/// *backend* flate2 uses to inflate (miniz_oxide vs zlib-ng) is a separate,
+/// build-time choice -- see the comment above `STREAM_BUFFER_BYTES` in this
+/// file for the G-4 measurement and decision.
 pub fn decode_sniffing_gzip(mut stream: BoxedStream) -> io::Result<BoxedStream> {
     let gzipped = looks_gzipped(stream.fill_buf()?);
     if gzipped {
@@ -307,6 +374,10 @@ impl InputSpec {
     /// Opens the stream, decompressing gzip. A named file is decided by
     /// extension (unchanged from `FastqReader::from_path`); stdin has no
     /// extension to consult, so it is decided by magic bytes.
+    ///
+    /// The gzip backend compiled in (miniz_oxide by default, zlib-ng if
+    /// built with `--features zlib-ng`) is the same for every branch here;
+    /// see the comment above `STREAM_BUFFER_BYTES` in this file.
     fn open(&self) -> io::Result<BoxedStream> {
         match self {
             InputSpec::File(path) => {
@@ -369,6 +440,10 @@ impl FastqReader<Box<dyn BufRead + Send>> {
         // `ffi.rs`) already decodes all members, and `preview`/`sketch`/
         // `hll` reading a truncated prefix of the same file must not
         // disagree with it.
+        //
+        // Which *backend* flate2 uses to inflate (miniz_oxide vs zlib-ng)
+        // is a build-time choice, not a call here -- see the comment above
+        // `STREAM_BUFFER_BYTES` for the G-4 measurement and decision.
         let reader: Box<dyn BufRead + Send> = if is_gzipped {
             Box::new(BufReader::with_capacity(128 * 1024, MultiGzDecoder::new(file)))
         } else {
@@ -878,6 +953,141 @@ impl RecordSource for MultiSourceReader {
             });
         }
         Ok(())
+    }
+}
+
+/// Which mate of a pair a `PairedSourceReader` operation concerns. Used
+/// only to attribute an error or a desynchronization to the right side when
+/// reporting it -- see `PairedReadError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairedRecordSide {
+    R1,
+    R2,
+}
+
+impl PairedRecordSide {
+    /// The label used in error messages -- "R1"/"R2", matching this
+    /// crate's own `--input`/`--input2` flag naming and BBDuk's `in1=`/
+    /// `in2=` convention it mirrors.
+    pub fn label(self) -> &'static str {
+        match self {
+            PairedRecordSide::R1 => "R1",
+            PairedRecordSide::R2 => "R2",
+        }
+    }
+}
+
+/// The ways `PairedSourceReader::next_pair_into` can fail. Kept separate
+/// from `FastqReadError` (rather than reusing it directly) because a
+/// paired read has one extra failure mode plain `FastqReadError` has no
+/// room for: the two mate streams disagreeing about how many records they
+/// hold in total ("desync") -- see `Desync`'s own doc comment.
+#[derive(Debug)]
+pub enum PairedReadError {
+    /// Reading one mate's stream failed at the I/O level. Not a data
+    /// problem.
+    Io(PairedRecordSide, io::Error),
+    /// One mate's stream yielded a structurally invalid record.
+    Malformed(PairedRecordSide, String),
+    /// One mate's stream ended before its partner's: the two sides do not
+    /// hold the same total number of records, so there is no way to keep
+    /// stepping them together past this point. Names the side that ran out
+    /// first (the shorter stream) -- the side that is *not* named still had
+    /// at least one more record waiting, now orphaned.
+    Desync(PairedRecordSide),
+}
+
+/// Reads two lists of input files in lock-step, yielding synchronized
+/// (R1, R2) record pairs -- the paired-end counterpart of
+/// `MultiSourceReader`'s single concatenated stream, used wherever a
+/// decision must be made once per *pair*, not once per read (see
+/// `read_filter::filter_records_paired`).
+///
+/// `r1` and `r2` are each read exactly the way `MultiSourceReader` already
+/// reads a single-end input list -- several files opened lazily, one at a
+/// time, and concatenated into one stream -- and the two concatenated
+/// streams are then stepped together, record by record. This deliberately
+/// does *not* require `r1` and `r2` to name the same number of individual
+/// files: an R1 side split across two lane files and an R2 side already
+/// concatenated into one still pair up correctly, as long as the two
+/// sides' *total* record counts agree, because pairing happens against
+/// each side's flattened stream position, not its file boundaries.
+/// Nothing here re-implements FASTQ/FASTA parsing, gzip detection, or
+/// per-file bookkeeping: both sides are plain `MultiSourceReader`s, reused
+/// wholesale.
+///
+/// A genuine mismatch -- the two sides' total record counts actually
+/// differ -- is not silently tolerated by truncating to the shorter
+/// stream (which would silently drop the longer side's tail with no
+/// diagnostic, precisely the kind of silent data loss this crate's
+/// conventions reject). It surfaces as `PairedReadError::Desync` the
+/// moment one side runs out while the other still has a record.
+pub struct PairedSourceReader {
+    r1: MultiSourceReader,
+    r2: MultiSourceReader,
+}
+
+/// One side's answer from `PairedSourceReader::current_sources` -- the
+/// file (and how many records have been read from it so far) that side is
+/// currently reading, or `None` if it has no file of its own yet. Same
+/// shape as `MultiSourceReader::current_source`'s own return type, named
+/// here only so `current_sources` does not have to spell out a tuple of
+/// two of them inline.
+pub type PairedSourceLocation = Option<(PathBuf, u64)>;
+
+impl PairedSourceReader {
+    pub fn new(r1: Vec<InputSpec>, r2: Vec<InputSpec>) -> Self {
+        PairedSourceReader { r1: MultiSourceReader::new(r1), r2: MultiSourceReader::new(r2) }
+    }
+
+    /// Rejects an empty side before any work is scheduled. Delegates to
+    /// each `MultiSourceReader::validate`, so "no R1 files" and "no R2
+    /// files" are both caught the same way `MultiSourceReader` already
+    /// catches "no input files" for a single-end run.
+    pub fn validate(&self) -> Result<()> {
+        self.r1.validate()?;
+        self.r2.validate()
+    }
+
+    /// The file (and per-file record count) each side is currently
+    /// reading, for error attribution -- see `MultiSourceReader::
+    /// current_source`. `PairedSourceLocation` names the per-side half of
+    /// this pair so the type does not have to be spelled out inline (which
+    /// is what clippy's `type_complexity` lint objects to).
+    pub fn current_sources(&self) -> (PairedSourceLocation, PairedSourceLocation) {
+        (self.r1.current_source(), self.r2.current_source())
+    }
+
+    /// Reads the next record from each side into `rec1`/`rec2`. Returns
+    /// `Ok(true)` when both sides yielded a record, `Ok(false)` when both
+    /// are exhausted (the run is done), and `Err` for any I/O failure,
+    /// malformed record, or desynchronization between the two sides -- see
+    /// `PairedReadError`.
+    ///
+    /// Both sides are always read, even when the first of the two already
+    /// failed: a desync can only be told apart from an ordinary end of
+    /// stream by seeing what the *other* side did on the same step.
+    pub fn next_pair_into(
+        &mut self,
+        rec1: &mut FastqRecord,
+        rec2: &mut FastqRecord,
+    ) -> std::result::Result<bool, PairedReadError> {
+        let got1 = self.r1.next_record_into(rec1);
+        let got2 = self.r2.next_record_into(rec2);
+        match (got1, got2) {
+            (Err(FastqReadError::Io(e)), _) => Err(PairedReadError::Io(PairedRecordSide::R1, e)),
+            (Err(FastqReadError::Malformed(reason)), _) => {
+                Err(PairedReadError::Malformed(PairedRecordSide::R1, reason))
+            }
+            (_, Err(FastqReadError::Io(e))) => Err(PairedReadError::Io(PairedRecordSide::R2, e)),
+            (_, Err(FastqReadError::Malformed(reason))) => {
+                Err(PairedReadError::Malformed(PairedRecordSide::R2, reason))
+            }
+            (Ok(true), Ok(true)) => Ok(true),
+            (Ok(false), Ok(false)) => Ok(false),
+            (Ok(true), Ok(false)) => Err(PairedReadError::Desync(PairedRecordSide::R2)),
+            (Ok(false), Ok(true)) => Err(PairedReadError::Desync(PairedRecordSide::R1)),
+        }
     }
 }
 
@@ -1457,5 +1667,125 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -- PairedSourceReader ---------------------------------------------
+
+    #[test]
+    fn paired_reader_pairs_records_from_two_single_files() {
+        let fx = Fixture::new("paired_basic");
+        let r1 = fx.write("r1.fastq", b"@a/1\nACGT\n+\nIIII\n@b/1\nTTTT\n+\nIIII\n");
+        let r2 = fx.write("r2.fastq", b"@a/2\nGGGG\n+\nIIII\n@b/2\nCCCC\n+\nIIII\n");
+
+        let mut reader =
+            PairedSourceReader::new(vec![InputSpec::File(r1)], vec![InputSpec::File(r2)]);
+        reader.validate().expect("both sides have files");
+
+        let mut rec1 = FastqRecord::default();
+        let mut rec2 = FastqRecord::default();
+
+        assert!(reader.next_pair_into(&mut rec1, &mut rec2).expect("pair 1"));
+        assert_eq!(rec1.seq, b"ACGT");
+        assert_eq!(rec2.seq, b"GGGG");
+
+        assert!(reader.next_pair_into(&mut rec1, &mut rec2).expect("pair 2"));
+        assert_eq!(rec1.seq, b"TTTT");
+        assert_eq!(rec2.seq, b"CCCC");
+
+        assert!(!reader.next_pair_into(&mut rec1, &mut rec2).expect("both exhausted"));
+    }
+
+    /// The two sides do not need the same number of *files*, only the same
+    /// total record count -- pairing is against each side's flattened
+    /// stream position, not its file boundaries.
+    #[test]
+    fn paired_reader_pairs_correctly_when_file_counts_differ_but_totals_match() {
+        let fx = Fixture::new("paired_uneven_files");
+        let r1_a = fx.write("r1_lane1.fastq", b"@a/1\nAAAA\n+\nIIII\n");
+        let r1_b = fx.write("r1_lane2.fastq", b"@b/1\nTTTT\n+\nIIII\n");
+        let r2_one = fx.write("r2_combined.fastq", b"@a/2\nGGGG\n+\nIIII\n@b/2\nCCCC\n+\nIIII\n");
+
+        let mut reader = PairedSourceReader::new(
+            vec![InputSpec::File(r1_a), InputSpec::File(r1_b)],
+            vec![InputSpec::File(r2_one)],
+        );
+        reader.validate().expect("both sides have files");
+
+        let mut rec1 = FastqRecord::default();
+        let mut rec2 = FastqRecord::default();
+
+        assert!(reader.next_pair_into(&mut rec1, &mut rec2).expect("pair 1"));
+        assert_eq!(rec1.seq, b"AAAA");
+        assert_eq!(rec2.seq, b"GGGG");
+
+        assert!(reader.next_pair_into(&mut rec1, &mut rec2).expect("pair 2"));
+        assert_eq!(rec1.seq, b"TTTT");
+        assert_eq!(rec2.seq, b"CCCC");
+
+        assert!(!reader.next_pair_into(&mut rec1, &mut rec2).expect("both exhausted"));
+    }
+
+    #[test]
+    fn paired_reader_reports_desync_when_r1_has_an_extra_record() {
+        let fx = Fixture::new("paired_desync_r1_longer");
+        let r1 = fx.write("r1.fastq", b"@a/1\nACGT\n+\nIIII\n@b/1\nTTTT\n+\nIIII\n");
+        let r2 = fx.write("r2.fastq", b"@a/2\nGGGG\n+\nIIII\n");
+
+        let mut reader =
+            PairedSourceReader::new(vec![InputSpec::File(r1)], vec![InputSpec::File(r2)]);
+        let mut rec1 = FastqRecord::default();
+        let mut rec2 = FastqRecord::default();
+
+        assert!(reader.next_pair_into(&mut rec1, &mut rec2).expect("pair 1"));
+        match reader.next_pair_into(&mut rec1, &mut rec2) {
+            Err(PairedReadError::Desync(PairedRecordSide::R2)) => {}
+            other => panic!("expected Desync(R2) since R2 ran out first, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paired_reader_reports_desync_when_r2_has_an_extra_record() {
+        let fx = Fixture::new("paired_desync_r2_longer");
+        let r1 = fx.write("r1.fastq", b"@a/1\nACGT\n+\nIIII\n");
+        let r2 = fx.write("r2.fastq", b"@a/2\nGGGG\n+\nIIII\n@b/2\nCCCC\n+\nIIII\n");
+
+        let mut reader =
+            PairedSourceReader::new(vec![InputSpec::File(r1)], vec![InputSpec::File(r2)]);
+        let mut rec1 = FastqRecord::default();
+        let mut rec2 = FastqRecord::default();
+
+        assert!(reader.next_pair_into(&mut rec1, &mut rec2).expect("pair 1"));
+        match reader.next_pair_into(&mut rec1, &mut rec2) {
+            Err(PairedReadError::Desync(PairedRecordSide::R1)) => {}
+            other => panic!("expected Desync(R1) since R1 ran out first, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paired_reader_reports_io_errors_naming_the_failing_side() {
+        let fx = Fixture::new("paired_io_error");
+        let r1 = fx.write("r1.fastq", b"@a/1\nACGT\n+\nIIII\n");
+        let missing_r2 = fx.dir.join("does_not_exist_r2.fastq");
+
+        let mut reader = PairedSourceReader::new(
+            vec![InputSpec::File(r1)],
+            vec![InputSpec::File(missing_r2)],
+        );
+        let mut rec1 = FastqRecord::default();
+        let mut rec2 = FastqRecord::default();
+
+        match reader.next_pair_into(&mut rec1, &mut rec2) {
+            Err(PairedReadError::Io(PairedRecordSide::R2, _)) => {}
+            other => panic!("expected Io(R2, ..), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paired_reader_validate_rejects_an_empty_side() {
+        let fx = Fixture::new("paired_validate_empty");
+        let r1 = fx.write("r1.fastq", b"@a/1\nACGT\n+\nIIII\n");
+
+        let reader = PairedSourceReader::new(vec![InputSpec::File(r1)], vec![]);
+        assert!(reader.validate().is_err(), "an empty R2 list must be rejected up front");
     }
 }

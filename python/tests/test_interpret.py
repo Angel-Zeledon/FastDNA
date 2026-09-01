@@ -359,8 +359,10 @@ def test_top_features_and_fasta_round_trip_against_the_real_kmer_vectorizer(tmp_
     assert len(records) == n
     selected = set(names)
     counted_kmers = set(
-        fastdna.count(paths[0], k=k).table.column("kmer_sequence").to_pylist()
-    ) | set(fastdna.count(paths[-1], k=k).table.column("kmer_sequence").to_pylist())
+        fastdna.count(paths[0], k=k, with_sequence=True).table.column("kmer_sequence").to_pylist()
+    ) | set(
+        fastdna.count(paths[-1], k=k, with_sequence=True).table.column("kmer_sequence").to_pylist()
+    )
 
     for header, sequence in records:
         assert header.startswith("rank")
