@@ -3,6 +3,7 @@
 // The public surface. These are the modules a consumer of `fastdna_core`
 // is expected to name, and the ones the `[[bin]]`, the `python` feature's
 // `ffi` and the `wasm` feature all reach through.
+pub mod chimera_scan;
 pub mod cli;
 pub mod cohort;
 pub mod cohort_vocab;

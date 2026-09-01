@@ -45,7 +45,8 @@ use std::time::Duration;
 // the translation tables use builders, because their row count is not known
 // before streaming (see `translate_file`). Both forms are needed here.
 use arrow::array::{
-    ArrayRef, Int8Builder, StringArray, StringBuilder, UInt32Array, UInt32Builder, UInt64Array,
+    ArrayRef, Float64Builder, Int8Builder, StringArray, StringBuilder, UInt32Array, UInt32Builder,
+    UInt64Array,
 };
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -57,6 +58,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
 
+use crate::chimera_scan;
 use crate::cohort;
 use crate::cohort_vocab;
 use crate::counter::KmerCounter;
@@ -2326,6 +2328,98 @@ fn project_cohort_onto_vocabulary(
     batch.to_pyarrow(py)
 }
 
+/// The schema of the table `scan_chimeras()` hands back -- see `chimera_
+/// scan.rs`'s module doc comment for the detection algorithm this table is
+/// the output of.
+///
+/// **Column contract:**
+///
+/// - `contig_id`: `"{file stem}::{header accession}"`
+///   (`chimera_scan::read_contigs`), unique across every file
+///   `scan_chimeras()` was given.
+/// - `position`: 0-based position in the contig where a candidate
+///   breakpoint's "before" window ends and "after" window begins.
+/// - `divergence`: the raw Jensen-Shannon divergence (bits, base-2 log,
+///   `[0, 1]`) between the two windows' canonical k-mer composition -- the
+///   magnitude of the compositional shift.
+/// - `confidence`: see `chimera_scan::Breakpoint::confidence`'s own doc
+///   comment for the exact scoring rule.
+///
+/// Rows are file-major, then contig-major within a file, then
+/// position-ascending within a contig -- a plain long/tidy table, one row
+/// per candidate breakpoint, shaped so it can be joined later against
+/// taxonomic annotation by `contig_id`.
+fn chimeras_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("contig_id", DataType::Utf8, false),
+        Field::new("position", DataType::UInt32, false),
+        Field::new("divergence", DataType::Float64, false),
+        Field::new("confidence", DataType::Float64, false),
+    ]))
+}
+
+/// Scans every contig of every file in `paths` for composition-based
+/// chimera candidates (`chimera_scan::scan_paths`), returning a
+/// `pyarrow.RecordBatch` under `chimeras_schema`.
+///
+/// `threshold=None` (the default) returns the *unfiltered* divergence
+/// profile -- every candidate breakpoint on the `window`/`step` grid, one
+/// row each, `confidence == divergence` -- which is what a calibration
+/// sweep needs to see the raw curve rather than a pre-thresholded one.
+/// Pass a threshold in `[0, 1]` (Jensen-Shannon divergence, bits) to get
+/// flagged, clustered breakpoints instead -- see `chimera_scan.rs`'s
+/// module doc comment for the exact clustering rule.
+///
+/// `k` defaults to `4` (tetranucleotide composition), this technique's
+/// namesake and this project's calibrated default -- not `fastdna.count`'s
+/// own `k=31` default, which would make every window's k-mer set nearly
+/// unique and the composition comparison meaningless.
+///
+/// Raises `InvalidConfigError` (via `FastDnaError::InvalidConfig`,
+/// `chimera_scan::ChimeraScanParams::validate`) for a bad `window`/`step`/
+/// `k`/`threshold` combination, before any file is opened.
+///
+/// Released under `py.allow_threads` like every other bulk operation in
+/// this module: scanning a directory of MAGs is I/O- and CPU-bound work
+/// that holds no Python state.
+#[pyfunction]
+#[pyo3(signature = (paths, window, step, k=4, threshold=None))]
+fn scan_chimeras(
+    py: Python<'_>,
+    paths: Vec<String>,
+    window: usize,
+    step: usize,
+    k: usize,
+    threshold: Option<f64>,
+) -> PyResult<PyObject> {
+    let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    let params = chimera_scan::ChimeraScanParams { window, step, k, threshold };
+
+    let breakpoints = py.allow_threads(move || chimera_scan::scan_paths(&path_bufs, &params))?;
+
+    let mut contig_ids = StringBuilder::new();
+    let mut positions = UInt32Builder::with_capacity(breakpoints.len());
+    let mut divergences = Float64Builder::with_capacity(breakpoints.len());
+    let mut confidences = Float64Builder::with_capacity(breakpoints.len());
+    for bp in &breakpoints {
+        contig_ids.append_value(&bp.contig_id);
+        positions.append_value(bp.position);
+        divergences.append_value(bp.divergence);
+        confidences.append_value(bp.confidence);
+    }
+
+    let batch = in_memory_batch(
+        chimeras_schema(),
+        vec![
+            Arc::new(contig_ids.finish()) as ArrayRef,
+            Arc::new(positions.finish()) as ArrayRef,
+            Arc::new(divergences.finish()) as ArrayRef,
+            Arc::new(confidences.finish()) as ArrayRef,
+        ],
+    )?;
+    batch.to_pyarrow(py)
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
@@ -2362,5 +2456,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(filter_reads, m)?)?;
     m.add_function(wrap_pyfunction!(filter_reads_paired, m)?)?;
     m.add_function(wrap_pyfunction!(profile_reads, m)?)?;
+    m.add_function(wrap_pyfunction!(scan_chimeras, m)?)?;
     Ok(())
 }
