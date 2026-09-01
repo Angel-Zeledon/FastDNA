@@ -25,3 +25,6 @@ venv/
 
 # Stray atomic-write temp files from interrupted agent runs
 *.py.tmp.*
+
+# Scratch workspace for ad hoc analysis/repro scripts and downloaded data
+/scratch/

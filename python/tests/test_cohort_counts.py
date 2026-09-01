@@ -50,6 +50,46 @@ def test_count_cohort_derives_sample_ids_from_filenames(tmp_path):
     assert sum(counts.row_counts) == len(counts.kmers)
 
 
+def _write_fasta(tmp_path, name, seq):
+    p = tmp_path / name
+    p.write_text(f">contig1\n{seq}\n")
+    return str(p)
+
+
+def test_count_cohort_derives_sample_ids_from_fna_filenames(tmp_path):
+    """Regression test: `.fna` is the standard extension genome archives
+    (BV-BRC, NCBI) use for assembled nucleotide FASTA, and
+    `fastdna.count()`'s Rust core content-sniffs FASTA regardless of
+    extension -- but `_sample_id_from_path` used to only strip
+    `.fastq`/`.fq`/`.fasta`/`.fa`/`.gz`, leaving a stray `.fna` in every
+    sample_id derived from a real genome-assembly cohort. See
+    `cohort_counts.py::_sample_id_from_path`'s docstring for the concrete
+    failure this caused in `fastdna.audit()`-style usage: a `paths`/`groups`
+    positional mismatch against sample_ids computed elsewhere.
+    """
+    rng = np.random.default_rng(1)
+    bases = np.array(list("ACGT"))
+    seq = "".join(rng.choice(bases, size=300))
+    path = _write_fasta(tmp_path, "562.48346.fna", seq)
+
+    counts = fastdna.count_cohort([path], k=11)
+    assert counts.sample_ids == ("562.48346",)
+
+
+def test_count_cohort_finds_fna_files_in_a_directory(tmp_path):
+    """`.fna` (and gzipped `.fna.gz`) must be discovered by the
+    directory-scan path, not just accepted when passed explicitly -- the
+    directory filter used to omit both."""
+    rng = np.random.default_rng(2)
+    bases = np.array(list("ACGT"))
+    for i in range(3):
+        seq = "".join(rng.choice(bases, size=300))
+        _write_fasta(tmp_path, f"genome_{i}.fna", seq)
+
+    counts = fastdna.count_cohort(tmp_path, k=11)
+    assert set(counts.sample_ids) == {"genome_0", "genome_1", "genome_2"}
+
+
 def test_count_cohort_accepts_an_explicit_id_mapping(tmp_path):
     paths = _cohort(tmp_path, n=2)
     mapping = {"patientA": paths[0], "patientB": paths[1]}

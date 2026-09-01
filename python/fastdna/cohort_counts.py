@@ -165,15 +165,28 @@ class CohortCounts:
 
 
 def _sample_id_from_path(path: _PathLike) -> str:
-    """The file's stem with a trailing `.fastq`/`.fq`/`.gz` suffix
-    stripped -- the same convention `multiomics._sample_id_from_filename`
-    already uses, kept identical here so a cohort built either way gets
-    the same sample_ids for the same files. `pathlib.Path.stem` only
-    strips the *last* suffix, so a `.fastq.gz` file's stem would otherwise
-    keep a stray `.fastq` in every sample_id.
+    """The file's stem with a trailing `.fastq`/`.fq`/`.fasta`/`.fa`/`.fna`/
+    `.gz` suffix stripped. `pathlib.Path.stem` only strips the *last*
+    suffix, so a `.fastq.gz` file's stem would otherwise keep a stray
+    `.fastq` in every sample_id -- this strips every suffix in the tuple
+    that matches, in order, so a double extension like `.fna.gz` loses both
+    parts (`.gz` first, then `.fna`) the same way `.fastq.gz` already does.
+
+    `.fna` matters beyond FASTQ read files: `fastdna.count()`'s Rust core
+    sniffs FASTA vs. FASTQ from a stream's first byte, not from the
+    extension (`src/fastq.rs::sniff_format`), and `.fna` -- not `.fasta` or
+    `.fa` -- is the extension BV-BRC, NCBI and most other genome archives
+    actually use for assembled nucleotide FASTA (e.g. BV-BRC's own
+    `genome_sequence` API and its `ftp://ftp.bvbrc.org/genomes/<id>/<id>.fna`
+    layout). Without it here, a cohort built from real downloaded genome
+    assemblies got sample_ids with a stray `.fna` still attached (breaking
+    any caller-side matching against `sample_id`s from elsewhere, e.g.
+    `fastdna.audit(..., groups=...)`'s own `paths` positional alignment),
+    while `count_cohort(directory)` silently found nothing at all to count
+    if pointed at a directory of `.fna` files.
     """
     name = os.path.basename(str(path))
-    for suffix in (".gz", ".fastq", ".fq", ".fasta", ".fa"):
+    for suffix in (".gz", ".fastq", ".fq", ".fasta", ".fa", ".fna"):
         if name.lower().endswith(suffix):
             name = name[: -len(suffix)]
     return name
@@ -234,7 +247,9 @@ def count_cohort(
         entries = sorted(
             os.path.join(samples, f)
             for f in os.listdir(samples)
-            if f.lower().endswith((".fastq", ".fq", ".fastq.gz", ".fq.gz", ".fasta", ".fa"))
+            if f.lower().endswith(
+                (".fastq", ".fq", ".fastq.gz", ".fq.gz", ".fasta", ".fa", ".fna", ".fna.gz")
+            )
         )
         if not entries:
             raise ValueError(f"no FASTQ/FASTA files found in {samples}")
