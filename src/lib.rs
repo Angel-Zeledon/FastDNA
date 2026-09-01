@@ -5,6 +5,7 @@
 // `ffi` and the `wasm` feature all reach through.
 pub mod cli;
 pub mod cohort;
+pub mod cohort_vocab;
 pub mod counter;
 pub mod error;
 pub mod export;

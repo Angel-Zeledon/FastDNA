@@ -58,6 +58,7 @@ use pyo3::types::PyDict;
 use std::collections::HashMap;
 
 use crate::cohort;
+use crate::cohort_vocab;
 use crate::counter::KmerCounter;
 use crate::error::FastDnaError;
 use crate::export;
@@ -2225,6 +2226,106 @@ fn cohort_presence_matrix(
     Ok(dict.into())
 }
 
+/// The schema of `rank_cohort_vocabulary`'s returned `pyarrow.RecordBatch`:
+/// one row per selected k-mer, already in ranked (best-first) order -- see
+/// `cohort_vocab::rank_vocabulary`'s own doc comment for the ranking rule
+/// (`prevalence` desc, `total_freq` desc, `kmer_u64` asc).
+fn cohort_vocab_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("kmer_u64", DataType::UInt64, false),
+        Field::new("prevalence", DataType::UInt32, false),
+        Field::new("total_freq", DataType::UInt32, false),
+    ]))
+}
+
+/// K-way merges every sample table named in `table_paths` (each a sorted
+/// `(kmer_u64, frequency)` Parquet table -- see `ktab.rs`) and ranks the
+/// resulting distinct k-mers, returning a `pyarrow.RecordBatch` under
+/// `cohort_vocab_schema` (`kmer_u64`/`prevalence`/`total_freq`), already in
+/// ranked (best-first) order -- nothing left for the caller to sort. The
+/// Python-visible counterpart of `cohort_vocab::rank_vocabulary`; see that
+/// function's own doc comment for the streaming merge, the tie-break rule,
+/// and the bounded-memory guarantee `top_n` provides.
+///
+/// `python/fastdna/sklearn.py::KmerVectorizer`'s `disk_backed=True`
+/// vocabulary-learning path calls this directly on each training sample's
+/// own per-sample Parquet table, instead of `_learn_vocabulary`/`_learn_
+/// vocabulary_streaming`'s approach of holding the cohort's rows (fully, or
+/// `chunk_size` at a time) in Python-side Arrow arrays. See that module's
+/// own docstring for why `disk_backed` exists and how it interacts with
+/// `chunk_size`.
+///
+/// Released under `py.allow_threads` like every other bulk operation in
+/// this module (`ktab_union` and friends): merging several real k-mer
+/// tables is I/O- and CPU-bound work with nothing Python-specific in it,
+/// and holding the GIL for it would freeze the calling interpreter for a
+/// cohort-sized run.
+#[pyfunction]
+#[pyo3(signature = (table_paths, top_n=None))]
+fn rank_cohort_vocabulary(py: Python<'_>, table_paths: Vec<String>, top_n: Option<usize>) -> PyResult<PyObject> {
+    let paths: Vec<PathBuf> = table_paths.into_iter().map(PathBuf::from).collect();
+    let (kmers, prevalence, total_freq) =
+        py.allow_threads(|| cohort_vocab::rank_vocabulary(&paths, top_n))?;
+
+    let batch = in_memory_batch(
+        cohort_vocab_schema(),
+        vec![
+            Arc::new(UInt64Array::from(kmers)) as ArrayRef,
+            Arc::new(UInt32Array::from(prevalence)) as ArrayRef,
+            Arc::new(UInt32Array::from(total_freq)) as ArrayRef,
+        ],
+    )?;
+    batch.to_pyarrow(py)
+}
+
+/// The schema of `project_cohort_onto_vocabulary`'s returned
+/// `pyarrow.RecordBatch`: one row per nonzero `(sample, vocabulary k-mer)`
+/// entry, in COO form -- `scipy.sparse.csr_matrix` accepts `(data, (row,
+/// col))` triples in any order, so no particular ordering is promised here
+/// (matches `cohort_triples_schema`'s own contract, above).
+fn cohort_projection_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("row", DataType::UInt32, false),
+        Field::new("col", DataType::UInt32, false),
+        Field::new("value", DataType::UInt32, false),
+    ]))
+}
+
+/// Projects every sample table in `table_paths` onto the fixed
+/// `vocabulary` (a list of `kmer_u64` codes, typically `rank_cohort_
+/// vocabulary`'s own `kmer_u64` column), returning a `pyarrow.RecordBatch`
+/// under `cohort_projection_schema` (`row`/`col`/`value`) -- one COO entry
+/// per `(sample, vocabulary k-mer)` pair actually present in that sample's
+/// table. The Python-visible counterpart of `cohort_vocab::project_onto_
+/// vocabulary`; see that function's own doc comment for the memory bound
+/// this exists to provide (one sample's own table plus the vocabulary
+/// lookup resident at a time, never the whole cohort at once) and for why
+/// `col` matches `vocabulary`'s own given order rather than a re-sorted
+/// one.
+///
+/// Released under `py.allow_threads` for the same reason as `rank_cohort_
+/// vocabulary` and every other bulk table operation in this module.
+#[pyfunction]
+fn project_cohort_onto_vocabulary(
+    py: Python<'_>,
+    table_paths: Vec<String>,
+    vocabulary: Vec<u64>,
+) -> PyResult<PyObject> {
+    let paths: Vec<PathBuf> = table_paths.into_iter().map(PathBuf::from).collect();
+    let (rows, cols, values) =
+        py.allow_threads(|| cohort_vocab::project_onto_vocabulary(&paths, &vocabulary))?;
+
+    let batch = in_memory_batch(
+        cohort_projection_schema(),
+        vec![
+            Arc::new(UInt32Array::from(rows)) as ArrayRef,
+            Arc::new(UInt32Array::from(cols)) as ArrayRef,
+            Arc::new(UInt32Array::from(values)) as ArrayRef,
+        ],
+    )?;
+    batch.to_pyarrow(py)
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
@@ -2253,6 +2354,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(protein_kmers, m)?)?;
     m.add_function(wrap_pyfunction!(build_database, m)?)?;
     m.add_function(wrap_pyfunction!(cohort_presence_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(rank_cohort_vocabulary, m)?)?;
+    m.add_function(wrap_pyfunction!(project_cohort_onto_vocabulary, m)?)?;
     m.add_function(wrap_pyfunction!(ktab_union, m)?)?;
     m.add_function(wrap_pyfunction!(ktab_intersect, m)?)?;
     m.add_function(wrap_pyfunction!(ktab_diff, m)?)?;

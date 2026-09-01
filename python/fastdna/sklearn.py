@@ -39,13 +39,17 @@ label).
 
 from __future__ import annotations
 
+import contextlib
 import os
+import shutil
+import tempfile
 import warnings
 from typing import Iterable, NamedTuple
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 from scipy import sparse
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
@@ -138,6 +142,73 @@ def _validate_paths(X, method_name):
             f"path {str(X)!r} -- wrap it in a list: [{str(X)!r}]"
         )
     return [str(p) for p in X]
+
+
+def _make_scratch_dir() -> str:
+    """A fresh, empty scratch directory for `disk_backed=True`'s per-sample
+    Parquet k-mer tables, honouring the `FASTDNA_SPILL_DIR` environment
+    variable if set (falling back to the OS temp directory otherwise) --
+    the same convention `disk_spill.rs::ScratchDir` already uses for the
+    Rust-side disk-spill counting strategy's own scratch space, so a
+    caller who has already pointed FastDNA's scratch space at a drive with
+    room does not need a second, differently-named knob for this path
+    too.
+    """
+    base = os.environ.get("FASTDNA_SPILL_DIR") or None
+    return tempfile.mkdtemp(prefix="fastdna-sklearn-disk-backed-", dir=base)
+
+
+def _write_sample_table(kmers, frequencies, k: int, output_path: str) -> None:
+    """Writes one sample's `(kmer_u64, frequency)` columns to `output_path`
+    as a Parquet file carrying the exact footer key-value metadata
+    `src/ktab.rs::KmerTable::open` requires before it will treat a
+    `.parquet` file as a queryable k-mer table -- `fastdna.sorted_by=
+    kmer_u64` and `fastdna.k=<k>` (`ktab::SORTED_BY_KEY`/`ktab::K_KEY`).
+
+    `kmers`/`frequencies` are trusted to already be globally sorted
+    ascending and deduplicated -- true of anything `_count_cohort` hands
+    back for a single sample, since that is ultimately `fastdna.count()`'s
+    `.table`, itself built from `counter.rs`'s `KmerCounter::iter`, whose
+    `CountTable` invariant guarantees exactly that order (see
+    `_CohortCounts`'s own doc comment). This function does no re-sorting
+    of its own, the same trust `export::export_pairs_parquet` (Rust-side)
+    already places in an in-crate caller.
+
+    A plain `pyarrow.Table.replace_schema_metadata()` followed by
+    `pyarrow.parquet.write_table()` is enough to produce a file
+    `KmerTable::open` accepts, with no Rust FFI call needed for this step
+    at all: PyArrow embeds a `Table`'s schema-level metadata into the
+    Parquet file's own key-value metadata verbatim on write (confirmed
+    empirically while building this), and `kmer_u64`/`frequency` written
+    as `uint64`/`uint32` round-trip through Parquet as the exact
+    `INT64`-physical/unsigned-logical column `ktab.rs` expects, complete
+    with the per-row-group min/max statistics PyArrow computes
+    automatically -- the same shape `export_counts_parquet` (Rust-side)
+    produces for `fastdna count`'s own output.
+
+    The schema is built explicitly with `nullable=False` on both fields --
+    `pa.table({...})`'s default schema inference marks every field
+    `nullable=True` regardless of whether the backing array actually
+    contains a null (confirmed empirically: an all-non-null `pa.array(...,
+    type=pa.uint64())` still infers as a nullable field), and
+    `KmerTable::open` rejects a nullable `kmer_u64`/`frequency` column
+    outright (see its own doc comment for why: a null slot's decoded value
+    is unspecified, not zero). An explicit `pa.schema([...])` is the only
+    way to assert non-nullability on write, matching what `export.rs`'s
+    Arrow schema declares for these two columns.
+    """
+    kmers = kmers if isinstance(kmers, (pa.Array, pa.ChunkedArray)) else pa.array(kmers, type=pa.uint64())
+    frequencies = (
+        frequencies if isinstance(frequencies, (pa.Array, pa.ChunkedArray)) else pa.array(frequencies, type=pa.uint32())
+    )
+    schema = pa.schema(
+        [pa.field("kmer_u64", pa.uint64(), nullable=False), pa.field("frequency", pa.uint32(), nullable=False)]
+    )
+    table = pa.table({"kmer_u64": kmers, "frequency": frequencies}, schema=schema)
+    table = table.replace_schema_metadata(
+        {b"fastdna.sorted_by": b"kmer_u64", b"fastdna.k": str(k).encode("ascii")}
+    )
+    pq.write_table(table, output_path)
 
 
 class KmerVectorizer(BaseEstimator, TransformerMixin):
@@ -260,6 +331,63 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         -- see its own docstring for why, and prefer `fit()` followed by
         per-batch `transform()` calls for a cohort large enough that
         `chunk_size` matters in the first place.
+    disk_backed : bool, default False
+        Bounds memory for **both** vocabulary learning and projection by
+        never holding more than one sample's own k-mer table (plus a small,
+        fixed vocabulary lookup) in memory at once -- unlike `chunk_size`,
+        which only bounds the vocabulary-learning half (see its own
+        docstring above), leaving `_project`'s single all-at-once
+        `_CohortCounts` as the actual remaining bottleneck for a cohort
+        whose *projected* matrix, not just its vocabulary tally, does not
+        fit in memory (`docs/audit/ml-gaps.md` G-9's remaining half: for
+        10,000 bacterial genomes at ~5M distinct k-mers each, that
+        `_CohortCounts` alone is on the order of hundreds of GB, even
+        though the final vocabulary is typically `top_features=10_000`
+        columns wide).
+
+        Off by default: this is an opt-in path for a cohort that does not
+        fit in memory, not a silent behaviour change for the common case
+        every existing caller of this class already relies on. When `True`,
+        `fit()`/`fit_transform()`/`transform()` each write every sample
+        they touch to its own scratch Parquet k-mer table (honouring the
+        `FASTDNA_SPILL_DIR` environment variable, the same scratch-space
+        convention `disk_spill.rs::ScratchDir` already uses for the
+        Rust-side disk-spill counting strategy), removing that scratch
+        directory again once the call returns -- a sample is never counted
+        into a resident `_CohortCounts` at all on this path. Vocabulary
+        ranking (`fastdna._core.rank_cohort_vocabulary`, Rust-side
+        `cohort_vocab::rank_vocabulary`) and projection
+        (`fastdna._core.project_cohort_onto_vocabulary`, Rust-side
+        `cohort_vocab::project_onto_vocabulary`) both stream those scratch
+        tables directly, one Arrow batch at a time; see each Rust
+        function's own doc comment for the exact memory bound.
+
+        `disk_backed=True` and `chunk_size` (non-`None`) together raise
+        `InvalidConfigError` in `fit()`/`fit_transform()`, rather than one
+        silently overriding the other: `disk_backed` already solves a
+        strictly larger version of the problem `chunk_size` addresses
+        (memory for projection, not just vocabulary learning), so
+        combining them would add a second, differently-shaped memory bound
+        on top of one that already covers it, for no benefit -- an
+        ambiguity worth refusing outright rather than silently picking a
+        winner. Pass one or the other.
+
+        Interoperates with `counts` (a precomputed `fastdna.CohortCounts`):
+        each sample is still resolved via `self.counts.subset([sample_id])`
+        rather than a fresh `fastdna.count()` call, exactly as `_count_
+        cohort` already does for every other code path -- but note that
+        `counts` itself is a single resident artifact built once, up
+        front, so combining it with `disk_backed=True` does not bound the
+        memory `count_cohort()` needed to build `counts` in the first
+        place; `disk_backed` only avoids adding a *second* full-cohort
+        copy on top of it during vocabulary learning and projection.
+
+        `fit_transform()` learns the vocabulary and projects the matrix
+        via the same per-sample scratch-table streaming for both halves
+        (unlike `chunk_size`'s `fit_transform()`, which falls back to a
+        second, in-memory counting pass for projection) -- `disk_backed`
+        bounds both halves identically, so there is no equivalent
+        fallback needed here.
     representation : {"presence", "count", "relative", "clr"}, default "presence"
         What each matrix cell holds. `"presence"` is 0/1 (a k-mer was
         observed in this sample or not) and is immune to sequencing depth
@@ -298,6 +426,7 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         counts: fastdna.CohortCounts | None = None,
         representation: str = "presence",
         chunk_size: int | None = None,
+        disk_backed: bool = False,
     ) -> None:
         # scikit-learn convention: __init__ only assigns parameters, with
         # no validation and no other side effects, so that
@@ -322,6 +451,7 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         self.threads = threads
         self.counts = counts
         self.chunk_size = chunk_size
+        self.disk_backed = disk_backed
         # "presence" (0/1), not "count" (raw), by default.
         #
         # A sample sequenced at 100x has roughly 5x the k-mer counts of one
@@ -384,6 +514,14 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
             not isinstance(self.chunk_size, (int, np.integer)) or isinstance(self.chunk_size, bool) or self.chunk_size <= 0
         ):
             raise _core.InvalidConfigError(f"chunk_size must be a positive int or None, got {self.chunk_size!r}")
+        if self.disk_backed and self.chunk_size is not None:
+            raise _core.InvalidConfigError(
+                "disk_backed=True and chunk_size are mutually exclusive: disk_backed already "
+                "bounds memory for both vocabulary learning AND projection (chunk_size only "
+                "bounds the former -- see each parameter's own docstring), so combining them "
+                "would add a second, differently-shaped memory bound on top of one that "
+                "already covers it, for no benefit. Pass one or the other, not both."
+            )
         return paths
 
     def _count_cohort(self, keys):
@@ -443,6 +581,77 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
             frequencies=pa.concat_arrays(frequency_arrays),
             row_counts=row_counts,
         )
+
+    @contextlib.contextmanager
+    def _disk_backed_sample_tables(self, keys):
+        """Writes one per-sample scratch Parquet k-mer table per entry of
+        `keys` (FASTQ paths, or `sample_id`s when `self.counts` is set --
+        the same duality `_count_cohort` already resolves), yields their
+        paths as a list, and removes the whole scratch directory again
+        once the caller is done with them -- on success or on a raised
+        exception alike, via the `finally` below.
+
+        Each sample is counted (or sliced) with `self._count_cohort([key])`
+        -- one call per sample, reusing the exact branch (`counts=` slice
+        vs. fresh `fastdna.count()`) every other code path in this class
+        already goes through, rather than a third copy of that decision
+        here. `_count_cohort`'s own per-sample cost is unavoidable here
+        regardless of `self.counts`: even the `counts=` branch still
+        allocates that one sample's own slice, which is exactly what gets
+        written out and then dropped before the next sample is touched --
+        never more than one sample's rows resident at a time, matching
+        `cohort_vocab::project_onto_vocabulary`'s own memory bound
+        Rust-side.
+
+        The `k` recorded in each scratch table's footer metadata is
+        `self.counts.k` when `self.counts` is set (the k those samples
+        were actually counted at) and `self.k` otherwise -- the same `k`
+        `_count_cohort` itself reads from in each branch.
+        """
+        sample_k = self.counts.k if self.counts is not None else self.k
+        scratch_dir = _make_scratch_dir()
+        try:
+            table_paths = []
+            for index, key in enumerate(keys):
+                sample_counts = self._count_cohort([key])
+                path = os.path.join(scratch_dir, f"sample_{index}.parquet")
+                _write_sample_table(sample_counts.kmers, sample_counts.frequencies, sample_k, path)
+                table_paths.append(path)
+            yield table_paths
+        finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    def _learn_vocabulary_disk_backed(self, keys):
+        """The `disk_backed=True` equivalent of `_learn_vocabulary`/
+        `_learn_vocabulary_streaming`: writes every sample in `keys` to its
+        own scratch Parquet k-mer table (`_disk_backed_sample_tables`),
+        then ranks the vocabulary directly from those tables via
+        `fastdna._core.rank_cohort_vocabulary` (Rust-side `cohort_vocab::
+        rank_vocabulary`) -- never holding more than one sample table's own
+        Arrow batch, plus the running per-k-mer tally, in memory at once
+        (see that Rust function's own doc comment for the exact bound).
+        Peak Python-side memory during this call is therefore independent
+        of the cohort's total row count, unlike `chunk_size`, which still
+        scales with `chunk_size`'s own row count rather than with a fixed
+        amount -- see `disk_backed`'s docstring in `__init__` for the full
+        comparison.
+
+        The ranking itself -- `(prevalence desc, total_freq desc, kmer_u64
+        asc)` -- is `_select_vocabulary`'s exact rule, reimplemented
+        Rust-side rather than called into from here: `_select_vocabulary`
+        operates on already-materialized NumPy arrays, and this path's
+        entire purpose is to never materialize the cohort that way. See
+        `cohort_vocab::rank_vocabulary`'s own doc comment for why it is a
+        drop-in replacement for that ranking, not a new policy -- the
+        result assigned below is used exactly as `_select_vocabulary`'s
+        own output would be.
+        """
+        with self._disk_backed_sample_tables(keys) as table_paths:
+            batch = _core.rank_cohort_vocabulary(table_paths, self.top_features)
+
+        self.vocabulary_ = np.asarray(batch.column("kmer_u64"))
+        self._feature_sequences_ = _decode_kmers(self.vocabulary_, self.k)
+        self.n_features_in_ = len(self.vocabulary_)
 
     def _learn_vocabulary(self, counts):
         """Ranks the cohort's k-mers and assigns `vocabulary_`,
@@ -672,6 +881,7 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         column = np.asarray(pc.fill_null(pc.index_in(counts.kmers, value_set=pa.array(self.vocabulary_)), -1))
         kept = column >= 0
         rows = np.repeat(np.arange(n_samples, dtype=np.int64), counts.row_counts)[kept]
+        cols = column[kept].astype(np.int64)
         # float64: most downstream consumers (LogisticRegression, other
         # linear models, and anything that normalizes counts before
         # fitting) expect a floating dtype and would otherwise silently
@@ -680,6 +890,80 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         # `TfidfVectorizer` (scikit-learn's own closest analogue) returns.
         data = np.asarray(counts.frequencies)[kept].astype(np.float64)
 
+        return self._matrix_from_triples(rows, cols, data, n_samples)
+
+    def _project_disk_backed(self, keys, n_samples):
+        """The `disk_backed=True` equivalent of `_project`: writes every
+        sample in `keys` to its own scratch Parquet k-mer table
+        (`_disk_backed_sample_tables`) and resolves the COO `(row, col,
+        value)` triple directly from those tables via `fastdna._core.
+        project_cohort_onto_vocabulary` (Rust-side `cohort_vocab::
+        project_onto_vocabulary`) -- never holding more than one sample's
+        own table plus the (small, fixed) `self.vocabulary_` lookup in
+        memory at once, instead of `_project`'s single all-at-once
+        `_CohortCounts` over every sample in `keys`.
+
+        The representation math itself (`presence`/`count`/`relative`/
+        `clr`, and the `DepthConfoundingWarning` check) is not duplicated
+        here -- both this method and `_project` end at the same
+        `_matrix_from_triples`, so which one ran is invisible in the
+        result, the same "one implementation of the rule" property
+        `_select_vocabulary` already provides for `_learn_vocabulary`/
+        `_learn_vocabulary_streaming`.
+
+        Parameters
+        ----------
+        keys : list of str
+            Sample paths, or sample ids when `self.counts` is set -- see
+            `_disk_backed_sample_tables`.
+        n_samples : int
+            Row count of the returned matrix.
+
+        Returns
+        -------
+        scipy.sparse.csr_matrix of shape (n_samples, len(self.vocabulary_))
+        """
+        if self.representation not in _VALID_REPRESENTATIONS:
+            raise ValueError(
+                f"representation must be one of {list(_VALID_REPRESENTATIONS)}, "
+                f"got {self.representation!r}"
+            )
+
+        with self._disk_backed_sample_tables(keys) as table_paths:
+            batch = _core.project_cohort_onto_vocabulary(table_paths, [int(v) for v in self.vocabulary_])
+
+        rows = np.asarray(batch.column("row")).astype(np.int64)
+        cols = np.asarray(batch.column("col")).astype(np.int64)
+        data = np.asarray(batch.column("value")).astype(np.float64)
+
+        return self._matrix_from_triples(rows, cols, data, n_samples)
+
+    def _matrix_from_triples(self, rows, cols, data, n_samples):
+        """Builds the final `scipy.sparse.csr_matrix` in `self.
+        representation` from an already-resolved COO `(rows, cols, data)`
+        triple -- shared by `_project` (in-memory: `cols` resolved via
+        `pyarrow.compute.index_in` against `self.vocabulary_`) and
+        `_project_disk_backed` (`cols` already resolved Rust-side by
+        `cohort_vocab::project_onto_vocabulary`), so the representation
+        math (`presence`/`count`/`relative`/`clr`, and the
+        `DepthConfoundingWarning` check) is implemented exactly once
+        regardless of which path produced the triple.
+
+        Parameters
+        ----------
+        rows, cols : numpy.ndarray of int64
+            The COO row/column indices of every kept (sample, vocabulary
+            k-mer) entry -- `cols` already restricted to `self.
+            vocabulary_`'s own index space by whichever caller built it.
+        data : numpy.ndarray of float64
+            The raw per-entry count, aligned with `rows`/`cols`.
+        n_samples : int
+            Row count of the returned matrix.
+
+        Returns
+        -------
+        scipy.sparse.csr_matrix of shape (n_samples, len(self.vocabulary_))
+        """
         if self.representation == "presence":
             # Every stored entry is already >= 1 by construction (a k-mer
             # that was never observed simply has no row), so setting them
@@ -707,7 +991,12 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
                         "Use representation='presence' (the default) unless raw abundance "
                         "is the signal you are after.",
                         DepthConfoundingWarning,
-                        stacklevel=3,
+                        # One frame deeper than before this method was split out of
+                        # `_project` (warn -> _matrix_from_triples -> _project(_disk_backed)
+                        # -> transform()/fit_transform() -> caller): stacklevel=4 points at
+                        # that caller, the same target stacklevel=3 pointed at when this
+                        # code lived directly inside `_project`.
+                        stacklevel=4,
                     )
 
             if self.representation == "relative":
@@ -729,7 +1018,7 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
             # "count": data is already the raw counts computed above.
 
         return sparse.csr_matrix(
-            (data, (rows, column[kept].astype(np.int64))),
+            (data, (rows, cols)),
             shape=(n_samples, len(self.vocabulary_)),
             dtype=np.float64,
         )
@@ -781,7 +1070,9 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         this note.
         """
         paths = self._validated_fit_paths(X)
-        if self.chunk_size is None:
+        if self.disk_backed:
+            self._learn_vocabulary_disk_backed(paths)
+        elif self.chunk_size is None:
             self._learn_vocabulary(self._count_cohort(paths))
         else:
             self._learn_vocabulary_streaming(paths)
@@ -820,6 +1111,17 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         enough that neither does, call `fit()` alone and `transform()` it
         in smaller batches instead (see `chunk_size` in `__init__`).
 
+        `disk_backed`: unlike `chunk_size`, this parameter bounds memory
+        for *both* halves of this method identically -- vocabulary
+        learning (`_learn_vocabulary_disk_backed`) and projection
+        (`_project_disk_backed`) each stream every sample's own scratch
+        Parquet table independently, so there is no in-memory fallback for
+        the projection half to reuse or avoid here. This does mean each
+        sample is counted and written to a scratch table twice (once per
+        half) rather than once, the same "read each sample twice" trade
+        `chunk_size` makes above -- but bounded at a fixed, small memory
+        cost per call rather than at `chunk_size`'s own row count.
+
         Parameters
         ----------
         X : iterable of str or pathlib.Path
@@ -840,6 +1142,9 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
             See `fit()`.
         """
         paths = self._validated_fit_paths(X)
+        if self.disk_backed:
+            self._learn_vocabulary_disk_backed(paths)
+            return self._project_disk_backed(paths, len(paths))
         if self.chunk_size is None:
             counts = self._count_cohort(paths)
             self._learn_vocabulary(counts)
@@ -860,7 +1165,10 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
             fresh with the same `k`/`min_count`/`threads` used in `fit()`
             -- unless `self.counts` was given, in which case these are
             `sample_id` strings sliced out of it instead, with no counting
-            at all.
+            at all. When `self.disk_backed` is `True`, each is counted and
+            written to its own scratch Parquet table and projected
+            directly from it -- see `_project_disk_backed` and
+            `disk_backed`'s own docstring in `__init__`.
 
         Returns
         -------
@@ -876,6 +1184,8 @@ class KmerVectorizer(BaseEstimator, TransformerMixin):
         """
         check_is_fitted(self, "vocabulary_")
         paths = _validate_paths(X, "transform")
+        if self.disk_backed:
+            return self._project_disk_backed(paths, len(paths))
         return self._project(self._count_cohort(paths), len(paths))
 
     def get_feature_names_out(self, input_features: object = None) -> np.ndarray:

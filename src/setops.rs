@@ -143,9 +143,17 @@ impl CombineOp {
 /// input table's own frequency for it (in the same order the tables were
 /// given to `MultiTableMerge::new`), `None` where that table does not have
 /// this k-mer at all.
-struct MergedRow {
-    kmer: u64,
-    per_table: Vec<Option<u32>>,
+///
+/// `pub(crate)` (not `pub`): `cohort_vocab.rs`'s `rank_vocabulary` reuses
+/// this struct's fields directly (`per_table.iter().filter(Option::is_some).
+/// count()` is exactly "how many distinct tables contributed to this
+/// k-mer", i.e. prevalence) rather than re-deriving the same information a
+/// second, subtly different way. Still crate-private: nothing outside this
+/// crate has a `KmerTable` to build a `MultiTableMerge` from in the first
+/// place.
+pub(crate) struct MergedRow {
+    pub(crate) kmer: u64,
+    pub(crate) per_table: Vec<Option<u32>>,
 }
 
 /// Streams `MergedRow`s across several `KmerTable`s in ascending `kmer_u64`
@@ -165,7 +173,7 @@ struct MergedRow {
 /// an owned iterator with its own file handle, not one borrowed from the
 /// table), so this -- and everything built on it -- carries no lifetime
 /// tied back to the `&[KmerTable]` it was built from.
-struct MultiTableMerge {
+pub(crate) struct MultiTableMerge {
     sources: Vec<RangeIter>,
     heap: BinaryHeap<Reverse<(u64, usize)>>,
     /// The count belonging to whichever entry each source currently has *in
@@ -176,7 +184,7 @@ struct MultiTableMerge {
 }
 
 impl MultiTableMerge {
-    fn new<'t>(tables: impl IntoIterator<Item = &'t KmerTable>) -> Result<Self> {
+    pub(crate) fn new<'t>(tables: impl IntoIterator<Item = &'t KmerTable>) -> Result<Self> {
         let mut sources: Vec<RangeIter> = Vec::new();
         for table in tables {
             sources.push(table.iter()?);
@@ -250,7 +258,12 @@ impl Iterator for MultiTableMerge {
 /// and a `k=31` encoding of the same integer are unrelated sequences), so
 /// merging them by raw integer comparison would silently produce a
 /// nonsensical result rather than fail loudly.
-fn check_same_k<'t>(tables: impl IntoIterator<Item = &'t KmerTable>) -> Result<()> {
+///
+/// `pub(crate)`: `cohort_vocab.rs` needs the exact same guard for
+/// `rank_vocabulary`'s own multi-table merge, which is built on this
+/// module's `MultiTableMerge` for the same reason `union`/`intersect`/
+/// `diff` are -- one merge primitive, one k-mismatch check, not two.
+pub(crate) fn check_same_k<'t>(tables: impl IntoIterator<Item = &'t KmerTable>) -> Result<()> {
     let mut tables = tables.into_iter();
     let Some(first) = tables.next() else { return Ok(()) };
     let k = first.k();

@@ -11,6 +11,8 @@ for were ever broken -- see `test_unseen_sample_never_influences_vocabulary`.
 from __future__ import annotations
 
 import pathlib
+import random
+import shutil
 
 import pytest
 
@@ -428,6 +430,7 @@ def test_get_params_round_trips():
         "counts": None,
         "representation": "presence",
         "chunk_size": None,
+        "disk_backed": False,
     }
 
     from sklearn.base import clone
@@ -775,3 +778,256 @@ def test_chunk_size_default_is_none_and_unused(tmp_path):
     assert vec.chunk_size is None
     vec.fit([str(path)])
     assert len(vec.vocabulary_) == 2
+
+
+# ---------------------------------------------------------------------------
+# disk_backed -- both vocabulary learning AND projection bounded to O(one
+# sample's own table + the vocabulary) at a time, never the whole cohort's
+# rows at once (the remaining half of docs/audit/ml-gaps.md G-9 that
+# `chunk_size` above does not cover: it only bounds vocabulary learning).
+#
+# The single most important property under test here is equivalence:
+# `disk_backed=True` must produce an IDENTICAL vocabulary and matrix to
+# `disk_backed=False` on the same cohort, for every representation and
+# several cohort shapes -- not an approximation, since both paths implement
+# the exact same ranking/projection rules (Rust-side `cohort_vocab::
+# rank_vocabulary`/`project_onto_vocabulary` are a drop-in replacement for
+# `_select_vocabulary`/`_project`'s own rules, not a new policy).
+# ---------------------------------------------------------------------------
+
+
+def test_disk_backed_fit_matches_in_memory_fit_exactly(tmp_path):
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+
+    disk_backed = KmerVectorizer(k=k, top_features=None, disk_backed=True).fit(paths)
+    in_memory = KmerVectorizer(k=k, top_features=None).fit(paths)
+
+    assert list(disk_backed.vocabulary_) == list(in_memory.vocabulary_)
+    assert disk_backed.n_features_in_ == in_memory.n_features_in_
+    assert list(disk_backed.get_feature_names_out()) == list(in_memory.get_feature_names_out())
+
+
+@pytest.mark.parametrize("top_features", [None, 1, 3, 1000])
+def test_disk_backed_fit_respects_top_features_cap_identically(tmp_path, top_features):
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+
+    disk_backed = KmerVectorizer(k=k, top_features=top_features, disk_backed=True).fit(paths)
+    in_memory = KmerVectorizer(k=k, top_features=top_features).fit(paths)
+
+    assert list(disk_backed.vocabulary_) == list(in_memory.vocabulary_)
+
+
+def test_disk_backed_fit_then_transform_matches_in_memory(tmp_path):
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+
+    disk_backed = KmerVectorizer(k=k, top_features=None, disk_backed=True).fit(paths)
+    in_memory = KmerVectorizer(k=k, top_features=None).fit(paths)
+
+    matrix_disk_backed = disk_backed.transform(paths)
+    matrix_in_memory = in_memory.transform(paths)
+    assert (matrix_disk_backed != matrix_in_memory).nnz == 0
+    assert matrix_disk_backed.shape == matrix_in_memory.shape
+
+
+def test_disk_backed_fit_transform_matches_in_memory_fit_transform(tmp_path):
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+
+    matrix_disk_backed = KmerVectorizer(k=k, top_features=None, disk_backed=True).fit_transform(paths)
+    matrix_in_memory = KmerVectorizer(k=k, top_features=None).fit_transform(paths)
+    assert (matrix_disk_backed != matrix_in_memory).nnz == 0
+
+
+@pytest.mark.parametrize("representation", ["presence", "count", "relative", "clr"])
+def test_disk_backed_matches_in_memory_for_every_representation(tmp_path, representation):
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+
+    disk_backed = KmerVectorizer(k=k, top_features=None, representation=representation, disk_backed=True)
+    in_memory = KmerVectorizer(k=k, top_features=None, representation=representation)
+
+    matrix_disk_backed = disk_backed.fit_transform(paths)
+    matrix_in_memory = in_memory.fit_transform(paths)
+
+    np.testing.assert_allclose(matrix_disk_backed.toarray(), matrix_in_memory.toarray())
+
+
+def test_disk_backed_interoperates_with_precomputed_cohort_counts(tmp_path):
+    """`disk_backed` and `counts=` (a precomputed `fastdna.CohortCounts`)
+    are not mutually exclusive: each sample is still resolved via
+    `self.counts.subset([sample_id])` rather than a fresh `fastdna.count()`
+    call -- see `_disk_backed_sample_tables`. Must still be exact.
+    """
+    paths = _chunk_size_test_cohort(tmp_path)
+    k = 6
+    cohort = fastdna.count_cohort(paths, k=k)
+
+    disk_backed = KmerVectorizer(k=k, top_features=None, counts=cohort, disk_backed=True)
+    disk_backed.fit(list(cohort.sample_ids))
+
+    in_memory = KmerVectorizer(k=k, top_features=None, counts=cohort)
+    in_memory.fit(list(cohort.sample_ids))
+
+    assert list(disk_backed.vocabulary_) == list(in_memory.vocabulary_)
+
+    matrix_disk_backed = disk_backed.transform(list(cohort.sample_ids))
+    matrix_in_memory = in_memory.transform(list(cohort.sample_ids))
+    assert (matrix_disk_backed != matrix_in_memory).nnz == 0
+
+
+def test_disk_backed_true_and_chunk_size_together_raises_invalidconfig(tmp_path):
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTAC"] * 3)
+    with pytest.raises(ValueError):
+        KmerVectorizer(k=5, disk_backed=True, chunk_size=2).fit([str(path)])
+
+
+def test_disk_backed_default_is_false_and_unused(tmp_path):
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTAC"] * 3)
+    vec = KmerVectorizer(k=5, top_features=None)
+    assert vec.disk_backed is False
+    vec.fit([str(path)])
+    assert len(vec.vocabulary_) == 2
+
+
+def test_disk_backed_fit_cleans_up_its_scratch_directory(tmp_path, monkeypatch):
+    """`_disk_backed_sample_tables` must remove its whole scratch directory
+    once `fit()` returns -- a leftover directory per `fit()`/`transform()`
+    call would silently fill up disk on any long-lived process (a notebook,
+    a service) that calls this repeatedly.
+    """
+    spill_base = tmp_path / "spill"
+    spill_base.mkdir()
+    monkeypatch.setenv("FASTDNA_SPILL_DIR", str(spill_base))
+
+    paths = _chunk_size_test_cohort(tmp_path)
+    KmerVectorizer(k=6, top_features=None, disk_backed=True).fit(paths)
+
+    assert list(spill_base.iterdir()) == [], "no scratch directory should remain after fit() returns"
+
+
+def test_disk_backed_scratch_tables_survive_a_mid_fit_error_cleanup(tmp_path, monkeypatch):
+    """A failure partway through writing the scratch tables must still
+    clean up the scratch directory (the `finally` in
+    `_disk_backed_sample_tables`), not leak it.
+    """
+    spill_base = tmp_path / "spill"
+    spill_base.mkdir()
+    monkeypatch.setenv("FASTDNA_SPILL_DIR", str(spill_base))
+
+    # A path that does not exist: fastdna.count() raises inside
+    # `_count_cohort`, partway through `_disk_backed_sample_tables`'s loop.
+    missing = str(tmp_path / "does_not_exist.fastq")
+    vec = KmerVectorizer(k=5, top_features=None, disk_backed=True)
+    with pytest.raises(Exception):
+        vec.fit([missing])
+
+    assert list(spill_base.iterdir()) == [], "the scratch directory must be removed even after an error"
+
+
+def test_make_scratch_dir_honors_fastdna_spill_dir_env_var(tmp_path, monkeypatch):
+    from fastdna.sklearn import _make_scratch_dir
+
+    spill_base = tmp_path / "spill"
+    spill_base.mkdir()
+    monkeypatch.setenv("FASTDNA_SPILL_DIR", str(spill_base))
+
+    scratch = pathlib.Path(_make_scratch_dir())
+    try:
+        assert scratch.parent == spill_base
+        assert scratch.is_dir()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _synthetic_large_cohort(tmp_path, n_samples=15, reads_per_sample=400, read_length=60, seed=1234):
+    """A larger synthetic cohort -- enough samples and distinct k-mers per
+    sample that `disk_backed=True`'s per-sample scratch-table streaming
+    architecture is genuinely exercised (several hundred to a few thousand
+    distinct k-mers per sample, several Arrow batches per Parquet table),
+    not just trivially handled the way a 2-3-row fixture would be. This is
+    a correctness test at a size where the streaming code path actually
+    streams, not a memory benchmark -- real peak RSS is not asserted here
+    (unreliable in CI); only that `disk_backed=True` and `disk_backed=False`
+    agree exactly on the result.
+    """
+    rng = random.Random(seed)
+    bases = "ACGT"
+    paths = []
+    for i in range(n_samples):
+        reads = ["".join(rng.choice(bases) for _ in range(read_length)) for _ in range(reads_per_sample)]
+        paths.append(str(write_fastq(tmp_path, f"large_s{i}.fastq", reads)))
+    return paths
+
+
+def test_disk_backed_matches_in_memory_on_a_larger_synthetic_cohort(tmp_path):
+    paths = _synthetic_large_cohort(tmp_path)
+    k = 21
+
+    disk_backed = KmerVectorizer(k=k, top_features=200, disk_backed=True).fit(paths)
+    in_memory = KmerVectorizer(k=k, top_features=200).fit(paths)
+
+    assert len(disk_backed.vocabulary_) > 0, "the synthetic cohort must actually produce a nonempty vocabulary"
+    assert list(disk_backed.vocabulary_) == list(in_memory.vocabulary_)
+
+    matrix_disk_backed = disk_backed.transform(paths)
+    matrix_in_memory = in_memory.transform(paths)
+    assert (matrix_disk_backed != matrix_in_memory).nnz == 0
+
+
+def test_disk_backed_fit_transform_matches_in_memory_on_a_larger_synthetic_cohort(tmp_path):
+    paths = _synthetic_large_cohort(tmp_path, n_samples=10, reads_per_sample=200)
+    k = 15
+
+    matrix_disk_backed = KmerVectorizer(k=k, top_features=500, disk_backed=True).fit_transform(paths)
+    matrix_in_memory = KmerVectorizer(k=k, top_features=500).fit_transform(paths)
+    assert (matrix_disk_backed != matrix_in_memory).nnz == 0
+
+
+def test_disk_backed_empty_x_raises_valueerror():
+    with pytest.raises(ValueError):
+        KmerVectorizer(k=5, disk_backed=True).fit([])
+
+
+def test_disk_backed_single_sample(tmp_path):
+    path = write_fastq(tmp_path, "a.fastq", ["ACGTACGTAC"] * 3)
+
+    disk_backed = KmerVectorizer(k=5, top_features=None, disk_backed=True).fit([str(path)])
+    in_memory = KmerVectorizer(k=5, top_features=None).fit([str(path)])
+
+    assert list(disk_backed.vocabulary_) == list(in_memory.vocabulary_)
+    assert len(disk_backed.vocabulary_) == 2
+
+
+def test_disk_backed_transform_with_zero_vocabulary_overlap_returns_a_true_all_zero_row(tmp_path):
+    train = write_fastq(tmp_path, "train.fastq", ["ACGTACGTAC"] * 3)
+    disjoint = write_fastq(tmp_path, "disjoint.fastq", ["GGGGGGGGGG"] * 3)
+    _assert_pairwise_disjoint(5, {"train": train, "disjoint": disjoint})
+
+    vec = KmerVectorizer(k=5, top_features=None, disk_backed=True).fit([str(train)])
+    matrix = vec.transform([str(disjoint)])
+
+    assert matrix.shape == (1, len(vec.vocabulary_))
+    assert matrix.nnz == 0
+
+
+def test_disk_backed_never_leaks_across_folds(tmp_path):
+    """The same leakage guarantee `test_unseen_sample_never_influences_
+    vocabulary` pins for the in-memory path must hold for `disk_backed=True`
+    too: `transform()` on a held-out fold must not be able to influence
+    `fit()`'s already-decided vocabulary, and a matrix produced by
+    `transform()` on training samples must be identical whether or not a
+    disjoint sample was ever passed to `transform()` first.
+    """
+    k = 6
+    train_a = write_fastq(tmp_path, "train_a.fastq", ["ACGTACGTACGTACGTACGT"] * 3)
+    train_b = write_fastq(tmp_path, "train_b.fastq", ["TTGGCCAATTGGCCAATTGG"] * 3)
+    held_out = write_fastq(tmp_path, "held_out.fastq", ["CTAGCTAGCTAGCTAGCTAG"] * 3)
+
+    vec = KmerVectorizer(k=k, top_features=None, disk_backed=True).fit([str(train_a), str(train_b)])
+    vocabulary_before = list(vec.vocabulary_)
+
+    vec.transform([str(held_out)])
+    assert list(vec.vocabulary_) == vocabulary_before, "transform() must never mutate the already-fitted vocabulary"
