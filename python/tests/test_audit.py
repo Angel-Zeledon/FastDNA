@@ -234,6 +234,101 @@ def test_audit_accepts_a_precomputed_matrix_with_explicit_groups():
     assert report.score_random > report.score_lineage
 
 
+def test_safe_is_classifier_and_is_regressor_do_not_raise_for_a_bare_duck_typed_object():
+    """`sklearn.base.is_classifier`/`is_regressor` raise `AttributeError`
+    (not return `False`) for a plain duck-typed object that does not
+    inherit `sklearn.base.BaseEstimator` and defines no `__sklearn_tags__`
+    of its own, under scikit-learn's >=1.6 tags machinery -- confirmed
+    directly against this environment's installed scikit-learn before this
+    test was written. Every caller in `fastdna.audit` (`_default_scoring`,
+    `_phenotype_is_categorical`, `_random_cv_splitter`) documents that
+    `False` as the intended, no-crash answer for exactly this case, which
+    the raise silently broke -- including `audit()` itself, which crashed
+    outright inside `_confounding` (computed before any fold, see its own
+    docstring) on a plain `fastdna.mic.MicRegressor()` before that module
+    grew its own `__sklearn_tags__`. `_safe_is_classifier`/
+    `_safe_is_regressor` restore the documented behaviour; this test
+    guards them directly, independent of whatever a full `cross_val_score`
+    call would additionally require from the estimator downstream (see
+    `test_audit_composes_with_a_duck_typed_regressor_shaped_like_micregressor`
+    for that fuller, realistic case).
+    """
+    from fastdna.audit import _safe_is_classifier, _safe_is_regressor
+
+    class BareDuckTypedObject:
+        """No `get_params`/`set_params`/`__sklearn_tags__` at all -- the
+        worst case `is_classifier`/`is_regressor` can be asked about."""
+
+        def fit(self, X, y):
+            return self
+
+        def predict(self, X):
+            return X
+
+    obj = BareDuckTypedObject()
+    assert _safe_is_classifier(obj) is False
+    assert _safe_is_regressor(obj) is False
+
+
+def test_audit_composes_with_a_duck_typed_regressor_shaped_like_micregressor():
+    """A regressor that implements the scikit-learn estimator protocol by
+    hand -- `fit`/`predict`/`get_params`/`set_params`/`__sklearn_tags__` --
+    without inheriting `sklearn.base.BaseEstimator`, exactly the shape
+    `fastdna.mic.MicRegressor` uses (see that module's own `get_params`
+    docstring for why it does not inherit `BaseEstimator`). Unlike a fully
+    bare duck-typed object (see the test above), scikit-learn's own
+    `cross_val_score`/`check_scoring` internals -- which `audit()` does not
+    control -- also call `is_classifier`/`get_tags` directly, so a full,
+    successful `audit()` run additionally requires the estimator to answer
+    that question itself; `_safe_is_classifier`/`_safe_is_regressor` alone
+    cannot substitute for a missing `__sklearn_tags__` once execution
+    reaches scikit-learn's own code. This test is the realistic end-to-end
+    case: a hand-rolled, non-`BaseEstimator` regressor that (like
+    `MicRegressor`) does supply its own tags composes cleanly with
+    `audit()` end to end.
+    """
+    from sklearn.utils import RegressorTags, Tags, TargetTags
+
+    class DuckTypedRegressor:
+        _estimator_type = "regressor"
+
+        def get_params(self, deep=True):
+            return {}
+
+        def set_params(self, **params):
+            return self
+
+        def __sklearn_tags__(self):
+            return Tags(
+                estimator_type="regressor",
+                target_tags=TargetTags(required=True),
+                regressor_tags=RegressorTags(),
+                input_tags=__import__("sklearn.utils", fromlist=["InputTags"]).InputTags(),
+            )
+
+        def fit(self, X, y):
+            self.mean_ = float(np.mean(np.asarray(y)))
+            return self
+
+        def predict(self, X):
+            return np.full(np.asarray(X).shape[0], self.mean_)
+
+    X, groups = _synthetic_matrix_cohort(seed=3)
+    y = np.arange(X.shape[0], dtype=float)  # continuous, non-degenerate target
+
+    # scoring="r2" explicit: this estimator has no .score() (also true of
+    # MicRegressor -- see that module's own docstring for why a raw-scale
+    # default would be misleading), so scoring=None would still fail
+    # cross_val_score's own check_scoring() -- a separate, expected
+    # limitation, not what this test is about.
+    report = audit(DuckTypedRegressor(), X, y, groups=groups, n_splits=4, scoring="r2")
+
+    assert report.scoring == "r2"
+    # Reached the dtype-based fallback (float y -> continuous) rather than
+    # crashing inside is_classifier/is_regressor.
+    assert report.confounding.statistic == "omega_squared"
+
+
 def test_audit_warns_when_almost_every_sample_is_its_own_lineage():
     """Real motivation, not a hypothetical: this project's own bacterial
     AMR reproduction (`scratch/amr_repro/audit_report.json`) hit exactly

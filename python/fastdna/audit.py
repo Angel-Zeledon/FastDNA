@@ -740,6 +740,45 @@ class AuditReport:
         return header + df.to_html(index=False)
 
 
+def _safe_is_classifier(estimator):
+    """`sklearn.base.is_classifier`, but treating a duck-typed estimator
+    that scikit-learn cannot answer the question for (anything that is
+    not a `BaseEstimator` subclass and defines no `__sklearn_tags__` of
+    its own -- `fastdna.mic.MicRegressor` is exactly this shape) as "no
+    answer" rather than letting it propagate as an exception.
+
+    Every caller in this module documents `is_classifier`/`is_regressor`
+    returning `False` for such an object as the deliberate, no-crash
+    fallback path (see `_phenotype_is_categorical`'s own docstring). That
+    was true through scikit-learn's older tag machinery; the 1.6
+    `__sklearn_tags__` rewrite changed `is_classifier`/`is_regressor` to
+    raise `AttributeError` for a non-`BaseEstimator` duck-typed estimator
+    instead of returning `False`, which silently broke every one of this
+    module's own documented fallbacks -- including `audit()` itself, which
+    crashed outright (before ever reaching a fold) on a plain
+    `MicRegressor()`. This wrapper (and `_safe_is_regressor` below)
+    restores the documented behaviour under both old and new scikit-learn
+    tag machinery.
+    """
+    from sklearn.base import is_classifier
+
+    try:
+        return is_classifier(estimator)
+    except AttributeError:
+        return False
+
+
+def _safe_is_regressor(estimator):
+    """The `is_regressor` counterpart of `_safe_is_classifier` -- see its
+    docstring for why this wrapper exists."""
+    from sklearn.base import is_regressor
+
+    try:
+        return is_regressor(estimator)
+    except AttributeError:
+        return False
+
+
 def _default_scoring(estimator, y):
     """`"roc_auc"` for a binary-classification `estimator`/`y` pair, `None`
     (each `cross_val_score` call then falls back to `estimator`'s own
@@ -755,9 +794,7 @@ def _default_scoring(estimator, y):
     default rather than guessing a specific metric this module cannot
     justify picking on the caller's behalf.
     """
-    from sklearn.base import is_classifier
-
-    if is_classifier(estimator) and np.unique(np.asarray(y)).size == 2:
+    if _safe_is_classifier(estimator) and np.unique(np.asarray(y)).size == 2:
         return "roc_auc"
     return None
 
@@ -784,11 +821,9 @@ def _phenotype_is_categorical(estimator, y):
     which one ran, so the misreading is visible in the report rather than
     silent.
     """
-    from sklearn.base import is_classifier, is_regressor
-
-    if is_classifier(estimator):
+    if _safe_is_classifier(estimator):
         return True
-    if is_regressor(estimator):
+    if _safe_is_regressor(estimator):
         return False
     return np.asarray(y).dtype.kind in "biuOSU"
 
@@ -1057,9 +1092,7 @@ def _random_cv_splitter(estimator, y, n_splits, random_state):
     """
     from sklearn.model_selection import KFold, StratifiedKFold
 
-    from sklearn.base import is_classifier
-
-    if is_classifier(estimator):
+    if _safe_is_classifier(estimator):
         counts = np.unique(np.asarray(y), return_counts=True)[1]
         if counts.min() >= n_splits:
             return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
