@@ -81,6 +81,25 @@ KMERS = ["ACGTACGTA", "TTGCATTGC", "GGCCGGCCG", "AATTAATTA"]
 # ---------------------------------------------------------------------------
 
 
+def test_is_classifier_true_under_sklearn_tags():
+    """`sklearn.base.is_classifier(SetCoveringClassifier())` must be `True`
+    -- `fastdna.audit()`'s own `_default_scoring` (and sklearn's own
+    `cross_val_score`/`GridSearchCV` internals more generally) rely on it
+    to pick `"roc_auc"` for a binary phenotype instead of silently falling
+    back to accuracy. This was `False` under scikit-learn's >=1.6
+    `__sklearn_tags__` API with the class's previous base-class order
+    (`BaseEstimator, ClassifierMixin` -- `BaseEstimator.__sklearn_tags__`
+    resolved before `ClassifierMixin`'s own cooperative `super()` call ever
+    ran, so `estimator_type` silently stayed unset); see the class's own
+    comment for the full explanation. Caught while composing
+    `SetCoveringClassifier` into `fastdna.audit()` at
+    `scratch/amr_repro_scaled/`'s scale.
+    """
+    from sklearn.base import is_classifier
+
+    assert is_classifier(SetCoveringClassifier()) is True
+
+
 def test_single_separating_feature_yields_exactly_one_rule():
     clf = SetCoveringClassifier()
     fitted = clf.fit(ONE_FEATURE_X, ONE_FEATURE_Y)

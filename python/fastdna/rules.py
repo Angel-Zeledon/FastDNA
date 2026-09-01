@@ -221,7 +221,24 @@ def _resolve_sample_weights(class_weight, y, classes):
     return weights
 
 
-class SetCoveringClassifier(BaseEstimator, ClassifierMixin):
+class SetCoveringClassifier(ClassifierMixin, BaseEstimator):
+    # `ClassifierMixin` before `BaseEstimator`, not the other way around:
+    # `__sklearn_tags__()` under scikit-learn's own tags API cooperatively
+    # chains via `super().__sklearn_tags__()`, and Python's MRO resolves
+    # `super()` left-to-right through the base-class list. With
+    # `BaseEstimator` listed first, `BaseEstimator.__sklearn_tags__` would
+    # be found before `ClassifierMixin.__sklearn_tags__` ever runs, so
+    # `estimator_type` would silently stay unset -- `sklearn.base.
+    # is_classifier(SetCoveringClassifier())` would (and, before this fix,
+    # did) return `False`, which made `fastdna.audit()`'s own
+    # `_default_scoring` fall back to accuracy instead of `"roc_auc"` for
+    # this class specifically, silently, with no error. Confirmed directly
+    # (`is_classifier(SetCoveringClassifier())` was `False` with the old
+    # base-class order, `True` with this one) while building
+    # `scratch/amr_repro_scaled/`'s multi-model comparison. This is
+    # scikit-learn's own documented convention -- every one of its built-in
+    # estimators lists its mixin(s) before `BaseEstimator` -- not a
+    # FastDNA-specific pattern.
     """A Set Covering Machine: a short conjunction (or disjunction) of
     present/absent k-mer rules, fitted greedily.
 

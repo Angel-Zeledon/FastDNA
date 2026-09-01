@@ -41,6 +41,24 @@ def write_fastq(tmp_path: pathlib.Path, name: str, reads: list[str]) -> pathlib.
 # ---------------------------------------------------------------------------
 
 
+def test_sklearn_tags_transformer_tags_is_set():
+    """`KmerVectorizer().__sklearn_tags__().transformer_tags` must be a
+    real `TransformerTags()`, not `None` -- this was `None` under
+    scikit-learn's >=1.6 `__sklearn_tags__` API with the class's previous
+    base-class order (`BaseEstimator, TransformerMixin` --
+    `BaseEstimator.__sklearn_tags__` resolved before `TransformerMixin`'s
+    own cooperative `super()` call ever ran, so `transformer_tags` silently
+    stayed unset); see the class's own comment for the full explanation,
+    and `fastdna.rules`'s `test_is_classifier_true_under_sklearn_tags` for
+    the identical bug in `SetCoveringClassifier` this mirrors. Caught while
+    composing `KmerVectorizer` into `fastdna.audit()`/`GridSearchCV` at
+    `scratch/amr_repro_scaled/`'s scale.
+    """
+    tags = KmerVectorizer().__sklearn_tags__()
+    assert tags.transformer_tags is not None
+    assert tags.estimator_type is None  # a transformer, not a classifier/regressor
+
+
 def test_fit_sets_vocabulary_and_n_features_in(tmp_path):
     # Same hand-checkable reads as test_api.py's EXPECTED_CANONICAL_COUNTS:
     # at k=5, "ACGTACGTAC" x3 yields exactly two distinct canonical 5-mers

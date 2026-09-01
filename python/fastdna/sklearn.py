@@ -211,7 +211,20 @@ def _write_sample_table(kmers, frequencies, k: int, output_path: str) -> None:
     pq.write_table(table, output_path)
 
 
-class KmerVectorizer(BaseEstimator, TransformerMixin):
+class KmerVectorizer(TransformerMixin, BaseEstimator):
+    # `TransformerMixin` before `BaseEstimator`: scikit-learn's own
+    # convention (every built-in transformer lists its mixin(s) first),
+    # and load-bearing under the >=1.6 `__sklearn_tags__` API --
+    # `TransformerMixin.__sklearn_tags__` cooperatively calls
+    # `super().__sklearn_tags__()`, and Python's MRO resolves that
+    # left-to-right through the base-class list, so with `BaseEstimator`
+    # listed first `TransformerMixin`'s own tags method is never reached
+    # and `transformer_tags` silently stays `None` instead of a real
+    # `TransformerTags()` -- confirmed directly (`KmerVectorizer().
+    # __sklearn_tags__().transformer_tags` was `None` with the old
+    # base-class order) while building `scratch/amr_repro_scaled/`'s
+    # multi-model comparison, alongside the identical bug this fix mirrors
+    # in `fastdna.rules.SetCoveringClassifier` (see its own comment).
     """Projects FASTQ(.gz) files onto a fixed, learned k-mer vocabulary,
     producing a sparse count matrix suitable for `sklearn.pipeline.Pipeline`
     steps (`LogisticRegression`, `XGBClassifier`, etc.) and for
