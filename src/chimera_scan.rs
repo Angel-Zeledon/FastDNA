@@ -5,6 +5,60 @@
 //! long-read assembler having fused sequence from two unrelated organisms
 //! into one contig.
 //!
+//! # Calibration result: composition alone did not clear its own negative-
+//! # control gate -- read this before trusting a flagged breakpoint
+//!
+//! `examples/chimera_calibration.rs` built synthetic multi-domain chimeras
+//! from real reference genomes (deterministic seed 9001: *E. coli* fused
+//! with *Bacillus subtilis* -- the "hard" same-domain-different-phylum
+//! case -- and with *Methanocaldococcus jannaschii* and *Saccharomyces
+//! cerevisiae* -- the "easy" cross-domain cases), swept window size
+//! (300-4000 bases) and threshold (0.05-0.40 bits), and ran the *same*
+//! calibrated thresholds against six real, complete (or largest-contig),
+//! genuinely non-chimeric reference sequences as a negative control.
+//!
+//! **Finding: no (window, threshold) combination in the swept range gives
+//! both usable sensitivity and an acceptable false-positive rate.** Every
+//! operating point that detects a majority of real chimeras also flags
+//! the overwhelming majority of real, non-chimeric genome content (at
+//! small windows, hundreds to thousands of spurious breakpoints per
+//! megabase -- ordinary multinomial sampling noise in a k-mer count, not
+//! biology); every operating point with a clean negative control collapses
+//! sensitivity, and does so hardest for the same-domain-different-phylum
+//! case, whose true-junction divergence overlaps its own single-genome
+//! background noise almost entirely (`hard_sens` reaches exactly `0.0` at
+//! every window size once the threshold is high enough to keep negative-
+//! control flagging under roughly one flag per genome). The best balanced
+//! points found (e.g. window 2000, threshold 0.15-0.18) still flag 17-50%
+//! of real, single-organism reference genomes at least once while
+//! detecting well under half of even the "easy" cross-domain synthetic
+//! chimeras. This is a real result, not a bug: unlike the maximally
+//! disjoint A/T-only-vs-G/C-only construction this module's own unit tests
+//! use, real cross-taxon tetranucleotide differences are compositionally
+//! modest, and real single genomes have their own natural local
+//! compositional heterogeneity (genomic islands, prophages, rRNA operons,
+//! and apparently plain local variation even without any of those) of
+//! comparable magnitude.
+//!
+//! **Conclusion:** tetranucleotide composition (Jensen-Shannon divergence,
+//! this module's own measure) is not, on its own, a sufficient signal for
+//! reliable multi-domain chimera calling against real assemblies. This
+//! module and its `scan_chimeras()`/`fastdna.chimeras.scan_chimeras()`
+//! surface remain correct and tested (see this module's own unit tests and
+//! `python/tests/test_chimeras.py`) as a composition-divergence primitive,
+//! and are useful as *one input among several* or for a caller who has
+//! already accepted a much higher false-positive tolerance than a
+//! production flagging pipeline would -- but a flagged breakpoint from
+//! this module alone should not be read as "this is a chimera". Combining
+//! it with read-coverage evidence (the `anvi-script-find-misassemblies`
+//! approach this module's own doc comment below describes as
+//! complementary) is the natural next step, not merely a nice-to-have; a
+//! CLI subcommand and a from-this-module-alone "chimera report" were
+//! deliberately not built on top of this until that combination -- or some
+//! other way to close this gap -- exists. See this project's calibration
+//! report (delivered alongside this change, not committed as source) for
+//! the full sensitivity/false-positive tables this summary is drawn from.
+//!
 //! # Why composition, and why this is a complement to read-mapping tools
 //!
 //! Tetranucleotide (4-mer) composition is approximately constant within one
