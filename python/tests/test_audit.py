@@ -34,6 +34,34 @@ from fastdna.explain import explain  # noqa: E402
 from fastdna.sklearn import KmerVectorizer  # noqa: E402
 
 
+def test_fastdna_audit_survives_repeated_top_level_access():
+    """`fastdna.audit` (and `fastdna.explain`) are re-exported at the top
+    level via a lazy `fastdna.__getattr__`, specifically so a bare `import
+    fastdna` never needs numpy (see `fastdna/__init__.py`'s own comment).
+    A first version of that `__getattr__` returned the right function on
+    the FIRST access but silently shadowed itself with the `audit`
+    *submodule* (not callable) on every access after that, because `from
+    .audit import audit` implicitly binds the submodule onto the package
+    as an import-machinery side effect, and regular attribute lookup finds
+    that binding before `__getattr__` is ever consulted again. This
+    exercises the fix: every access must keep returning the same callable,
+    not the submodule, and `fastdna.audit is fastdna.audit` must hold
+    (bypassing `__getattr__` entirely once cached).
+    """
+    import fastdna as _fastdna_top_level
+
+    first = _fastdna_top_level.audit
+    second = _fastdna_top_level.audit
+    third = _fastdna_top_level.explain
+
+    assert first is audit
+    assert second is audit
+    assert first is second
+    assert callable(_fastdna_top_level.audit)
+    assert third is explain
+    assert callable(_fastdna_top_level.explain)
+
+
 def _write(tmp_path, name, reads):
     p = tmp_path / name
     p.write_text("".join(f"@r{i}\n{s}\n+\n{'I' * len(s)}\n" for i, s in enumerate(reads)))
