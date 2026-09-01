@@ -28,7 +28,13 @@ np = pytest.importorskip("numpy")
 
 import pyarrow as pa
 
-from fastdna.cv import LineageKFold, lineage_groups, permutation_importance_pvalues
+from fastdna.cv import (
+    LineageKFold,
+    lineage_groups,
+    lineage_groups_from_distances,
+    lineage_groups_from_tree,
+    permutation_importance_pvalues,
+)
 
 
 def write_fastq(tmp_path: pathlib.Path, name: str, reads: list[str]) -> pathlib.Path:
@@ -165,6 +171,134 @@ class TestLineageGroups:
 
         with pytest.raises(ValueError):
             lineage_groups(paths, k=_K, sketch_size=_SKETCH_SIZE, distance_threshold=0.0)
+
+
+class TestLineageGroupsFromDistances:
+    def test_two_clear_clusters_via_block_diagonal_matrix(self):
+        """Four samples, two clusters of two: small within-block distance,
+        large between-block distance, built by hand so the expected
+        grouping is obvious.
+        """
+        distances = np.array(
+            [
+                [0.00, 0.01, 1.00, 1.00],
+                [0.01, 0.00, 1.00, 1.00],
+                [1.00, 1.00, 0.00, 0.02],
+                [1.00, 1.00, 0.02, 0.00],
+            ]
+        )
+
+        groups = lineage_groups_from_distances(distances, distance_threshold=0.1)
+
+        assert _as_partition(groups) == _as_partition([0, 0, 1, 1])
+
+    def test_agrees_with_lineage_groups_over_the_equivalent_mash_matrix(self, lineage_cohort):
+        """The shared-math claim, pinned directly: clustering the exact
+        Mash-distance matrix `lineage_groups()` builds internally, by hand
+        via `lineage_groups_from_distances()`, must reproduce the identical
+        labels `lineage_groups()` itself returns -- not just a plausible-
+        looking grouping.
+        """
+        from fastdna.cv import _mash_distance_matrix
+
+        paths, _ = lineage_cohort
+        matrix = _mash_distance_matrix(paths, _K, _SKETCH_SIZE)
+
+        via_distances = lineage_groups_from_distances(matrix, distance_threshold=_THRESHOLD)
+        via_paths = lineage_groups(paths, k=_K, sketch_size=_SKETCH_SIZE, distance_threshold=_THRESHOLD)
+
+        assert via_distances.tolist() == via_paths.tolist()
+
+    def test_non_square_matrix_raises(self):
+        with pytest.raises(ValueError) as exc_info:
+            lineage_groups_from_distances(np.zeros((3, 4)), distance_threshold=0.1)
+
+        assert "square" in str(exc_info.value)
+
+    def test_asymmetric_matrix_raises(self):
+        distances = np.array([[0.0, 0.5, 0.9], [0.1, 0.0, 0.8], [0.9, 0.8, 0.0]])
+
+        with pytest.raises(ValueError) as exc_info:
+            lineage_groups_from_distances(distances, distance_threshold=0.1)
+
+        assert "symmetric" in str(exc_info.value)
+
+    def test_nonzero_diagonal_raises(self):
+        distances = np.array([[0.3, 0.5, 0.9], [0.5, 0.0, 0.8], [0.9, 0.8, 0.0]])
+
+        with pytest.raises(ValueError) as exc_info:
+            lineage_groups_from_distances(distances, distance_threshold=0.1)
+
+        assert "diagonal" in str(exc_info.value)
+
+    def test_non_positive_distance_threshold_raises(self):
+        distances = np.array([[0.0, 0.5], [0.5, 0.0]])
+
+        with pytest.raises(ValueError):
+            lineage_groups_from_distances(distances, distance_threshold=0.0)
+
+
+class TestLineageGroupsFromTree:
+    # Root has two children: leaf A (branch 0.1) and an internal node
+    # (branch 0.2) whose own two children are leaves B and C (branch 0.05
+    # each). Patristic distances, computed by hand:
+    #   A-B = 0.1 + 0.2 + 0.05 = 0.35
+    #   A-C = 0.1 + 0.2 + 0.05 = 0.35
+    #   B-C = 0.05 + 0.05      = 0.10
+    # so a threshold of 0.15 merges B and C but leaves A on its own.
+    _NEWICK = "(A:0.1,(B:0.05,C:0.05):0.2);"
+
+    def test_newick_string_recovers_the_hand_computed_groups(self):
+        pytest.importorskip("Bio")
+
+        groups = lineage_groups_from_tree(self._NEWICK, ["A", "B", "C"], distance_threshold=0.15)
+
+        assert groups.tolist() == [0, 1, 1]
+
+    def test_newick_file_path_gives_the_same_result_as_the_string(self, tmp_path):
+        pytest.importorskip("Bio")
+
+        tree_path = tmp_path / "tree.nwk"
+        tree_path.write_text(self._NEWICK)
+
+        from_path = lineage_groups_from_tree(tree_path, ["A", "B", "C"], distance_threshold=0.15)
+        from_str_path = lineage_groups_from_tree(str(tree_path), ["A", "B", "C"], distance_threshold=0.15)
+        from_string = lineage_groups_from_tree(self._NEWICK, ["A", "B", "C"], distance_threshold=0.15)
+
+        assert from_path.tolist() == from_string.tolist()
+        assert from_str_path.tolist() == from_string.tolist()
+
+    def test_missing_leaf_name_raises_with_leaf_label_guidance(self):
+        pytest.importorskip("Bio")
+
+        with pytest.raises(ValueError) as exc_info:
+            lineage_groups_from_tree(self._NEWICK, ["A", "B", "not_in_tree"], distance_threshold=0.15)
+
+        message = str(exc_info.value)
+        assert "not_in_tree" in message
+        # A few real tree leaf labels should be surfaced too, to help spot a
+        # spelling mismatch.
+        assert "A" in message and "B" in message and "C" in message
+
+    def test_a_higher_threshold_merges_all_three_leaves(self):
+        pytest.importorskip("Bio")
+
+        groups = lineage_groups_from_tree(self._NEWICK, ["A", "B", "C"], distance_threshold=0.5)
+
+        assert len(set(groups.tolist())) == 1
+
+    def test_a_lower_threshold_splits_all_three_leaves(self):
+        pytest.importorskip("Bio")
+
+        groups = lineage_groups_from_tree(self._NEWICK, ["A", "B", "C"], distance_threshold=0.01)
+
+        assert len(set(groups.tolist())) == 3
+
+    def test_non_positive_distance_threshold_raises(self):
+        pytest.importorskip("Bio")
+
+        with pytest.raises(ValueError):
+            lineage_groups_from_tree(self._NEWICK, ["A", "B", "C"], distance_threshold=0.0)
 
 
 class TestLineageKFold:

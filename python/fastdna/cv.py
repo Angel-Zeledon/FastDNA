@@ -56,8 +56,9 @@ never requires either package, only calling into it does.
 """
 from __future__ import annotations
 
+import io
 import os
-from typing import Any, Iterable, Iterator, Optional, Tuple, Union
+from typing import Any, Iterable, Iterator, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -65,7 +66,13 @@ import pyarrow as pa
 import fastdna
 from . import _core
 
-__all__ = ["lineage_groups", "LineageKFold", "permutation_importance_pvalues"]
+__all__ = [
+    "lineage_groups",
+    "lineage_groups_from_distances",
+    "lineage_groups_from_tree",
+    "LineageKFold",
+    "permutation_importance_pvalues",
+]
 
 
 def _missing_dependency(caller, package, hint=None):
@@ -258,6 +265,326 @@ def lineage_groups(
     condensed = squareform(matrix, checks=False)
     labels = fcluster(linkage(condensed, method="single"), t=distance_threshold, criterion="distance")
     return _relabel_by_first_appearance(labels)
+
+
+def _validate_distance_threshold(distance_threshold, caller):
+    """Shared positivity check for `distance_threshold`, used by both
+    `lineage_groups_from_distances()` and `lineage_groups_from_tree()`.
+    `lineage_groups()` keeps its own copy of this same check inline rather
+    than calling this helper, so as not to touch that function's body.
+
+    Parameters
+    ----------
+    distance_threshold : float
+    caller : str
+        Name of the calling function, used only to name it in the raised
+        error message.
+
+    Raises
+    ------
+    ValueError
+        If `distance_threshold` is not a positive number.
+    """
+    if not distance_threshold > 0:
+        raise _core.InvalidConfigError(
+            f"{caller} needs a positive distance_threshold, got {distance_threshold!r}. "
+            "At or below 0 every sample becomes its own lineage, which defeats the point."
+        )
+
+
+def _validate_distance_matrix(distances, caller):
+    """Refuses the three ways an already-computed distance matrix fails to
+    be a valid input to single-linkage clustering: not square, a diagonal
+    that is not (near) zero, and asymmetry.
+
+    Symmetry and the diagonal are checked with a floating-point tolerance
+    rather than exact equality, for the same reason `lineage_groups()`
+    passes `checks=False` to `scipy.spatial.distance.squareform()`:
+    squareform's own built-in validation is strict enough to reject a
+    matrix that is symmetric by construction but carries ordinary
+    floating-point rounding noise from whatever produced it (a caller's
+    own pairwise-distance computation, not FastDNA's). This function's
+    tolerance (`1e-6`) is deliberately looser than that, and its own
+    `squareform(..., checks=False)` call in `_single_linkage_groups()`
+    relies on this check having already run.
+
+    Parameters
+    ----------
+    distances : array-like
+    caller : str
+        Name of the calling function, used only to name it in raised error
+        messages.
+
+    Returns
+    -------
+    numpy.ndarray of float64, shape (n, n)
+
+    Raises
+    ------
+    ValueError
+        If `distances` is not square, has fewer than 2 samples, has a
+        diagonal that is not (near) zero, or is not (near) symmetric.
+    """
+    distances = np.asarray(distances, dtype=np.float64)
+    if distances.ndim != 2 or distances.shape[0] != distances.shape[1]:
+        raise _core.InvalidConfigError(f"{caller} needs a square distance matrix, got shape {distances.shape}")
+
+    n = distances.shape[0]
+    if n < 2:
+        raise _core.InvalidConfigError(
+            f"{caller} needs at least 2 samples to compute pairwise distances, got a "
+            f"{n}x{n} matrix"
+        )
+
+    max_diagonal = float(np.max(np.abs(np.diagonal(distances))))
+    if max_diagonal > 1e-6:
+        raise _core.InvalidConfigError(
+            f"{caller} needs a zero-diagonal distance matrix (a sample's distance to "
+            f"itself must be 0), but the diagonal has values up to {max_diagonal!r}"
+        )
+
+    max_asymmetry = float(np.max(np.abs(distances - distances.T)))
+    if max_asymmetry > 1e-6:
+        raise _core.InvalidConfigError(
+            f"{caller} needs a symmetric distance matrix (distances[i, j] must equal "
+            f"distances[j, i]), but the maximum asymmetry found is {max_asymmetry!r}"
+        )
+
+    return distances
+
+
+def _single_linkage_groups(distances, distance_threshold, caller):
+    """The clustering core `lineage_groups_from_distances()` runs, matching
+    `lineage_groups()`'s own `scipy.cluster.hierarchy.linkage(squareform(...),
+    method="single")` + `fcluster(..., criterion="distance")` +
+    `_relabel_by_first_appearance()` sequence exactly, so that "the same
+    distance_threshold" means the same thing regardless of whether the
+    distance matrix came from FastDNA's own Mash sketching or from
+    somewhere else entirely.
+
+    Parameters
+    ----------
+    distances : numpy.ndarray of float64, shape (n, n)
+        Already validated by `_validate_distance_matrix()`.
+    distance_threshold : float
+    caller : str
+        Name of the calling function, used only to name it in a raised
+        ImportError.
+
+    Returns
+    -------
+    numpy.ndarray of int64, shape (n,)
+    """
+    try:
+        from scipy.cluster.hierarchy import fcluster, linkage
+        from scipy.spatial.distance import squareform
+    except ImportError:
+        raise _missing_dependency(caller, "scipy") from None
+
+    condensed = squareform(distances, checks=False)
+    labels = fcluster(linkage(condensed, method="single"), t=distance_threshold, criterion="distance")
+    return _relabel_by_first_appearance(labels)
+
+
+def lineage_groups_from_distances(
+    distances: np.ndarray,
+    *,
+    distance_threshold: float,
+) -> np.ndarray:
+    """Assigns each row of an already-computed distance matrix an integer
+    lineage label, by the same single-linkage clustering `lineage_groups()`
+    runs over its own Mash-distance matrix.
+
+    Use this when a phylogenetic proxy for relatedness already exists from
+    somewhere other than FastDNA's own sketching: a Roary/Panaroo gene-
+    presence-absence distance, a core-genome SNP distance, DBGWAS unitig
+    distances, or any other square distance matrix over the same samples
+    `groups=` will be paired with. `lineage_groups_from_tree()` is the
+    equivalent entry point starting from a Newick tree instead of an
+    already-computed matrix.
+
+    See `lineage_groups()`'s own docstring for what `distance_threshold`
+    means and why single linkage is the conservative choice for this
+    purpose (chaining, not splitting, clonal groups) -- that reasoning
+    applies identically here and is not repeated.
+
+    Parameters
+    ----------
+    distances : numpy.ndarray, shape (n, n)
+        A square, symmetric, zero-diagonal distance matrix over `n`
+        samples, any distance metric. Symmetry and the diagonal are
+        checked with a floating-point tolerance (not exact equality),
+        because a matrix computed elsewhere routinely carries ordinary
+        rounding noise rather than being symmetric by literal
+        construction.
+    distance_threshold : float
+        The distance below which two samples are considered the same
+        lineage, on the same scale as `distances`. Must be positive.
+        There is no dataset-independent default the way
+        `lineage_groups()`'s Mash-distance `0.01` is: `distances` can be on
+        any scale (a Jaccard distance, a SNP count, a normalized unitig
+        distance), so inspect its distribution and pick a value from the
+        gap between within-lineage and between-lineage distances, the same
+        way `lineage_groups()`'s own docstring recommends for Mash
+        distances.
+
+    Returns
+    -------
+    numpy.ndarray of int, shape (n,)
+        Integer lineage labels, 0-based and contiguous, numbered by first
+        appearance -- the identical convention `lineage_groups()` uses.
+
+    Raises
+    ------
+    ValueError
+        If `distances` is not square, is not (near) symmetric, does not
+        have a (near) zero diagonal, or `distance_threshold` is not
+        positive.
+    ImportError
+        If scipy is not installed.
+
+    Example
+    -------
+    A caller with a Roary `gene_presence_absence.csv` already has a
+    sample-by-gene presence/absence matrix. Turning it into a distance
+    matrix (e.g. `scipy.spatial.distance.squareform(scipy.spatial.distance.
+    pdist(genes, metric="jaccard"))`) and calling
+    `lineage_groups_from_distances(matrix, distance_threshold=0.1)`
+    produces labels in the same shape `lineage_groups()` would, ready for
+    `LineageKFold(groups=labels)` or `audit(groups=labels, paths=X)`.
+    """
+    _validate_distance_threshold(distance_threshold, "lineage_groups_from_distances()")
+    distances = _validate_distance_matrix(distances, "lineage_groups_from_distances()")
+    return _single_linkage_groups(distances, distance_threshold, "lineage_groups_from_distances()")
+
+
+def lineage_groups_from_tree(
+    tree: Union[str, os.PathLike],
+    leaf_names: Sequence[str],
+    *,
+    distance_threshold: float,
+) -> np.ndarray:
+    """Assigns each of `leaf_names` an integer lineage label, derived from
+    the all-pairs patristic distances (the sum of branch lengths along the
+    path connecting two leaves) of a Newick-format phylogenetic tree.
+
+    This is the entry point for a caller who already has a real tree --
+    typically from IQ-TREE, RAxML, or a Gubbins recombination-corrected
+    tree -- rather than FastDNA's own Mash-sketch proxy for one. It
+    computes the patristic distance matrix over `leaf_names` and hands it
+    to `lineage_groups_from_distances()`, so the two functions agree
+    exactly on what "the same distance_threshold" means; see that
+    function's docstring, and `lineage_groups()`'s, for the shared single-
+    linkage reasoning this builds on.
+
+    Parameters
+    ----------
+    tree : str or os.PathLike
+        Either a path to a Newick file, or a Newick string directly (e.g.
+        `"(A:0.1,(B:0.2,C:0.3):0.1);"`). A `str` is treated as a path when
+        it names an existing file (checked with `os.path.isfile`);
+        otherwise it is parsed as Newick text directly. An `os.PathLike`
+        (e.g. `pathlib.Path`) is always treated as a path.
+    leaf_names : sequence of str
+        The sample_ids/paths the output labels correspond to, in the
+        desired output order. Every entry must be a leaf label that
+        actually exists in `tree` -- see Raises below.
+    distance_threshold : float
+        The patristic distance below which two leaves are considered the
+        same lineage, on the tree's own branch-length scale (typically
+        substitutions per site for a maximum-likelihood tree). This is
+        *not* comparable to `lineage_groups()`'s Mash-distance default of
+        `0.01`: inspect the tree's own branch lengths before picking a
+        value, the same way `lineage_groups()`'s docstring recommends
+        inspecting the Mash-distance distribution.
+
+    Returns
+    -------
+    numpy.ndarray of int, shape (len(leaf_names),)
+        Integer lineage labels, 0-based and contiguous, numbered by first
+        appearance, in `leaf_names` order.
+
+    Raises
+    ------
+    ImportError
+        If Biopython is not installed.
+    ValueError
+        If `tree` names a path that does not exist, if any of `leaf_names`
+        is not a leaf label found in `tree` (the message names which are
+        missing and shows a few of the tree's own leaf labels for
+        comparison -- tree-building tools commonly spell sample names
+        differently from a caller's own sample_ids, e.g. underscores vs
+        spaces or an appended `_1`/accession suffix), or if
+        `distance_threshold` is not positive.
+
+    Example
+    -------
+    Given an IQ-TREE run's `sample.treefile`::
+
+        groups = lineage_groups_from_tree(
+            "sample.treefile", sample_ids, distance_threshold=0.02,
+        )
+        cv = LineageKFold(n_splits=5, groups=groups)
+
+    or directly from a Newick string, without writing a file::
+
+        newick = "(A:0.1,(B:0.05,C:0.05):0.2);"
+        groups = lineage_groups_from_tree(newick, ["A", "B", "C"], distance_threshold=0.15)
+        # groups == array([0, 1, 1]) -- B and C share a recent common
+        # ancestor (patristic distance 0.05 + 0.05 = 0.10, under the
+        # threshold); A is 0.1 + 0.2 = 0.3 from both, over it.
+    """
+    _validate_distance_threshold(distance_threshold, "lineage_groups_from_tree()")
+    leaf_names = list(leaf_names)
+    if len(leaf_names) < 2:
+        raise _core.InvalidConfigError(
+            f"lineage_groups_from_tree() needs at least 2 leaf_names to compute pairwise "
+            f"distances, got {len(leaf_names)}"
+        )
+
+    try:
+        from Bio import Phylo
+    except ImportError:
+        raise _missing_dependency("lineage_groups_from_tree()", "biopython") from None
+
+    if isinstance(tree, os.PathLike):
+        source = os.fspath(tree)
+    elif isinstance(tree, str) and os.path.isfile(tree):
+        source = tree
+    else:
+        source = io.StringIO(str(tree))
+
+    try:
+        parsed = Phylo.read(source, "newick")
+    except FileNotFoundError as e:
+        raise _core.IoNotFoundError(
+            f"lineage_groups_from_tree() could not find the Newick tree file {source!r}."
+        ) from e
+
+    leaf_map = {clade.name: clade for clade in parsed.get_terminals() if clade.name is not None}
+    missing = [name for name in leaf_names if name not in leaf_map]
+    if missing:
+        example_tree_leaves = sorted(leaf_map)[:5]
+        raise _core.InvalidConfigError(
+            f"lineage_groups_from_tree() could not find {len(missing)} of the requested "
+            f"leaf_names as leaf labels in the tree: {missing[:5]}"
+            f"{', ...' if len(missing) > 5 else ''}. A few leaf labels that ARE in the "
+            f"tree, for comparison: {example_tree_leaves}. Tree-building tools commonly "
+            "spell sample names differently from a caller's own sample_ids (underscores "
+            "vs spaces, an appended '_1' or accession suffix) -- check for a naming "
+            "mismatch before assuming the sample is truly absent from the tree."
+        )
+
+    n = len(leaf_names)
+    distances = np.zeros((n, n), dtype=np.float64)
+    clades = [leaf_map[name] for name in leaf_names]
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = parsed.distance(clades[i], clades[j])
+            distances[i, j] = d
+            distances[j, i] = d
+
+    return lineage_groups_from_distances(distances, distance_threshold=distance_threshold)
 
 
 def _n_samples(X):
