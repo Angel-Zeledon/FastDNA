@@ -302,15 +302,57 @@ demonstration now exists, on a phenotype chosen for the opposite property:
 *E. coli* + ciprofloxacin is polygenic (stepwise `gyrA`/`parC`, efflux,
 `qnr`) and clone-associated (ST131).
 
-> **The numbers in this section were measured on truncated genomes.** They
-> predate the discovery that `load_amr` was returning only each assembly's
-> first 25 contigs -- about 26% of an *E. coli* genome -- because the BV-BRC
-> endpoint paginates at 25 rows and the URL did not ask for more (fixed; see
-> the CHANGELOG). All 200 genomes were truncated the same way, so the
-> comparison *between* groupings holds and the qualitative finding stands:
-> a large positive gap under MLST, a false negative at the old default
-> threshold. The exact magnitudes should be re-measured on complete genomes
-> before being quoted anywhere that matters.
+> # RETRACTED (2026-09-01, same day)
+>
+> **The gap reported below is an artefact of the truncation bug, not a
+> demonstration of population-structure leakage. Do not cite it.**
+>
+> These numbers were measured before it was discovered that `load_amr`
+> returned only each assembly's first 25 contigs. Re-measuring after the fix
+> did not reproduce them. A three-way comparison isolates the cause -- B and
+> C differ *only* in whether the genomes were truncated:
+>
+> | | genomes | n | top_features | random-CV AUC | gap |
+> |---|---|---:|---:|---:|---:|
+> | A (as published below) | truncated | 200 | 10,000 | 0.755 | **+0.165** |
+> | B | **complete** | 80 | 5,000 | **0.480** | -0.041 |
+> | C | **truncated** | 80 | 5,000 | **0.715** | +0.007 |
+>
+> On complete genomes the model does not beat chance (0.480), so there is no
+> signal for population structure to inflate. The apparent predictive power
+> came from the truncation.
+>
+> **Why truncation created signal.** The cut was not uniform: it kept the
+> first 25 contigs, so a 2-contig assembly survived intact and a 553-contig
+> one was reduced to 3%. Across this cohort the surviving fraction ranged
+> from 3.2% to 100% (median 24%), did **not** correlate with the phenotype
+> (r=+0.072, p=0.52), and had **41% of its variance explained by sequence
+> type** (R²=0.407). The bug therefore introduced an artificial variable
+> encoding lineage -- and lineage does predict this phenotype (ST131 is 68%
+> resistant). A model could learn that variable; blocking by lineage removed
+> it; that produced the gap. The large gap additionally needed the 200-genome
+> cohort: at n=80 the same truncated data gives +0.007.
+>
+> Worth stating plainly: `audit()` was not wrong. It correctly detected
+> leakage from population structure. The structure had simply been
+> manufactured by a data bug rather than by biology -- which is exactly why
+> a leakage audit is a measurement about a *cohort*, not a verdict about a
+> *method*.
+>
+> **What survives**, because it was measured on the complete genomes and
+> improved rather than collapsed: `cv.lineage_groups` recovers the MLST
+> partition almost exactly, ARI **0.931** (40 inferred groups against 38 real
+> sequence types), where the truncated data gave 0.003. The lineage inference
+> is sound; the input had been broken.
+>
+> A genuine leakage demonstration still needs a cohort where a model has real
+> signal to begin with. Ciprofloxacin resistance is driven by point mutations
+> in `gyrA`/`parC`, which are unlikely to appear among the most *prevalent*
+> k-mers that `top_features` selects -- a plausible reason the honest model
+> finds nothing here, and the first thing to test next.
+>
+> The original section is kept below, unedited, because a retraction that
+> deletes its own evidence is not a retraction.
 
 200 BV-BRC genomes, 66 resistant / 134 susceptible, 79 sequence types:
 
