@@ -294,3 +294,66 @@ fn profile_rejects_a_file_that_is_not_a_kmer_table() {
     ]);
     assert!(!stderr.is_empty());
 }
+
+/// REGRESSION: `--summary`'s default is a file NAME placed beside
+/// `--output`, not a path relative to the working directory.
+///
+/// `ProfileArgs`'s doc comment always said "defaults alongside `--output`",
+/// and a bare relative `default_value` did not do that: it resolved against
+/// the process's working directory, so `-o /data/run1/prof.parquet` wrote
+/// the summary to `./read_profile_summary.parquet`. Untidy on its own, and
+/// destructive in a loop -- profiling many samples into separate output
+/// directories had every iteration overwrite one shared summary, keeping
+/// only the last, with no error.
+#[test]
+fn the_default_summary_lands_beside_the_output_not_in_the_cwd() {
+    use fastdna_core::cli::{ProfileArgs, DEFAULT_PROFILE_SUMMARY};
+    use std::path::PathBuf;
+
+    let args = ProfileArgs {
+        input: vec![PathBuf::from("reads.fastq")],
+        table: PathBuf::from("ref.parquet"),
+        output: PathBuf::from("/data/run1/prof.parquet"),
+        summary: None,
+    };
+
+    assert_eq!(
+        args.resolve_summary_path(),
+        PathBuf::from("/data/run1").join(DEFAULT_PROFILE_SUMMARY),
+        "the default summary must sit in --output's directory"
+    );
+}
+
+/// The other half: an explicit `--summary` is used exactly as given, with
+/// no directory rewriting.
+#[test]
+fn an_explicit_summary_path_is_left_alone() {
+    use fastdna_core::cli::ProfileArgs;
+    use std::path::PathBuf;
+
+    let args = ProfileArgs {
+        input: vec![PathBuf::from("reads.fastq")],
+        table: PathBuf::from("ref.parquet"),
+        output: PathBuf::from("/data/run1/prof.parquet"),
+        summary: Some(PathBuf::from("/elsewhere/mine.parquet")),
+    };
+
+    assert_eq!(args.resolve_summary_path(), PathBuf::from("/elsewhere/mine.parquet"));
+}
+
+/// A bare output filename has no directory to place the summary in; it must
+/// fall back to the plain name rather than building "/read_profile_summary".
+#[test]
+fn a_bare_output_filename_keeps_the_summary_bare_too() {
+    use fastdna_core::cli::{ProfileArgs, DEFAULT_PROFILE_SUMMARY};
+    use std::path::PathBuf;
+
+    let args = ProfileArgs {
+        input: vec![PathBuf::from("reads.fastq")],
+        table: PathBuf::from("ref.parquet"),
+        output: PathBuf::from("prof.parquet"),
+        summary: None,
+    };
+
+    assert_eq!(args.resolve_summary_path(), PathBuf::from(DEFAULT_PROFILE_SUMMARY));
+}

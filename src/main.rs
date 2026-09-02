@@ -1097,10 +1097,17 @@ fn run_spectrum(args: SpectrumArgs) -> Result<()> {
 /// `fastdna profile`: thin console-output wrapper around `read_profile::
 /// run_profile` (see `cli::ProfileArgs`'s doc comment for the full design).
 fn run_profile(args: ProfileArgs) -> Result<()> {
+    // Resolved once, before the guards: `--summary`'s default is a file
+    // NAME placed beside `--output`, not a path relative to the working
+    // directory (see `ProfileArgs::resolve_summary_path`). Everything
+    // below -- the clobber guards, the preflight, the banner -- must see
+    // the path that will actually be written.
+    let summary = args.resolve_summary_path();
+
     // Same "would this write clobber something the run still needs to
     // read" guard every other subcommand runs: neither the reference table
     // nor any input file may be one of this run's own outputs.
-    for guarded in [&args.output, &args.summary] {
+    for guarded in [&args.output, &summary] {
         if fastdna_core::atomic::same_file(&args.table, guarded) {
             return Err(FastDnaError::InvalidConfig {
                 parameter: "output paths",
@@ -1117,7 +1124,7 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
         }
     }
     fastdna_core::atomic::preflight_writable(&args.output)?;
-    fastdna_core::atomic::preflight_writable(&args.summary)?;
+    fastdna_core::atomic::preflight_writable(&summary)?;
 
     let inputs: Vec<InputSpec> = args.input.iter().map(|p| InputSpec::from_arg(p)).collect();
 
@@ -1127,7 +1134,7 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
     println!("Input:   {}", format_inputs(&inputs));
     println!("Table:   {}", args.table.display());
     println!("Profile: {}", args.output.display());
-    println!("Summary: {}", args.summary.display());
+    println!("Summary: {}", summary.display());
     println!("--------------------------------------------------");
 
     let table = KmerTable::open(&args.table)?;
@@ -1137,7 +1144,7 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
 
     let pb = spinner("Profiling reads...");
     let start = Instant::now();
-    let stats = read_profile::run_profile(inputs, &index, &args.output, &args.summary).inspect_err(|_| pb.abandon())?;
+    let stats = read_profile::run_profile(inputs, &index, &args.output, &summary).inspect_err(|_| pb.abandon())?;
     let elapsed = start.elapsed().as_secs_f64();
     pb.finish_with_message(format!("Profiling completed in {elapsed:.2}s"));
 
@@ -1145,7 +1152,7 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
     println!("Reads read:     {}", stats.reads_total);
     println!("Reads profiled: {}", stats.reads_profiled);
     println!("Profile output: {}", args.output.display());
-    println!("Summary output: {}", args.summary.display());
+    println!("Summary output: {}", summary.display());
 
     Ok(())
 }

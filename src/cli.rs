@@ -987,12 +987,42 @@ pub struct ProfileArgs {
 
     /// Output path for the per-read summary table (`read_id`, `n_kmers`,
     /// `n_present_kmers`, `min_count`, `median_count`, `max_count`; see
-    /// `read_profile::summary_schema`). Defaults alongside `--output`, the
-    /// same "auxiliary output has its own default path" convention `count`'s
-    /// `--qc` already uses.
-    #[arg(long, value_name = "FILE", default_value = "read_profile_summary.parquet")]
-    pub summary: PathBuf,
+    /// `read_profile::summary_schema`).
+    ///
+    /// Defaults to `read_profile_summary.parquet` **in `--output`'s own
+    /// directory**, which is what this doc comment always claimed and what
+    /// the code did not do: a bare relative `default_value` resolves against
+    /// the process's working directory, so `-o /data/run1/prof.parquet`
+    /// silently wrote the summary to `./read_profile_summary.parquet`
+    /// instead. That is worse than untidy -- a loop profiling many samples
+    /// into separate output directories had every iteration overwrite one
+    /// shared summary file, keeping only the last, with no error.
+    ///
+    /// `None` here means "not given"; `resolve_summary_path` derives it.
+    /// An explicit value is used exactly as passed.
+    #[arg(long, value_name = "FILE")]
+    pub summary: Option<PathBuf>,
 }
+
+impl ProfileArgs {
+    /// The summary path to actually write: the caller's if they gave one,
+    /// otherwise `read_profile_summary.parquet` beside `--output`.
+    pub fn resolve_summary_path(&self) -> PathBuf {
+        if let Some(explicit) = &self.summary {
+            return explicit.clone();
+        }
+        match self.output.parent() {
+            // `parent()` of a bare filename is `Some("")`, which would build
+            // "/read_profile_summary.parquet" if joined blindly.
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(DEFAULT_PROFILE_SUMMARY),
+            _ => PathBuf::from(DEFAULT_PROFILE_SUMMARY),
+        }
+    }
+}
+
+/// File name used for `fastdna profile`'s summary table when `--summary` is
+/// not given. Only the name: the directory comes from `--output`.
+pub const DEFAULT_PROFILE_SUMMARY: &str = "read_profile_summary.parquet";
 
 impl MatrixArgs {
     /// Cross-flag validation clap cannot express declaratively -- the same
