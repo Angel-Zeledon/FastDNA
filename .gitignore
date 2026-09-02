@@ -28,3 +28,9 @@ venv/
 
 # Scratch workspace for ad hoc analysis/repro scripts and downloaded data
 /scratch/
+
+# scripts/validation/leakage_survey.py: counted cohorts (~150 MB each) and
+# the study's own output. Both are reproducible from the script.
+cache/
+leakage_survey*.json
+survey*.json

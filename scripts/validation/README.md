@@ -31,6 +31,11 @@ data. Useful, and not a correctness check.
 
 ## The scripts
 
+Two layers. The first compares against an **external implementation** of the
+same algorithm; the second, where no reference tool exists, compares against
+**truth that was constructed** -- data built so the right answer is known
+before the module runs.
+
 | script | checks | against |
 |---|---|---|
 | `kmc3_equivalence.py` | k-mer counting | KMC3 3.2.4, **exact equality** |
@@ -39,6 +44,9 @@ data. Useful, and not a correctness check.
 | `assembly_qc_vs_merqury.py` | assembly QV | Merqury 1.4.1 |
 | `taxonomy_real_species.py` | species classification | published species identity |
 | `lineage_leakage_experiment.py` | the leakage audit end to end | MLST as ground truth |
+| `known_truth_checks.py` | 22 modules with no reference tool | constructed truth |
+| `leakage_calibration.py` | does the audit's gap track leakage *magnitude* | injected leakage, swept |
+| `leakage_survey.py` | the study itself, many cohorts | -- it produces the result |
 
 Reference tools arrive as **pinned biocontainers**, not manual builds, so a
 rerun a year from now compares against the same versions rather than
@@ -55,6 +63,20 @@ python scripts/validation/kmc3_equivalence.py
 Docker is required for every script that names an external tool. Data
 downloads are cached under `~/.fastdna/` and shared between scripts, so the
 first run is slow and later ones are not.
+
+`leakage_survey.py` is the long one -- roughly four hours for 30 cohorts --
+and is built to be interrupted:
+
+```bash
+python scripts/validation/leakage_survey.py --list                 # candidates
+python scripts/validation/leakage_survey.py --max-cohorts 30 --json survey.json
+python scripts/validation/leakage_survey.py --json survey.json     # resumes
+```
+
+Finished cohorts are skipped on a re-run, and counted cohorts are cached
+under `--cache-dir` (default `cache/cohort_counts/`, ~150 MB each) so a
+re-run that changes the *analysis* rather than the cohorts starts at the
+audit instead of at counting.
 
 ## What "passing" means here
 
