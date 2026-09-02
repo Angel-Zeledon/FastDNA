@@ -206,3 +206,99 @@ published/expected numbers, for defensible biological reasons that were
 checked, not assumed. Neither is a reproduction of one specific paper's
 exact benchmark on the exact same split -- that remains open work, and
 should not be described as done.
+
+---
+
+# Track C -- against the field's own tools (2026-09-01)
+
+Tracks A and B above validate *outcomes* against biological ground truth.
+This track validates *components* against the established implementation of
+the same algorithm, which is a different and complementary question: Track B
+can only say "the classification looks right", not "the k-mer counts
+underneath it are the same numbers KMC3 would produce".
+
+**Unlike everything above, this track is executable.** Each row is produced
+by a committed script, and `.github/workflows/validation.yml` runs them on a
+schedule. That is deliberate: the two tracks above exist only as this
+document, so if a regression broke them tomorrow, nothing would notice --
+the exact failure mode that let `audit.py` cite an artefact
+(`scratch/amr_repro/audit_report.json`) that is not in the repository.
+
+| what | against | result | script |
+|---|---|---|---|
+| k-mer counting | **KMC3 3.2.4** | **exact match**, k=31/21/15 | `kmc3_equivalence.py` |
+| HyperLogLog cardinality | exact count | -0.26% (bound ~0.8% at p=14) | `estimator_accuracy.py` |
+| ntCard spectrum (f1/f2/f3) | exact histogram | -0.63% / +2.04% / -1.45% | `estimator_accuracy.py` |
+| genome size | **GenomeScope2 2.0.1** | -0.29% | `estimator_accuracy.py` |
+| MinHash distances | **Mash 2.3** | r=0.997, bias ~0 | `sketch_vs_mash.py` |
+
+Data: ENA `DRR002015` (*E. coli*, 2,343,637 reads) for the read-based rows;
+8 BV-BRC *E. coli* assemblies for the Mash comparison. Reference tools run
+from pinned biocontainers, so a rerun a year from now compares against the
+same versions.
+
+Three details that matter more than the headline percentages:
+
+- **The counting comparison allows no tolerance at all.** With `-q 0`
+  (trimming off) and `-ci1` (singletons kept), both tools solve the identical
+  problem, so any difference is a bug. The comparison also has teeth: KMC's
+  own default `-ci2` returns 4,766,994 distinct instead of 19,062,700, a 75%
+  difference, so a flag mismatch could not slip through unnoticed.
+- **The Mash comparison asserts bias, not equality.** MinHash is sampling;
+  two correct implementations disagree by an amount falling as
+  `1/sqrt(sketch_size)`. Measured: error fell 3.06x for a 10x sketch, against
+  the 3.16x that `sqrt(10)` predicts, with bias ~0 at both sizes. An
+  implementation whose error did *not* shrink with sketch size would be
+  sampling the wrong space, and that check would catch it even if both tools
+  shared a bug.
+- **The genome-size row is the one that closed a real gap.** Before it,
+  `profile_genome`'s central claim was tested only against a spectrum drawn
+  from the same model family it fits, with an end-to-end assertion that
+  accepted any answer between 2,500 and 10,000 bp on a synthetic 5 kb
+  "genome". It now lands within 0.3% of GenomeScope2 on the same histogram,
+  and reports heterozygosity ~0.001 -- the correct answer for a haploid
+  organism, not an artefact.
+
+Stated rather than buried: *E. coli* is haploid while both genome-size tools
+assume diploid (`ploidy=2` / `-p 2`). They are outside their design
+assumption in the same way, which is what keeps them comparable to each
+other. A diploid cohort with a published genome size would exercise more of
+the model and is still open work.
+
+## Track D -- the leakage demonstration (2026-09-01)
+
+The honest caveat in Track A said the *S. aureus* + oxacillin cohort could
+not demonstrate `LineageKFold`'s value, because near-monogenic resistance
+(*mecA*) leaves nothing for population structure to inflate. That
+demonstration now exists, on a phenotype chosen for the opposite property:
+*E. coli* + ciprofloxacin is polygenic (stepwise `gyrA`/`parC`, efflux,
+`qnr`) and clone-associated (ST131).
+
+200 BV-BRC genomes, 66 resistant / 134 susceptible, 79 sequence types:
+
+| grouping | lineages | random CV | lineage-blocked | gap |
+|---|---:|---:|---:|---:|
+| MLST (ground truth) | 79 | 0.7548 | 0.5899 | **+0.165** |
+| sketching @ 0.03 | 95 | 0.7548 | 0.5797 | **+0.175** |
+| sketching @ 0.01 (old default) | 198 | 0.7548 | 0.7661 | -0.011 |
+
+Chance is 0.5, so the model's lift over chance falls from 0.255 to 0.090:
+**about 65% of its apparent predictive power was lineage memorisation.**
+The cohort's confounding is measurable without any model at all -- a
+predictor using *only* the sequence type, leave-one-out, scores AUC 0.815
+(ST131 is 68% resistant; ST73 is 0%).
+
+Two findings for the library itself came out of this, both since fixed:
+sketch-derived grouping **reproduces** the MLST answer once the threshold is
+right (so `cv.lineage_groups` is sound and only its default was
+miscalibrated), and the old fixed `lineage_threshold=0.01` fell outside the
+range this cohort's own dendrogram spans (0.019-0.044). See
+`scripts/validation/lineage_leakage_experiment.py`, which carries a written
+pre-registration that a near-zero gap is a reportable outcome rather than a
+reason to try another antibiotic.
+
+This is a demonstration that the tool works, not a discovery: PLOS Biology
+2025 already measured this inflation across 24,000+ genomes, and arXiv
+2502.07749 already named phylogeny-aware cross-validation the field's
+missing standard tool. What is new here is that it runs end to end from
+public accessions in one command.
