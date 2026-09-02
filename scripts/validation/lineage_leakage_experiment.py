@@ -35,9 +35,53 @@ phenotype:
     "this genome is ST131" scores well without learning any resistance
     biology at all -- exactly the failure `audit()` exists to expose.
 
+STATUS (2026-09-01): THIS SCRIPT HAS NOT YET PRODUCED A VALID DEMONSTRATION.
+Read this before quoting any number it prints.
+
+Three attempts, and why each fails:
+
+  1. E. coli + ciprofloxacin, 200 genomes, on TRUNCATED assemblies:
+     random-CV AUC 0.755, gap +0.165. **Retracted** -- an artefact of the
+     `load_amr` truncation bug (see the retraction notice in
+     `docs/validation-real-data.md`). The truncation encoded lineage
+     (R^2=0.407 of surviving fraction explained by sequence type), the model
+     learned that, and blocking removed it.
+  2. Same, on COMPLETE assemblies, n=80: random-CV AUC 0.480. The model does
+     not beat chance, so there is nothing for structure to inflate. A
+     leakage audit needs a result before it can ask whether the result is
+     real.
+  3. E. coli + ampicillin (resistance by an accessory gene, `blaTEM`, which
+     presence/absence of k-mers CAN see, unlike ciprofloxacin's gyrA/parC
+     point mutations), complete assemblies, n=80: random-CV AUC 0.566, gap
+     +0.075 with +/-0.12 on the blocked side. A gap from "barely above
+     chance" to "chance" is noise, not a demonstration.
+
+The likely cause of 2 and 3 is this script's own design, not the library:
+**5,000 features against 80 samples** (p/n = 62) with an unregularised
+logistic regression cannot learn anything that generalises, signal or no
+signal. Attempt 1 had the same ratio and was rescued only by spurious
+signal.
+
+What a valid demonstration needs, stated so the next attempt does not
+rediscover this:
+
+  * **n >= ~500 complete genomes**, which does NOT fit in 16 GB with
+    `counts=` in memory (200 complete genomes already drove this machine
+    into swap thrashing). Use `KmerVectorizer(disk_backed=True)` WITHOUT
+    `counts=`, paying a re-count per fold.
+  * **A phenotype driven by accessory-gene content**, and ideally one with
+    a published effect size to sanity-check against.
+  * **Regularisation matched to p >> n**, or far fewer features.
+
 HONEST PRE-REGISTRATION. A gap near zero is a publishable outcome of this
 script and must be reported as such, not retried with a different antibiotic
-until the number looks good. If the gap is small here, the honest reading is
+until the number looks good. Attempt 3 above changed antibiotic after
+attempt 2, and the distinction matters: it was not because the gap was
+small, but because the model had NO SIGNAL AT ALL (AUC 0.480), which makes
+the leakage question unanswerable rather than answered in the negative. The
+replacement was chosen mechanistically (accessory gene vs. point mutation)
+before its result was known, and its unfavourable result is reported here
+rather than dropped. If the gap is small here, the honest reading is
 that this cohort's signal is also strong enough to survive lineage blocking
 -- which is information, not failure. The one thing that would be dishonest
 is shopping for a cohort.

@@ -345,11 +345,32 @@ demonstration now exists, on a phenotype chosen for the opposite property:
 > sequence types), where the truncated data gave 0.003. The lineage inference
 > is sound; the input had been broken.
 >
-> A genuine leakage demonstration still needs a cohort where a model has real
-> signal to begin with. Ciprofloxacin resistance is driven by point mutations
-> in `gyrA`/`parC`, which are unlikely to appear among the most *prevalent*
-> k-mers that `top_features` selects -- a plausible reason the honest model
-> finds nothing here, and the first thing to test next.
+> **A replacement attempt also failed, and is reported rather than dropped.**
+> *E. coli* + ampicillin was tried next, chosen mechanistically before its
+> result was known: resistance there is carried by an accessory gene
+> (`blaTEM`), which presence/absence of k-mers can see, unlike
+> ciprofloxacin's `gyrA`/`parC` point mutations. On complete genomes, n=80:
+> random-CV AUC **0.566**, gap **+0.075** with ±0.12 on the blocked side. A
+> gap from "barely above chance" to "chance" is noise, not a demonstration.
+>
+> The likely cause is the experiment's design rather than the library:
+> **5,000 features against 80 samples** (p/n = 62) with an unregularised
+> logistic regression cannot learn anything that generalises. Attempt A had
+> the same ratio and was rescued only by the spurious signal.
+>
+> What a valid demonstration would need, so the next attempt does not
+> rediscover this: **n ≥ ~500 complete genomes** (which does not fit in 16 GB
+> with `counts=` resident -- 200 already caused swap thrashing, so it wants
+> `KmerVectorizer(disk_backed=True)` without `counts=`), a phenotype driven
+> by accessory-gene content, and regularisation matched to p >> n.
+>
+> Changing antibiotic after attempt B is not the cherry-picking the script's
+> own pre-registration forbids, and the distinction is worth being explicit
+> about: B produced **no signal at all** (AUC 0.480), which makes the leakage
+> question unanswerable rather than answered. Picking a new cohort because
+> the gap was small would be cherry-picking; picking one because the model
+> had nothing to audit is not. The unfavourable result of that new attempt is
+> recorded above.
 >
 > The original section is kept below, unedited, because a retraction that
 > deletes its own evidence is not a retraction.
