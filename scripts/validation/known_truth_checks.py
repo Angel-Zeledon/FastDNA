@@ -368,8 +368,69 @@ def check_interop_biopython() -> Tuple[bool, str]:
                 f"plain strings -> {from_strings.distinct_kmers}")
 
 
+def check_gwas_recovers_causal_variant() -> Tuple[bool, str]:
+    """A screen that cannot find a variant which perfectly predicts the
+    phenotype is not screening. One column is set equal to the labels, so
+    its position is the known right answer among 300 candidates."""
+    import numpy as np
+    import scipy.sparse as sp
+
+    from fastdna.gwas import prefilter_association
+
+    rng = np.random.default_rng(4)
+    n_samples, n_features, causal = 200, 300, 42
+    matrix = (rng.random((n_samples, n_features)) > 0.7).astype(np.uint8)
+    phenotype = rng.integers(0, 2, size=n_samples)
+    matrix[:, causal] = phenotype
+    names = [f"kmer_{i}" for i in range(n_features)]
+
+    table = prefilter_association(sp.csr_matrix(matrix), phenotype, names)
+    p_values = np.asarray(table.column("p_value"))
+    best = table.column("kmer_sequence").to_pylist()[int(np.argmin(p_values))]
+
+    ok = best == f"kmer_{causal}"
+    return ok, f"top hit {best} (injected: kmer_{causal}), p={p_values.min():.2e}"
+
+
+def check_annotate_locates_genes() -> Tuple[bool, str]:
+    """A k-mer taken from inside a gene must come back named; one from an
+    intergenic stretch must come back as intergenic rather than guessed at.
+    Both coordinates are known because the annotation is written here."""
+    import numpy as np
+
+    from fastdna.annotate import load_annotation, locate_kmer
+
+    rng = np.random.default_rng(9)
+    bases = np.array(list("ACGT"))
+    sequence = "".join(rng.choice(bases, size=3000))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = pathlib.Path(tmp)
+        (directory / "ref.fasta").write_text(
+            ">contig1\n" + "\n".join(sequence[i : i + 60] for i in range(0, len(sequence), 60)) + "\n"
+        )
+        (directory / "ann.gff").write_text(
+            "##gff-version 3\n"
+            "contig1\ttest\tgene\t1001\t1500\t.\t+\t.\tID=geneA;Name=geneA\n"
+        )
+        annotation = load_annotation(directory / "ref.fasta", directory / "ann.gff")
+        inside = locate_kmer(annotation, sequence[1100:1121])[0]
+        between = locate_kmer(annotation, sequence[100:121])[0]
+
+    ok = (
+        inside.gene_name == "geneA"
+        and inside.feature_type == "gene"
+        and between.feature_type == "intergenic"
+        and between.gene_name is None
+    )
+    return ok, (f"in-gene -> {inside.gene_name} at {inside.start}-{inside.end}, "
+                f"intergenic -> {between.feature_type}")
+
+
 CHECKS: Dict[str, Callable[[], Tuple[bool, str]]] = {
     "active_learning": check_active_learning_ordering,
+    "annotate": check_annotate_locates_genes,
+    "gwas": check_gwas_recovers_causal_variant,
     "anomaly": check_anomaly,
     "calibration": check_calibration,
     "embed": check_embed_preserves_structure,
