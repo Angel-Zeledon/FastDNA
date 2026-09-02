@@ -231,6 +231,7 @@ the exact failure mode that let `audit.py` cite an artefact
 | ntCard spectrum (f1/f2/f3) | exact histogram | -0.63% / +2.04% / -1.45% | `estimator_accuracy.py` |
 | genome size | **GenomeScope2 2.0.1** | -0.29% | `estimator_accuracy.py` |
 | MinHash distances | **Mash 2.3** | r=0.997, bias ~0 | `sketch_vs_mash.py` |
+| assembly QV | **Merqury 1.4.1** | 18.4192 vs 18.4205 | `assembly_qc_vs_merqury.py` |
 
 Data: ENA `DRR002015` (*E. coli*, 2,343,637 reads) for the read-based rows;
 8 BV-BRC *E. coli* assemblies for the Mash comparison. Reference tools run
@@ -251,6 +252,13 @@ Three details that matter more than the headline percentages:
   implementation whose error did *not* shrink with sketch size would be
   sampling the wrong space, and that check would catch it even if both tools
   shared a bug.
+- **The QV row separates a formula from a pipeline.** The suite already
+  transcribed Merqury's `qv.sh` arithmetic verbatim and checked FastDNA
+  computes the same expression -- good evidence for the formula, none for
+  which k-mers reach its numerator and denominator, since the fixtures
+  behind it are 300 pseudorandom bases at a uniform Phred 40. Run on the
+  same real (assembly, reads) pair, the two agree to four significant
+  figures on a log-scale metric.
 - **The genome-size row is the one that closed a real gap.** Before it,
   `profile_genome`'s central claim was tested only against a spectrum drawn
   from the same model family it fits, with an end-to-end assertion that

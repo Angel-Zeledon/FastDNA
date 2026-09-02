@@ -147,6 +147,7 @@ sequencing data rather than generated input**, by scripts committed under
 | k-mer counting | KMC3 3.2.4 | **exact match** at k=31, 21 and 15 |
 | MinHash distances | Mash 2.3 | r = 0.997, no systematic bias |
 | genome size | GenomeScope2 2.0.1 | within 0.29% |
+| assembly QV | Merqury 1.4.1 | 18.4192 vs 18.4205 |
 | HyperLogLog cardinality | the exact count | −0.26% (bound: ~0.8%) |
 | ntCard spectrum | the exact histogram | −0.6% / +2.0% / −1.5% at f1/f2/f3 |
 
