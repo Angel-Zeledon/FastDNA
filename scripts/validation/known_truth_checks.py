@@ -523,9 +523,77 @@ def check_read_profile_against_membership() -> Tuple[bool, str]:
                 f"random: count={by_read['random']['count']}")
 
 
+def check_provenance_digest_tracks_content() -> Tuple[bool, str]:
+    """A provenance record whose digest does not change with the file is
+    decoration. Checked by recomputing the hash independently and by
+    editing the file -- `digest_method` naming an algorithm is not evidence
+    that the algorithm was used."""
+    import hashlib
+
+    from fastdna.provenance import capture
+
+    before_bytes = b"@a\nACGT\n+\nIIII\n"
+    after_bytes = b"@a\nTTTT\n+\nIIII\n"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "x.fastq"
+        path.write_bytes(before_bytes)
+        before = capture(inputs=[path]).to_dict()["inputs"][0]
+        path.write_bytes(after_bytes)
+        after = capture(inputs=[path]).to_dict()["inputs"][0]
+
+    method = before["digest_method"]
+    independent = hashlib.new(method, before_bytes).hexdigest()
+    ok = (
+        before["digest"] == independent          # the named algorithm is the one used
+        and before["digest"] != after["digest"]  # and it responds to content
+    )
+    return ok, (f"{method} matches an independent hash={before['digest'] == independent}, "
+                f"changes with content={before['digest'] != after['digest']}")
+
+
+def check_workflow_emits_its_warnings() -> Tuple[bool, str]:
+    """The end-to-end workflow's value is partly in what it refuses to let
+    pass silently. Running it must produce the warnings the modules promise,
+    not just a result object."""
+    import numpy as np
+
+    from fastdna.workflow import AssociationWorkflow
+
+    rng = np.random.default_rng(31)
+    bases = np.array(list("ACGT"))
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = pathlib.Path(tmp)
+        marker = "".join(rng.choice(bases, size=200))
+        paths, phenotype = [], []
+        for lineage in range(4):
+            root = "".join(rng.choice(bases, size=3000))
+            for member in range(5):
+                seq = list(root)
+                for pos in rng.choice(len(seq), size=20, replace=False):
+                    seq[pos] = str(rng.choice(bases))
+                label = 1 if member % 2 == 0 else 0
+                paths.append(_write_fastq(
+                    directory, f"L{lineage}_{member}.fastq",
+                    "".join(seq) + (marker if label else ""),
+                ))
+                phenotype.append(label)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = AssociationWorkflow(paths, np.asarray(phenotype), k=21).run()
+            emitted = {w.category.__name__ for w in caught}
+
+    expected = {"ScreeningOnlyWarning", "UncalibratedScoresWarning"}
+    ok = expected <= emitted and result is not None
+    return ok, f"emitted {sorted(emitted & expected)} of {sorted(expected)}"
+
+
 CHECKS: Dict[str, Callable[[], Tuple[bool, str]]] = {
     "active_learning": check_active_learning_ordering,
     "annotate": check_annotate_locates_genes,
+    "provenance": check_provenance_digest_tracks_content,
+    "workflow": check_workflow_emits_its_warnings,
     "gwas": check_gwas_recovers_causal_variant,
     "interpret": check_interpret_ranking,
     "read_profile": check_read_profile_against_membership,
