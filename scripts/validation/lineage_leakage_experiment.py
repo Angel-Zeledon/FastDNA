@@ -75,7 +75,7 @@ def main() -> int:
     # collapses to zero for a reason that has nothing to do with leakage.
     # The automatic leakage curve sweeps thresholds precisely so this is
     # visible rather than silent; this flag is for pinning one afterwards.
-    parser.add_argument("--lineage-threshold", type=float, default=0.01)
+    parser.add_argument("--lineage-threshold", type=float, default=None)
     # `sketch` (default) derives lineages the way a user with nothing but
     # FASTQ files must: MinHash distance under a threshold. `mlst` instead
     # uses the cohort's own `sequence_type` -- the field's established
@@ -147,8 +147,17 @@ def main() -> int:
             from sklearn.metrics import adjusted_rand_score
             from fastdna.cv import lineage_groups
 
+            # Mirror what audit() itself now does when the threshold is left
+            # unset: derive it from this cohort's own dendrogram rather than
+            # applying a constant.
+            ari_threshold = args.lineage_threshold
+            if ari_threshold is None:
+                from fastdna.cv import default_threshold_curve
+
+                pts = default_threshold_curve(counts, n_points=5)
+                ari_threshold = float(np.median(pts)) if pts else 0.01
             inferred = lineage_groups(
-                counts, sketch_size=1000, distance_threshold=args.lineage_threshold
+                counts, sketch_size=1000, distance_threshold=ari_threshold
             )
             ari = adjusted_rand_score(groups, np.asarray(inferred))
             print(f"           sketch-vs-MLST agreement: ARI = {ari:.3f} "

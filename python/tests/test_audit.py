@@ -559,6 +559,51 @@ def test_a_degenerate_grouping_withholds_the_gap_instead_of_reporting_a_small_nu
     assert "Gap withheld" in report.to_markdown()
 
 
+def test_lineage_threshold_defaults_to_a_value_derived_from_the_cohort(tmp_path):
+    """`lineage_threshold=None` (the default) must read the cut off this
+    cohort's own dendrogram, not apply a constant.
+
+    Mash distance has no universal scale, so a fixed default is wrong by
+    construction for some cohort -- and it demonstrably was: on 200 BV-BRC
+    E. coli genomes the old 0.01 produced 198 lineages out of 200 samples
+    and reported `gap=-0.011` where MLST-grouped truth is `+0.165`
+    (`scripts/validation/lineage_leakage_experiment.py`). The derived value
+    there is 0.029, which reproduces the MLST answer.
+    """
+    from fastdna.cv import default_threshold_curve
+
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=10)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+
+    report = audit(
+        _pipeline(), paths, phenotype, n_splits=3, sketch_size=200, random_state=0
+    )
+
+    expected = float(
+        np.median(default_threshold_curve(paths, n_points=5, sketch_size=200))
+    )
+    assert report.lineage_threshold == pytest.approx(expected)
+    assert report.lineage_threshold != 0.01, (
+        "the derived threshold happens to equal the retired constant; pick a "
+        "fixture whose dendrogram does not, or this test proves nothing"
+    )
+
+
+def test_an_explicit_lineage_threshold_still_wins_over_the_derived_one(tmp_path):
+    """Deriving is a default, not a policy: a caller who pins the threshold
+    gets exactly that number back, which is what makes the leakage curve's
+    own points reproducible one at a time."""
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=10)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+
+    report = audit(
+        _pipeline(), paths, phenotype, n_splits=3, sketch_size=200,
+        lineage_threshold=0.02, random_state=0,
+    )
+
+    assert report.lineage_threshold == pytest.approx(0.02)
+
+
 def test_a_clustered_cohort_reports_a_real_gap_with_no_undefined_reason():
     """The other half of the contract: withholding must be the exception. A
     cohort with genuine lineage structure gets a plain float and no reason.

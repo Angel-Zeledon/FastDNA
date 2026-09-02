@@ -359,6 +359,14 @@ __all__ = [
 # question.
 _DEGENERATE_LINEAGE_FRACTION = 0.9
 
+#: Used only when a cohort's own dendrogram cannot offer a threshold at all
+#: (every merge height is exactly 0, i.e. every sample is identical to every
+#: other at this sketch resolution). This was `audit()`'s fixed default
+#: before the threshold became data-driven; it survives as a last resort,
+#: not as a recommendation -- on a real E. coli cohort it produced 198
+#: lineages out of 200 samples.
+_FALLBACK_LINEAGE_THRESHOLD = 0.01
+
 
 class DegenerateLineagesWarning(UserWarning):
     """`groups` (derived or supplied to `audit()`) puts almost every sample
@@ -1217,7 +1225,7 @@ def audit(
     scoring: Optional[Union[str, Callable[..., float]]] = None,
     k: int = 21,
     sketch_size: int = 1000,
-    lineage_threshold: float = 0.01,
+    lineage_threshold: Optional[float] = None,
     lineage_threshold_curve: Optional[Sequence[float]] = None,
     auto_leakage_curve: bool = True,
     default_curve_points: int = 5,
@@ -1324,14 +1332,36 @@ def audit(
         resolves to `"roc_auc"` for a binary-classification `estimator`
         (see `_default_scoring`), or to `None` itself (each estimator's
         own default scorer) otherwise.
-    k, sketch_size, lineage_threshold
+    k, sketch_size
         Forwarded to `cv.lineage_groups` when `groups` is not given;
-        ignored otherwise. Defaults match `cv.lineage_groups`'s own
-        (`k=21`, `distance_threshold=0.01`) except `sketch_size`, which
-        matches `fastdna.sketch()`'s default of 1000. `k` specifically is
+        ignored otherwise. `k=21` matches `cv.lineage_groups`'s own default;
+        `sketch_size=1000` matches `fastdna.sketch()`'s. `k` specifically is
         further overridden -- silently, and always -- to `paths.k` when
         `paths` is a `fastdna.CohortCounts`; see `paths` above and `cv.
         _mash_distance_matrix()`'s own docstring for why.
+    lineage_threshold : float, optional
+        The Mash distance at which `cv.lineage_groups` cuts the dendrogram.
+        Ignored when `groups=` is supplied.
+
+        **`None` (the default) derives it from this cohort**, as the median
+        of `cv.default_threshold_curve`'s points -- i.e. the middle of the
+        range of granularities this cohort's own merge heights actually
+        span. Pass a float to pin it.
+
+        It is not a constant because Mash distance has no universal scale:
+        what separates two lineages depends on how divergent the cohort is,
+        which is the same argument `default_threshold_curve` already makes
+        for the curve. The previous fixed default of 0.01 was measurably
+        wrong on real data -- on 200 BV-BRC E. coli genomes it put 198 of
+        them in their own lineage and reported `gap=-0.011` where the
+        MLST-grouped truth is `+0.165` (`scripts/validation/
+        lineage_leakage_experiment.py`). The derived value on that same
+        cohort is 0.029, which reproduces the MLST answer.
+
+        Deriving is usually free: when a leakage curve is computed at all
+        (the default, see `auto_leakage_curve`) its points are already in
+        hand. With `auto_leakage_curve=False` this costs one extra
+        dendrogram pass, which is still cheaper than being quietly wrong.
     lineage_threshold_curve : sequence of float, optional
         Additional Mash-distance thresholds at which to repeat the
         lineage-blocked comparison, producing `AuditReport.leakage_curve` --
@@ -1500,9 +1530,41 @@ def audit(
         else:
             resolved_curve_thresholds = None
 
+        # `lineage_threshold=None` (the default) means "read it off this
+        # cohort's own dendrogram" rather than a fixed constant. A single
+        # constant cannot work here: Mash distance has no universal scale,
+        # so what separates lineages depends entirely on how divergent this
+        # particular cohort is -- the same argument `default_threshold_curve`
+        # already makes for the curve, applied to the primary cut too.
+        #
+        # The old constant (0.01) was measurably wrong for a real E. coli
+        # cohort: it put 198 of 200 genomes in their own lineage and turned
+        # a real +0.165 gap into -0.011. The median of this cohort's own
+        # curve points lands at 0.029 (100 lineages), reproducing the
+        # MLST-grouped answer. See `scripts/validation/
+        # lineage_leakage_experiment.py`.
+        derived_threshold = None
+        if lineage_threshold is None:
+            curve_for_median = resolved_curve_thresholds
+            if not curve_for_median:
+                # No curve was computed (auto_leakage_curve=False and none
+                # supplied), so pay for one dendrogram pass to derive the
+                # threshold. Still cheaper than being silently wrong.
+                curve_for_median = default_threshold_curve(
+                    lineage_source, n_points=default_curve_points, k=k, sketch_size=sketch_size
+                )
+            derived_threshold = (
+                float(np.median(np.asarray(curve_for_median, dtype=float)))
+                if curve_for_median
+                else _FALLBACK_LINEAGE_THRESHOLD
+            )
+        effective_lineage_threshold = (
+            derived_threshold if lineage_threshold is None else float(lineage_threshold)
+        )
+
         if resolved_curve_thresholds is not None:
             curve_thresholds = resolved_curve_thresholds
-            primary_threshold = float(lineage_threshold)
+            primary_threshold = float(effective_lineage_threshold)
             # One dendrogram, cut at the primary threshold plus every
             # DISTINCT threshold the curve asks for -- duplicates
             # (including a curve entry equal to lineage_threshold itself)
@@ -1522,9 +1584,10 @@ def audit(
             resolved_lineage_threshold = primary_threshold
         else:
             groups = lineage_groups(
-                lineage_source, k=k, sketch_size=sketch_size, distance_threshold=lineage_threshold
+                lineage_source, k=k, sketch_size=sketch_size,
+                distance_threshold=effective_lineage_threshold,
             )
-            resolved_lineage_threshold = float(lineage_threshold)
+            resolved_lineage_threshold = float(effective_lineage_threshold)
 
     def _warn_if_degenerate(n_lineages_here, grouping_label):
         """Warns, and returns a reason string when the grouping is degenerate
