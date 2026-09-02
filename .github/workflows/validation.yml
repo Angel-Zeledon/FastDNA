@@ -126,6 +126,12 @@ jobs:
           python scripts/validation/assembly_qc_vs_merqury.py \
             --assembly "$ASM" --reads "$READS"
 
+      # Cheap next to the steps above (assemblies, not read sets) and the
+      # only one whose ground truth is an organism's published identity
+      # rather than another tool's output.
+      - name: Taxonomy calls real species correctly
+        run: python scripts/validation/taxonomy_real_species.py
+
       # Uploaded even on failure: the JSON is what a human compares against
       # the previous run to see whether a number moved a little or a lot.
       - name: Upload validation results

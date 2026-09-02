@@ -232,6 +232,7 @@ the exact failure mode that let `audit.py` cite an artefact
 | genome size | **GenomeScope2 2.0.1** | -0.29% | `estimator_accuracy.py` |
 | MinHash distances | **Mash 2.3** | r=0.997, bias ~0 | `sketch_vs_mash.py` |
 | assembly QV | **Merqury 1.4.1** | 18.4192 vs 18.4205 | `assembly_qc_vs_merqury.py` |
+| species classification | published species identity | 12/12 held-out genomes | `taxonomy_real_species.py` |
 
 Data: ENA `DRR002015` (*E. coli*, 2,343,637 reads) for the read-based rows;
 8 BV-BRC *E. coli* assemblies for the Mash comparison. Reference tools run
