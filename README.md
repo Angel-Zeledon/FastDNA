@@ -632,6 +632,48 @@ exact disk-partitioned mode rather than failing when it does not.
 
 ---
 
+## Auditing a genomic model: is the result real?
+
+A model trained on bacterial genomes can score well by recognising which
+clone each sample belongs to, rather than by learning any biology. The
+scores look identical either way. FastDNA answers that with three numbers,
+each measuring something the others cannot -- and each calibrated against a
+known answer rather than asserted:
+
+| question | field | how it was verified |
+|---|---|---|
+| How much leakage does this **cohort** make available? | `AuditReport.confounding` | Spearman **1.000** against injected leakage |
+| How much did **this model** take? | `AuditReport.gap` | 0.000 for transferable signal, +0.427 for pure lineage |
+| Is **this feature** biology or a clone marker? | `explain()` | 3 lineages vs 1, `lineage_restricted` correct |
+
+```python
+report = fastdna.audit(pipeline, paths, phenotype)
+print(report.confounding)   # the cohort could have fooled a model
+print(report.gap)           # ...and whether this one let it
+```
+
+The verification injects a known quantity of leakage and checks that what
+comes back tracks it, which is the only way to know whether a reported
+number is the *right* number -- on real data nobody knows the true answer.
+Full method and results in
+[`docs/validation-real-data.md`](docs/validation-real-data.md) (Tracks E and
+F); the sweep is `scripts/validation/leakage_calibration.py`.
+
+**Read `confounding` and `gap` as a pair.** High confounding with a small
+gap is the informative combination and the easiest to misread: the cohort
+*could* have fooled a model, and this particular one resisted. That is a
+fact about the model, not a clearance for the next one.
+
+Two limits, stated because a validation table that lists only successes is
+the failure mode this project exists to name. `gap` is a threshold detector,
+not a linear meter -- it stays flat until population structure supplies most
+of the phenotype, which is why `confounding` is the number to read for
+partial leakage. And a positive gap can also be produced by overfitting
+alone: read `score_random` alongside it, since a large gap on a model that
+never beat chance is capacity, not leakage.
+
+---
+
 ## Python API reference
 
 ### `fastdna.count(path, *, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=100_000) -> KmerCounts`
