@@ -16,6 +16,35 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **`scripts/validation/`: comprobación contra herramientas externas, y un
+  workflow programado que la ejecuta** (`.github/workflows/validation.yml`).
+  Seis scripts que contrastan FastDNA con la implementación establecida de
+  cada algoritmo que toma prestado, **sobre datos de secuenciación reales**
+  en vez de generados, con las herramientas de referencia como
+  biocontenedores fijados por tag:
+
+  | qué | contra | resultado |
+  |---|---|---|
+  | conteo de k-mers | KMC3 3.2.4 | **coincidencia exacta** (k=31/21/15) |
+  | distancias MinHash | Mash 2.3 | r=0,997, sesgo ~0 |
+  | tamaño de genoma | GenomeScope2 2.0.1 | −0,29% |
+  | QV de ensamblado | Merqury 1.4.1 | 18,4192 vs 18,4205 |
+  | cardinalidad HLL | el conteo exacto | −0,26% (límite ~0,8%) |
+  | espectro ntCard | el histograma exacto | −0,6% / +2,0% / −1,5% |
+  | clasificación de especie | identidad publicada | 12/12 genomas held-out |
+
+  Cada script asserta lo más estricto que su objeto admite: igualdad exacta
+  para el conteo (ambas herramientas resuelven el mismo problema una vez
+  desactivado el trimming), el límite documentado para los estimadores, y
+  ausencia de sesgo más decaimiento `1/sqrt(sketch_size)` para MinHash
+  (exigir igualdad ahí sería exigir reproducir el ruido de muestreo de Mash).
+  Cubre los huecos que `docs/audit/`ya señalaba: el claim central de
+  `genomescope` solo se probaba contra un espectro generado por la misma
+  familia de modelos que ajusta, y el de `taxonomy` contra motivos repetidos
+  (`"ACGTGGCATCAGT"*n`). Lo que **no** cubre está listado explícitamente en
+  `docs/validation-real-data.md`. Los tres bugs corregidos en esta versión
+  fueron encontrados por estos scripts, no por los ~1.700 tests.
+
 - Rust/Python: new pyfunction `sketch_from_kmers(kmers, k, sketch_size)` /
   `fastdna.sketch_from_kmers()`, wrapping the already-existing
   `sketch::GenomeSketch::from_kmers` -- builds a MinHash `Sketch` directly
