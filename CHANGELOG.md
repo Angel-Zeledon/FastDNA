@@ -16,6 +16,28 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **Python: nuevo módulo `fastdna.design` con `check_design()`** -- responde
+  si un experimento *puede* producir un resultado, antes de correrlo. Solo
+  necesita la forma del diseño (etiquetas, número de features, grupos,
+  folds): ni genomas, ni conteo, ni ajuste. Reporta `p/n`, tamaño de la
+  clase minoritaria, grupos frente a folds, cuota del grupo dominante,
+  tamaño del fold de test más pequeño, y el intervalo de confianza de
+  Hanley-McNeil (1982) sobre el AUC que se espera detectar.
+
+  Nace de una pérdida concreta de esta sesión: dos intentos de demostración
+  de fuga que no podían funcionar, ambos diagnosticables por aritmética de
+  antemano. 80 muestras contra 5.000 features (`p/n = 62`) no puede aprender
+  nada generalizable, y el IC al 95% sobre un AUC de 0.75 en esa cohorte es
+  ±0.11 -- más ancho que el gap de +0.075 que la corrida acabó reportando.
+  Ambas cifras salen en milisegundos.
+
+  Sin veredicto: reporta números y nombra preocupaciones, no devuelve
+  PASS/FAIL ni impide correr nada -- misma postura que `audit()` y
+  `evaluation`. `auc_standard_error()` está validada **contra simulación
+  Monte Carlo**, no contra una constante copiada del paper. No se
+  re-exporta en `fastdna.__all__` (sigue el precedente de
+  `fastdna.datasets`): `from fastdna.design import check_design`.
+
 - **`scripts/validation/`: comprobación contra herramientas externas, y un
   workflow programado que la ejecuta** (`.github/workflows/validation.yml`).
   Seis scripts que contrastan FastDNA con la implementación establecida de
