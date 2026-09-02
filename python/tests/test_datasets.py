@@ -419,6 +419,38 @@ def test_load_amr_real_network(tmp_path):
 
 
 @pytest.mark.network
+def test_downloaded_assemblies_are_not_truncated_by_api_pagination(tmp_path):
+    """REGRESSION. BV-BRC's endpoint is Solr-backed and paginates at 25 rows
+    by default, and one row is one contig -- so without an explicit
+    `limit()` a draft assembly came back cut off at its first 25 contigs,
+    silently, as a perfectly well-formed FASTA. Genome 562.13671 returned
+    1,261,838 bases across 25 contigs instead of 4,834,860 across 98: **26%
+    of an E. coli genome**, inherited by every k-mer count, sketch, lineage
+    assignment and model built on `load_amr` output.
+
+    The test above cannot catch this and neither could any of the offline
+    ones: a truncated assembly still starts with ">", still has multiple
+    contigs, and still parses. Only comparing the base count against the
+    species' known genome size does -- so that is what this asserts.
+
+    E. coli is 4.5-5.5 Mb; the bound below is deliberately loose enough to
+    tolerate a genuinely incomplete draft while still failing hard on a
+    quarter-genome.
+    """
+    cohort = load_amr(
+        "Escherichia coli", "ciprofloxacin", n_samples=2, random_state=0, cache_dir=tmp_path
+    )
+    for path in cohort.paths:
+        with open(path, encoding="ascii", errors="replace") as handle:
+            bases = sum(len(line.strip()) for line in handle if not line.startswith(">"))
+        assert bases > 3_500_000, (
+            f"{path} holds only {bases:,} bases; E. coli is 4.5-5.5 Mb. This is the "
+            "API pagination truncation described in this test's docstring -- check "
+            "that _BVBRC_GENOME_SEQUENCE_URL still carries its limit() parameter."
+        )
+
+
+@pytest.mark.network
 def test_load_hiv_resistance_real_network(tmp_path):
     cohort = load_hiv_resistance("NFV", n_samples=4, random_state=0, cache_dir=tmp_path)
     assert len(cohort) == 4

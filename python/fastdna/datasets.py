@@ -315,8 +315,31 @@ _AMR_SPECIES_FILES = {
 #: E. coli genome ids (a Klebsiella pneumoniae genome id was spot-checked
 #: against this same endpoint while writing this module and returned a
 #: real multi-contig assembly, matching the E. coli behavior exactly).
+#:
+#: `limit()` IS LOAD-BEARING, and its absence was a silent data-truncation
+#: bug. The endpoint is Solr-backed and paginates at **25 rows** by default,
+#: and one row is one contig -- so a draft assembly came back cut off at its
+#: first 25 contigs, with no error, no warning, and a perfectly well-formed
+#: FASTA. Measured on genome 562.13671: 25 contigs / 1,261,838 bases without
+#: this parameter, versus 98 contigs / 4,834,860 bases with it. That is 26%
+#: of an E. coli genome, silently, and every downstream k-mer count,
+#: sketch, lineage assignment and model trained on `load_amr` output
+#: inherited it.
+#:
+#: The "real multi-contig assembly" the comment above reports spot-checking
+#: is exactly the observation that made this invisible: the truncated file
+#: *is* multi-contig and *does* look real. Only comparing the base count
+#: against the species' known genome size catches it, which is what
+#: `scripts/validation/` now does.
+#:
+#: 100,000 rather than a snug bound: the cost of an over-large limit is
+#: nothing (the server returns what exists), while the cost of one that is
+#: too small is this bug again, for the one highly-fragmented assembly that
+#: exceeds it. Bacterial draft assemblies run to thousands of contigs; a
+#: pathological one will not reach six figures.
 _BVBRC_GENOME_SEQUENCE_URL = (
-    "https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,{genome_id})&http_accept=application/dna+fasta"
+    "https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,{genome_id})"
+    "&limit(100000)&http_accept=application/dna+fasta"
 )
 
 #: Extracts the first embedded number from a BV-BRC `MIC` field such as
