@@ -265,6 +265,34 @@ because a linear model refit on the whole cohort is not any one of
 `audit()`'s per-fold fits, and claiming otherwise would overstate how
 tightly "the CV gap" and "which k-mers drove it" actually connect.
 
+## A positive gap does not by itself mean population-structure leakage
+
+Overfitting produces one too, and the two are not distinguishable from the
+gap alone. Measured on a real *E. coli* + ampicillin cohort (80 complete
+BV-BRC assemblies, MLST as groups) where the model has essentially no
+signal to begin with -- random-CV AUC hovers at 0.53-0.58 regardless -- only
+`top_features` was varied:
+
+    features   p/n     random-CV   lineage-blocked   gap
+         200   2.5        0.5326            0.5199   +0.013
+       1,000  12.5        0.5799            0.5465   +0.034
+       5,000  62.5        0.5666            0.4918   +0.075
+
+The gap grows monotonically with the parameter-to-sample ratio on data
+containing no learnable biology. The mechanism is straightforward once
+stated: a model with enough capacity memorises individual samples, and a
+memorised sample's near-clones sit in its own lineage, so grouping them out
+of the training fold costs more score the more memorisation there was. That
+is a real drop in a real held-out score -- `LineageKFold` is not
+malfunctioning -- but attributing it to *population structure confounding
+the phenotype* would be wrong.
+
+What tells them apart is not this function: it is whether the model has
+genuine signal in the first place. `score_random` far above chance with a
+large gap is the leakage story; `score_random` near chance with a large gap
+is capacity. Read the two numbers together, never the gap alone -- which is
+also why `gap` is reported next to both scores rather than on its own.
+
 ## What this module does not do
 
 Same posture as `cv.py` and `evaluation.py`, stated here for this module
