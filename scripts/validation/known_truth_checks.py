@@ -640,10 +640,129 @@ def check_metagenomics_classifies_and_abstains() -> Tuple[bool, str]:
     return ok, f"{hits}/{len(truth)} reads to the right taxon; unrelated read -> tax_id {negative}"
 
 
+def check_chimeras_textbook_case_only() -> Tuple[bool, str]:
+    """Detects a maximally artificial chimera -- and that is ALL this
+    establishes.
+
+    `src/chimera_scan.rs` records a negative result from real chimeras
+    (E. coli / B. subtilis / M. jannaschii / S. cerevisiae, with six real
+    negative controls): no operating point gives usable sensitivity at an
+    acceptable false-positive rate. That finding stands, and this check does
+    not contest it.
+
+    What it pins is narrower and still worth having: the scanner responds to
+    a compositional break at all, and its background on an ordinary sequence
+    is what it was. A pure-AT half joined to a pure-GC half is the easiest
+    possible case, nothing like two bacteria that share base composition,
+    which is exactly why the real result is negative. Kept as a canary for
+    the machinery, not as evidence the module works in practice.
+    """
+    import collections
+
+    import numpy as np
+
+    from fastdna.chimeras import scan_chimeras
+
+    rng = np.random.default_rng(19)
+    bases = np.array(list("ACGT"))
+    at_half = "".join(rng.choice(list("AT"), size=600))
+    gc_half = "".join(rng.choice(list("GC"), size=600))
+    ordinary = "".join(rng.choice(bases, size=1200))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "s.fasta"
+        path.write_text(f">chimera\n{at_half + gc_half}\n>normal\n{ordinary}\n")
+        rows = scan_chimeras(str(path), window_size=200, step=50, k=4).to_pylist()
+
+    by_contig = collections.defaultdict(list)
+    for row in rows:
+        by_contig[row["contig_id"]].append(row["divergence"])
+    peak = {name: max(values) for name, values in by_contig.items()}
+    chimera_peak = next(v for name, v in peak.items() if "chimera" in name)
+    background = next(v for name, v in peak.items() if "normal" in name)
+
+    ok = chimera_peak > background * 1.5
+    return ok, (f"textbook chimera {chimera_peak:.3f} vs background {background:.3f} "
+                f"(real chimeras remain undetectable -- see chimera_scan.rs)")
+
+
+def check_report_preserves_numbers() -> Tuple[bool, str]:
+    """A report that renders without carrying its numbers through is worse
+    than no report: it looks like documentation of a result."""
+    import numpy as np
+
+    from fastdna.evaluation import calibration_report
+    from fastdna.report import to_report
+
+    y = np.array([1, 0, 1, 1, 0, 1, 0, 0, 1, 0] * 5)
+    scores = np.array([0.9, 0.2, 0.8, 0.7, 0.1, 0.95, 0.3, 0.15, 0.85, 0.05] * 5)
+    calibration = calibration_report(y, scores)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = pathlib.Path(tmp) / "r.md"
+        to_report(out, calibration=calibration, metadata={"cohort": "demo"}, title="Demo")
+        text = out.read_text()
+
+    brier = calibration.brier_score
+    ok = (
+        f"{brier:.3f}" in text or f"{brier:.4f}"[:5] in text
+    ) and "demo" in text and "Demo" in text
+    return ok, f"brier {brier} present={f'{brier:.3f}' in text}, metadata and title carried"
+
+
+def check_plotting_renders() -> Tuple[bool, str]:
+    """Both plotting entry points produce a real figure from data whose
+    structure is known (three well-separated clusters, three strongly
+    significant k-mers)."""
+    import numpy as np
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pyarrow as pa
+    from scipy.spatial.distance import pdist, squareform
+
+    from fastdna.plotting import plot_population_structure, plot_significance
+
+    rng = np.random.default_rng(2)
+    n = 200
+    p_values = np.concatenate([rng.uniform(0.01, 1, n - 3), [1e-12, 1e-10, 1e-9]])
+    table = pa.table({
+        "kmer_sequence": [f"k{i}" for i in range(n)],
+        "p_value": p_values,
+        "p_bonferroni": np.minimum(p_values * n, 1.0),
+        "q_value_bh": np.minimum(p_values * n / np.arange(1, n + 1), 1.0),
+        "odds_ratio": rng.lognormal(0, 1, n),
+    })
+    coords = np.vstack([rng.normal(centre, 0.3, (10, 2)) for centre in (0, 8, 16)])
+
+    sizes = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = pathlib.Path(tmp)
+        plot_significance(table)
+        plt.savefig(directory / "sig.png", dpi=60)
+        plt.close("all")
+        sizes["significance"] = (directory / "sig.png").stat().st_size
+
+        plot_population_structure(
+            squareform(pdist(coords)), [f"s{i}" for i in range(30)],
+            groups=np.repeat([0, 1, 2], 10), kind="dendrogram",
+        )
+        plt.savefig(directory / "pop.png", dpi=60)
+        plt.close("all")
+        sizes["population"] = (directory / "pop.png").stat().st_size
+
+    ok = all(size > 1000 for size in sizes.values())
+    return ok, ", ".join(f"{name}={size}B" for name, size in sizes.items())
+
+
 CHECKS: Dict[str, Callable[[], Tuple[bool, str]]] = {
     "active_learning": check_active_learning_ordering,
     "annotate": check_annotate_locates_genes,
+    "chimeras": check_chimeras_textbook_case_only,
     "metagenomics": check_metagenomics_classifies_and_abstains,
+    "plotting": check_plotting_renders,
+    "report": check_report_preserves_numbers,
     "provenance": check_provenance_digest_tracks_content,
     "workflow": check_workflow_emits_its_warnings,
     "gwas": check_gwas_recovers_causal_variant,
