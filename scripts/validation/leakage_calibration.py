@@ -53,6 +53,50 @@ Failure of (3) with (1) and (2) holding would mean the gap is a detector of
 the extremes but not a measure -- still useful, and a different claim from
 the one this script tests. That outcome gets reported, not retried.
 
+## RESULT (2026-09-01): (1) and (2) hold, (3) does not
+
+n=150 over 6 lineages, 1,000 features, 10 replicates per point:
+
+    lambda    random   blocked        gap      sd     se
+      0.00    1.0000    1.0000    +0.0000   0.000      -
+      0.20    0.9331    0.9056    +0.0275   0.013  0.004
+      0.40    0.8674    0.8573    +0.0101   0.021  0.006
+      0.60    0.8147    0.7908    +0.0239   0.027  0.009
+      0.80    0.8530    0.7296    +0.1234   0.037  0.012
+      1.00    0.8730    0.4463    +0.4267   0.083  0.026
+
+    Spearman(lambda, gap) = 0.829
+
+The extremes are unambiguous and the middle is flat: the gap stays around
+0.01-0.03 up to lambda=0.6, then rises sharply. With ten replicates the
+standard errors are small enough to separate those middle points, and the
+Spearman coefficient is **identical** to the three-replicate run (0.8286
+both times), so the non-monotonicity is a property of the system rather than
+sampling noise.
+
+**Mechanism.** A model learns the cheapest available signal. The marker is
+one consistent feature; "lineage" requires memorising six separate sets of
+clone-characteristic k-mers. While the marker still explains a substantial
+share of the labels (lambda <= 0.6 leaves it explaining >= 40%), the model
+prefers it -- and the marker transfers, so blocking costs nothing. Only when
+the marker stops predicting does the model fall back on memorising clones,
+and only then does blocking hurt.
+
+**What this means for `audit()`, stated as a limitation rather than
+discovered by a user.** The gap is a detector of *dominant* leakage, not a
+linear measure of partial leakage. It fires clearly when population
+structure is the main explanation of the phenotype. It is insensitive when
+leakage coexists with genuine, transferable biological signal that the model
+can use instead -- which is a common and comfortable regime, and one where a
+small gap should NOT be read as "no confounding present", only as "not the
+dominant explanation".
+
+The pre-registration is honoured: prediction (3) failed, it is reported
+here, and the sweep was not re-run with different settings to rescue it. The
+ten-replicate run exists only because the three-replicate one lacked the
+power to distinguish its own middle points -- more precision on the same
+design, not a different design.
+
 ## Design sizing, done before generating anything
 
 `fastdna.design.check_design` was used to pick the cohort shape rather than

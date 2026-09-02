@@ -293,6 +293,38 @@ large gap is the leakage story; `score_random` near chance with a large gap
 is capacity. Read the two numbers together, never the gap alone -- which is
 also why `gap` is reported next to both scores rather than on its own.
 
+## The gap detects dominant leakage, and is insensitive to partial leakage
+
+Calibrated against known injected leakage
+(`scripts/validation/leakage_calibration.py`, which builds cohorts whose
+phenotype is `lambda`-determined by lineage and `(1-lambda)`-determined by a
+transferable marker, 10 replicates per point):
+
+    lambda    random   blocked        gap
+      0.00    1.0000    1.0000    +0.0000
+      0.20    0.9331    0.9056    +0.0275
+      0.40    0.8674    0.8573    +0.0101
+      0.60    0.8147    0.7908    +0.0239
+      0.80    0.8530    0.7296    +0.1234
+      1.00    0.8730    0.4463    +0.4267
+
+The extremes behave exactly as intended -- no gap when the signal transfers,
+a large one when it does not -- but the response is a threshold, not a
+slope: flat at 0.01-0.03 until lineage supplies roughly 80% of the
+phenotype, then sharply rising.
+
+The mechanism is that a model learns the cheapest available signal. While a
+transferable feature still explains a good share of the labels, the model
+prefers it over memorising several clones' worth of k-mers, and a
+transferable feature costs nothing when a lineage is held out.
+
+**The practical consequence, which belongs in any interpretation of a small
+gap**: a gap near zero means population structure is not the *dominant*
+explanation of the phenotype. It does not mean the cohort is unconfounded.
+`AuditReport.confounding` answers that second question directly -- it is
+computed from the label vectors with no model involved, and so is unaffected
+by whichever signal the model happened to find easiest.
+
 ## What this module does not do
 
 Same posture as `cv.py` and `evaluation.py`, stated here for this module
