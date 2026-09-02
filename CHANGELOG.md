@@ -16,6 +16,24 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- Rust/Python: new pyfunction `sketch_from_kmers(kmers, k, sketch_size)` /
+  `fastdna.sketch_from_kmers()`, wrapping the already-existing
+  `sketch::GenomeSketch::from_kmers` -- builds a MinHash `Sketch` directly
+  from an in-memory k-mer array, with no FASTQ file read. `python/fastdna/
+  cv.py`'s `_mash_distance_matrix()`/`lineage_groups_at_thresholds()`/
+  `default_threshold_curve()` now accept a `fastdna.CohortCounts` in place
+  of paths, sketching each sample from its already-counted k-mers instead
+  of re-reading its FASTQ file (`k` is always taken from `counts.k` in that
+  case, silently, by design -- see `_mash_distance_matrix()`'s own
+  docstring). `fastdna.audit()`'s `paths` argument accepts a `CohortCounts`
+  too: `X` becomes `list(counts.sample_ids)` (satisfying
+  `KmerVectorizer(counts=...)` automatically) and lineage/leakage-curve
+  derivation reads from the same `counts`, closing the previous mutual
+  exclusion between the fast, no-reread model path
+  (`KmerVectorizer(counts=...)`) and the automatic leakage curve
+  (`auto_leakage_curve=True`, the default), which previously required real
+  FASTQ paths. Every existing call passing real paths is unaffected -- this
+  is purely additive.
 - Python: new module `fastdna.datasets` with `load_amr()` and
   `load_hiv_resistance()` -- real, labeled genomic cohorts (BV-BRC
   antimicrobial-resistance metadata; Stanford HIVDB HIV-1 protease

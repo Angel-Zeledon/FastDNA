@@ -292,14 +292,32 @@ specifically:
   composable call, more concretely than the original sketch asked for --
   see "Feature attribution to lineage" above for why that stays a
   separate function rather than a field grown here.
-- **No repeated-counting optimization.** Each `cross_val_score` call
-  re-transforms every training and test path through whatever vectorizer
-  `estimator` wraps, exactly like `sklearn.model_selection.cross_val_score`
-  always does; the `CohortCounts`-based single-count-per-cohort path
-  (`docs/audit/ml-gaps.md`, G-6) is a separate, already-landed piece of
-  `fastdna.sklearn.KmerVectorizer` (its `counts=` parameter) that a caller
-  can opt into by passing a `KmerVectorizer(counts=...)`-based pipeline as
-  `estimator` -- `audit()` itself adds no new counting behaviour.
+- **No repeated-counting optimization, beyond what accepting a
+  `CohortCounts` directly makes possible.** Each `cross_val_score` call
+  still re-transforms every training and test path through whatever
+  vectorizer `estimator` wraps, exactly like `sklearn.model_selection.
+  cross_val_score` always does -- `audit()` does not change that. What it
+  does do now (this was the gap this note used to describe, before `paths`
+  could be a `CohortCounts`): a caller can pass `audit(pipeline_using_
+  KmerVectorizer(counts=cc), cc, phenotype)` -- the same `CohortCounts`
+  object as both `paths` and the pipeline's own `counts=` -- and every
+  `cross_val_score` fold's `.transform()` call resolves to `CohortCounts.
+  subset()` (`fastdna.sklearn.KmerVectorizer`'s own `counts=` contract, an
+  O(rows in that fold) slice, no FASTQ reread), *and* lineage-group
+  derivation for both the primary threshold and the automatic/explicit
+  leakage curve reads from that same `CohortCounts` too (`cv.
+  lineage_groups_at_thresholds()`'s `CohortCounts` support), instead of
+  needing real FASTQ paths that only `KmerVectorizer`'s *fit/transform*
+  side could take advantage of. Before this, the fast, no-reread model path
+  (`KmerVectorizer(counts=...)`) and automatic leakage-curve derivation
+  (which needed real file paths to sketch from) were mutually exclusive
+  within one `audit()` call -- a caller had to either give up the curve (by
+  precomputing `groups=` and losing `auto_leakage_curve` entirely, since
+  `groups=` supplied directly skips curve derivation) or give up the fast
+  path (by passing real paths, forcing every fold to re-read and re-count
+  its FASTQ files). Passing a `CohortCounts` as `paths` removes that
+  exclusion: both sides read from the one upfront count. See `paths`'
+  own parameter docs above for the exact mechanism.
 """
 
 from __future__ import annotations
@@ -313,6 +331,7 @@ import numpy as np
 import pyarrow as pa
 
 from . import _core
+from .cohort_counts import CohortCounts
 from .cv import LineageKFold, default_threshold_curve, lineage_groups, lineage_groups_at_thresholds
 
 __all__ = [
@@ -1154,7 +1173,7 @@ def _validate_covariates(covariates, n_samples):
 
 def audit(
     estimator: Any,  # unfitted/fitted sklearn estimator or Pipeline; soft dependency, not imported at module level
-    paths: Sequence[Any],  # ordinarily real FASTQ(.gz) paths, but a precomputed feature matrix when groups= is given -- see below
+    paths: Union[Sequence[Any], "CohortCounts"],  # ordinarily real FASTQ(.gz) paths, a precomputed feature matrix when groups= is given, or a fastdna.CohortCounts -- see below
     phenotype: Union[Sequence[Any], np.ndarray],
     *,
     groups: Optional[Union[Sequence[int], np.ndarray]] = None,
@@ -1189,25 +1208,70 @@ def audit(
         those paths directly as `X`, which a `Pipeline([("kmers",
         KmerVectorizer(...)), ("clf", ...)])` does -- exactly the usage
         `cv.LineageKFold`'s own docstring already demonstrates with
-        `cross_val_score`.
-    paths : sequence
-        The `X` given to `cross_val_score` for every splitter this
-        function runs, in order. Ordinarily real FASTQ(.gz) paths (at
-        least 2, no duplicates -- `cv.lineage_groups` validates this when
-        it derives `groups` below). If `groups=` is supplied directly
-        instead, lineage detection never runs and `paths` is passed to
-        `estimator` unexamined, so it does not need to be real files in
-        that case -- it can be a precomputed feature matrix and `estimator`
-        a plain classifier, exactly like `cv.LineageKFold(groups=...)`'s
-        own `paths`-free usage.
+        `cross_val_score`. When `paths` is a `fastdna.CohortCounts`
+        instead (see `paths` below), `estimator` needs to accept
+        `CohortCounts.sample_ids` as `X`, which a
+        `Pipeline([("kmers", KmerVectorizer(counts=paths)), ("clf", ...)])`
+        does -- the same `counts=` contract `fastdna.sklearn.
+        KmerVectorizer` already documents for cross-validation without
+        recounting.
+    paths : sequence, or fastdna.CohortCounts
+        The cohort this function evaluates `estimator` over. Three shapes,
+        all pre-existing behaviour except the third:
+
+        - **A list of real FASTQ(.gz) paths** (the ordinary case, and the
+          default assumption everywhere else in this docstring): the `X`
+          given to `cross_val_score` for every splitter this function runs,
+          in order, and also what `cv.lineage_groups`/`cv.
+          lineage_groups_at_thresholds`/`cv.default_threshold_curve` read
+          the cohort's genomes from to derive `groups` below (each real
+          file is opened and streamed once per distinct sketching pass
+          this function makes).
+        - **A precomputed feature matrix**, when `groups=` is supplied
+          directly instead of derived: lineage detection never runs in that
+          case, so `paths` is passed to `estimator` unexamined and does not
+          need to be real files -- it can be a precomputed feature matrix
+          and `estimator` a plain classifier, exactly like
+          `cv.LineageKFold(groups=...)`'s own `paths`-free usage.
+        - **A `fastdna.CohortCounts`** (e.g. from `fastdna.count_cohort()`):
+          the same cohort, already counted once. `X` for `cross_val_score`
+          becomes `list(paths.sample_ids)` -- what `KmerVectorizer(counts=
+          paths)` inside `estimator`'s pipeline expects to receive, via its
+          own `.subset()` contract (`python/fastdna/sklearn.py`'s
+          `_count_cohort()`) -- and lineage-group derivation (both the
+          primary threshold and the automatic/explicit curve, see
+          `lineage_threshold_curve`/`auto_leakage_curve` below) also reads
+          from this same `CohortCounts`, via `cv.lineage_groups_at_
+          thresholds()`'s own `CohortCounts` support, instead of `cv.
+          lineage_groups`/`cv.compare_all()` reopening every FASTQ file.
+          Net effect: after the one `count_cohort()` call that built
+          `paths`, `audit()` reads zero additional FASTQ bytes, no matter
+          how many curve points `auto_leakage_curve`/
+          `lineage_threshold_curve` sweep -- this is what closes the gap
+          documented in the module docstring's "No repeated-counting
+          optimization" section between the fast, no-reread model path
+          (`KmerVectorizer(counts=...)`) and automatic leakage-curve
+          derivation, which previously required real file paths and could
+          not be used in the same call. `k`/`sketch_size` below still
+          govern the *comparison* sketch size, but `k` specifically is
+          always overridden to `paths.k` in this case -- see `cv.
+          _mash_distance_matrix()`'s own docstring for exactly why a
+          silently-deferred `k` is the deliberate choice here, not an
+          oversight -- and `min_count > 1` on this `CohortCounts` changes
+          what the derived lineage groups see (singleton k-mers already
+          dropped before sketching), the same real, documented difference
+          noted there.
     phenotype : array-like, length `len(paths)`
-        One label per sample, in `paths` order.
+        One label per sample, in `paths` order (`paths.sample_ids` order,
+        when `paths` is a `CohortCounts`).
     groups : array-like of int, optional
         Precomputed lineage labels (e.g. from an earlier
         `cv.lineage_groups()` call, or a real phylogeny's clades). `None`
         (the default) derives them with `cv.lineage_groups(paths, k=k,
         sketch_size=sketch_size, distance_threshold=lineage_threshold)`,
-        which needs `paths` to be real FASTQ files.
+        which needs `paths` to be either real FASTQ files or a
+        `fastdna.CohortCounts` -- see `paths` above for what changes
+        between the two.
     covariates : mapping of str to array-like, optional
         One additional blocked-CV comparison per entry -- see the module
         docstring's `covariates=` section for exactly what is computed and
@@ -1229,7 +1293,10 @@ def audit(
         Forwarded to `cv.lineage_groups` when `groups` is not given;
         ignored otherwise. Defaults match `cv.lineage_groups`'s own
         (`k=21`, `distance_threshold=0.01`) except `sketch_size`, which
-        matches `fastdna.sketch()`'s default of 1000.
+        matches `fastdna.sketch()`'s default of 1000. `k` specifically is
+        further overridden -- silently, and always -- to `paths.k` when
+        `paths` is a `fastdna.CohortCounts`; see `paths` above and `cv.
+        _mash_distance_matrix()`'s own docstring for why.
     lineage_threshold_curve : sequence of float, optional
         Additional Mash-distance thresholds at which to repeat the
         lineage-blocked comparison, producing `AuditReport.leakage_curve` --
@@ -1323,10 +1390,32 @@ def audit(
     if not isinstance(n_splits, (int, np.integer)) or isinstance(n_splits, bool) or n_splits < 2:
         raise ValueError(f"n_splits must be an integer >= 2, got {n_splits!r}")
 
-    paths = list(paths)
-    n_samples = len(paths)
-    if n_samples < 2:
-        raise ValueError(f"audit() needs at least 2 samples, got {n_samples}")
+    # `paths` doubles as two different things below: the `X` given to every
+    # `cross_val_score` call, and the source `cv.lineage_groups`/`cv.
+    # lineage_groups_at_thresholds`/`cv.default_threshold_curve` derive
+    # lineage groups from. Those used to always be the same object (a list
+    # of real FASTQ paths); they no longer are once `paths` may be a
+    # `fastdna.CohortCounts` -- see this function's own docstring's `paths`
+    # entry. `lineage_source` keeps the object those three `cv` calls need
+    # (the `CohortCounts` itself, so they can sketch from its already-
+    # counted k-mers with no FASTQ reread); `paths` is reassigned to
+    # `list(counts.sample_ids)`, exactly what `KmerVectorizer(counts=...)`'s
+    # own `subset()` contract expects as `X` (see `sklearn.py`'s
+    # `_count_cohort()`), so every `cross_val_score` call below needs no
+    # change at all -- it already just uses `paths`.
+    if isinstance(paths, CohortCounts):
+        counts = paths
+        n_samples = len(counts)
+        if n_samples < 2:
+            raise ValueError(f"audit() needs at least 2 samples, got {n_samples}")
+        paths = list(counts.sample_ids)
+        lineage_source = counts
+    else:
+        paths = list(paths)
+        n_samples = len(paths)
+        if n_samples < 2:
+            raise ValueError(f"audit() needs at least 2 samples, got {n_samples}")
+        lineage_source = paths
 
     phenotype = np.asarray(phenotype)
     if phenotype.shape[0] != n_samples:
@@ -1371,7 +1460,7 @@ def audit(
             # genuinely no positive threshold this cohort's own dendrogram
             # can offer.
             resolved_curve_thresholds = default_threshold_curve(
-                paths, n_points=default_curve_points, k=k, sketch_size=sketch_size
+                lineage_source, n_points=default_curve_points, k=k, sketch_size=sketch_size
             ) or None
         else:
             resolved_curve_thresholds = None
@@ -1391,14 +1480,14 @@ def audit(
                     batch_thresholds.append(t)
                     seen_thresholds.add(t)
             batch_groups = lineage_groups_at_thresholds(
-                paths, batch_thresholds, k=k, sketch_size=sketch_size
+                lineage_source, batch_thresholds, k=k, sketch_size=sketch_size
             )
             threshold_to_groups = dict(zip(batch_thresholds, batch_groups))
             groups = threshold_to_groups[primary_threshold]
             resolved_lineage_threshold = primary_threshold
         else:
             groups = lineage_groups(
-                paths, k=k, sketch_size=sketch_size, distance_threshold=lineage_threshold
+                lineage_source, k=k, sketch_size=sketch_size, distance_threshold=lineage_threshold
             )
             resolved_lineage_threshold = float(lineage_threshold)
 

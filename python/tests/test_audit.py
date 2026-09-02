@@ -186,6 +186,163 @@ def test_audit_reports_a_small_gap_without_lineage_confounding(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# `paths` as a fastdna.CohortCounts: the mutual-exclusion fix. Before this,
+# the fast, no-reread model path (KmerVectorizer(counts=...)) and automatic
+# leakage-curve derivation (which needed real file paths to sketch from)
+# could not be used in the same audit() call -- see the module docstring's
+# "No repeated-counting optimization" section for exactly what this closes.
+# ---------------------------------------------------------------------------
+
+
+def _pipeline_with_counts(counts, top_features=200):
+    return Pipeline(
+        [
+            ("kmers", KmerVectorizer(k=counts.k, top_features=top_features, representation="presence", counts=counts)),
+            ("clf", LogisticRegression(max_iter=2000)),
+        ]
+    )
+
+
+def test_audit_accepts_a_cohortcounts_and_the_leakage_curve_works_in_the_fast_path(tmp_path, monkeypatch):
+    """The end-to-end demonstration this whole feature exists for: build a
+    CohortCounts once, hand it to audit() as BOTH the cohort (`paths`) and
+    the pipeline's own `counts=` -- confirming (a) it works at all (the
+    mutual exclusion between `KmerVectorizer(counts=...)` and automatic
+    leakage-curve derivation is gone), (b) `leakage_curve` is populated
+    under the default `auto_leakage_curve=True`, exactly as it would be for
+    a real-paths `audit()` call, and (c) not a single FASTQ file is reread
+    after the one `count_cohort()` call that built `counts` -- neither by
+    `fastdna.count()` (the counting path) nor by `fastdna._core.sketch()`
+    (the streaming-sketch path a plain-paths `audit()` call would have used
+    for lineage derivation instead). Mirrors
+    `test_cohort_counts.py::test_cross_validation_with_the_artifact_never_recounts`'s
+    own spy pattern.
+    """
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=20)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+
+    counts = fastdna.count_cohort(paths, k=21)
+
+    count_calls = {"n": 0}
+    sketch_calls = {"n": 0}
+    real_count = fastdna.count
+    real_sketch = fastdna._core.sketch
+
+    def count_spy(*args, **kwargs):
+        count_calls["n"] += 1
+        return real_count(*args, **kwargs)
+
+    def sketch_spy(*args, **kwargs):
+        sketch_calls["n"] += 1
+        return real_sketch(*args, **kwargs)
+
+    monkeypatch.setattr(fastdna, "count", count_spy)
+    monkeypatch.setattr("fastdna.sklearn.fastdna.count", count_spy)
+    monkeypatch.setattr(fastdna._core, "sketch", sketch_spy)
+
+    report = audit(
+        _pipeline_with_counts(counts),
+        counts,
+        phenotype,
+        n_splits=3,
+        sketch_size=200,
+        lineage_threshold=0.02,
+        default_curve_points=3,
+        random_state=0,
+    )
+
+    # (a) it works at all -- the API shape the mutual exclusion used to
+    # block outright.
+    assert isinstance(report, AuditReport)
+    assert report.n_samples == len(paths)
+    assert report.n_lineages == 4
+
+    # (b) the automatic leakage curve is populated, same as it would be for
+    # a real-paths call -- CohortCounts input does not silently disable it.
+    assert report.leakage_curve is not None
+    assert len(report.leakage_curve) == 3
+    for point in report.leakage_curve:
+        assert isinstance(point, LeakageCurvePoint)
+
+    # (c) zero additional FASTQ reads: count_cohort() above already made
+    # exactly len(paths) fastdna.count() calls, all BEFORE the spies were
+    # installed, so anything captured here is purely from audit() itself.
+    assert count_calls["n"] == 0, (
+        f"audit() with a CohortCounts made {count_calls['n']} fastdna.count() calls after "
+        "the initial count_cohort() -- it must make none"
+    )
+    assert sketch_calls["n"] == 0, (
+        f"audit() with a CohortCounts made {sketch_calls['n']} fastdna._core.sketch() calls -- "
+        "lineage derivation must sketch from the already-counted k-mers, not reopen any FASTQ file"
+    )
+
+
+def test_audit_from_cohortcounts_matches_audit_from_paths(tmp_path):
+    """The equivalence check: feeding audit() a CohortCounts must not
+    change the answer relative to the pre-existing real-paths call --
+    same phenotype, same k/sketch_size/lineage_threshold, same
+    random_state, `auto_leakage_curve=False` on both sides to keep this
+    fast and to compare a single random-vs-lineage-blocked pair rather
+    than a whole curve.
+    """
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=6, seed=21)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+    counts = fastdna.count_cohort(paths, k=21)
+
+    common = dict(
+        n_splits=3, sketch_size=200, lineage_threshold=0.02, auto_leakage_curve=False, random_state=0,
+    )
+    from_paths = audit(_pipeline(), paths, phenotype, **common)
+    from_counts = audit(_pipeline_with_counts(counts), counts, phenotype, **common)
+
+    assert from_counts.n_lineages == from_paths.n_lineages
+    assert from_counts.score_random == pytest.approx(from_paths.score_random)
+    assert from_counts.score_lineage == pytest.approx(from_paths.score_lineage)
+    assert from_counts.gap == pytest.approx(from_paths.gap)
+    assert from_counts.leakage_curve is None
+
+
+def test_audit_rejects_a_cohortcounts_with_fewer_than_two_samples(tmp_path):
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=1, per_lineage=1, seed=22)
+    counts = fastdna.count_cohort(paths, k=21)
+
+    with pytest.raises(ValueError, match="2"):
+        audit(_pipeline_with_counts(counts), counts, np.array([0]))
+
+
+def test_audit_from_cohortcounts_respects_explicit_groups_and_skips_curve_derivation(tmp_path, monkeypatch):
+    """Supplying `groups=` directly alongside a CohortCounts must still
+    skip lineage derivation entirely (same documented behaviour as with
+    real paths) -- and, since there is then nothing to sketch at all,
+    must make zero calls to `fastdna._core.sketch()` too.
+    """
+    paths, lineage_of = _lineage_cohort(tmp_path, n_lineages=4, per_lineage=3, seed=23)
+    phenotype = np.array([1 if lineage in (0, 1) else 0 for lineage in lineage_of])
+    counts = fastdna.count_cohort(paths, k=21)
+
+    sketch_calls = {"n": 0}
+    real_sketch = fastdna._core.sketch
+
+    def sketch_spy(*args, **kwargs):
+        sketch_calls["n"] += 1
+        return real_sketch(*args, **kwargs)
+
+    monkeypatch.setattr(fastdna._core, "sketch", sketch_spy)
+
+    report = audit(
+        _pipeline_with_counts(counts),
+        counts,
+        phenotype,
+        groups=lineage_of,
+        n_splits=3,
+    )
+
+    assert np.isnan(report.lineage_threshold)
+    assert report.leakage_curve is None
+    assert sketch_calls["n"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Fast path: precomputed matrix + explicit groups=, no real FASTQ/sketching.
 # ---------------------------------------------------------------------------
 
