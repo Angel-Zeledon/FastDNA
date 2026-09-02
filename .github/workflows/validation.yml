@@ -1,0 +1,125 @@
+# Runs the external-reference validation suite in `scripts/validation/`.
+#
+# WHY THIS IS A SEPARATE WORKFLOW, and not steps bolted onto `ci.yml`.
+#
+# `ci.yml` is the gate: it runs on every push, finishes in minutes, and
+# needs no network beyond fetching crates and wheels. Everything here breaks
+# all three of those properties on purpose -- it pulls ~100 MB of real
+# sequencing data from ENA, pulls three biocontainers from quay.io, and
+# takes tens of minutes. Putting that on the per-push path would make the
+# gate slow AND flaky for reasons that have nothing to do with the change
+# under test (ENA being down is not a regression in this repository).
+#
+# But leaving it un-run is exactly the failure this repo already has a
+# history of. `docs/BENCHMARKS.md` records an exact agreement with KMC3 that
+# nothing re-checks; `scripts/bench/crosscheck.py` was written specifically
+# so a claim would fail loudly when it stopped being true, and no workflow
+# ever invoked it; and `audit.py` justified a constant by citing
+# `scratch/amr_repro/audit_report.json`, a file under a gitignored directory
+# that is not in the repository at all. Every one of those is the same bug:
+# evidence with no mechanism to re-derive it.
+#
+# So: scheduled, not per-push. Slow and networked is fine when nothing is
+# waiting on it; silent is not.
+
+name: Validation (external references)
+
+on:
+  # 05:00 UTC daily. Nothing is blocked on this, so the time only matters
+  # for not colliding with the busiest hours of the public endpoints it
+  # depends on (ENA, quay.io).
+  schedule:
+    - cron: "0 5 * * *"
+  # So a human can run it on demand -- before cutting a release, or after
+  # touching anything in the counting path -- without waiting for the
+  # schedule or pushing a dummy commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: FastDNA vs KMC3, Mash, GenomeScope2
+    runs-on: ubuntu-latest
+    # Generous: a cold run downloads ~100 MB of reads plus three
+    # biocontainers, builds with `--release` (fat LTO, one codegen unit --
+    # Cargo.toml documents that this is deliberately slow), and then runs
+    # several full k-mer counts. It should finish well inside this; the
+    # limit exists so a hung download cannot sit for six hours.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # `--release`, unlike `ci.yml`'s debug build, and not for speed alone:
+      # these scripts count real files, and a debug build was measured 4-5x
+      # slower in this project's own benchmarking (see the README). It also
+      # means this workflow is the one place where `[profile.release]`'s
+      # `panic = "unwind"` is exercised outside `wheels.yml`.
+      #
+      # No `--features python` here: per `ci.yml`'s header, a bare cargo
+      # build must never enable it. The Python side arrives via maturin
+      # below.
+      - name: Build the release binary
+        run: cargo build --release
+
+      - name: Install the Python extension and its test extras
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          echo "VIRTUAL_ENV=${PWD}/.venv" >> "$GITHUB_ENV"
+          echo "${PWD}/.venv/bin" >> "$GITHUB_PATH"
+          ./.venv/bin/python -m pip install --upgrade pip
+          ./.venv/bin/python -m pip install "maturin>=1.5,<2.0"
+          ./.venv/bin/maturin develop --release --features python --extras test
+
+      # Each step is separate so the checks list names which reference tool
+      # disagreed, rather than reporting one opaque "validation failed".
+
+      # Exact equality, no tolerance: with trimming disabled and singletons
+      # kept, FastDNA and KMC3 solve the identical problem. Any difference
+      # at all is a counting bug.
+      - name: Counting is exactly KMC3's (real reads)
+        run: |
+          python scripts/validation/kmc3_equivalence.py \
+            --json "${RUNNER_TEMP}/kmc3.json"
+
+      # The three approximate answers, each against its own documented
+      # bound, plus genome size against the real GenomeScope2.
+      - name: Estimators are inside their documented bounds
+        run: |
+          python scripts/validation/estimator_accuracy.py \
+            --json "${RUNNER_TEMP}/estimators.json"
+
+      # Needs assemblies rather than reads, so it reuses the AMR cohort
+      # loader. `--n-samples 8` keeps the download small: this checks
+      # agreement with Mash, which needs a handful of genuinely different
+      # genomes, not a large cohort.
+      - name: Sketch distances agree with Mash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from fastdna.datasets import load_amr
+          cohort = load_amr("Escherichia coli", "ciprofloxacin", n_samples=8, random_state=0)
+          out = Path("mash_genomes")
+          out.mkdir(exist_ok=True)
+          for path in cohort.paths:
+              (out / Path(path).name).write_bytes(Path(path).read_bytes())
+          print(f"staged {len(cohort.paths)} genomes in {out}")
+          PY
+          python scripts/validation/sketch_vs_mash.py --genomes mash_genomes
+
+      # Uploaded even on failure: the JSON is what a human compares against
+      # the previous run to see whether a number moved a little or a lot.
+      - name: Upload validation results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: validation-results
+          path: ${{ runner.temp }}/*.json
+          if-no-files-found: warn
