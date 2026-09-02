@@ -445,6 +445,29 @@ La superficie con compatibilidad garantizada es:
 
 ### Changed
 
+- **Rompedor (Python): `fastdna.audit()`'s `lineage_threshold` ahora se
+  deriva de la cohorte en vez de valer 0.01 fijo.** Pasa a ser
+  `Optional[float] = None`; `None` significa "léelo del dendrograma de esta
+  cohorte" (la mediana de los puntos de `cv.default_threshold_curve`).
+  Pasar un float sigue fijándolo exactamente, que es lo que mantiene
+  reproducible cada punto de la curva por separado.
+
+  El motivo es que la constante era medible-mente incorrecta sobre datos
+  reales, no una preferencia de estilo. Sobre 200 genomas públicos de
+  *E. coli* de BV-BRC (`scripts/validation/lineage_leakage_experiment.py`):
+  con `0.01` salían 198 linajes de 200 muestras y `gap = -0.011`; agrupando
+  por MLST (verdad externa) `gap = +0.165`; con `0.03`, `gap = +0.175`. El
+  valor derivado en esa cohorte es 0.029, que cae con las dos respuestas
+  correctas. La curva de esa cohorte abarca de 0.019 a 0.044, así que 0.01
+  no era solo subóptimo: quedaba fuera del rango que sus propias alturas de
+  fusión ofrecen. La distancia Mash no tiene escala universal --
+  `cv.default_threshold_curve` ya lo argumentaba, y aun así el corte
+  principal de `audit()` usaba una constante.
+
+  Coste: normalmente cero. Cuando se calcula la curva de fuga (el
+  comportamiento por defecto) sus puntos ya están disponibles. Solo con
+  `auto_leakage_curve=False` se paga una pasada extra de dendrograma.
+
 - **(rompedor)** El esquema de exportación por defecto (CSV/Parquet) ya no
   incluye la columna `kmer_sequence`. Antes: `kmer_u64,kmer_sequence,
   frequency` siempre. Ahora: `kmer_u64,frequency` salvo pedirla
@@ -584,6 +607,26 @@ La superficie con compatibilidad garantizada es:
     y los rechazos de validación cruzada de flags).
 
 ### Fixed
+
+- Python: `fastdna.audit()` ya no reporta un `gap` numérico cuando el
+  agrupamiento fue degenerado. Antes avisaba (`DegenerateLineagesWarning`)
+  y devolvía el número igualmente -- y esa es la mitad peligrosa: los avisos
+  se filtran, los tragan los notebooks o simplemente no se leen, mientras
+  que el número que acaba en un paper es `report.gap`. Ahora `gap` es
+  `float("nan")` con un `gap_undefined_reason` nuevo que nombra la causa,
+  siguiendo la misma convención de "devuelve una razón, no un número" que
+  `Confounding.value`/`undefined_reason` ya usaba (y que, de hecho, ya se
+  activaba sobre ese mismo agrupamiento degenerado, `r == n`).
+  `score_random`/`score_lineage` siguen poblados: esos sí se midieron, solo
+  su diferencia es insegura de interpretar. Todas las vistas legibles
+  (`__repr__`, `to_markdown`, `_repr_html_`) muestran "undefined
+  (degenerate grouping)" en vez de "+nan".
+
+- Rust: corregidos los tres avisos de clippy que habían dejado el paso del
+  ratchet de CI por encima de su baseline de 8 sitios (`chimera_scan.rs` y
+  `cohort_vocab.rs`, ambos añadidos después de fijarse ese baseline). Los
+  tres son mecánicos y preservan el comportamiento; los 8 preexistentes se
+  dejan intactos a propósito.
 
 - Rust: `pipeline::resolve_strategy`, al forzar `--strategy binned`, ahora
   reporta `StrategyDecision.estimated_peak_bytes` usando el nuevo modelo
