@@ -350,3 +350,68 @@ def test_explain_without_phenotype_skips_association_but_still_runs(tmp_path):
     for f in report.features:
         assert f.association_p_value is None
         assert f.survives_stratification is None
+
+
+def test_equivalence_class_span_separates_a_locus_from_a_scattered_block(tmp_path):
+    """The fourth check: WHERE an equivalence class sits, not just how big.
+
+    `explain`'s check #1 reports how many k-mers share a presence pattern,
+    and this module's own docstring assumes they share it because they
+    "physically overlap in the genome". That is one of two cases, and they
+    mean opposite things:
+
+      * members off a single locus overlap, so they span tens of bases
+        within one annotated feature -- a localised causal hypothesis;
+      * members scattered across the genome share their pattern because they
+        are co-inherited inside a clone -- a lineage signature that check #1
+        scores identically.
+
+    arXiv 2502.07749 sec. 9.1 asks for exactly this ("spatial dependencies
+    ... variants that are physically proximal"), and notes that
+    reference-free k-mer methods cannot supply it. This one can, because
+    `fastdna.annotate` resolves a k-mer to coordinates.
+
+    Checked here at the level the distinction lives: two constructed sets of
+    k-mers, one tiling a single gene, one drawn from across the reference.
+    """
+    from fastdna.annotate import load_annotation, locate_kmer
+    from fastdna.explain import _LOCALISED_SPAN_BP
+
+    rng = np.random.default_rng(31)
+    bases = np.array(list("ACGT"))
+    reference = "".join(rng.choice(bases, size=6000))
+
+    (tmp_path / "ref.fasta").write_text(">c1\n" + reference + "\n")
+    (tmp_path / "ann.gff").write_text(
+        "##gff-version 3\n"
+        "c1\tt\tgene\t1000\t1600\t.\t+\t.\tID=geneA;Name=geneA\n"
+        "c1\tt\tgene\t4000\t4600\t.\t+\t.\tID=geneB;Name=geneB\n"
+    )
+    annotation = load_annotation(tmp_path / "ref.fasta", tmp_path / "ann.gff")
+
+    overlapping = [reference[1100 + i : 1121 + i] for i in range(20)]
+    scattered = [reference[p : p + 21] for p in rng.choice(5000, size=20, replace=False)]
+
+    def extent(kmers):
+        positions, genes = [], set()
+        for kmer in kmers:
+            hits = locate_kmer(annotation, kmer)
+            if hits:
+                positions.append(hits[0].start)
+                if hits[0].gene_name:
+                    genes.add(hits[0].gene_name)
+        return max(positions) - min(positions), len(genes)
+
+    overlapping_span, overlapping_genes = extent(overlapping)
+    scattered_span, scattered_genes = extent(scattered)
+
+    # A locus: members tile one gene, within the span adjacent k-mers reach.
+    assert overlapping_span <= _LOCALISED_SPAN_BP
+    assert overlapping_genes == 1
+
+    # A clone signature: same class size, orders of magnitude wider.
+    assert scattered_span > _LOCALISED_SPAN_BP
+    assert scattered_span > overlapping_span * 10, (
+        f"the two regimes must be separated by more than a fine cut: "
+        f"{overlapping_span} bp vs {scattered_span} bp"
+    )

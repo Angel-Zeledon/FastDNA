@@ -80,6 +80,26 @@ _ALPHA = 0.05
 _LINEAGE_RESTRICTED_FRACTION = 0.25
 _MIN_LINEAGES_FOR_RESTRICTION = 4
 
+#: How far apart an equivalence class's members may sit and still count as
+#: one locus rather than a scattered, co-inherited set.
+#:
+#: Adjacent k-mers off a single variant tile a window not much wider than a
+#: read: overlapping 21-mers spanning a 200 bp insert land within ~200 bp of
+#: each other. A class whose members are thousands of bases apart is not one
+#: variant seen many times; it is many variants that travel together because
+#: they sit in the same clone. Measured on a constructed pair: 20
+#: overlapping k-mers spanned 19 bp, 20 scattered ones 4,669 bp -- the two
+#: regimes are separated by orders of magnitude, not by a fine cut, which is
+#: why a round number serves and a fitted threshold would be false
+#: precision.
+_LOCALISED_SPAN_BP = 500
+
+#: Members of a class actually located before deciding its extent. Each
+#: lookup scans the reference, and a class can run to thousands of k-mers;
+#: the span of a block is established by a sample of it long before the last
+#: member is checked.
+_SPATIAL_SAMPLE_CAP = 40
+
 
 @dataclass(frozen=True)
 class FeatureExplanation:
@@ -105,6 +125,37 @@ class FeatureExplanation:
     annotation: Optional[str]  # best-effort gene/feature name, if given a reference
 
     verdict: str
+
+    # --- spatial extent of the equivalence class (needs `annotation=`) ----
+    #
+    # `None` when no reference/annotation was supplied, since both are read
+    # off real coordinates rather than inferred.
+    #
+    # Check #1 reports how MANY k-mers share this pattern. These report
+    # WHERE they are, which is what separates two cases that check #1 scores
+    # identically and that mean opposite things:
+    #
+    #   * a class whose members physically overlap -- adjacent k-mers off one
+    #     locus -- spans tens of bases and touches one gene. That is a
+    #     localised causal hypothesis, and it is the case this module's own
+    #     docstring assumes ("most often because they physically overlap").
+    #   * a class scattered across the genome shares its pattern because its
+    #     members are co-inherited within a clone, not because they are one
+    #     variant. That is a lineage signature wearing check #1's clothing.
+    #
+    # Measured on a constructed pair: 20 overlapping k-mers span 19 bp across
+    # 1 gene; 20 scattered ones span 4,669 bp across 2. Reporting only the
+    # class size collapses that distinction.
+    #
+    # arXiv 2502.07749 sec. 9.1 ("Spatial dependencies") asks for exactly
+    # this -- encoding physical position so that "variants that are
+    # physically proximal ... may be more likely to interact epistatically"
+    # can constrain interpretation. Reference-free k-mer methods normally
+    # cannot: they do not know where a k-mer lands. This one can, because
+    # `fastdna.annotate` already resolves a k-mer to coordinates.
+    class_span_bp: Optional[int] = None
+    class_n_genes: Optional[int] = None
+    class_localised: Optional[bool] = None  # confined to a single annotated feature
 
     def __repr__(self) -> str:
         return (
@@ -380,6 +431,16 @@ def explain(
     # `sequence -> equivalence class size`, resolved once for the whole
     # vocabulary rather than once per top feature.
     class_sizes = np.zeros(len(vectorizer._feature_sequences_), dtype=np.int64)
+    # class_id -> the sequences in it, for the spatial extent of a class.
+    # Built from the same table `members_by_sequence` inverts, so no extra
+    # pass over the cohort.
+    class_members_by_id = {}
+    for _seq, _cid in zip(
+        equivalence.members.column("kmer_sequence").to_pylist(),
+        equivalence.members.column("class_id").to_pylist(),
+    ):
+        class_members_by_id.setdefault(_cid, []).append(_seq)
+
     members_by_sequence = dict(
         zip(
             equivalence.members.column("kmer_sequence").to_pylist(),
@@ -428,6 +489,7 @@ def explain(
         )
 
         gene_name = None
+        class_span_bp = class_n_genes = class_localised = None
         if loaded_annotation is not None:
             from .annotate import locate_kmer
 
@@ -435,8 +497,41 @@ def explain(
             if hits:
                 gene_name = hits[0].gene_name or hits[0].feature_type
 
+            # Where the REST of this k-mer's equivalence class sits. Check #1
+            # says how many share the pattern; this says whether they are one
+            # locus or scattered, which is the difference between a localised
+            # causal hypothesis and a clone signature (see
+            # `FeatureExplanation.class_span_bp`).
+            class_id = members_by_sequence.get(sequence)
+            if class_id is not None:
+                siblings = class_members_by_id.get(class_id, ())
+                # Capped: a class can run to thousands of k-mers and each
+                # lookup scans the reference. The span of a large block is
+                # already established by a sample of it.
+                positions, genes = [], set()
+                for sibling in siblings[:_SPATIAL_SAMPLE_CAP]:
+                    sibling_hits = locate_kmer(loaded_annotation, sibling)
+                    if not sibling_hits:
+                        continue
+                    positions.append(sibling_hits[0].start)
+                    if sibling_hits[0].gene_name:
+                        genes.add(sibling_hits[0].gene_name)
+                if positions:
+                    class_span_bp = int(max(positions) - min(positions))
+                    class_n_genes = len(genes)
+                    # One annotated feature and a span no wider than the
+                    # k-mers themselves could tile: overlapping members off a
+                    # single locus.
+                    class_localised = class_n_genes <= 1 and class_span_bp <= _LOCALISED_SPAN_BP
+
         if eq_size > 1:
             verdict = f"non-identifiable (linked block of {eq_size} k-mers)"
+            # The spatial half of the answer, when it is available: the same
+            # block size means opposite things depending on this.
+            if class_localised is True:
+                verdict += f", localised to {gene_name or 'one feature'}"
+            elif class_localised is False:
+                verdict += f", scattered over {class_span_bp} bp"
         elif lineage_restricted:
             verdict = "lineage marker"
         elif survives is True:
@@ -460,6 +555,9 @@ def explain(
                 survives_stratification=survives,
                 annotation=gene_name,
                 verdict=verdict,
+                class_span_bp=class_span_bp,
+                class_n_genes=class_n_genes,
+                class_localised=class_localised,
             )
         )
 
