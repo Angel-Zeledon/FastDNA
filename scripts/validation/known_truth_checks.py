@@ -213,10 +213,172 @@ def check_generated_null() -> Tuple[bool, str]:
     return ok, f"null verdicts: {verdicts}"
 
 
+def check_active_learning_ordering() -> Tuple[bool, str]:
+    """Uncertainty must fall as the classes separate. Four queries whose
+    separation is known by construction, from a dead tie to near-certainty."""
+    from fastdna.active_learning import uncertainty_score
+
+    cases = [[0.50, 0.50], [0.52, 0.48], [0.90, 0.10], [0.99, 0.01]]
+    scores = [uncertainty_score((case, ["A", "B"])) for case in cases]
+    monotone = all(scores[i] > scores[i + 1] for i in range(len(scores) - 1))
+    return monotone, (
+        "tie=%.3f -> near-certain=%.3f, monotone=%s" % (scores[0], scores[-1], monotone)
+    )
+
+
+def check_spectrum_valley() -> Tuple[bool, str]:
+    """`suggest_min_count` claims to find the valley between the error peak
+    and the coverage peak. Build spectra whose valley position is known by
+    construction (a decaying error component plus a normal coverage peak at
+    a chosen depth) and check it lands there."""
+    import numpy as np
+
+    from fastdna.spectrum import suggest_min_count
+
+    hits = []
+    for coverage in (10, 20, 30, 50, 80):
+        depths = np.arange(1, coverage * 3)
+        errors = 6_000_000 * np.exp(-depths / 0.8)
+        peak = 2_000_000 * np.exp(-((depths - coverage) ** 2) / (2 * max(2.0, coverage / 4) ** 2))
+        spectrum = {int(d): int(v) for d, v in zip(depths, (errors + peak).astype(int)) if v > 0}
+
+        observed_peak = max((d for d in spectrum if d > 3), key=lambda d: spectrum[d])
+        true_valley = min((d for d in spectrum if d < observed_peak), key=lambda d: spectrum[d])
+        hits.append(suggest_min_count(spectrum) == true_valley)
+
+    ok = all(hits)
+    return ok, f"exact valley found in {sum(hits)}/{len(hits)} constructed spectra"
+
+
+def check_embed_preserves_structure() -> Tuple[bool, str]:
+    """An embedding that does not keep known lineages together is not
+    preserving the structure it exists to show. Silhouette against the true
+    lineage labels makes that checkable rather than eyeballed."""
+    import numpy as np
+    from sklearn.metrics import silhouette_score
+
+    from fastdna.embed import embed_cohort
+
+    rng = np.random.default_rng(21)
+    bases = np.array(list("ACGT"))
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = pathlib.Path(tmp)
+        paths, truth = [], []
+        for lineage in range(4):
+            root = "".join(rng.choice(bases, size=4000))
+            for member in range(6):
+                seq = list(root)
+                for pos in rng.choice(len(seq), size=25, replace=False):
+                    seq[pos] = str(rng.choice(bases))
+                paths.append(_write_fastq(directory, f"L{lineage}_{member}.fastq", "".join(seq)))
+                truth.append(lineage)
+
+        scores = {}
+        for method in ("pcoa", "umap"):
+            table = embed_cohort(paths, method=method, k=21, sketch_size=500)
+            coords = np.column_stack(
+                [np.asarray(table.column(c)) for c in table.column_names if c in ("x", "y")]
+            )
+            scores[method] = float(silhouette_score(coords, np.asarray(truth)))
+
+    ok = all(v > 0.5 for v in scores.values())
+    return ok, "silhouette vs true lineages: " + ", ".join(
+        f"{m}={v:+.3f}" for m, v in scores.items()
+    )
+
+
+def check_equivalence_collapse() -> Tuple[bool, str]:
+    """Columns with identical presence profiles are one equivalence class.
+    Built from three independent features duplicated four times each, so the
+    right answer is three."""
+    import numpy as np
+    import scipy.sparse as sp
+
+    from fastdna.equivalence import collapse_equivalence_classes
+
+    base = (np.random.default_rng(0).random((30, 3)) > 0.5).astype(np.uint8)
+    matrix = np.hstack([np.repeat(base[:, [i]], 4, axis=1) for i in range(3)])
+    names = [f"f{i}c{j}" for i in range(3) for j in range(4)]
+
+    result = collapse_equivalence_classes(sp.csr_matrix(matrix), names)
+    n_classes = len(result.representative)
+    ok = n_classes == 3
+    return ok, f"12 columns (3 features x 4 copies) -> {n_classes} classes"
+
+
+def check_mic_essential_agreement() -> Tuple[bool, str]:
+    """Essential agreement is a CLSI convention: a prediction within one
+    two-fold dilution of the true MIC counts as agreeing. That gives an
+    external, published definition to check against rather than an internal
+    one."""
+    import numpy as np
+
+    from fastdna.mic import log2_mic, mic_regression_report
+
+    truth = np.array([0.25, 0.5, 1, 2, 4, 8, 16, 32])
+    exact = mic_regression_report(truth, truth).essential_agreement
+    one = mic_regression_report(truth, truth * 2).essential_agreement
+    two = mic_regression_report(truth, truth * 4).essential_agreement
+    log2_ok = list(np.asarray(log2_mic(np.array([0.25, 1, 4, 16])))) == [-2.0, 0.0, 2.0, 4.0]
+
+    ok = exact == 1.0 and one == 1.0 and two == 0.0 and log2_ok
+    return ok, (f"EA exact={exact}, 1 dilution={one}, 2 dilutions={two}; "
+                f"log2_mic exact={log2_ok}")
+
+
+def check_multiomics_joins_by_id() -> Tuple[bool, str]:
+    """Layers arrive in different orders with different sample sets. Joining
+    by position instead of by id would silently pair the wrong rows, which is
+    the failure this check exists to exclude."""
+    pandas = __import__("pandas")
+
+    from fastdna.multiomics import join_omics_layers
+
+    kmers = pandas.DataFrame({"sample_id": ["S1", "S2", "S3"], "kmer": [1.0, 2.0, 3.0]})
+    rna = pandas.DataFrame({"sample_id": ["S3", "S1", "S9"], "rna": [30.0, 10.0, 90.0]})
+
+    frame, report = join_omics_layers({"kmers": kmers, "rna": rna})
+    indexed = frame.set_index("sample_id")
+    ok = (
+        len(frame) == 2
+        and indexed.loc["S1", "rna"] == 10.0   # would be 30.0 if joined by position
+        and indexed.loc["S3", "rna"] == 30.0
+        and set(report.dropped_sample_ids) == {"S2", "S9"}
+    )
+    return ok, f"kept {report.kept_sample_ids}, dropped {sorted(report.dropped_sample_ids)}"
+
+
+def check_interop_biopython() -> Tuple[bool, str]:
+    """Real Biopython SeqRecords, not a hand-written stand-in: the claim is
+    interoperability with that specific library, so the check has to import
+    it."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+
+    from fastdna.interop import count_from_sequences
+
+    sequence = "ACGTACGTTGCAACGTACGTACGTACGT" * 5
+    records = [SeqRecord(Seq(sequence), id=f"r{i}") for i in range(3)]
+
+    from_records = count_from_sequences(records, k=11)
+    from_strings = count_from_sequences([sequence] * 3, k=11)
+
+    ok = from_records.distinct_kmers == from_strings.distinct_kmers
+    return ok, (f"SeqRecord -> {from_records.distinct_kmers} distinct, "
+                f"plain strings -> {from_strings.distinct_kmers}")
+
+
 CHECKS: Dict[str, Callable[[], Tuple[bool, str]]] = {
-    "calibration": check_calibration,
+    "active_learning": check_active_learning_ordering,
     "anomaly": check_anomaly,
+    "calibration": check_calibration,
+    "embed": check_embed_preserves_structure,
+    "equivalence": check_equivalence_collapse,
     "genomic_model": check_genomic_model_domain,
+    "interop": check_interop_biopython,
+    "mic": check_mic_essential_agreement,
+    "multiomics": check_multiomics_joins_by_id,
+    "spectrum": check_spectrum_valley,
     "validate_generated": check_generated_null,
 }
 
