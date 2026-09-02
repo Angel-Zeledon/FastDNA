@@ -162,7 +162,26 @@ def _scores_from_probability_vector(probs, labels):
             f"has {len(labels)} -- they must be the same length and "
             "correspond position-by-position."
         )
-    return [float(p) for p in probs]
+    try:
+        return [float(p) for p in probs]
+    except TypeError as exc:
+        # The overwhelmingly likely cause: someone passed a whole batch --
+        # `estimator.predict_proba(X)`, shape (n_samples, n_classes) -- to a
+        # function that scores ONE query. numpy's own message for that
+        # ("only 0-dimensional arrays can be converted to Python scalars")
+        # names neither the argument nor the expected shape, so a caller
+        # doing the most natural thing gets no way back.
+        shape = getattr(probs, "shape", None)
+        if shape is not None and len(shape) > 1:
+            raise _core.InvalidConfigError(
+                f"uncertainty_score: probs has shape {shape}, but this function scores "
+                "ONE query at a time -- it expects that query's per-class "
+                "probabilities, e.g. `probs[i]` rather than the whole "
+                "`predict_proba(X)` matrix. To rank a batch, call it per row: "
+                "`[uncertainty_score((row, labels)) for row in predict_proba(X)]`, "
+                "or use `prioritize_for_review`, which takes the batch directly."
+            ) from exc
+        raise
 
 
 def _extract_scores(ranked_results_or_probs):

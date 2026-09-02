@@ -247,3 +247,26 @@ def test_suggest_reference_additions_filters_by_threshold():
     # A threshold nothing clears.
     none_candidates = suggest_reference_additions(queue, uncertainty_threshold=999)
     assert none_candidates == []
+
+
+def test_passing_a_whole_predict_proba_matrix_says_what_went_wrong():
+    """REGRESSION. `uncertainty_score` scores ONE query, but the most
+    natural thing to hand it is `estimator.predict_proba(X)` -- a whole
+    (n_samples, n_classes) batch. That used to surface numpy's own
+    "only 0-dimensional arrays can be converted to Python scalars", which
+    names neither the argument nor the expected shape, leaving a caller
+    doing the obvious thing with no route back.
+    """
+    np = pytest.importorskip("numpy")
+    from fastdna.active_learning import uncertainty_score
+
+    batch = np.array([[0.9, 0.1], [0.5, 0.5]])
+
+    with pytest.raises(ValueError) as exc_info:
+        uncertainty_score((batch, ["A", "B"]))
+
+    message = str(exc_info.value)
+    assert "(2, 2)" in message           # names the shape it actually got
+    assert "ONE query" in message        # names the expectation
+    assert "predict_proba" in message    # names the likely source
+    assert "prioritize_for_review" in message  # names the batch alternative
