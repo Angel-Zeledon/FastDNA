@@ -635,7 +635,33 @@ class TestLineageKFold:
         with pytest.raises(ValueError) as exc_info:
             LineageKFold(n_splits=4, groups=[0, 0, 1, 1, 2, 2])
 
-        assert "distance_threshold" in str(exc_info.value)
+        assert "4" in str(exc_info.value) and "3" in str(exc_info.value)
+
+    def test_the_remedy_offered_depends_on_where_the_groups_came_from(self, lineage_cohort):
+        """The advice has to name a knob the caller can actually turn.
+
+        When `groups=` is supplied, `distance_threshold` was never consulted:
+        the grouping came in finished. Telling that caller to "raise
+        distance_threshold" sends them to tune a parameter with no effect on
+        their problem -- a message that sounds actionable and is not. This
+        pins both halves: derived groupings get the threshold advice, supplied
+        ones are told explicitly that it does not apply.
+        """
+        paths, _ = lineage_cohort
+        derived = LineageKFold(
+            n_splits=4, paths=paths, k=_K, sketch_size=_SKETCH_SIZE, distance_threshold=_THRESHOLD
+        )
+        with pytest.raises(ValueError) as derived_exc:
+            list(derived.split(paths))
+        derived_message = str(derived_exc.value)
+        assert "raise distance_threshold" in derived_message
+
+        with pytest.raises(ValueError) as supplied_exc:
+            LineageKFold(n_splits=4, groups=[0, 0, 1, 1, 2, 2])
+        supplied_message = str(supplied_exc.value)
+        assert "supply coarser groups=" in supplied_message
+        assert "not involved here" in supplied_message
+        assert "raise distance_threshold" not in supplied_message
 
     def test_accepts_precomputed_groups_without_sketching(self):
         groups = [0, 0, 1, 1, 2, 2]

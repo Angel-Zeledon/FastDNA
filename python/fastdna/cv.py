@@ -1124,23 +1124,37 @@ class LineageKFold:
             # now. Failing at construction beats failing halfway through a
             # GridSearchCV that has already spent minutes fitting.
             self._groups = np.asarray(groups)
-            self._check_n_splits(self._groups)
+            self._check_n_splits(self._groups, derived=False)
 
-    def _check_n_splits(self, groups):
+    def _check_n_splits(self, groups, *, derived: bool):
         n_groups = len(np.unique(groups))
-        if self.n_splits > n_groups:
-            raise _core.InvalidConfigError(
-                f"n_splits={self.n_splits} exceeds the number of distinct lineages "
-                f"({n_groups}) found in this cohort. A fold boundary can only fall "
-                "between lineages, so more folds than lineages is impossible without "
-                "splitting a lineage across train and test -- exactly the leakage this "
-                f"splitter exists to prevent. Either lower n_splits to at most "
-                f"{n_groups}, or raise distance_threshold (currently "
-                f"{self.distance_threshold!r}) so that near-clonal samples merge into "
-                "fewer, larger lineages. If neither is acceptable, this cohort does not "
-                "contain enough independent lineages to support the evaluation you are "
-                "asking for, and that is itself the finding."
+        if self.n_splits <= n_groups:
+            return
+        # The second half of the advice depends on where `groups` came from.
+        # When the caller supplied them directly, `distance_threshold` was
+        # never consulted -- pointing at it would send someone to tune a
+        # parameter that cannot affect the grouping they are stuck with.
+        if derived:
+            remedy = (
+                f"raise distance_threshold (currently {self.distance_threshold!r}) so "
+                "that near-clonal samples merge into fewer, larger lineages"
             )
+        else:
+            remedy = (
+                "supply coarser groups= (distance_threshold is not involved here: "
+                "these lineages were given directly, not derived from the genomes, "
+                "so changing it would have no effect)"
+            )
+        raise _core.InvalidConfigError(
+            f"n_splits={self.n_splits} exceeds the number of distinct lineages "
+            f"({n_groups}) found in this cohort. A fold boundary can only fall "
+            "between lineages, so more folds than lineages is impossible without "
+            "splitting a lineage across train and test -- exactly the leakage this "
+            f"splitter exists to prevent. Either lower n_splits to at most "
+            f"{n_groups}, or {remedy}. If neither is acceptable, this cohort does not "
+            "contain enough independent lineages to support the evaluation you are "
+            "asking for, and that is itself the finding."
+        )
 
     @property
     def groups_(self) -> np.ndarray:
@@ -1151,7 +1165,7 @@ class LineageKFold:
                 sketch_size=self.sketch_size,
                 distance_threshold=self.distance_threshold,
             )
-            self._check_n_splits(self._groups)
+            self._check_n_splits(self._groups, derived=True)
         return self._groups
 
     def get_n_splits(
