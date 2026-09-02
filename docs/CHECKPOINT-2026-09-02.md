@@ -151,5 +151,7 @@ export PATH="$HOME/.cargo/bin:$PATH"    # cargo/maturin are not on the default P
 cargo test --release
 ```
 
-State at this checkpoint: **1,035 Python tests + 729 Rust passing**, clippy
-at its 8-site baseline (the ratchet), 1 intentional xfail.
+State at this checkpoint, verified rather than remembered: **1,035 Python
+tests passing (1 xfail) + 729 Rust passing (0 failed, 1 intentionally
+ignored)**, clippy at its 8-site baseline — the ratchet in `ci.yml` fails on
+9, so any new warning site has to be fixed rather than allowed.
