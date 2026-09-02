@@ -132,6 +132,19 @@ jobs:
       - name: Taxonomy calls real species correctly
         run: python scripts/validation/taxonomy_real_species.py
 
+      # The only step here that needs neither network nor Docker: it builds
+      # its cohorts in a temp directory. It lives in this workflow anyway
+      # because it takes minutes, not seconds, and because it belongs next to
+      # the other "is the answer right" checks rather than among the unit
+      # tests. Three replicates rather than ten: enough to catch a
+      # regression at the extremes, which is what a scheduled run is for.
+      - name: The leakage detector still tracks injected leakage
+        run: |
+          python scripts/validation/leakage_calibration.py \
+            --lambdas 0.0 1.0 --replicates 3 \
+            --n-lineages 6 --per-lineage 25 --top-features 1000 \
+            --json "${RUNNER_TEMP}/calibration.json"
+
       # Uploaded even on failure: the JSON is what a human compares against
       # the previous run to see whether a number moved a little or a lot.
       - name: Upload validation results
