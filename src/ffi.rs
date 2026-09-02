@@ -1077,6 +1077,70 @@ fn load_sketch(path: String) -> PyResult<PySketch> {
     Ok(PySketch { inner })
 }
 
+/// Builds a MinHash sketch directly from an already-counted k-mer set --
+/// the in-memory counterpart to `sketch()`, with no FASTQ file read at all.
+///
+/// Exists so a `fastdna.CohortCounts` (built once by `count_cohort()`) can
+/// feed lineage/distance derivation (`fastdna.cv`) from the very same
+/// counted k-mers a `KmerVectorizer(counts=...)` pipeline already reuses
+/// for the model, instead of `fastdna.compare_all()` re-opening and
+/// re-sketching every FASTQ file from scratch. `kmers` is typically one
+/// sample's `kmer_u64` column (e.g. `CohortCounts.subset([sample_id]).
+/// kmers`, or an equivalent slice) -- every distinct value present is
+/// inserted into the same bottom-k working set `sketch()`'s own streaming
+/// construction uses (`sketch::GenomeSketch::from_kmers`, reused directly
+/// here, not reimplemented), so a sketch built from a sample's complete,
+/// unfiltered k-mer stream is bit-identical to the one `sketch(path)` would
+/// build by reading the file -- see `sketch.rs`'s own `streaming_
+/// construction_matches_in_memory_path` test, which pins exactly that
+/// equivalence for the Rust call this wraps. Repeats in `kmers` are handled
+/// the same way a real k-mer stream's repeats are (deduplicated by the
+/// bottom-k working set), so passing every occurrence or only the distinct
+/// values present makes no difference to the result.
+///
+/// `k` is a plain `usize`, not derived from `kmers` itself: nothing about a
+/// bare `u64` says what k-mer size produced it, so the caller must state
+/// it, exactly as `sketch()`'s own `k` names the size of the k-mers its
+/// streaming construction extracts from a FASTQ file. Passing a `k` that
+/// does not match the k-mer size `kmers` was actually counted at produces a
+/// sketch that is silently wrong (no error a Rust type can catch), so
+/// callers should always supply `counts.k`, not a separately-chosen value,
+/// when sketching from a `CohortCounts` -- see `python/fastdna/cv.py`'s own
+/// `_mash_distance_matrix` docstring for the Python-level contract this
+/// backs.
+///
+/// Validated the same way `sketch()`'s streaming construction validates
+/// (`sketch::GenomeSketch::from_reader`'s own guards): `k` outside `1..=32`
+/// raises `InvalidKError`, and `sketch_size == 0` raises `InvalidConfigError`
+/// -- both checked here rather than left to `GenomeSketch::from_kmers`
+/// itself, since that function (used by callers inside this crate that
+/// already know their own `k`/`sketch_size` are valid, e.g. every existing
+/// Rust unit test) has no validation of its own and would otherwise let a
+/// bad `k` reach Python as a silently-empty or nonsensical sketch instead
+/// of a raised, catchable exception -- silent empty output is a bug class,
+/// not a behavior (see this project's own CLI validation philosophy).
+///
+/// Released under `py.allow_threads` like `sketch()`'s own construction:
+/// hashing every element of a large `kmers` array is real CPU work with no
+/// Python state touched, and holding the GIL for it would freeze the
+/// calling interpreter for the whole build.
+#[pyfunction]
+#[pyo3(signature = (kmers, k=21, sketch_size=1000))]
+fn sketch_from_kmers(py: Python<'_>, kmers: Vec<u64>, k: usize, sketch_size: usize) -> PyResult<PySketch> {
+    if k == 0 || k > 32 {
+        return Err(FastDnaError::InvalidK { k }.into());
+    }
+    if sketch_size == 0 {
+        return Err(FastDnaError::InvalidConfig {
+            parameter: "sketch_size",
+            reason: "must be at least 1".to_string(),
+        }
+        .into());
+    }
+    let inner = py.allow_threads(|| GenomeSketch::from_kmers(&kmers, sketch_size, k));
+    Ok(PySketch { inner })
+}
+
 /// The Python-visible result of `frac_sketch()` and `load_frac_sketch()`.
 /// Wraps `sketch::FracSketch` -- a FracMinHash ("scaled MinHash")
 /// fingerprint whose size scales with the underlying k-mer set's true
@@ -2439,6 +2503,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_info, m)?)?;
     m.add_function(wrap_pyfunction!(sketch, m)?)?;
     m.add_function(wrap_pyfunction!(load_sketch, m)?)?;
+    m.add_function(wrap_pyfunction!(sketch_from_kmers, m)?)?;
     m.add_function(wrap_pyfunction!(frac_sketch, m)?)?;
     m.add_function(wrap_pyfunction!(load_frac_sketch, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_cardinality, m)?)?;

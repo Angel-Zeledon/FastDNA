@@ -37,6 +37,7 @@ __all__ = [
     "Sketch",
     "sketch",
     "load_sketch",
+    "sketch_from_kmers",
     "FracSketch",
     "frac_sketch",
     "load_frac_sketch",
@@ -648,6 +649,55 @@ def sketch(path: _PathLike, *, k: int = 21, sketch_size: int = 1000) -> Sketch:
 def load_sketch(path: _PathLike) -> Sketch:
     """Loads a sketch previously written by `Sketch.save`."""
     return Sketch(_core.load_sketch(str(path)))
+
+
+def sketch_from_kmers(kmers, *, k: int = 21, sketch_size: int = 1000) -> Sketch:
+    """Builds a MinHash sketch directly from an already-counted k-mer set --
+    the in-memory counterpart to :func:`sketch`, with no FASTQ file read at
+    all.
+
+    Exists so a `fastdna.CohortCounts` (built once by `count_cohort()`) can
+    feed lineage/distance derivation (`fastdna.cv`) from the very same
+    counted k-mers a `KmerVectorizer(counts=...)` pipeline already reuses
+    for the model, instead of `fastdna.compare_all()` re-opening and
+    re-sketching every FASTQ file from scratch. See `fastdna.cv`'s own
+    `_mash_distance_matrix` for the built-in caller of this function; most
+    callers should not need to call it directly.
+
+    Parameters
+    ----------
+    kmers : iterable of int
+        `kmer_u64` values, typically one sample's own column -- e.g.
+        `CohortCounts.subset([sample_id]).kmers`, or a zero-copy slice of
+        `CohortCounts.kmers` for that sample's row range. Every distinct
+        value present is inserted into the same bottom-k working set
+        :func:`sketch`'s own streaming construction uses, so a sketch built
+        from a sample's complete, unfiltered k-mer stream is bit-identical
+        to the one `sketch(path)` would build by reading the file. Passing
+        every occurrence or only the distinct values present makes no
+        difference to the result (repeats are deduplicated the same way a
+        real k-mer stream's repeats are). Accepts a `pyarrow.Array`/
+        `ChunkedArray`, a NumPy array, or any plain sequence of ints.
+    k : int, default 21
+        The k-mer size `kmers` was actually counted/extracted at. Nothing
+        about a bare `u64` says what k produced it, so this must be stated
+        explicitly -- pass the *same* `k` the k-mers were counted with
+        (e.g. a `CohortCounts.k`), not `sketch()`'s own unrelated default;
+        passing a mismatched `k` silently produces a wrong (but not
+        erroring) sketch.
+    sketch_size : int, default 1000
+        Matches `sketch()`'s own default.
+
+    Returns
+    -------
+    Sketch
+    """
+    import numpy as np
+
+    if isinstance(kmers, (pa.Array, pa.ChunkedArray)):
+        kmers = kmers.to_numpy(zero_copy_only=False)
+    kmers_list = np.asarray(kmers, dtype=np.uint64).tolist()
+    return Sketch(_core.sketch_from_kmers(kmers_list, k, sketch_size))
 
 
 class FracSketch:
