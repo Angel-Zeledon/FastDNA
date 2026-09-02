@@ -28,6 +28,7 @@ np = pytest.importorskip("numpy")
 
 import pyarrow as pa
 
+import fastdna
 from fastdna.cv import (
     LineageKFold,
     default_threshold_curve,
@@ -301,6 +302,125 @@ class TestDefaultThresholdCurve:
 
         with pytest.raises(ValueError):
             default_threshold_curve(paths, n_points=0, k=_K, sketch_size=_SKETCH_SIZE)
+
+
+class TestCohortCountsInput:
+    """`lineage_groups()`/`lineage_groups_at_thresholds()`/
+    `default_threshold_curve()` all accept a `fastdna.CohortCounts` in
+    place of a list of paths (see `_mash_distance_matrix()`'s own
+    docstring). The equivalence check that matters: sketching from the
+    already-counted k-mers must reproduce exactly what sketching by
+    streaming the same files would have produced, and the whole point is
+    that it does so without opening a single FASTQ file again.
+    """
+
+    @pytest.fixture
+    def lineage_counts(self, lineage_cohort):
+        paths, true_groups = lineage_cohort
+        counts = fastdna.count_cohort(paths, k=_K)
+        # count_cohort()'s sample_ids come from the filenames, in `paths`
+        # order -- so `true_groups` (aligned to `paths`) is also aligned to
+        # `counts.sample_ids` here, letting every test below reuse it as-is.
+        return counts, true_groups
+
+    def test_lineage_groups_from_counts_matches_lineage_groups_from_paths(self, lineage_cohort, lineage_counts):
+        paths, _ = lineage_cohort
+        counts, _ = lineage_counts
+
+        from_paths = lineage_groups(paths, k=_K, sketch_size=_SKETCH_SIZE, distance_threshold=_THRESHOLD)
+        # k is intentionally NOT passed here (or passed and ignored, see the
+        # next test) -- sketching for a CohortCounts input always uses
+        # counts.k.
+        from_counts = lineage_groups(counts, sketch_size=_SKETCH_SIZE, distance_threshold=_THRESHOLD)
+
+        assert from_counts.tolist() == from_paths.tolist()
+
+    def test_an_explicit_k_alongside_a_cohortcounts_is_silently_ignored(self, lineage_cohort, lineage_counts):
+        """The documented design decision (`_mash_distance_matrix()`'s own
+        docstring): `k=` cannot be told apart from "the caller never
+        mentioned k", so a CohortCounts input always sketches at
+        `counts.k`, and passing a different `k=` alongside it changes
+        nothing -- rather than raising or silently producing a different
+        (wrong) result.
+        """
+        paths, _ = lineage_cohort
+        counts, _ = lineage_counts
+        assert counts.k == _K
+
+        default_k = lineage_groups(counts, sketch_size=_SKETCH_SIZE, distance_threshold=_THRESHOLD)
+        # A deliberately wrong k, nowhere near _K -- if it were honoured,
+        # sketching would use a completely different k-mer size than the
+        # cohort was counted at and very likely change the grouping.
+        wrong_k = lineage_groups(counts, k=5, sketch_size=_SKETCH_SIZE, distance_threshold=_THRESHOLD)
+
+        assert wrong_k.tolist() == default_k.tolist()
+
+    def test_lineage_groups_at_thresholds_from_counts_matches_from_paths(self, lineage_cohort, lineage_counts):
+        paths, _ = lineage_cohort
+        counts, _ = lineage_counts
+        thresholds = [1e-6, _THRESHOLD, 1.5]
+
+        from_paths = lineage_groups_at_thresholds(paths, thresholds, k=_K, sketch_size=_SKETCH_SIZE)
+        from_counts = lineage_groups_at_thresholds(counts, thresholds, sketch_size=_SKETCH_SIZE)
+
+        for threshold, expected, actual in zip(thresholds, from_paths, from_counts):
+            assert actual.tolist() == expected.tolist(), f"mismatch at threshold {threshold}"
+
+    def test_default_threshold_curve_from_counts_matches_from_paths(self, lineage_cohort, lineage_counts):
+        paths, _ = lineage_cohort
+        counts, _ = lineage_counts
+
+        from_paths = default_threshold_curve(paths, n_points=5, k=_K, sketch_size=_SKETCH_SIZE)
+        from_counts = default_threshold_curve(counts, n_points=5, sketch_size=_SKETCH_SIZE)
+
+        assert from_counts == pytest.approx(from_paths)
+
+    def test_fewer_than_two_samples_in_a_cohortcounts_raises(self, lineage_counts):
+        counts, _ = lineage_counts
+        one_sample = counts.subset([counts.sample_ids[0]])
+
+        with pytest.raises(ValueError) as exc_info:
+            lineage_groups(one_sample, sketch_size=_SKETCH_SIZE, distance_threshold=_THRESHOLD)
+
+        assert "2" in str(exc_info.value)
+
+    def test_lineage_groups_from_a_cohortcounts_never_rereads_a_fastq_file(self, lineage_counts, monkeypatch):
+        """The point of accepting a CohortCounts at all, measured directly:
+        deriving lineage groups from it must not touch `fastdna.count()`
+        (which `count_cohort()` used, once, before this test starts) nor
+        `fastdna._core.sketch()` (the streaming, real-file sketch path
+        `fastdna.sketch()`/`fastdna.compare_all()` use for a plain paths
+        input) -- every sketch must come from `sketch_from_kmers()` over
+        the already-counted k-mers instead. Mirrors
+        `test_cohort_counts.py::test_cross_validation_with_the_artifact_never_recounts`'s
+        own spy pattern.
+        """
+        counts, _ = lineage_counts
+
+        count_calls = {"n": 0}
+        sketch_calls = {"n": 0}
+        real_count = fastdna.count
+        real_sketch = fastdna._core.sketch
+
+        def count_spy(*args, **kwargs):
+            count_calls["n"] += 1
+            return real_count(*args, **kwargs)
+
+        def sketch_spy(*args, **kwargs):
+            sketch_calls["n"] += 1
+            return real_sketch(*args, **kwargs)
+
+        monkeypatch.setattr(fastdna, "count", count_spy)
+        monkeypatch.setattr(fastdna._core, "sketch", sketch_spy)
+
+        lineage_groups(counts, sketch_size=_SKETCH_SIZE, distance_threshold=_THRESHOLD)
+        default_threshold_curve(counts, n_points=3, sketch_size=_SKETCH_SIZE)
+
+        assert count_calls["n"] == 0, "deriving lineage groups from a CohortCounts must not call fastdna.count()"
+        assert sketch_calls["n"] == 0, (
+            "deriving lineage groups from a CohortCounts must not stream any FASTQ file via "
+            "fastdna._core.sketch()"
+        )
 
 
 class TestLineageGroupsFromDistances:

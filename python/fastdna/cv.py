@@ -65,6 +65,7 @@ import pyarrow as pa
 
 import fastdna
 from . import _core
+from .cohort_counts import CohortCounts
 
 __all__ = [
     "default_threshold_curve",
@@ -126,29 +127,207 @@ def _validate_paths(paths, caller):
     return paths
 
 
-def _mash_distance_matrix(paths, k, sketch_size):
-    """Dense, symmetric `n x n` Mash-distance matrix over `paths`, in
-    `paths` order, built from `fastdna.compare_all(..., metric=
-    "mash_distance")`'s long-format `(sample_a, sample_b, mash_distance)`
-    table.
+def _validate_cohort_counts(counts, caller):
+    """The `CohortCounts` analogue of `_validate_paths()`'s length check --
+    refuses a cohort too small for a pairwise structure to exist.
 
-    `mash_distance` and not `jaccard`: it is already a distance (0 =
-    identical), so no similarity-to-distance conversion is involved, and it
-    is on an interpretable per-base-divergence scale, which is what makes a
-    `distance_threshold` something a caller can reason about rather than
-    tune blindly.
+    No duplicate-entry check is needed here, unlike `_validate_paths()`:
+    `CohortCounts.sample_ids` cannot contain a duplicate id in the first
+    place -- `count_cohort()` raises before ever building the object if two
+    input paths would derive the same `sample_id` (see its own docstring),
+    and `CohortCounts.subset()` can only select from `sample_ids` already
+    known to be unique, so there is no way to construct a `CohortCounts`
+    with a repeated id to guard against here.
 
     Parameters
     ----------
-    paths : list of str
-        Sample paths, already validated by `_validate_paths()`.
-    k, sketch_size : int
-        Forwarded to `fastdna.compare_all()`.
+    counts : fastdna.CohortCounts
+    caller : str
+        Name of the calling function, used only to name it in raised error
+        messages.
 
     Returns
     -------
-    numpy.ndarray of float64, shape (len(paths), len(paths))
+    fastdna.CohortCounts
+        `counts`, unchanged -- returned for symmetry with `_validate_paths()`,
+        which does transform its input.
+
+    Raises
+    ------
+    ValueError
+        If `counts` has fewer than 2 samples.
     """
+    if len(counts) < 2:
+        raise _core.InvalidConfigError(
+            f"{caller} needs at least 2 samples to compute pairwise distances, got "
+            f"{len(counts)} in this CohortCounts"
+        )
+    return counts
+
+
+def _validate_paths_or_counts(samples, caller):
+    """Validates `samples` for pairwise Mash-distance computation, accepting
+    either FASTQ(.gz) paths (`_validate_paths()`) or an already-counted
+    `fastdna.CohortCounts` (`_validate_cohort_counts()`) -- the two inputs
+    `_mash_distance_matrix()` knows how to sketch from. Dispatches purely on
+    `isinstance(samples, CohortCounts)`, so every existing call passing a
+    plain iterable of paths is routed to `_validate_paths()` exactly as
+    before.
+
+    Parameters
+    ----------
+    samples : iterable of str/pathlib.Path, or fastdna.CohortCounts
+    caller : str
+        Name of the calling function, used only to name it in raised error
+        messages.
+
+    Returns
+    -------
+    list of str, or fastdna.CohortCounts
+        Matches whichever of `_validate_paths()`/`_validate_cohort_counts()`
+        actually ran.
+    """
+    if isinstance(samples, CohortCounts):
+        return _validate_cohort_counts(samples, caller)
+    return _validate_paths(samples, caller)
+
+
+def _cohort_counts_sketches(counts, sketch_size):
+    """One `fastdna.Sketch` per sample in `counts`, built directly from its
+    already-counted k-mers via `fastdna.sketch_from_kmers()` -- no FASTQ
+    file is read. The in-memory counterpart to sketching every one of
+    `paths` by streaming it, used by `_mash_distance_matrix()` when it is
+    given a `CohortCounts` instead of paths.
+
+    Every sketch is built at `counts.k`, never at a separately-passed `k`
+    argument -- see `_mash_distance_matrix()`'s own docstring for why that
+    is the deliberate, documented choice here, not an oversight.
+
+    Slicing is zero-copy (`pyarrow.Array.slice`) and each sample's whole row
+    range is handed to `fastdna.sketch_from_kmers()` in one call, so this is
+    one pass over `counts.kmers` in total, not one `CohortCounts.subset()`
+    call per sample (which would rebuild a `sample_id -> position` lookup
+    and recompute `offsets` on every call -- O(n) per sample, O(n^2) overall
+    for an n-sample cohort).
+
+    Parameters
+    ----------
+    counts : fastdna.CohortCounts
+        Already validated by `_validate_cohort_counts()` (at least 2
+        samples).
+    sketch_size : int
+
+    Returns
+    -------
+    list of fastdna.Sketch, one per `counts.sample_ids`, in that order.
+    """
+    offsets = counts.offsets
+    sketches = []
+    for i in range(len(counts)):
+        start, end = int(offsets[i]), int(offsets[i + 1])
+        kmer_slice = counts.kmers.slice(start, end - start)
+        sketches.append(fastdna.sketch_from_kmers(kmer_slice, k=counts.k, sketch_size=sketch_size))
+    return sketches
+
+
+def _mash_distance_matrix(samples, k, sketch_size):
+    """Dense, symmetric `n x n` Mash-distance matrix over `samples`, in
+    `samples` order.
+
+    `samples` is either a plain iterable of FASTQ(.gz) paths (already
+    validated by `_validate_paths()`) or an already-counted
+    `fastdna.CohortCounts` (already validated by `_validate_cohort_counts()`
+    -- see `_validate_paths_or_counts()`, which every caller of this
+    function runs first). The two inputs take genuinely different code
+    paths, not just a different source for the same sketching call:
+
+    - **Paths**: built from `fastdna.compare_all(..., metric=
+      "mash_distance")`'s long-format `(sample_a, sample_b, mash_distance)`
+      table -- every file is opened and streamed to build its sketch, the
+      same cost `fastdna.sketch()` has on its own.
+    - **CohortCounts**: built from `_cohort_counts_sketches()`, which
+      sketches every sample directly from its already-counted `kmer_u64`
+      column (`fastdna.sketch_from_kmers()`) and this function then compares
+      pairwise itself (`Sketch.mash_distance()`, one call per pair) -- no
+      FASTQ file is read at all. This is the path that makes
+      `fastdna.audit()`'s automatic leakage curve free of any additional
+      file I/O when given a `CohortCounts` cohort: the same one-time count
+      `KmerVectorizer(counts=...)` already reuses for the model also
+      supplies the lineage/distance side.
+
+    `mash_distance` and not `jaccard` in both cases: it is already a
+    distance (0 = identical), so no similarity-to-distance conversion is
+    involved, and it is on an interpretable per-base-divergence scale, which
+    is what makes a `distance_threshold` something a caller can reason about
+    rather than tune blindly.
+
+    **A real, small behavioural difference between the two inputs.** If
+    `samples` is a `CohortCounts` built with `min_count > 1`, singleton
+    k-mers (those appearing once in a sample) were already dropped by
+    `count_cohort()` before this function -- or `sketch_from_kmers()` --
+    ever sees them, because `min_count` filters at counting time, not at
+    sketching time. The paths input has no such filter: `fastdna.
+    compare_all()` sketches every raw k-mer occurrence a file streams,
+    unfiltered. This is closer to Mash's own `-m`/error-filtering
+    convention (dropping likely-sequencing-error k-mers before they can
+    pollute a sketch) than the paths-based path is, and it is not a defect
+    to reconcile -- the two inputs are allowed to differ here, deliberately
+    documented rather than silently matched, because "match them" would
+    mean quietly re-filtering the paths-based path (a behaviour change with
+    its own cost) to chase an input that most `CohortCounts` callers use
+    with the library's own `min_count=1` default anyway.
+
+    **Which `k` is used for the CohortCounts path, and why `k` can be
+    silently ignored there.** When `samples` is a `CohortCounts`, every
+    sketch is built at `samples.k` -- the k-mer size the cohort was actually
+    counted at -- and this function's own `k` argument is not consulted at
+    all for that path. This is a deliberate choice, not an omission: `k` is
+    passed down through several layers (`lineage_groups_at_thresholds()`,
+    `default_threshold_curve()`, `fastdna.audit()`) each with their own
+    `k=21` default, and a plain Python default argument cannot distinguish
+    "the caller explicitly asked for k=21" from "the caller never mentioned
+    k and this is just the default" -- so there is no reliable signal here
+    to compare against `samples.k` and decide whether a mismatch is real or
+    just an unrelated default surfacing. Silently deferring to `samples.k`
+    avoids that ambiguity entirely and is also almost always what a caller
+    wants: `count_cohort()`'s own default is `k=31`, so the ordinary case of
+    `audit(pipeline, counts, phenotype)` with every default left in place
+    would otherwise "mismatch" on nearly every call, which would make an
+    error (or even a warning) noise rather than signal. The alternative --
+    raising `InvalidConfigError` on a mismatch -- was considered and
+    rejected for exactly that reason: it cannot tell a genuine caller
+    mistake from the completely ordinary case of two unrelated defaults
+    (`k=21` here, `k=31` in `count_cohort()`) simply differing. A caller who
+    needs a different k for sketching than the cohort was counted at should
+    build a second `CohortCounts` at that k (`count_cohort(..., k=...)`) --
+    there is no way to sketch at a k the k-mers were never extracted at
+    without recounting anyway.
+
+    Parameters
+    ----------
+    samples : list of str, or fastdna.CohortCounts
+        Already validated by `_validate_paths_or_counts()`.
+    k, sketch_size : int
+        `sketch_size` is always honoured. `k` is honoured only for the
+        paths input (forwarded to `fastdna.compare_all()`); ignored for a
+        `CohortCounts` input, per the docstring section above.
+
+    Returns
+    -------
+    numpy.ndarray of float64, shape (len(samples), len(samples))
+    """
+    if isinstance(samples, CohortCounts):
+        sketches = _cohort_counts_sketches(samples, sketch_size)
+        n = len(sketches)
+        matrix = np.zeros((n, n), dtype=np.float64)
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = sketches[i].mash_distance(sketches[j])
+                matrix[i, j] = d
+                matrix[j, i] = d
+        return matrix
+
+    paths = samples
     table = fastdna.compare_all(paths, k=k, sketch_size=sketch_size, metric="mash_distance")
 
     n = len(paths)
@@ -216,7 +395,7 @@ def _validate_distance_threshold(distance_threshold, caller):
 
 
 def lineage_groups_at_thresholds(
-    paths: Iterable[Union[str, os.PathLike]],
+    paths: Union[Iterable[Union[str, os.PathLike]], "CohortCounts"],
     thresholds: Sequence[float],
     *,
     k: int = 21,
@@ -255,9 +434,19 @@ def lineage_groups_at_thresholds(
 
     Parameters
     ----------
-    paths : iterable of str or pathlib.Path
-        FASTQ(.gz) files, at least two, no duplicates. Each is sketched
-        exactly once, regardless of how many thresholds are given.
+    paths : iterable of str or pathlib.Path, or fastdna.CohortCounts
+        Ordinarily FASTQ(.gz) files, at least two, no duplicates -- each is
+        sketched exactly once, regardless of how many thresholds are given.
+        May also be an already-counted `fastdna.CohortCounts` (e.g. from
+        `fastdna.count_cohort()`), in which case every sample is sketched
+        directly from its already-counted k-mers (`fastdna.
+        sketch_from_kmers()`) instead of its FASTQ file being reopened and
+        restreamed -- see `_mash_distance_matrix()`'s own docstring for
+        exactly what changes between the two inputs, including the note on
+        which `k` is actually used for sketching in each case (the `k`
+        argument below is ignored for a `CohortCounts` input; `counts.k` is
+        used instead) and the small, deliberate behavioural difference
+        `min_count > 1` introduces on that path.
     thresholds : sequence of float
         The Mash-distance cut points to evaluate, each validated exactly as
         `lineage_groups()`'s own `distance_threshold` is (must be strictly
@@ -266,8 +455,10 @@ def lineage_groups_at_thresholds(
         deduplicated, since deduplicating here would desynchronize the
         output from `thresholds`' own order and length.
     k, sketch_size : int
-        Forwarded to the sketching inside `fastdna.compare_all()`, exactly
-        as in `lineage_groups()`.
+        Forwarded to the sketching inside `fastdna.compare_all()` when
+        `paths` is a plain iterable of paths, exactly as in
+        `lineage_groups()`. Ignored when `paths` is a `CohortCounts` (see
+        above).
 
     Returns
     -------
@@ -281,11 +472,12 @@ def lineage_groups_at_thresholds(
     Raises
     ------
     ValueError
-        Via `_validate_paths()`: fewer than 2 paths, or a duplicate path.
-        Via the per-threshold check above: `thresholds` is empty, or any
-        entry is not strictly positive.
+        Via `_validate_paths()`/`_validate_cohort_counts()`: fewer than 2
+        paths/samples, or (paths only) a duplicate path. Via the
+        per-threshold check above: `thresholds` is empty, or any entry is
+        not strictly positive.
     """
-    paths = _validate_paths(paths, "lineage_groups_at_thresholds()")
+    paths = _validate_paths_or_counts(paths, "lineage_groups_at_thresholds()")
     thresholds = list(thresholds)
     if len(thresholds) == 0:
         raise _core.InvalidConfigError(
@@ -317,7 +509,7 @@ def lineage_groups_at_thresholds(
 
 
 def default_threshold_curve(
-    paths: Iterable[Union[str, os.PathLike]],
+    paths: Union[Iterable[Union[str, os.PathLike]], "CohortCounts"],
     *,
     n_points: int = 5,
     k: int = 21,
@@ -367,16 +559,23 @@ def default_threshold_curve(
 
     Parameters
     ----------
-    paths : iterable of str or pathlib.Path
-        FASTQ(.gz) files, at least two, no duplicates.
+    paths : iterable of str or pathlib.Path, or fastdna.CohortCounts
+        Ordinarily FASTQ(.gz) files, at least two, no duplicates. May also
+        be an already-counted `fastdna.CohortCounts`, sketched directly from
+        its counted k-mers with no FASTQ file reread -- see
+        `_mash_distance_matrix()`'s own docstring for exactly what changes
+        (including which `k` is actually used: `counts.k`, not the `k`
+        argument below, for this input).
     n_points : int, default 5
         How many thresholds to return. Reduced automatically (with no
         error) if the cohort's dendrogram does not have `n_points` distinct
         merge heights to draw quantiles from -- a small cohort simply has
         less granularity to show a curve across.
     k, sketch_size : int
-        Forwarded to the sketching inside `fastdna.compare_all()`, exactly
-        as in `lineage_groups()`.
+        Forwarded to the sketching inside `fastdna.compare_all()` when
+        `paths` is a plain iterable of paths, exactly as in
+        `lineage_groups()`. Ignored when `paths` is a `CohortCounts` (see
+        above).
 
     Returns
     -------
@@ -388,11 +587,12 @@ def default_threshold_curve(
     Raises
     ------
     ValueError
-        Via `_validate_paths()`: fewer than 2 paths, or a duplicate path.
+        Via `_validate_paths()`/`_validate_cohort_counts()`: fewer than 2
+        paths/samples, or (paths only) a duplicate path.
     ValueError
         If `n_points` is not a positive integer.
     """
-    paths = _validate_paths(paths, "default_threshold_curve()")
+    paths = _validate_paths_or_counts(paths, "default_threshold_curve()")
     if not isinstance(n_points, (int, np.integer)) or isinstance(n_points, bool) or n_points < 1:
         raise _core.InvalidConfigError(f"n_points must be a positive integer, got {n_points!r}")
 
@@ -434,7 +634,7 @@ def default_threshold_curve(
 
 
 def lineage_groups(
-    paths: Iterable[Union[str, os.PathLike]],
+    paths: Union[Iterable[Union[str, os.PathLike]], "CohortCounts"],
     *,
     k: int = 21,
     sketch_size: int = 1000,
@@ -451,13 +651,19 @@ def lineage_groups(
 
     Parameters
     ----------
-    paths : iterable of str or pathlib.Path
-        FASTQ(.gz) files, at least two, no duplicates. Each is sketched
-        exactly once.
+    paths : iterable of str or pathlib.Path, or fastdna.CohortCounts
+        Ordinarily FASTQ(.gz) files, at least two, no duplicates -- each is
+        sketched exactly once. May also be an already-counted
+        `fastdna.CohortCounts`, sketched directly from its counted k-mers
+        with no FASTQ file reread -- see `lineage_groups_at_thresholds()`
+        (which this delegates to) and `_mash_distance_matrix()`'s own
+        docstring for exactly what changes, including which `k` is actually
+        used for that input (`counts.k`, not the `k` argument below).
     k, sketch_size : int
-        Forwarded to the sketching inside `fastdna.compare_all()`. The
-        defaults match `fastdna.sketch()`'s own (`k=21`, Mash's default
-        length for comparison work).
+        Forwarded to the sketching inside `fastdna.compare_all()` when
+        `paths` is a plain iterable of paths. The defaults match
+        `fastdna.sketch()`'s own (`k=21`, Mash's default length for
+        comparison work). Ignored when `paths` is a `CohortCounts`.
     distance_threshold : float, default 0.01
         The Mash distance below which two samples are considered the same
         lineage -- roughly, 1% estimated per-base divergence. This is the
