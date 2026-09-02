@@ -38,6 +38,27 @@ La superficie con compatibilidad garantizada es:
   re-exporta en `fastdna.__all__` (sigue el precedente de
   `fastdna.datasets`): `from fastdna.design import check_design`.
 
+- **`scripts/validation/known_truth_checks.py`: 19 módulos comprobados contra
+  una verdad construida.** Complementa la capa anterior: aquellos módulos se
+  anclan a una herramienta externa (KMC3, Merqury, Mash, GenomeScope2), y
+  estos no tienen ninguna disponible -- no existe una implementación de
+  referencia de "marca la muestra que no encaja" -- pero su afirmación sigue
+  siendo comprobable construyendo un caso cuya respuesta se conoce de
+  antemano: `P(y=1|x)` analítica para `calibration`, un contaminante
+  inyectado para `anomaly`, una variante causal para `gwas`, un GFF escrito
+  a mano para `annotate`, lecturas tomadas literalmente del genoma de
+  referencia para `read_profile` y `metagenomics`.
+
+  Dos tienen anclas genuinamente externas: `mic` se comprueba contra la
+  convención de *essential agreement* de CLSI, e `interop` importa Biopython
+  real, porque el claim es interoperar con esa librería concreta.
+
+  Encontró dos de los defectos corregidos en esta versión (el falso "very
+  deviated" de `validate_generated` y el `TypeError` de `uncertainty_score`).
+  Lo que **no** establece está dicho en el propio script: los casos
+  construidos son deliberadamente limpios, y las cohortes reales son más
+  sucias de formas que no reproducen.
+
 - **`scripts/validation/`: comprobación contra herramientas externas, y un
   workflow programado que la ejecuta** (`.github/workflows/validation.yml`).
   Seis scripts que contrastan FastDNA con la implementación establecida de
