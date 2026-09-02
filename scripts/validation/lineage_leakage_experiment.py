@@ -209,6 +209,22 @@ def main() -> int:
         except Exception as exc:  # never let the side-check kill the run
             print(f"           (sketch-vs-MLST check skipped: {exc})")
 
+    # Before spending twenty minutes: can this design resolve anything? Two
+    # of this script's three historical attempts could not, and both were
+    # diagnosable from the shape alone (see STATUS in the module docstring).
+    # Printed rather than enforced -- a marginal design may still be the only
+    # cohort available, and that is the runner's call.
+    from fastdna.design import check_design
+
+    design = check_design(
+        y, n_features=args.top_features, groups=groups, n_splits=args.n_splits
+    )
+    print(f"design   : p/n={design.p_over_n:.3g}, minority={design.minority_count}, "
+          f"{design.n_groups} groups, 95% CI on AUC=0.75 is "
+          f"+/-{design.auc_ci_halfwidth:.3g}")
+    for concern in design.concerns:
+        print(f"  WARNING [{concern.code}] {concern.message}", file=sys.stderr)
+
     print(f"auditing : {args.n_splits}-fold, scoring=roc_auc, groups={args.groups}")
     started = time.monotonic()
     report = audit(
