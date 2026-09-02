@@ -82,14 +82,32 @@ prefers it -- and the marker transfers, so blocking costs nothing. Only when
 the marker stops predicting does the model fall back on memorising clones,
 and only then does blocking hurt.
 
-**What this means for `audit()`, stated as a limitation rather than
-discovered by a user.** The gap is a detector of *dominant* leakage, not a
-linear measure of partial leakage. It fires clearly when population
-structure is the main explanation of the phenotype. It is insensitive when
-leakage coexists with genuine, transferable biological signal that the model
-can use instead -- which is a common and comfortable regime, and one where a
-small gap should NOT be read as "no confounding present", only as "not the
-dominant explanation".
+**What this means for `audit()`.** The gap is a detector of *dominant*
+leakage, not a linear measure of partial leakage. It fires clearly when
+population structure is the main explanation of the phenotype, and is
+insensitive when leakage coexists with transferable biological signal the
+model can use instead.
+
+**But the report's other number covers exactly that range.** Measuring
+`confounding` on the same sweep:
+
+    lambda    gap        confounding
+      0.0    +0.0000        0.0769
+      0.2    +0.0322        0.1859
+      0.4    +0.0103        0.3272
+      0.6    +0.0290        0.5576
+      0.8    +0.1559        0.7698
+      1.0    +0.4963        0.9864
+
+    Spearman(lambda, gap)         = 0.829
+    Spearman(lambda, confounding) = 1.000
+
+`confounding` is monotone, and near-linear, precisely where the gap is flat.
+The two are not rival estimates of one quantity: `confounding` asks how much
+leakage the COHORT makes available (computed from labels, no model, so no
+model-dependent blind spot), and `gap` asks how much THIS model took. A
+small gap with high confounding is the informative pair -- the cohort could
+have fooled a model, and this one did not.
 
 The pre-registration is honoured: prediction (3) failed, it is reported
 here, and the sweep was not re-run with different settings to rescue it. The
@@ -234,10 +252,10 @@ def main() -> int:
         print(f"  WARNING [{concern.code}] {concern.message}", file=sys.stderr)
     print(f"sweep    : lambda in {args.lambdas}, {args.replicates} replicates each\n")
 
-    print(f"  {'lambda':>7}  {'random':>8}  {'blocked':>8}  {'gap':>8}  {'sd':>6}")
+    print(f"  {'lambda':>7}  {'random':>8}  {'blocked':>8}  {'gap':>8}  {'sd':>6}  {'confound':>9}")
     rows = []
     for lam in args.lambdas:
-        gaps, randoms, blockeds = [], [], []
+        gaps, randoms, blockeds, confs = [], [], [], []
         for replicate in range(args.replicates):
             with tempfile.TemporaryDirectory() as tmp:
                 paths, y, groups = build_cohort(
@@ -256,26 +274,33 @@ def main() -> int:
             gaps.append(report.gap)
             randoms.append(report.score_random)
             blockeds.append(report.score_lineage)
+            confs.append(report.confounding.value)
         rows.append({
             "lambda": lam,
             "gap_mean": float(np.nanmean(gaps)),
             "gap_sd": float(np.nanstd(gaps, ddof=1)) if len(gaps) > 1 else 0.0,
             "score_random_mean": float(np.nanmean(randoms)),
             "score_lineage_mean": float(np.nanmean(blockeds)),
+            "confounding_mean": float(np.nanmean(confs)),
             "gaps": [float(g) for g in gaps],
         })
         print(f"  {lam:>7.2f}  {rows[-1]['score_random_mean']:>8.4f}  "
               f"{rows[-1]['score_lineage_mean']:>8.4f}  {rows[-1]['gap_mean']:>+8.4f}  "
-              f"{rows[-1]['gap_sd']:>6.4f}")
+              f"{rows[-1]['gap_sd']:>6.4f}  {rows[-1]['confounding_mean']:>9.4f}")
 
     lams = np.array([r["lambda"] for r in rows])
     means = np.array([r["gap_mean"] for r in rows])
     rho = float(spearmanr(lams, means).statistic)
-    print(f"\n  Spearman(lambda, gap) = {rho:.4f}")
+    confs_mean = np.array([r["confounding_mean"] for r in rows])
+    rho_conf = float(spearmanr(lams, confs_mean).statistic)
+    print(f"\n  Spearman(lambda, gap)         = {rho:.4f}")
+    # The number that closes the gap's blind spot: `confounding` is computed
+    # from the labels with no model, so it has no model-dependent threshold.
+    print(f"  Spearman(lambda, confounding) = {rho_conf:.4f}")
 
     if args.json is not None:
         args.json.write_text(json.dumps(
-            {"rows": rows, "spearman": rho, "design": {
+            {"rows": rows, "spearman": rho, "spearman_confounding": rho_conf, "design": {
                 "n_samples": n_samples, "p_over_n": design.p_over_n,
                 "auc_ci_halfwidth": design.auc_ci_halfwidth}}, indent=2))
         print(f"  wrote {args.json}")

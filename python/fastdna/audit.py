@@ -325,6 +325,37 @@ explanation of the phenotype. It does not mean the cohort is unconfounded.
 computed from the label vectors with no model involved, and so is unaffected
 by whichever signal the model happened to find easiest.
 
+That is not an assumption. On the same injected-leakage sweep, measured
+alongside the gap:
+
+    lambda    gap        confounding
+      0.0    +0.0000        0.0769
+      0.2    +0.0322        0.1859
+      0.4    +0.0103        0.3272
+      0.6    +0.0290        0.5576
+      0.8    +0.1559        0.7698
+      1.0    +0.4963        0.9864
+
+    Spearman(lambda, gap)         = 0.829
+    Spearman(lambda, confounding) = 1.000
+
+`confounding` rises monotonically -- and close to linearly -- across exactly
+the range where the gap is flat. The two are not competing estimates of one
+quantity; they answer different questions, and the sweep shows each
+answering its own:
+
+- **`confounding`: how much leakage is AVAILABLE in this cohort?** A
+  property of the design. No model, so no model-dependent blind spot.
+- **`gap`: how much did THIS model take?** A property of the model on this
+  cohort. It moves only once lineage is the easiest signal available, which
+  is the same reason a model with a transferable alternative ignores
+  lineage and shows no gap.
+
+**So read them as a pair.** High confounding with a small gap is the
+informative combination and the easiest to misread: the cohort *could* have
+fooled a model, and this particular one resisted -- which says something
+about the model, not about the cohort's safety for the next one.
+
 ## What this module does not do
 
 Same posture as `cv.py` and `evaluation.py`, stated here for this module
