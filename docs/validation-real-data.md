@@ -274,6 +274,25 @@ assumption in the same way, which is what keeps them comparable to each
 other. A diploid cohort with a published genome size would exercise more of
 the model and is still open work.
 
+### What Track C does not cover
+
+- **No Kraken 2 comparison.** `fastdna.metagenomics` is the one module whose
+  reference implementation is not checked head to head here, because a fair
+  comparison needs a Kraken 2 database built over the full NCBI taxonomy
+  (gigabytes of downloads and a build step), not the handful of genomes the
+  other rows use. What exists instead: Track B ran real *E. coli* reads
+  against a 5-species panel and got 99.16% of species-level calls right with
+  a biologically coherent cross-reaction pattern, and the taxonomy row above
+  gets 12/12 on held-out real genomes. Both measure the same claim against
+  ground truth rather than against Kraken 2's answer, which is weaker
+  evidence for compatibility and equally strong evidence for correctness.
+- **No diploid genome-size case**, per the note above.
+- **No degraded-quality read set.** DRR002015 is uniformly Q30+
+  (`q20_pct = 100.0`), so the quality-trimming path is never exercised by
+  any row in this table. The README attributes its small KMC3/FASTK count
+  differences to trimming; that explanation remains unverified, and a run
+  with real 3'-end quality decay is what would settle it.
+
 ## Track D -- the leakage demonstration (2026-09-01)
 
 The honest caveat in Track A said the *S. aureus* + oxacillin cohort could
