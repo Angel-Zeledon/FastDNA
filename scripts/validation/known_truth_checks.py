@@ -43,6 +43,8 @@ import tempfile
 import warnings
 from typing import Callable, Dict, List, Tuple
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
 
 def _write_fastq(directory: pathlib.Path, name: str, sequence: str, read_len: int = 120) -> str:
     reads = [
@@ -427,10 +429,107 @@ def check_annotate_locates_genes() -> Tuple[bool, str]:
                 f"intergenic -> {between.feature_type}")
 
 
+def check_rules_recovers_injected_rule() -> Tuple[bool, str]:
+    """`SetCoveringClassifier`'s claim is that its explanation IS the model.
+    Inject one feature that determines the phenotype exactly and it must
+    come back as the rule -- not merely predict well by some other route."""
+    import numpy as np
+    import scipy.sparse as sp
+
+    from fastdna.rules import SetCoveringClassifier
+
+    rng = np.random.default_rng(8)
+    n_samples, n_features, causal = 150, 200, 77
+    matrix = (rng.random((n_samples, n_features)) > 0.6).astype(np.uint8)
+    phenotype = rng.integers(0, 2, size=n_samples)
+    matrix[:, causal] = phenotype
+    names = [f"k{i}" for i in range(n_features)]
+
+    model = SetCoveringClassifier(max_rules=3)
+    model.fit(sp.csr_matrix(matrix), phenotype, feature_names=names)
+    learned = [getattr(r, "feature_name", str(r)) for r in model.rules_]
+    accuracy = float((model.predict(sp.csr_matrix(matrix)) == phenotype).mean())
+
+    ok = learned == [f"k{causal}"] and accuracy == 1.0
+    return ok, f"rules learned {learned} (injected k{causal}), accuracy {accuracy:.3f}"
+
+
+def check_interpret_ranking() -> Tuple[bool, str]:
+    """Ranking by importance is trivial to get subtly wrong (stable sort
+    direction, off-by-one in `n`), and silently: the output still looks like
+    a sensible list of k-mers."""
+    import numpy as np
+
+    from fastdna.interpret import top_features
+
+    importances = np.array([0.1, 0.9, 0.5, 0.7, 0.0])
+    names = ["ka", "kb", "kc", "kd", "ke"]
+
+    descending = top_features(importances, names, n=3).column("kmer").to_pylist()
+    ascending = top_features(importances, names, n=2, ascending=True).column("kmer").to_pylist()
+
+    ok = descending == ["kb", "kd", "kc"] and ascending == ["ke", "ka"]
+    return ok, f"top3={descending}, bottom2={ascending}"
+
+
+def check_read_profile_against_membership() -> Tuple[bool, str]:
+    """A read taken verbatim from the reference must profile as entirely
+    present; a random read of the same length as entirely absent. Both
+    answers are known because both reads are constructed."""
+    import subprocess
+
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    binary = REPO_ROOT / "target" / "release" / "fastdna"
+    if not binary.is_file():
+        return True, "skipped: no release binary (cargo build --release)"
+
+    rng = np.random.default_rng(13)
+    bases = np.array(list("ACGT"))
+    reference = "".join(rng.choice(bases, size=2000))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = pathlib.Path(tmp)
+        (directory / "ref.fasta").write_text(f">r\n{reference}\n")
+        subprocess.run(
+            [str(binary), "--input", str(directory / "ref.fasta"),
+             "--output", str(directory / "ref.parquet"),
+             "--qc", str(directory / "qc.json"), "-k", "21", "-q", "0", "-m", "1"],
+            capture_output=True, check=True,
+        )
+        from_reference = reference[500:620]
+        unrelated = "".join(rng.choice(bases, size=120))
+        (directory / "reads.fastq").write_text(
+            f"@in_ref\n{from_reference}\n+\n{'I' * 120}\n@random\n{unrelated}\n+\n{'I' * 120}\n"
+        )
+        subprocess.run(
+            [str(binary), "profile", "--input", str(directory / "reads.fastq"),
+             "--table", str(directory / "ref.parquet"),
+             "-o", str(directory / "prof.parquet")],
+            capture_output=True, check=True,
+        )
+        rows = pq.read_table(directory / "prof.parquet").to_pylist()
+
+    by_read = {r["read_id"]: r for r in rows}
+    # 120 bases at k=21 gives 100 k-mers, and RLE should compress a
+    # uniformly-present or uniformly-absent read into a single run.
+    ok = (
+        by_read["in_ref"]["count"] >= 1 and by_read["in_ref"]["run_length"] == 100
+        and by_read["random"]["count"] == 0 and by_read["random"]["run_length"] == 100
+    )
+    return ok, (f"from-reference: count={by_read['in_ref']['count']} over "
+                f"{by_read['in_ref']['run_length']} k-mers; "
+                f"random: count={by_read['random']['count']}")
+
+
 CHECKS: Dict[str, Callable[[], Tuple[bool, str]]] = {
     "active_learning": check_active_learning_ordering,
     "annotate": check_annotate_locates_genes,
     "gwas": check_gwas_recovers_causal_variant,
+    "interpret": check_interpret_ranking,
+    "read_profile": check_read_profile_against_membership,
+    "rules": check_rules_recovers_injected_rule,
     "anomaly": check_anomaly,
     "calibration": check_calibration,
     "embed": check_embed_preserves_structure,
