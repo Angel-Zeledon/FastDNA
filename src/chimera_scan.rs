@@ -640,7 +640,7 @@ mod tests {
     /// artifactual periodicity in the k-mer counts that a real genome does
     /// not have.
     fn pseudo_random_dna(len: usize, mut seed: u64) -> Vec<u8> {
-        let bases = [b'A', b'C', b'G', b'T'];
+        let bases = *b"ACGT";
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
             // xorshift64

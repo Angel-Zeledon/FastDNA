@@ -121,7 +121,7 @@ pub fn rank_vocabulary(
             }
             // Descending by key: the same (prevalence desc, total_freq
             // desc, kmer asc) order `rank_key` encodes.
-            ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            ranked.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
             Ok(unzip_ranked(ranked))
         }
         Some(top_n) => {
@@ -145,7 +145,7 @@ pub fn rank_vocabulary(
                 }
             }
             let mut ranked: Vec<(RankKey, u64)> = heap.into_iter().map(|std::cmp::Reverse(item)| item).collect();
-            ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            ranked.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
             Ok(unzip_ranked(ranked))
         }
     }
