@@ -461,11 +461,29 @@ noise.
 1. **The detector is correct at the extremes.** Transferable signal produces
    *exactly* zero gap; pure lineage signal produces +0.43. It is measuring
    what it claims to measure.
-2. **It is a detector, not a meter.** It identifies leakage as the dominant
-   explanation. It is insensitive to partial leakage coexisting with real
-   biological signal -- a common regime, and one where a small gap must not
-   be read as "unconfounded". `AuditReport.confounding` answers that
-   question directly, from the labels, with no model involved.
+2. **It is a detector, not a meter -- and the report's other number is the
+   meter.** The gap identifies leakage as the *dominant* explanation and is
+   insensitive to partial leakage coexisting with real biological signal.
+   Measuring `confounding` on the same sweep closes that range:
+
+   | lambda | gap | confounding |
+   |---:|---:|---:|
+   | 0.0 | +0.0000 | 0.0769 |
+   | 0.2 | +0.0322 | 0.1859 |
+   | 0.4 | +0.0103 | 0.3272 |
+   | 0.6 | +0.0290 | 0.5576 |
+   | 0.8 | +0.1559 | 0.7698 |
+   | 1.0 | +0.4963 | 0.9864 |
+
+   Spearman(lambda, gap) = 0.829; **Spearman(lambda, confounding) = 1.000**.
+
+   `confounding` is monotone and near-linear precisely where the gap is
+   flat, because it is computed from the labels with no model and so has no
+   model-dependent threshold. The two answer different questions -- how much
+   leakage the cohort makes *available*, versus how much this model *took* --
+   and must be read as a pair. High confounding with a small gap is the
+   informative combination: the cohort could have fooled a model, and this
+   one did not.
 3. **The overfitting confound is ruled out.** Both extremes share p/n, model
    and capacity; only the phenotype's source differs, and the gap moves from
    0.000 to +0.427. The capacity-driven gap documented in `audit`'s module
