@@ -395,6 +395,24 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
         place; `disk_backed` only avoids adding a *second* full-cohort
         copy on top of it during vocabulary learning and projection.
 
+        Two measured points for where that distinction starts to bite, on
+        complete (~5 Mb) bacterial assemblies at k=31, on a 16 GB machine:
+
+        - **80 genomes** (~400 Mb of sequence, `top_features=5000`): ~1.5 GB
+          resident, comfortable.
+        - **200 genomes** (~1 Gb of sequence, `top_features=10000`):
+          exhausted memory and drove the machine into swap thrashing --
+          15% CPU against 7.6 GB of swap in use, i.e. not progressing at all.
+
+        Those two runs differ in `top_features` as well as in cohort size,
+        so they are two observations rather than a scaling law. The point is
+        narrower and worth knowing: the resident `CohortCounts` is what runs
+        out first, and it does so at a cohort size a real study reaches
+        easily. Past it, the workable configuration is `disk_backed=True`
+        **without** `counts=`, paying a re-count per fold so that nothing
+        full-cohort stays resident -- precisely the cost `counts=` exists to
+        avoid, which is why these are two options rather than one default.
+
         `fit_transform()` learns the vocabulary and projects the matrix
         via the same per-sample scratch-table streaming for both halves
         (unlike `chunk_size`'s `fit_transform()`, which falls back to a
