@@ -589,9 +589,61 @@ def check_workflow_emits_its_warnings() -> Tuple[bool, str]:
     return ok, f"emitted {sorted(emitted & expected)} of {sorted(expected)}"
 
 
+def check_metagenomics_classifies_and_abstains() -> Tuple[bool, str]:
+    """Reads lifted verbatim from a reference genome must be called to that
+    genome's taxon, and a read belonging to nothing must be called to
+    nothing. The second half is the one worth pinning: a classifier that
+    always answers is worse than one that abstains, because its output looks
+    identical either way."""
+    import numpy as np
+
+    from fastdna.metagenomics import build_database
+
+    rng = np.random.default_rng(77)
+    bases = np.array(list("ACGT"))
+    sequence_taxa = {"seqA": 101, "seqB": 102, "seqC": 103}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = pathlib.Path(tmp)
+        sequences = {}
+        records = []
+        for sequence_id in sequence_taxa:
+            sequences[sequence_id] = "".join(rng.choice(bases, size=20_000))
+            records.append(f">{sequence_id}\n{sequences[sequence_id]}\n")
+        (directory / "ref.fasta").write_text("".join(records))
+        (directory / "tax.tsv").write_text(
+            "tax_id\tparent_tax_id\trank\tname\tsequence_ids\n"
+            "1\t1\tno rank\troot\t\n"
+            + "".join(
+                f"{taxon}\t1\tspecies\tsp{taxon}\t{sequence_id}\n"
+                for sequence_id, taxon in sequence_taxa.items()
+            )
+        )
+        database = build_database(directory / "ref.fasta", directory / "tax.tsv", k=31)
+
+        reads, truth = [], []
+        for sequence_id, taxon in sequence_taxa.items():
+            for i in range(5):
+                start = 1000 + i * 2000
+                fragment = sequences[sequence_id][start : start + 150]
+                reads.append(f"@{sequence_id}_{i}\n{fragment}\n+\n{'I' * len(fragment)}\n")
+                truth.append(taxon)
+        (directory / "reads.fastq").write_text("".join(reads))
+        calls = [r["tax_id"] for r in database.classify(str(directory / "reads.fastq")).to_pylist()]
+
+        unrelated = "".join(rng.choice(bases, size=150))
+        (directory / "neg.fastq").write_text(f"@rand\n{unrelated}\n+\n{'I' * 150}\n")
+        negative = database.classify(str(directory / "neg.fastq")).to_pylist()[0]["tax_id"]
+
+    hits = sum(1 for expected, got in zip(truth, calls) if expected == got)
+    ok = hits == len(truth) and negative == 0
+    return ok, f"{hits}/{len(truth)} reads to the right taxon; unrelated read -> tax_id {negative}"
+
+
 CHECKS: Dict[str, Callable[[], Tuple[bool, str]]] = {
     "active_learning": check_active_learning_ordering,
     "annotate": check_annotate_locates_genes,
+    "metagenomics": check_metagenomics_classifies_and_abstains,
     "provenance": check_provenance_digest_tracks_content,
     "workflow": check_workflow_emits_its_warnings,
     "gwas": check_gwas_recovers_causal_variant,
