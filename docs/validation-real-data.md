@@ -473,3 +473,55 @@ noise.
 
 Point 2 is a limitation found by measurement rather than reported by a user,
 which is the outcome this kind of calibration exists to produce.
+
+---
+
+# Track F -- module claims against constructed truth (2026-09-01)
+
+Tracks C and E check FastDNA against something outside it: an established
+implementation, or an injected quantity. Eighteen modules have neither
+available -- there is no reference tool for "flag the sample that does not
+belong" -- but their claims are still checkable, because the right answer
+can be **built**.
+
+Each check constructs a case whose answer exists before the call is made:
+
+| module | constructed truth | result |
+|---|---|---|
+| `calibration` | P(y=1\|x) known analytically | error to TRUE probability 0.212 -> 0.044 |
+| `anomaly` | one injected contaminant | flagged, 0 false positives |
+| `genomic_model` | fit on one organism, predict another | silent in-domain, warns out |
+| `validate_generated` | **the null**: identical distributions | no deviation claimed |
+| `spectrum` | valley at a chosen depth | exact in 5/5 spectra |
+| `embed` | known lineage labels | silhouette +0.996 (PCoA), +0.966 (UMAP) |
+| `equivalence` | 3 features duplicated 4x | 12 columns -> 3 classes |
+| `active_learning` | separation from tie to certainty | monotone, 1.000 -> 0.020 |
+| `multiomics` | layers in different orders | joins by id, not position |
+| `interop` | **real Biopython** SeqRecords | identical to plain strings |
+| `mic` | **CLSI** essential agreement | 1 dilution agrees, 2 do not |
+| `gwas` | one column set equal to phenotype | recovered, p=1.2e-59 |
+| `annotate` | GFF written here | in-gene named, intergenic not |
+| `rules` | one feature determines phenotype | that rule returned, accuracy 1.000 |
+| `interpret` | known importances | ranked correctly both directions |
+| `read_profile` | read lifted from the reference | all present vs all absent |
+| `provenance` | hash recomputed independently | matches, and moves with content |
+| `workflow` | end-to-end run | both promised warnings emitted |
+
+Two have genuinely external anchors rather than constructed ones: `mic` is
+checked against CLSI's essential-agreement convention, and `interop`
+imports real Biopython, because the claim is interoperability with that
+specific library and a stand-in cannot establish it.
+
+**One of the eighteen failed**, and it is the reason this track exists.
+`validate_generated` called identical distributions "very deviated" at
+k=6, 11 and 21 -- a false positive that fired on any input at high k. It is
+kept here as a permanent null control rather than trusted to stay fixed;
+see the CHANGELOG entry for the coverage guard.
+
+## What this track cannot establish
+
+Passing here means the module does what it says on a case built to have a
+knowable answer. It does not mean the module is useful on real data, and
+the constructed cases are deliberately clean -- a single contaminant, one
+causal feature, well-separated lineages. Real cohorts are messier in ways
+these cases do not reproduce, which is what Tracks A-D are for.
