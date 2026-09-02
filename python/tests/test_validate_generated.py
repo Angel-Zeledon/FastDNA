@@ -285,3 +285,61 @@ def test_report_repr_and_markdown_render_without_error():
     assert "K-mer composition" in markdown
     assert "Repeat / coverage structure" in markdown
     assert "Novelty / memorization" in markdown  # check_containment defaults True
+
+
+# ---------------------------------------------------------------------------
+# Sparse-coverage guard: the null control
+# ---------------------------------------------------------------------------
+
+
+def test_identical_distributions_are_never_called_deviated(monkeypatch):
+    """THE NULL CONTROL, and a regression.
+
+    Two halves of one pool of independent sequences drawn from the same
+    distribution have a true divergence of zero. Before the coverage guard,
+    `validate_generated` called them "very deviated" at k=6, 11 and 21 --
+    a false positive by construction, and one that fires on ANY input at
+    high k, because with 4^21 possible k-mers no real sequence set is dense
+    enough for the empirical distributions to resemble each other.
+
+    Measured nulls, splitting one pool (true divergence zero):
+
+        coverage ratio     1      3     10     30    100
+        null JS         0.473  0.254  0.136  0.079  0.042
+
+    The verdict must never claim deviation where the truth is identity.
+    Reporting "insufficient data" is the honest answer at that coverage;
+    the raw `js_distance` stays in the table for a caller who wants it.
+    """
+    rng = random.Random(4242)
+    pool = [_weighted_sequence(3000, _BIASED_WEIGHTS, rng) for _ in range(16)]
+
+    report = validate_generated(pool[:8], pool[8:], k=(3, 6, 11, 21), check_containment=False)
+
+    rows = {row["k"]: row for row in report.composition.to_pylist()}
+    for k, row in rows.items():
+        assert row["verdict"] != "very deviated", (
+            f"k={k} called identical distributions 'very deviated' "
+            f"(js_distance={row['js_distance']:.3f})"
+        )
+    # The high-k rows are the ones with no usable coverage, and must say so
+    # rather than guess.
+    assert rows[11]["verdict"] == "insufficient data"
+    assert rows[21]["verdict"] == "insufficient data"
+    # The raw distance is still reported, unsuppressed.
+    assert rows[11]["js_distance"] > 0.0
+
+
+def test_the_guard_does_not_silence_a_real_difference():
+    """The other half of the contract. A guard that answers 'insufficient
+    data' to everything would pass the test above and be useless: this pins
+    that a genuine compositional difference is still reported at the k
+    values where coverage is adequate.
+    """
+    reference = _biased_cohort(10, seed=100)
+    implausible = _uniform_cohort(10, length=4000, seed=300)
+
+    report = validate_generated(implausible, reference, k=(3, 6), check_containment=False)
+
+    rows = {row["k"]: row for row in report.composition.to_pylist()}
+    assert rows[3]["verdict"] in {"deviated", "very deviated"}

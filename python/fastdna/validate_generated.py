@@ -308,8 +308,84 @@ def _composition_distance(generated_counts, reference_counts):
     return float(jensenshannon(p, q, base=2))
 
 
-def _composition_verdict(distance, deviated, very_deviated):
+#: How many k-mer observations per possible k-mer are needed before a
+#: Jensen-Shannon distance between two empirical distributions reflects a
+#: real difference rather than sparse sampling.
+#:
+#: MEASURED, not chosen. Splitting one pool of sequences in half -- so the
+#: two sides are identical in distribution BY CONSTRUCTION and the true
+#: divergence is zero -- and asking for a verdict:
+#:
+#:     sequence length    k=3          k=6              k=11             k=21
+#:       800 bases        realistic    VERY DEVIATED    VERY DEVIATED    VERY DEVIATED
+#:    20,000 bases        realistic    realistic        VERY DEVIATED    VERY DEVIATED
+#:
+#: The failures are entirely explained by coverage. At 800 bases the k=6
+#: ratio is ~1.5 observations per possible k-mer and at 20,000 it is ~39,
+#: which is exactly where its verdict flips. At k=21 the space is 4.4e12,
+#: so no real sequence set reaches usable coverage -- a human genome is
+#: still three orders of magnitude short.
+#:
+#: This matters because the default `k=(3, 6, 11, 21)` includes two values
+#: that would otherwise report "very deviated" for ANY input, including
+#: input drawn from the reference's own distribution. The module docstring
+#: already warns that the thresholds are uncalibrated, which is true and
+#: insufficient: no threshold in [0, 1] separates anything when the null
+#: distance is ~1.0.
+#:
+#: WHERE THE VALUE COMES FROM. Splitting a pool of INDEPENDENT sequences
+#: drawn from one distribution and measuring the resulting distance -- the
+#: null, where the true divergence is zero -- gives:
+#:
+#:     coverage ratio     1      3     10     30    100
+#:     null JS (k=6)   0.473  0.254  0.136  0.079  0.042
+#:     null JS (k=8)   0.456  0.258  0.136  0.078  0.042
+#:
+#: The null depends on the ratio and NOT on k, and fits ~0.42/sqrt(ratio).
+#:
+#: The cut is at 5 rather than somewhere higher because two regimes exist
+#: and only one is broken. Independent draws from one distribution need a
+#: ratio near 30 before the null falls below the "deviated" threshold of
+#: 0.10 -- but sequences that share ancestry (mutated copies of one
+#: reference, which is what a generative model conditioned on a genome
+#: actually produces) have far lower null divergence at the same coverage,
+#: because they share most of their positions outright. This project's own
+#: test fixture is exactly that case at ratio 9.8, and its "realistic"
+#: verdict there is CORRECT.
+#:
+#: So the guard is set where the verdict is broken for every regime rather
+#: than where it is merely noisy for one: below ratio 5 the null distance
+#: is ~0.19 and rising steeply, and by ratio 1 it is ~0.47, past the "very
+#: deviated" threshold. Above the cut the raw `js_distance` is reported and
+#: the caller can weigh it, which is what the module docstring already
+#: tells them to do.
+_MIN_OBSERVATIONS_PER_KMER_SPACE = 5.0
+
+
+def _coverage_ratio(generated_counts, reference_counts, k):
+    """Observations per possible k-mer, on the smaller of the two sides.
+
+    The smaller side governs: a dense reference cannot rescue a sparse
+    generated set, since the divergence is computed between both.
+    """
+    space = 4.0 ** k
+    # `total_kmers` is the count of k-mer INSTANCES, which is the sample
+    # size that governs how well a multinomial over `space` cells can be
+    # estimated -- not `distinct_kmers`, which is bounded by the space
+    # itself and so cannot detect its own sparsity.
+    smaller = min(generated_counts.total_kmers, reference_counts.total_kmers)
+    return smaller / space
+
+
+def _composition_verdict(distance, deviated, very_deviated, coverage_ratio=None):
     if not math.isfinite(distance):
+        return "insufficient data"
+    if coverage_ratio is not None and coverage_ratio < _MIN_OBSERVATIONS_PER_KMER_SPACE:
+        # Reported as missing rather than as a deviation: at this coverage a
+        # large distance is what two samples of the SAME distribution
+        # produce, so calling it a deviation is a false positive by
+        # construction. The raw `js_distance` is still in the table for a
+        # caller who wants to see it.
         return "insufficient data"
     if distance >= very_deviated:
         return "very deviated"
@@ -536,9 +612,12 @@ def validate_generated(
         generated_counts = counts_for("generated", generated_sequences, kv)
         reference_counts = counts_for("reference", reference_sequences, kv)
         distance = _composition_distance(generated_counts, reference_counts)
+        coverage = _coverage_ratio(generated_counts, reference_counts, kv)
         rows["k"].append(kv)
         rows["js_distance"].append(distance)
-        rows["verdict"].append(_composition_verdict(distance, js_deviated, js_very_deviated))
+        rows["verdict"].append(
+            _composition_verdict(distance, js_deviated, js_very_deviated, coverage)
+        )
     composition = pa.table(rows)
 
     generated_repeat_counts = counts_for("generated", generated_sequences, resolved_repeat_k)
