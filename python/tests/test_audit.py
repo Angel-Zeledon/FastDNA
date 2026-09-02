@@ -487,13 +487,13 @@ def test_audit_composes_with_a_duck_typed_regressor_shaped_like_micregressor():
 
 
 def test_audit_warns_when_almost_every_sample_is_its_own_lineage():
-    """Real motivation, not a hypothetical, and now reproducible on demand:
+    """Real motivation, not a hypothetical, and reproducible on demand:
     `scripts/validation/lineage_leakage_experiment.py` hits exactly this on
-    200 public BV-BRC E. coli genomes at the library's default
-    `lineage_threshold` -- 198 of 200 each their own lineage, `gap` reading
-    -0.011 -- while the same cohort grouped by MLST reads +0.165. A naive
-    reading of the first report would have concluded "no leakage" when 65%
-    of the model's lift over chance was lineage memorisation.
+    200 public BV-BRC E. coli genomes at the library's old default
+    `lineage_threshold` -- 198 of 200 each their own lineage. `LineageKFold`
+    then has nothing to block on, so whatever `gap` it produces measures
+    nothing, while still being a small, well-formed float that reads as "no
+    leakage".
 
     (This previously cited `scratch/amr_repro/audit_report.json` at 149/150,
     which is the same finding on an earlier cohort -- but that path is under
@@ -564,11 +564,13 @@ def test_lineage_threshold_defaults_to_a_value_derived_from_the_cohort(tmp_path)
     cohort's own dendrogram, not apply a constant.
 
     Mash distance has no universal scale, so a fixed default is wrong by
-    construction for some cohort -- and it demonstrably was: on 200 BV-BRC
-    E. coli genomes the old 0.01 produced 198 lineages out of 200 samples
-    and reported `gap=-0.011` where MLST-grouped truth is `+0.165`
-    (`scripts/validation/lineage_leakage_experiment.py`). The derived value
-    there is 0.029, which reproduces the MLST answer.
+    construction for some cohort -- and it demonstrably was, in BOTH
+    directions, which is the strongest form that argument can take. On real
+    BV-BRC E. coli assemblies the old 0.01 produced 198 lineages out of 200
+    samples on one cohort (far too fine) and merged 80 genomes into 15
+    groups on another whose real structure is 38 sequence types (far too
+    coarse). The derived value on the second is 0.0041 -> 40 groups,
+    recovering the MLST partition at ARI 0.931 against the constant's 0.512.
     """
     from fastdna.cv import default_threshold_curve
 

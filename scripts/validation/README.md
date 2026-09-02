@@ -17,8 +17,11 @@ assertions about *shape*:
   an *E. coli* genome. The truncated FASTA starts with `>`, is multi-contig
   and parses fine. Only comparing its base count against the species' known
   genome size distinguishes it.
-- `audit()` reported `gap = -0.011` ("no leakage") on a cohort whose real
-  gap is +0.165. A small float is a perfectly valid float.
+- `audit()`'s default `lineage_threshold` put 198 of 200 genomes in their
+  own lineage, leaving `LineageKFold` nothing to block on -- and still
+  returned a small, well-formed `gap` that reads as "no leakage". The same
+  constant merges a different cohort into 15 groups where 38 sequence types
+  exist. A plausible number is not a correct one.
 - `genomescope`'s end-to-end test accepted any answer between 2,500 and
   10,000 bp on a synthetic 5 kb genome, so its central claim could not fail.
 

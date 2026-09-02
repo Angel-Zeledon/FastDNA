@@ -612,14 +612,20 @@ class AuditReport:
         `Confounding.undefined_reason` already uses for its own degenerate
         cases.
 
-        This exists because the failure it guards against is silent and
-        expensive: the same E. coli cohort that reads `gap=-0.011` at the
-        default threshold reads `+0.175` once the grouping is coarse enough
-        to have lineages to block on (`scripts/validation/
-        lineage_leakage_experiment.py`, and the same reversal is recorded at
-        `-0.018`/`+0.148` in this module's own notes). A caller who saw only
-        the first number would conclude their model was clean when 65% of
-        its lift over chance was lineage memorisation.
+        This exists because the failure it guards against is silent: a
+        degenerate grouping produces a small, well-formed float, and "small
+        gap" reads as "no leakage" to anyone who does not also check how
+        many lineages were found. The two are indistinguishable from the
+        number alone, which is why the number is withheld rather than
+        annotated. This module's own notes record the same reversal on an
+        earlier cohort (`-0.018` at the default, `+0.148` at a coarser,
+        data-driven threshold).
+
+        A worked example of how far the reading can be off is deliberately
+        NOT cited here: the one this project measured turned out to be an
+        artefact of a data-truncation bug (see the retraction at the top of
+        `docs/validation-real-data.md`'s Track D). The guard stands on the
+        argument above, which needs no cohort.
     n_lineages : int
         Distinct lineage labels found (or supplied via `groups=`).
     lineage_threshold : float
@@ -1352,11 +1358,14 @@ def audit(
         what separates two lineages depends on how divergent the cohort is,
         which is the same argument `default_threshold_curve` already makes
         for the curve. The previous fixed default of 0.01 was measurably
-        wrong on real data -- on 200 BV-BRC E. coli genomes it put 198 of
-        them in their own lineage and reported `gap=-0.011` where the
-        MLST-grouped truth is `+0.165` (`scripts/validation/
-        lineage_leakage_experiment.py`). The derived value on that same
-        cohort is 0.029, which reproduces the MLST answer.
+        wrong on real data, and wrong in *both directions* depending on the
+        cohort -- which is the clearest possible argument against any
+        constant. On BV-BRC *E. coli* assemblies it put 198 of 200 genomes
+        in their own lineage on one cohort, and merged 80 genomes into 15
+        groups on another whose real structure is 38 sequence types. The
+        derived value on the second is 0.0041, giving 40 groups and
+        recovering the MLST partition at **ARI 0.931**, against 0.512 for
+        the constant.
 
         Deriving is usually free: when a leakage curve is computed at all
         (the default, see `auto_leakage_curve`) its points are already in
@@ -1537,12 +1546,15 @@ def audit(
         # particular cohort is -- the same argument `default_threshold_curve`
         # already makes for the curve, applied to the primary cut too.
         #
-        # The old constant (0.01) was measurably wrong for a real E. coli
-        # cohort: it put 198 of 200 genomes in their own lineage and turned
-        # a real +0.165 gap into -0.011. The median of this cohort's own
-        # curve points lands at 0.029 (100 lineages), reproducing the
-        # MLST-grouped answer. See `scripts/validation/
-        # lineage_leakage_experiment.py`.
+        # A fixed constant cannot work, and the evidence for that is that
+        # the SAME constant fails in OPPOSITE directions on data of
+        # different completeness. Measured on real BV-BRC E. coli cohorts:
+        # `0.01` put 198 of 200 genomes in their own lineage on one cohort
+        # (far too fine) and merged 80 genomes into 15 groups on another
+        # (far too coarse, against 38 real sequence types). The derived
+        # value on the second lands at 0.0041 -> 40 groups, recovering the
+        # MLST partition at ARI 0.931 where the constant scores 0.512.
+        # See `scripts/validation/lineage_leakage_experiment.py`.
         derived_threshold = None
         if lineage_threshold is None:
             curve_for_median = resolved_curve_thresholds

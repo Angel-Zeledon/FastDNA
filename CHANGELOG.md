@@ -482,16 +482,23 @@ La superficie con compatibilidad garantizada es:
   reproducible cada punto de la curva por separado.
 
   El motivo es que la constante era medible-mente incorrecta sobre datos
-  reales, no una preferencia de estilo. Sobre 200 genomas públicos de
-  *E. coli* de BV-BRC (`scripts/validation/lineage_leakage_experiment.py`):
-  con `0.01` salían 198 linajes de 200 muestras y `gap = -0.011`; agrupando
-  por MLST (verdad externa) `gap = +0.165`; con `0.03`, `gap = +0.175`. El
-  valor derivado en esa cohorte es 0.029, que cae con las dos respuestas
-  correctas. La curva de esa cohorte abarca de 0.019 a 0.044, así que 0.01
-  no era solo subóptimo: quedaba fuera del rango que sus propias alturas de
-  fusión ofrecen. La distancia Mash no tiene escala universal --
+  reales, no una preferencia de estilo -- y lo era **en ambas direcciones**,
+  que es la forma más contundente de ese argumento. Sobre ensamblados
+  públicos de *E. coli* de BV-BRC
+  (`scripts/validation/lineage_leakage_experiment.py`): `0.01` dejaba 198
+  linajes de 200 muestras en una cohorte (demasiado fino) y fundía 80
+  genomas en 15 grupos en otra cuya estructura real son 38 sequence types
+  (demasiado grueso). El valor derivado en la segunda es `0.0041` -> 40
+  grupos, recuperando la partición MLST con **ARI 0.931** frente al 0.512 de
+  la constante. La distancia Mash no tiene escala universal --
   `cv.default_threshold_curve` ya lo argumentaba, y aun así el corte
   principal de `audit()` usaba una constante.
+
+  (Una versión anterior de esta entrada justificaba el cambio con un gap de
+  fuga de `+0.165`. Ese número está **retractado**: era artefacto del bug de
+  truncación descrito más abajo. Ver la nota de retractación al inicio del
+  Track D de `docs/validation-real-data.md`. La justificación de arriba se
+  midió sobre genomas completos y no depende de él.)
 
   Coste: normalmente cero. Cuando se calcula la curva de fuga (el
   comportamiento por defecto) sus puntos ya están disponibles. Solo con
