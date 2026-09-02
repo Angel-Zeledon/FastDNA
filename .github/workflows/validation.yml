@@ -114,6 +114,18 @@ jobs:
           PY
           python scripts/validation/sketch_vs_mash.py --genomes mash_genomes
 
+      # Reuses the assembly staged for the Mash step and the reads the
+      # earlier steps already cached, so this adds a Merqury run rather than
+      # another download. Merqury is the slowest single step here (meryl
+      # counts the whole read set again, in its own format).
+      - name: Assembly QV agrees with Merqury
+        run: |
+          set -euo pipefail
+          ASM=$(ls mash_genomes/*.fna | head -1)
+          READS="${HOME}/.fastdna/validation/DRR002015_1.fastq.gz"
+          python scripts/validation/assembly_qc_vs_merqury.py \
+            --assembly "$ASM" --reads "$READS"
+
       # Uploaded even on failure: the JSON is what a human compares against
       # the previous run to see whether a number moved a little or a lot.
       - name: Upload validation results
