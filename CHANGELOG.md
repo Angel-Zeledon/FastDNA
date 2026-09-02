@@ -608,6 +608,21 @@ La superficie con compatibilidad garantizada es:
 
 ### Fixed
 
+- **Python: `fastdna.datasets.load_amr()` descargaba en silencio el 26% de
+  cada genoma.** El endpoint `genome_sequence` de BV-BRC está respaldado por
+  Solr y pagina a 25 filas por defecto; una fila es un contig. Sin un
+  `limit()` explícito, un ensamblado draft llegaba cortado en sus primeros 25
+  contigs -- sin error, sin aviso, y como un FASTA perfectamente bien
+  formado. Medido sobre el genoma 562.13671: 25 contigs / 1.261.838 bases sin
+  el parámetro, frente a 98 contigs / 4.834.860 bases con él (*E. coli* son
+  4,5-5,5 Mb). Toda cohorte devuelta por `load_amr` hasta ahora llevaba un
+  cuarto de cada genoma, y lo heredaban todos los conteos de k-mers,
+  sketches, asignaciones de linaje y modelos construidos sobre ella. Ningún
+  test lo detectaba: `test_load_amr_real_network` comprobaba que el archivo
+  empieza por ">", y un archivo truncado también lo hace. El test de
+  regresión nuevo compara el número de bases contra el tamaño conocido de la
+  especie, que es la única comprobación que los distingue.
+
 - Python: `fastdna.audit()` ya no reporta un `gap` numérico cuando el
   agrupamiento fue degenerado. Antes avisaba (`DegenerateLineagesWarning`)
   y devolvía el número igualmente -- y esa es la mitad peligrosa: los avisos

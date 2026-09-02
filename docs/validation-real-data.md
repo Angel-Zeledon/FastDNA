@@ -274,6 +274,16 @@ demonstration now exists, on a phenotype chosen for the opposite property:
 *E. coli* + ciprofloxacin is polygenic (stepwise `gyrA`/`parC`, efflux,
 `qnr`) and clone-associated (ST131).
 
+> **The numbers in this section were measured on truncated genomes.** They
+> predate the discovery that `load_amr` was returning only each assembly's
+> first 25 contigs -- about 26% of an *E. coli* genome -- because the BV-BRC
+> endpoint paginates at 25 rows and the URL did not ask for more (fixed; see
+> the CHANGELOG). All 200 genomes were truncated the same way, so the
+> comparison *between* groupings holds and the qualitative finding stands:
+> a large positive gap under MLST, a false negative at the old default
+> threshold. The exact magnitudes should be re-measured on complete genomes
+> before being quoted anywhere that matters.
+
 200 BV-BRC genomes, 66 resistant / 134 susceptible, 79 sequence types:
 
 | grouping | lineages | random CV | lineage-blocked | gap |
