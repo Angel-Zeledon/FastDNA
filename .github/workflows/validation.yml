@@ -145,6 +145,13 @@ jobs:
             --n-lineages 6 --per-lineage 25 --top-features 1000 \
             --json "${RUNNER_TEMP}/calibration.json"
 
+      # Eighteen module claims checked against a constructed truth. Needs
+      # neither network nor Docker, and runs in a couple of minutes -- but
+      # it belongs beside the other "is the answer right" checks rather than
+      # among the unit tests, which is the distinction this workflow draws.
+      - name: Module claims hold against constructed truth
+        run: python scripts/validation/known_truth_checks.py
+
       # Uploaded even on failure: the JSON is what a human compares against
       # the previous run to see whether a number moved a little or a lot.
       - name: Upload validation results
