@@ -134,6 +134,30 @@ differences are FastDNA's quality trimming (the others don't trim), not a
 counting discrepancy; [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) has the
 cross-check that asserts this on demand.
 
+### Correctness, checked against the field's own tools
+
+Speed only matters if the numbers are right. FastDNA is validated against
+the established implementation of each algorithm it borrows, **on real
+sequencing data rather than generated input**, by scripts committed under
+[`scripts/validation/`](scripts/validation/) and re-run on a schedule by
+[`.github/workflows/validation.yml`](.github/workflows/validation.yml):
+
+| what | against | result |
+|---|---|---|
+| k-mer counting | KMC3 3.2.4 | **exact match** at k=31, 21 and 15 |
+| MinHash distances | Mash 2.3 | r = 0.997, no systematic bias |
+| genome size | GenomeScope2 2.0.1 | within 0.29% |
+| HyperLogLog cardinality | the exact count | −0.26% (bound: ~0.8%) |
+| ntCard spectrum | the exact histogram | −0.6% / +2.0% / −1.5% at f1/f2/f3 |
+
+Measured on ENA `DRR002015` (*E. coli*, 2,343,637 reads) and 8 BV-BRC
+assemblies; reference tools run from pinned biocontainers, so a rerun later
+compares against the same versions. The counting comparison allows **no
+tolerance at all** -- with trimming off and singletons kept, both tools solve
+the identical problem, so any difference would be a bug. Full methodology,
+including what each comparison can and cannot establish, is in
+[`docs/validation-real-data.md`](docs/validation-real-data.md).
+
 ---
 
 ## How the Rust core actually works
