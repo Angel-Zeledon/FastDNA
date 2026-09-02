@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 import fastdna
+from fastdna import _core
 
 # Guarded, and in this order, on purpose: a bare `import numpy` above the
 # `importorskip`s (the shape test_sklearn.py and others used to have) makes
@@ -234,3 +235,158 @@ def test_cross_validation_with_the_artifact_never_recounts(tmp_path, monkeypatch
         f"cross-validation with counts= read {calls['n']} FASTQ files; with the "
         "artifact it must read none"
     )
+
+
+# ---------------------------------------------------------------------------
+# save() / load(): the same "count once" saving, extended across processes.
+#
+# The equivalence test is the one that matters -- a cache that returns
+# something *close* to the original is worse than no cache, because every
+# downstream number would be quietly wrong rather than obviously broken. The
+# rejection tests exist because that failure mode is silent by nature: an
+# inconsistent `row_counts` slices samples apart at the wrong offsets and
+# still produces a plausible-looking result.
+# ---------------------------------------------------------------------------
+
+
+def test_save_load_round_trip_is_exact(tmp_path):
+    paths = _cohort(tmp_path, n=5)
+    counts = fastdna.count_cohort(paths, k=11)
+
+    target = tmp_path / "cohort.parquet"
+    counts.save(target)
+    restored = fastdna.CohortCounts.load(target)
+
+    assert restored.sample_ids == counts.sample_ids
+    assert restored.row_counts == counts.row_counts
+    assert restored.k == counts.k
+    assert restored.min_count == counts.min_count
+    assert restored.kmers.equals(counts.kmers)
+    assert restored.frequencies.equals(counts.frequencies)
+    # Types, not just values: uint32 frequencies silently widened to int64
+    # would round-trip equal here but change what the Rust side accepts.
+    assert restored.kmers.type == counts.kmers.type
+    assert restored.frequencies.type == counts.frequencies.type
+
+
+def test_a_loaded_cohort_subsets_to_the_same_rows(tmp_path):
+    """Round-tripping the arrays is not enough: the offsets have to survive
+    too, because `subset()` is what every fold of a cross-validation calls."""
+    paths = _cohort(tmp_path, n=6)
+    counts = fastdna.count_cohort(paths, k=11)
+    target = tmp_path / "cohort.parquet"
+    counts.save(target)
+
+    wanted = ["S01", "S04"]
+    original = counts.subset(wanted)
+    restored = fastdna.CohortCounts.load(target).subset(wanted)
+
+    assert restored.sample_ids == original.sample_ids
+    assert restored.row_counts == original.row_counts
+    assert restored.kmers.equals(original.kmers)
+    assert restored.frequencies.equals(original.frequencies)
+
+
+def test_a_loaded_cohort_vectorizes_identically(tmp_path):
+    """End to end: the cached cohort must produce the same feature matrix,
+    which is the only property a caller actually depends on."""
+    paths = _cohort(tmp_path, n=6)
+    counts = fastdna.count_cohort(paths, k=11)
+    target = tmp_path / "cohort.parquet"
+    counts.save(target)
+    restored = fastdna.CohortCounts.load(target)
+
+    ids = list(counts.sample_ids)
+    a = KmerVectorizer(k=11, top_features=50, counts=counts).fit_transform(ids)
+    b = KmerVectorizer(k=11, top_features=50, counts=restored).fit_transform(ids)
+
+    np.testing.assert_array_equal(a.toarray(), b.toarray())
+
+
+def test_load_rejects_a_plain_kmer_table(tmp_path):
+    """`fastdna count -o x.parquet` writes the same two columns but none of
+    the cohort structure. Loading it must say so, not invent one sample."""
+    import pyarrow.parquet as pq
+
+    paths = _cohort(tmp_path, n=2)
+    plain = tmp_path / "plain.parquet"
+    pq.write_table(fastdna.count(paths[0], k=11).table, plain)
+
+    with pytest.raises(_core.InvalidConfigError) as excinfo:
+        fastdna.CohortCounts.load(plain)
+    assert "footer metadata" in str(excinfo.value)
+
+
+def test_load_rejects_row_counts_that_do_not_sum_to_the_rows(tmp_path):
+    """The silent-corruption case: a truncated or hand-edited cache whose
+    offsets no longer match the data would mis-assign k-mers to samples and
+    return a confident, wrong answer."""
+    import pyarrow.parquet as pq
+
+    paths = _cohort(tmp_path, n=3)
+    counts = fastdna.count_cohort(paths, k=11)
+    target = tmp_path / "cohort.parquet"
+    counts.save(target)
+
+    table = pq.read_table(target)
+    metadata = dict(table.schema.metadata)
+    bad = list(counts.row_counts)
+    bad[0] += 7
+    import json
+
+    metadata[b"fastdna.row_counts"] = json.dumps(bad).encode()
+    pq.write_table(table.replace_schema_metadata(metadata), target)
+
+    with pytest.raises(_core.InvalidConfigError) as excinfo:
+        fastdna.CohortCounts.load(target)
+    assert "row counts" in str(excinfo.value)
+
+
+def test_load_rejects_more_sample_ids_than_row_counts(tmp_path):
+    import json
+
+    import pyarrow.parquet as pq
+
+    paths = _cohort(tmp_path, n=3)
+    counts = fastdna.count_cohort(paths, k=11)
+    target = tmp_path / "cohort.parquet"
+    counts.save(target)
+
+    table = pq.read_table(target)
+    metadata = dict(table.schema.metadata)
+    metadata[b"fastdna.sample_ids"] = json.dumps(
+        list(counts.sample_ids) + ["S99"]
+    ).encode()
+    pq.write_table(table.replace_schema_metadata(metadata), target)
+
+    with pytest.raises(_core.InvalidConfigError) as excinfo:
+        fastdna.CohortCounts.load(target)
+    assert "sample ids" in str(excinfo.value)
+
+
+def test_an_interrupted_save_leaves_the_previous_file_intact(tmp_path, monkeypatch):
+    """A cache is written by long jobs that get interrupted. If a failed
+    save could truncate the existing file, the next run would load a partial
+    cohort -- which is exactly the failure the whole file guards against."""
+    paths = _cohort(tmp_path, n=3)
+    counts = fastdna.count_cohort(paths, k=11)
+    target = tmp_path / "cohort.parquet"
+    counts.save(target)
+    good = target.read_bytes()
+
+    import pyarrow.parquet as pq
+
+    real_write = pq.write_table
+
+    def failing_write(table, where, *args, **kwargs):
+        real_write(table, where, *args, **kwargs)  # write it, then die
+        raise KeyboardInterrupt("laptop lid closed")
+
+    monkeypatch.setattr(pq, "write_table", failing_write)
+    with pytest.raises(KeyboardInterrupt):
+        counts.save(target)
+    monkeypatch.undo()
+
+    assert target.read_bytes() == good
+    assert not (tmp_path / "cohort.parquet.partial").exists()
+    assert fastdna.CohortCounts.load(target).sample_ids == counts.sample_ids

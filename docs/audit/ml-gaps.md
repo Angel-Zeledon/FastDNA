@@ -36,6 +36,15 @@ la maquinaria y no la estás usando para eso**.
 
 **Severidad: crítica. Está justo en el camino que quieres poseer.**
 
+> **Estado: cerrado.** `fastdna.count_cohort()` / `CohortCounts` eliminan el
+> recuento entre folds (medido en
+> `python/tests/test_cohort_counts.py::test_cross_validation_with_the_artifact_never_recounts`:
+> **cero** llamadas a `fastdna.count()` en una CV de 3 folds), y
+> `CohortCounts.save()`/`.load()` lo extienden entre procesos, que era la
+> mitad que faltaba: un segundo pase del mismo estudio —otro
+> `--top-features`, un arreglo en `audit()`— ya no vuelve a contar.
+> `scripts/validation/leakage_survey.py` lo usa vía `--cache-dir`.
+
 ### Qué pasa hoy
 
 `python/fastdna/sklearn.py:365-390`:

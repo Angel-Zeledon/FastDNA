@@ -34,8 +34,10 @@ only inside `fit()`, only on the training fold's own rows.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Optional, Sequence, Union
 
 import pyarrow as pa
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
 
 import fastdna
 from fastdna import _column_as_array, _PathLike
+from fastdna import _core
 
 __all__ = ["CohortCounts", "count_cohort"]
 
@@ -171,6 +174,126 @@ class CohortCounts:
             row_counts=tuple(self.row_counts[position[s]] for s in sample_ids),
             k=self.k,
             min_count=self.min_count,
+        )
+
+    def save(self, path: _PathLike) -> None:
+        """Writes this cohort to one Parquet file, so the counting work can
+        be reused by a later process.
+
+        Counting is the dominant cost of any cross-validated genomic
+        workflow, and it is repeated far more than it looks: `count_cohort`
+        exists so a cohort is counted once per *process*, but a study that
+        sweeps many cohorts, or resumes after an interruption, pays it again
+        every time. Measured on 150 complete bacterial genomes, counting is
+        minutes and the audit that follows is minutes -- so caching it
+        removes roughly half the wall time of a re-run, and considerably
+        more for a workflow that re-counts per fold.
+
+        The format is the same two columns the rest of this project already
+        writes (`kmer_u64`, `frequency`, see `export.rs`), with the cohort
+        structure carried in Parquet's own footer metadata under a
+        `fastdna.` prefix -- the convention `src/ktab.rs` established for
+        `fastdna.k`/`fastdna.sorted_by`. That means the file is readable by
+        any Parquet reader, and a tool that does not know about
+        `CohortCounts` still sees a valid k-mer table.
+
+        Written to a temporary file in the same directory and renamed into
+        place, so an interrupted save leaves the previous file intact rather
+        than a truncated one. A half-written cache that still loads is worse
+        than no cache: it would silently produce results over a partial
+        cohort.
+        """
+        # Deferred rather than imported at the top of the module: this file
+        # is imported by `fastdna/__init__.py` on every `import fastdna`, and
+        # `pyarrow.parquet` is the heaviest thing that import could pull in.
+        import pyarrow.parquet as pq
+
+        path = Path(path)
+        table = pa.table(
+            {"kmer_u64": self.kmers, "frequency": self.frequencies},
+            metadata={
+                b"fastdna.k": str(self.k).encode(),
+                b"fastdna.min_count": str(self.min_count).encode(),
+                b"fastdna.sample_ids": json.dumps(list(self.sample_ids)).encode(),
+                b"fastdna.row_counts": json.dumps(list(self.row_counts)).encode(),
+            },
+        )
+        temporary = path.with_name(path.name + ".partial")
+        try:
+            pq.write_table(table, temporary)
+            os.replace(temporary, path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    @classmethod
+    def load(cls, path: _PathLike) -> "CohortCounts":
+        """Reads back a cohort written by :meth:`save`.
+
+        Every field is validated against the data rather than trusted: a
+        cache whose `row_counts` do not sum to the number of rows would slice
+        samples apart at the wrong offsets and produce a plausible,
+        completely wrong result -- exactly the silent-corruption failure this
+        project has already been bitten by once.
+        """
+        import pyarrow.parquet as pq  # deferred, see `save()`
+
+        path = Path(path)
+        table = pq.read_table(path)
+        metadata = table.schema.metadata or {}
+
+        required = [b"fastdna.k", b"fastdna.min_count",
+                    b"fastdna.sample_ids", b"fastdna.row_counts"]
+        missing = [key.decode() for key in required if key not in metadata]
+        if missing:
+            raise _core.InvalidConfigError(
+                f"{path} is missing the CohortCounts footer metadata {missing}. "
+                "It may be a plain k-mer table (as written by `fastdna count`) "
+                "rather than a cohort saved by CohortCounts.save()."
+            )
+
+        try:
+            sample_ids = tuple(str(s) for s in json.loads(metadata[b"fastdna.sample_ids"]))
+            row_counts = tuple(int(n) for n in json.loads(metadata[b"fastdna.row_counts"]))
+            k = int(metadata[b"fastdna.k"])
+            min_count = int(metadata[b"fastdna.min_count"])
+        except (ValueError, TypeError) as exc:
+            raise _core.InvalidConfigError(
+                f"{path} carries fastdna.* footer metadata that could not be parsed "
+                f"({exc}). The file is corrupt."
+            ) from exc
+
+        missing_columns = [c for c in ("kmer_u64", "frequency")
+                           if c not in table.schema.names]
+        if missing_columns:
+            raise _core.InvalidConfigError(
+                f"{path} is missing the column(s) {missing_columns}; a cohort saved "
+                "by CohortCounts.save() has both `kmer_u64` and `frequency`."
+            )
+        kmers = _column_as_array(table.column("kmer_u64"))
+        frequencies = _column_as_array(table.column("frequency"))
+
+        if len(sample_ids) != len(row_counts):
+            raise _core.InvalidConfigError(
+                f"{path} records {len(sample_ids)} sample ids but {len(row_counts)} "
+                "row counts; the file is inconsistent and would slice samples apart "
+                "at the wrong offsets."
+            )
+        if sum(row_counts) != len(kmers):
+            raise _core.InvalidConfigError(
+                f"{path} records row counts summing to {sum(row_counts)} but holds "
+                f"{len(kmers)} rows. The file is truncated or was written by a "
+                "different version; loading it would silently mis-assign k-mers to "
+                "samples."
+            )
+
+        return cls(
+            sample_ids=sample_ids,
+            kmers=kmers,
+            frequencies=frequencies,
+            row_counts=row_counts,
+            k=k,
+            min_count=min_count,
         )
 
 

@@ -27,17 +27,26 @@ Roughly 5-8 minutes per cohort at n=80 (download is cached after the first
 cohort of each species, since combinations share genomes). Thirty cohorts is
 about four hours -- one overnight run.
 
-The dominant cost is that every fold re-counts its genomes. `CohortCounts`
-has no `save()`/`load()`, so the counting work cannot be reused across the
-two splitters and five folds. Implementing that (the G-6 gap in
-`docs/audit/ml-gaps.md`) would cut this roughly tenfold and is the single
-best speed-up available.
+Within a run, the folds already share one count: `count_cohort()` is called
+once per cohort and handed to `KmerVectorizer(counts=...)`, so the ten
+fit/transform passes `audit()` makes do not re-read a single FASTA. What
+that does *not* survive is the process. Every re-run of this study -- a
+different `--top-features`, a fixed bug in `audit()`, a metric added to the
+row -- paid for counting all over again.
+
+`CohortCounts.save()/load()` (the G-6 gap, now closed) is what this script
+uses to keep it: counts land in `--cache-dir` and a second run over the same
+cohorts starts at the audit. On the measured split that is most of a re-run's
+wall time, and it is what makes iterating on the analysis affordable rather
+than an overnight commitment each time.
 
 ## Resumability
 
 Results are appended to the output JSON after every cohort, and cohorts
 already present are skipped on a re-run. A four-hour job must survive a
-closed laptop lid, an OOM kill, or a Ctrl-C.
+closed laptop lid, an OOM kill, or a Ctrl-C. The count cache extends that to
+the case the results file cannot cover: a re-run that deliberately discards
+the old rows because the analysis changed.
 
 ## Before it runs anything
 
@@ -59,12 +68,13 @@ import argparse
 import csv
 import io
 import json
+import re
 import sys
 import time
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 #: Genomes per cohort. Chosen because it fits comfortably (measured: 150
 #: pushes this machine into swap with complete genomes) and because the
@@ -79,6 +89,59 @@ TOP_FEATURES = 500
 #: Minimum samples of the smaller class in the source metadata before a
 #: combination is worth downloading at all.
 MIN_MINORITY = 25
+
+#: Where counted cohorts are kept between runs. One Parquet file per
+#: (species, antibiotic, n, k); roughly 150 MB per cohort at n=80, k=31.
+DEFAULT_CACHE_DIR = Path("cache/cohort_counts")
+
+#: `k` is fixed for the whole study: a survey whose cohorts were counted at
+#: different k would not be comparable, and the cache key records it so a
+#: change here cannot silently reuse the old files.
+K = 31
+
+
+def _cache_path(cache_dir: Path, species: str, antibiotic: str, n: int, k: int) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", f"{species}__{antibiotic}").strip("_").lower()
+    return cache_dir / f"{slug}.n{n}.k{k}.parquet"
+
+
+def counts_for(paths, cache_dir: Optional[Path], species: str, antibiotic: str,
+               n: int, k: int = K) -> Tuple["object", bool]:
+    """The cohort's counts, from cache when the cache genuinely matches.
+
+    Returns `(counts, was_cached)`.
+
+    "Genuinely matches" is checked against the sample ids, not just the
+    filename: the cache key encodes species/antibiotic/n/k, but `load_amr`
+    picks *which* genomes by sampling, and a change in the upstream metadata
+    could change that selection under a key that looks identical. Counting
+    the wrong 80 genomes would produce a perfectly plausible row. A mismatch
+    recounts rather than raising -- a stale cache is a performance problem,
+    not a reason to abandon the night's run.
+    """
+    import fastdna
+    from fastdna.cohort_counts import _sample_id_from_path
+
+    if cache_dir is None:
+        return fastdna.count_cohort(paths, k=k), False
+
+    expected = tuple(_sample_id_from_path(p) for p in paths)
+    path = _cache_path(cache_dir, species, antibiotic, n, k)
+    if path.is_file():
+        try:
+            cached = fastdna.CohortCounts.load(path)
+        except Exception as exc:
+            print(f"    cache unreadable, recounting ({exc})", flush=True)
+        else:
+            if cached.sample_ids == expected and cached.k == k:
+                return cached, True
+            print("    cache holds a different sample selection, recounting",
+                  flush=True)
+
+    counts = fastdna.count_cohort(paths, k=k)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    counts.save(path)
+    return counts, False
 
 
 def candidate_cohorts() -> List[Dict]:
@@ -121,7 +184,8 @@ def candidate_cohorts() -> List[Dict]:
     return candidates
 
 
-def run_one(species: str, antibiotic: str, n_samples: int, top_features: int) -> Dict:
+def run_one(species: str, antibiotic: str, n_samples: int, top_features: int,
+            cache_dir: Optional[Path] = None) -> Dict:
     """Download, count, audit. Returns a row, or a row carrying `error`."""
     import warnings
 
@@ -129,7 +193,6 @@ def run_one(species: str, antibiotic: str, n_samples: int, top_features: int) ->
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline
 
-    import fastdna
     from fastdna.audit import audit
     from fastdna.datasets import load_amr
     from fastdna.design import check_design
@@ -165,7 +228,8 @@ def run_one(species: str, antibiotic: str, n_samples: int, top_features: int) ->
         return {"species": species, "antibiotic": antibiotic, "skipped": blocking,
                 "n_samples": len(y)}
 
-    counts = fastdna.count_cohort(cohort.paths, k=31)
+    counts, was_cached = counts_for(cohort.paths, cache_dir, species, antibiotic,
+                                    n_samples)
     pipeline = Pipeline([
         ("kmers", KmerVectorizer(counts=counts, top_features=top_features)),
         ("clf", LogisticRegression(max_iter=2000, random_state=0)),
@@ -188,6 +252,9 @@ def run_one(species: str, antibiotic: str, n_samples: int, top_features: int) ->
         "confounding_statistic": report.confounding.statistic,
         "design_ci_halfwidth": design.auc_ci_halfwidth,
         "design_concerns": [c.code for c in design.concerns],
+        # Recorded so a timing claim about the survey can distinguish the
+        # runs that paid for counting from the ones that did not.
+        "counts_cached": was_cached,
         "seconds": round(time.monotonic() - started, 1),
     }
 
@@ -225,7 +292,16 @@ def main() -> int:
     parser.add_argument("--n-samples", type=int, default=COHORT_SIZE)
     parser.add_argument("--top-features", type=int, default=TOP_FEATURES)
     parser.add_argument("--list", action="store_true", help="show candidates and exit")
+    parser.add_argument(
+        "--cache-dir", type=Path, default=DEFAULT_CACHE_DIR,
+        help="where counted cohorts are kept between runs (~150 MB each at n=80)",
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="count every cohort from the FASTAs, ignoring and not writing the cache",
+    )
     args = parser.parse_args()
+    cache_dir = None if args.no_cache else args.cache_dir
 
     candidates = candidate_cohorts()
     print(f"{len(candidates)} candidate cohorts with >= {MIN_MINORITY} in the smaller class")
@@ -255,7 +331,7 @@ def main() -> int:
               flush=True)
         try:
             row = run_one(candidate["species"], candidate["antibiotic"],
-                          args.n_samples, args.top_features)
+                          args.n_samples, args.top_features, cache_dir)
         except Exception as exc:  # one bad cohort must not end the night's run
             row = {"species": key[0], "antibiotic": key[1], "error": str(exc)[:300]}
 
@@ -266,7 +342,8 @@ def main() -> int:
         else:
             print(f"    random {row['score_random']:.4f} -> blocked "
                   f"{row['score_lineage']:.4f}   gap {row['gap']:+.4f}   "
-                  f"confounding {row['confounding']:.3f}   ({row['seconds']:.0f}s)",
+                  f"confounding {row['confounding']:.3f}   ({row['seconds']:.0f}s"
+                  f"{', cached counts' if row['counts_cached'] else ''})",
                   flush=True)
 
         rows.append(row)
