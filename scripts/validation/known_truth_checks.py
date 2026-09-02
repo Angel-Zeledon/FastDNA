@@ -756,10 +756,89 @@ def check_plotting_renders() -> Tuple[bool, str]:
     return ok, ", ".join(f"{name}={size}B" for name, size in sizes.items())
 
 
+def check_explain_separates_biology_from_clone() -> Tuple[bool, str]:
+    """The third leg of the audit, and the one a reader acts on.
+
+    `confounding` says how much leakage the cohort offers; `gap` says how
+    much the model took; `explain` answers the question those two cannot --
+    for THIS feature, is it biology or a clone marker? Getting it wrong is
+    how a lineage tag ends up in a paper as a resistance determinant.
+
+    Two markers with known provenance are planted: one inserted into cases
+    across three lineages (biological -- transferable), one inserted into a
+    single lineage that is entirely cases (a clone marker that predicts
+    perfectly and generalises to nothing). `n_lineages_present` and
+    `lineage_restricted` must tell them apart.
+    """
+    import numpy as np
+
+    from fastdna.explain import explain
+    from fastdna.sklearn import KmerVectorizer
+
+    rng = np.random.default_rng(23)
+    bases = np.array(list("ACGT"))
+    biological = "".join(rng.choice(bases, size=150))
+    clonal = "".join(rng.choice(bases, size=150))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = pathlib.Path(tmp)
+        paths, phenotype = [], []
+        for lineage in range(4):
+            root = "".join(rng.choice(bases, size=3000))
+            for member in range(6):
+                seq = list(root)
+                for pos in rng.choice(len(seq), size=20, replace=False):
+                    seq[pos] = str(rng.choice(bases))
+                sequence = "".join(seq)
+                if lineage == 0:
+                    # Whole lineage is cases, and carries the clone marker:
+                    # perfectly predictive, entirely non-transferable.
+                    label = 1
+                    sequence += clonal
+                else:
+                    label = 1 if member < 3 else 0
+                    if label:
+                        sequence += biological
+                paths.append(_write_fastq(
+                    directory, f"L{lineage}_{member}.fastq", sequence))
+                phenotype.append(label)
+
+        y = np.asarray(phenotype)
+        vectorizer = KmerVectorizer(k=21, top_features=800, representation="presence")
+        matrix = vectorizer.fit_transform(paths, y)
+        dense = np.asarray(
+            matrix.todense() if hasattr(matrix, "todense") else matrix
+        ).astype(float)
+        importances = np.abs(dense[y == 1].mean(0) - dense[y == 0].mean(0))
+        report = explain(vectorizer, importances, paths, y,
+                         top_n=400, k=21, lineage_threshold=0.02)
+
+    found = {}
+    for feature in report.features:
+        if feature.kmer in biological:
+            found.setdefault("biological", feature)
+        elif feature.kmer in clonal:
+            found.setdefault("clonal", feature)
+
+    if len(found) < 2:
+        return False, f"only found {sorted(found)} among the explained features"
+
+    bio, clone = found["biological"], found["clonal"]
+    ok = (
+        bio.n_lineages_present > 1 and not bio.lineage_restricted
+        and clone.n_lineages_present == 1 and clone.lineage_restricted
+    )
+    return ok, (f"biological: {bio.n_lineages_present} lineages, "
+                f"restricted={bio.lineage_restricted}; "
+                f"clonal: {clone.n_lineages_present} lineage, "
+                f"restricted={clone.lineage_restricted}")
+
+
 CHECKS: Dict[str, Callable[[], Tuple[bool, str]]] = {
     "active_learning": check_active_learning_ordering,
     "annotate": check_annotate_locates_genes,
     "chimeras": check_chimeras_textbook_case_only,
+    "explain": check_explain_separates_biology_from_clone,
     "metagenomics": check_metagenomics_classifies_and_abstains,
     "plotting": check_plotting_renders,
     "report": check_report_preserves_numbers,
