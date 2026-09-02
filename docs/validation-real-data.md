@@ -403,3 +403,73 @@ This is a demonstration that the tool works, not a discovery: PLOS Biology
 2502.07749 already named phylogeny-aware cross-validation the field's
 missing standard tool. What is new here is that it runs end to end from
 public accessions in one command.
+
+---
+
+# Track E -- calibrating the detector against known leakage (2026-09-01)
+
+Tracks A-D validate against reality. This one validates against a
+*constructed* truth, and it answers a question the others structurally
+cannot: **when `audit()` reports a gap, is that the right number?**
+
+On real data nobody knows the true amount of leakage, so a real-cohort
+result is always a single point with no reference. Track D is the sharp
+illustration -- it produced a confident +0.165 that turned out to measure a
+data bug. Injecting a known amount of leakage removes that ambiguity
+entirely.
+
+## Construction
+
+Two deliberately separable sources of phenotype, mixed by `lambda`
+(`scripts/validation/leakage_calibration.py`):
+
+- **Biological**: a marker sequence inserted independently of lineage. A
+  model that learns it generalises to unseen lineages, because the marker is
+  there too.
+- **Lineage**: membership of designated resistant clones, predictable from
+  k-mers characteristic of each clone -- which work under random CV and are
+  absent from a held-out lineage.
+
+`lambda = 0` means the phenotype is entirely the marker; `lambda = 1` means
+it is entirely lineage. Three predictions were written down before running.
+
+## Result
+
+n=150 over 6 lineages, 1,000 features, 10 replicates per point:
+
+| lambda | random CV | lineage-blocked | gap | sd | se |
+|---:|---:|---:|---:|---:|---:|
+| 0.0 | 1.0000 | 1.0000 | **+0.0000** | 0.000 | — |
+| 0.2 | 0.9331 | 0.9056 | +0.0275 | 0.013 | 0.004 |
+| 0.4 | 0.8674 | 0.8573 | +0.0101 | 0.021 | 0.006 |
+| 0.6 | 0.8147 | 0.7908 | +0.0239 | 0.027 | 0.009 |
+| 0.8 | 0.8530 | 0.7296 | +0.1234 | 0.037 | 0.012 |
+| 1.0 | 0.8730 | 0.4463 | **+0.4267** | 0.083 | 0.026 |
+
+Spearman(lambda, gap) = 0.829.
+
+**Predictions 1 and 2 hold. Prediction 3 -- monotone increase -- does not.**
+The response is a threshold rather than a slope: flat at 0.01-0.03 until
+lineage supplies roughly 80% of the phenotype, then rising sharply. Ten
+replicates make the standard errors small enough to separate the middle
+points, and the Spearman coefficient is identical to the three-replicate run
+(0.8286 both times), so this is a property of the system, not sampling
+noise.
+
+## What it establishes
+
+1. **The detector is correct at the extremes.** Transferable signal produces
+   *exactly* zero gap; pure lineage signal produces +0.43. It is measuring
+   what it claims to measure.
+2. **It is a detector, not a meter.** It identifies leakage as the dominant
+   explanation. It is insensitive to partial leakage coexisting with real
+   biological signal -- a common regime, and one where a small gap must not
+   be read as "unconfounded". `AuditReport.confounding` answers that
+   question directly, from the labels, with no model involved.
+3. **The overfitting confound is ruled out.** Both extremes share p/n, model
+   and capacity; only the phenotype's source differs, and the gap moves from
+   0.000 to +0.427. The capacity-driven gap documented in `audit`'s module
+   docstring cannot explain this.
+
+Point 2 is a limitation found by measurement rather than reported by a user,
+which is the outcome this kind of calibration exists to produce.
