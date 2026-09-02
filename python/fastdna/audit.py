@@ -590,6 +590,28 @@ class AuditReport:
         Can be negative or near zero; neither is an error (see the module
         docstring's discussion of the 2026 preprint finding the reverse
         pattern on some cohorts).
+
+        **`nan` when the grouping was degenerate** -- see
+        `gap_undefined_reason`. A degenerate grouping is one where
+        `LineageKFold` had almost nothing to block on, so the difference
+        between the two splitters measures nothing; reporting it as a small
+        float invites exactly the wrong conclusion ("no leakage here"). The
+        two `score_*` fields stay populated, because those were really
+        measured; only their difference is withheld.
+    gap_undefined_reason : str, optional
+        `None` on an ordinary report. A short sentence naming why `gap` is
+        `nan`, in the same "return a reason, not a number" convention
+        `Confounding.undefined_reason` already uses for its own degenerate
+        cases.
+
+        This exists because the failure it guards against is silent and
+        expensive: the same E. coli cohort that reads `gap=-0.011` at the
+        default threshold reads `+0.175` once the grouping is coarse enough
+        to have lineages to block on (`scripts/validation/
+        lineage_leakage_experiment.py`, and the same reversal is recorded at
+        `-0.018`/`+0.148` in this module's own notes). A caller who saw only
+        the first number would conclude their model was clean when 65% of
+        its lift over chance was lineage memorisation.
     n_lineages : int
         Distinct lineage labels found (or supplied via `groups=`).
     lineage_threshold : float
@@ -660,6 +682,17 @@ class AuditReport:
     per_fold: pa.Table
     covariates: Tuple[CovariateAudit, ...]
     leakage_curve: Optional[Tuple[LeakageCurvePoint, ...]] = None
+    gap_undefined_reason: Optional[str] = None
+
+    @property
+    def _gap_label(self) -> str:
+        """How `gap` renders in every human-facing view. A withheld gap must
+        not print as `+nan`: that reads like a numerical accident rather than
+        a deliberate refusal to answer, and the whole point of withholding it
+        is that the reader changes what they do next."""
+        if self.gap_undefined_reason:
+            return "undefined (degenerate grouping)"
+        return f"{self.gap:+.4g}"
 
     def to_markdown(self) -> str:
         scoring_label = self.scoring if self.scoring is not None else "estimator default"
@@ -677,10 +710,12 @@ class AuditReport:
             lines.append(f"| covariate:{c.name} | {c.score:.4g} | {c.score_std:.4g} |")
         lines += [
             "",
-            f"Gap (random - lineage-blocked): {self.gap:+.4g}",
+            f"Gap (random - lineage-blocked): {self._gap_label}",
             f"{self.n_lineages} lineages (Mash distance threshold {threshold_label}).",
             f"Phenotype-vs-lineage confounding: {self.confounding}",
         ]
+        if self.gap_undefined_reason:
+            lines += ["", f"**Gap withheld.** {self.gap_undefined_reason}"]
         if self.covariates:
             lines += [
                 "",
@@ -734,7 +769,7 @@ class AuditReport:
     def __repr__(self):
         return (
             f"AuditReport(n_samples={self.n_samples}, score_random={self.score_random:.4g}, "
-            f"score_lineage={self.score_lineage:.4g}, gap={self.gap:+.4g}, "
+            f"score_lineage={self.score_lineage:.4g}, gap={self._gap_label}, "
             f"n_lineages={self.n_lineages}, "
             f"confounding={self.confounding.value:.4g} ({self.confounding.statistic}), "
             f"n_covariates={len(self.covariates)})"
@@ -761,7 +796,7 @@ class AuditReport:
         rows["gap_vs_random"][0] = 0.0
         df = pd.DataFrame(rows)
         header = (
-            f"<p><b>AuditReport</b> &mdash; {self.n_samples} samples, gap={self.gap:+.4g}, "
+            f"<p><b>AuditReport</b> &mdash; {self.n_samples} samples, gap={self._gap_label}, "
             f"{self.n_lineages} lineages, phenotype-vs-lineage confounding "
             f"{self.confounding}</p>"
         )
@@ -1492,6 +1527,9 @@ def audit(
             resolved_lineage_threshold = float(lineage_threshold)
 
     def _warn_if_degenerate(n_lineages_here, grouping_label):
+        """Warns, and returns a reason string when the grouping is degenerate
+        (`None` otherwise) so the caller can withhold `gap` rather than
+        report a difference that measures nothing."""
         if n_samples > 0 and n_lineages_here / n_samples >= _DEGENERATE_LINEAGE_FRACTION:
             warnings.warn(
                 f"{n_lineages_here} of {n_samples} samples are each their own lineage (or "
@@ -1502,9 +1540,16 @@ def audit(
                 DegenerateLineagesWarning,
                 stacklevel=3,
             )
+            return (
+                f"{n_lineages_here} of {n_samples} samples are each their own lineage under "
+                f"{grouping_label}, so LineageKFold had almost nothing to block on and the "
+                "difference between the two splitters does not measure leakage. The score_* "
+                "fields are still the scores actually measured."
+            )
+        return None
 
     n_lineages = int(np.unique(groups).size)
-    _warn_if_degenerate(
+    gap_undefined_reason = _warn_if_degenerate(
         n_lineages,
         "the current grouping" if groups_supplied_directly else f"the grouping at threshold {resolved_lineage_threshold:g}",
     )
@@ -1637,11 +1682,17 @@ def audit(
         score_random_std=_nan_aware_std(scores_random),
         score_lineage=mean_lineage,
         score_lineage_std=_nan_aware_std(scores_lineage),
-        gap=float(mean_random - mean_lineage),
+        # Withheld, not reported small, when the grouping was degenerate:
+        # `LineageKFold` had nothing to block on, so this difference is not a
+        # measurement of leakage and a caller who reads it as one draws the
+        # opposite of the right conclusion. Same convention as
+        # `Confounding.value`/`undefined_reason`.
+        gap=float("nan") if gap_undefined_reason else float(mean_random - mean_lineage),
         n_lineages=n_lineages,
         lineage_threshold=resolved_lineage_threshold,
         confounding=confounding,
         per_fold=per_fold,
         covariates=tuple(covariate_reports),
         leakage_curve=leakage_curve,
+        gap_undefined_reason=gap_undefined_reason,
     )

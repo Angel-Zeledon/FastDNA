@@ -487,12 +487,19 @@ def test_audit_composes_with_a_duck_typed_regressor_shaped_like_micregressor():
 
 
 def test_audit_warns_when_almost_every_sample_is_its_own_lineage():
-    """Real motivation, not a hypothetical: this project's own bacterial
-    AMR reproduction (`scratch/amr_repro/audit_report.json`) hit exactly
-    this at the library's default `lineage_threshold` -- 149 of 150
-    genomes each their own lineage, `gap` near zero -- and a naive reading
-    of that report would have concluded "no leakage" when the real issue
-    was that the grouping gave LineageKFold almost nothing to block on.
+    """Real motivation, not a hypothetical, and now reproducible on demand:
+    `scripts/validation/lineage_leakage_experiment.py` hits exactly this on
+    200 public BV-BRC E. coli genomes at the library's default
+    `lineage_threshold` -- 198 of 200 each their own lineage, `gap` reading
+    -0.011 -- while the same cohort grouped by MLST reads +0.165. A naive
+    reading of the first report would have concluded "no leakage" when 65%
+    of the model's lift over chance was lineage memorisation.
+
+    (This previously cited `scratch/amr_repro/audit_report.json` at 149/150,
+    which is the same finding on an earlier cohort -- but that path is under
+    the gitignored `/scratch/` and is not in the repository, so nobody could
+    check it. The script above replaces it with something a stranger can
+    run.)
     """
     n_samples = 20
     X, groups = _synthetic_matrix_cohort(seed=2, n_per_group=1, n_groups=n_samples)
@@ -508,6 +515,70 @@ def test_audit_warns_when_almost_every_sample_is_its_own_lineage():
             scoring="accuracy",
         )
     assert report.n_lineages == n_samples
+
+
+def test_a_degenerate_grouping_withholds_the_gap_instead_of_reporting_a_small_number():
+    """The warning above is necessary but not sufficient: warnings are
+    routinely filtered, swallowed by notebooks, or simply not read, and the
+    number that survives into a paper is `report.gap`. When the grouping
+    gave LineageKFold nothing to block on, that difference is not a
+    measurement of leakage, so it is withheld rather than reported small --
+    the same "return a reason, not a number" convention
+    `Confounding.undefined_reason` already uses.
+    """
+    n_samples = 20
+    X, groups = _synthetic_matrix_cohort(seed=2, n_per_group=1, n_groups=n_samples)
+    phenotype = np.array([i % 2 for i in range(n_samples)])
+
+    with pytest.warns(DegenerateLineagesWarning):
+        report = audit(
+            LogisticRegression(max_iter=1000),
+            X,
+            phenotype,
+            groups=groups,
+            n_splits=4,
+            scoring="accuracy",
+        )
+
+    assert np.isnan(report.gap)
+    assert report.gap_undefined_reason is not None
+    assert "20 of 20" in report.gap_undefined_reason
+
+    # The two scores were really measured and stay readable: only their
+    # difference is unsafe to interpret, not the measurements themselves.
+    assert not np.isnan(report.score_random)
+    assert not np.isnan(report.score_lineage)
+
+    # And no human-facing view may render this as "gap=+nan", which reads
+    # like a numerical accident rather than a deliberate refusal to answer.
+    # (`confounding` legitimately renders as `nan (undefined)` in the same
+    # repr: this exact grouping is also its own degenerate case, `r == n`.
+    # That is the convention being followed here, not a leak of it.)
+    assert "gap=undefined (degenerate grouping)" in repr(report)
+    assert "gap=+nan" not in repr(report)
+    assert "Gap withheld" in report.to_markdown()
+
+
+def test_a_clustered_cohort_reports_a_real_gap_with_no_undefined_reason():
+    """The other half of the contract: withholding must be the exception. A
+    cohort with genuine lineage structure gets a plain float and no reason.
+    """
+    X, groups = _synthetic_matrix_cohort(seed=1)  # 4 groups of 8
+    phenotype = np.array([1 if g in (0, 1) else 0 for g in groups])
+
+    report = audit(
+        LogisticRegression(max_iter=1000),
+        X,
+        phenotype,
+        groups=groups,
+        n_splits=4,
+        scoring="accuracy",
+    )
+
+    assert report.gap_undefined_reason is None
+    assert not np.isnan(report.gap)
+    assert "undefined" not in repr(report)
+    assert "Gap withheld" not in report.to_markdown()
 
 
 def test_audit_does_not_warn_for_a_genuinely_clustered_cohort():
