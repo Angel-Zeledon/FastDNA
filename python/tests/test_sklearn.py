@@ -13,6 +13,7 @@ from __future__ import annotations
 import pathlib
 import random
 import shutil
+import warnings
 
 import pytest
 
@@ -28,7 +29,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
 import fastdna
-from fastdna.sklearn import KmerVectorizer
+from fastdna.sklearn import EmptyVocabularyWarning, KmerVectorizer
 
 
 def write_fastq(tmp_path: pathlib.Path, name: str, reads: list[str]) -> pathlib.Path:
@@ -294,8 +295,17 @@ def test_transform_on_training_samples_is_reproducible_regardless_of_fit_scope(t
     b = write_fastq(tmp_path, "b.fastq", ["ACGTACGTAC"] * 2)
     c = write_fastq(tmp_path, "c.fastq", ["TTTTTGGGGG"] * 3)
 
-    vec_ab = KmerVectorizer(k=k, top_features=None).fit([str(a), str(b)])
-    vec_abc = KmerVectorizer(k=k, top_features=None).fit([str(a), str(b), str(c)])
+    # representation="count": a and b carry identical sequence, so under
+    # the default presence encoding every k-mer of the {a, b} cohort is
+    # present in both samples, constant, and correctly dropped -- an empty
+    # vocabulary, and nothing left to compare. The property under test
+    # (projection is a function of the vocabulary alone) holds for every
+    # representation; this one keeps the fixture's two-sample cohort able
+    # to have a vocabulary at all.
+    vec_ab = KmerVectorizer(k=k, top_features=None, representation="count").fit([str(a), str(b)])
+    vec_abc = KmerVectorizer(k=k, top_features=None, representation="count").fit(
+        [str(a), str(b), str(c)]
+    )
 
     names_ab = list(vec_ab.get_feature_names_out())
     names_abc = list(vec_abc.get_feature_names_out())
@@ -651,9 +661,15 @@ def test_cross_validation_vocabulary_excludes_kmers_unique_to_the_test_fold(tmp_
             "vocabulary fitted on the training fold contains k-mers only the "
             "held-out fold could have supplied -- feature selection leaked"
         )
-        # And the vocabulary must be exactly the training fold's k-mers,
-        # not merely a subset avoiding the marked ones.
-        assert fitted_vocab == train_kmers
+        # And the vocabulary must be exactly the training fold's *informative*
+        # k-mers, not merely a subset avoiding the marked ones. Under the
+        # default presence encoding that excludes the backbone every training
+        # sample shares: a k-mer present in all of them encodes to 1 in every
+        # row, so its column is constant and the ranking drops it (see
+        # `_select_vocabulary`). The markers, present in one training sample
+        # each, all survive -- which is what makes this assertion sharp.
+        shared_by_every_training_sample = set.intersection(*(per_sample[p] for p in train_paths))
+        assert fitted_vocab == train_kmers - shared_by_every_training_sample
 
         # transform() on the held-out fold must not change that.
         vec.transform(test_paths)
@@ -1120,3 +1136,99 @@ def test_disk_backed_never_leaks_across_folds(tmp_path):
 
     vec.transform([str(held_out)])
     assert list(vec.vocabulary_) == vocabulary_before, "transform() must never mutate the already-fitted vocabulary"
+
+
+# ---------------------------------------------------------------------------
+# The presence-encoding vocabulary rule (see `_select_vocabulary`, and
+# python/tests/test_review_findings_2026_09_02.py for the defect that made
+# the split by `representation` necessary). Here: the edges of that rule --
+# what happens when it selects nothing, when the cohort is too small for it
+# to mean anything, and when the budget outruns the informative set.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("disk_backed", [False, True])
+def test_presence_fit_warns_when_no_kmer_varies_across_the_cohort(tmp_path, disk_backed):
+    """Two samples with identical content have no k-mer that is present in
+    one and absent from the other, so the presence rule correctly selects
+    nothing at all. That must be said out loud at `fit()` time: the
+    alternative is an `(n_samples, 0)` matrix failing several calls later
+    with an error that names neither the cohort nor the cause.
+
+    Parametrized over `disk_backed` because the vocabulary is assigned in
+    two different places (`_select_vocabulary` and
+    `_learn_vocabulary_disk_backed`), and a caller must hear about this
+    from both.
+    """
+    a = write_fastq(tmp_path, "a.fastq", ["ACGTACGTACGTACGT"] * 3)
+    b = write_fastq(tmp_path, "b.fastq", ["ACGTACGTACGTACGT"] * 2)
+
+    with pytest.warns(EmptyVocabularyWarning, match="0 features"):
+        vec = KmerVectorizer(k=6, top_features=None, disk_backed=disk_backed).fit([str(a), str(b)])
+
+    assert len(vec.vocabulary_) == 0
+    assert vec.n_features_in_ == 0
+
+
+def test_count_representation_does_not_warn_on_the_same_cohort(tmp_path):
+    """The mirror of the test above, and the reason the warning names
+    `representation='presence'` specifically: under a count encoding those
+    same k-mers still vary (sample a carries three reads, b two), so there
+    is nothing degenerate to report.
+    """
+    a = write_fastq(tmp_path, "a.fastq", ["ACGTACGTACGTACGT"] * 3)
+    b = write_fastq(tmp_path, "b.fastq", ["ACGTACGTACGTACGT"] * 2)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", EmptyVocabularyWarning)
+        vec = KmerVectorizer(k=6, top_features=None, representation="count").fit([str(a), str(b)])
+
+    assert len(vec.vocabulary_) > 0
+
+
+def test_presence_fit_on_a_single_sample_still_selects_a_vocabulary(tmp_path):
+    """Below two samples there is no across-sample variance to rank by, and
+    every k-mer is trivially "present in every sample" -- so the presence
+    rule is skipped rather than applied literally, which would return
+    nothing for a question (which of this sample's k-mers matter) that the
+    count-shaped rule still answers.
+    """
+    a = write_fastq(tmp_path, "a.fastq", ["ACGTACGTACGTACGT"] * 3)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", EmptyVocabularyWarning)
+        vec = KmerVectorizer(k=6, top_features=None).fit([str(a)])
+
+    assert len(vec.vocabulary_) > 0
+
+
+def test_presence_vocabulary_may_be_shorter_than_top_features(tmp_path):
+    """The budget is a cap, not a quota. Once the constants are dropped, a
+    `top_features` larger than the informative set leaves the vocabulary
+    short rather than refilling it with the columns the rule just excluded
+    -- which is what would otherwise make the cap silently reintroduce the
+    defect at any generous budget.
+    """
+    shared = "ACGTTGCATTACGGCATTAGCCATGGATCCATTAGGCATCAGTTACGGATCAGTTACCGGA"
+    extra = "TTTTGGGGCCCCAAAATTTTGGGGCCCCAAAA"
+    a = write_fastq(tmp_path, "a.fastq", [shared + extra])
+    b = write_fastq(tmp_path, "b.fastq", [shared])
+
+    vec = KmerVectorizer(k=9, top_features=10_000).fit([str(a), str(b)])
+    dense = np.asarray(vec.transform([str(a), str(b)]).todense())
+
+    assert 0 < len(vec.vocabulary_) < 10_000
+    assert (dense.std(axis=0) > 0).all(), "every selected feature must vary across the cohort"
+
+
+def test_fit_rejects_an_unknown_representation_before_counting_anything(tmp_path):
+    """`representation` now decides the vocabulary rule, not just the cell
+    values, so an unrecognised one has to fail at `fit()` -- otherwise it
+    takes the count-shaped branch by default and returns a well-formed
+    vocabulary chosen by the wrong rule, raising only at `transform()`.
+    """
+    a = write_fastq(tmp_path, "a.fastq", ["ACGTACGTACGTACGT"] * 3)
+    b = write_fastq(tmp_path, "b.fastq", ["TTGGCCAATTGGCCAA"] * 3)
+
+    with pytest.raises(ValueError, match="representation must be one of"):
+        KmerVectorizer(k=6, representation="binary").fit([str(a), str(b)])

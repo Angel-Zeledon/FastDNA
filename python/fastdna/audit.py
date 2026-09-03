@@ -287,6 +287,21 @@ is a real drop in a real held-out score -- `LineageKFold` is not
 malfunctioning -- but attributing it to *population structure confounding
 the phenotype* would be wrong.
 
+**These three numbers were measured under the pre-2026-09-03 vocabulary
+rule and are pending re-measurement.** `KmerVectorizer`'s presence encoding
+then ranked candidates by descending prevalence, so at every budget in the
+table the features selected were the cohort's most nearly universal k-mers
+-- the least variable ones available, and on a more clonal cohort they
+would have been literally constant (see `fastdna.sklearn.KmerVectorizer.
+_select_vocabulary` and `python/tests/test_review_findings_2026_09_02.py`).
+The rule now ranks by `min(prevalence, n_samples - prevalence)` and drops
+the constants, so the same three commands select different features today.
+The monotone trend above is not a second, independent measurement of the
+mechanism below it -- it is the only one -- so until it is re-run, treat
+the mechanism as an argument with one supporting observation rather than as
+a calibrated effect size. The instruction it leads to is the safe reading
+either way: it costs nothing if the effect turns out smaller.
+
 What tells them apart is not this function: it is whether the model has
 genuine signal in the first place. `score_random` far above chance with a
 large gap is the leakage story; `score_random` near chance with a large gap

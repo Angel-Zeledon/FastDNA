@@ -63,18 +63,57 @@ use crate::error::Result;
 use crate::ktab::KmerTable;
 use crate::setops::{self, MultiTableMerge};
 
+/// How a cohort's distinct k-mers are ordered when only `top_n` of them can
+/// be kept. Both variants are implemented identically by
+/// `python/fastdna/sklearn.py::_select_vocabulary`, which is the reason
+/// this is an explicit parameter rather than a constant: the two code paths
+/// (in-memory NumPy and this one) must not be able to drift apart, and
+/// `python/tests/test_sklearn.py::test_disk_backed_fit_matches_in_memory_
+/// fit_exactly` fails if they do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VocabularyRanking {
+    /// `(prevalence desc, total_freq desc, kmer_u64 asc)`. The right rule
+    /// when the feature value is a *count*: a k-mer present in every sample
+    /// still varies in depth between them, so universal presence is a mark
+    /// of a trustworthy, sample-general feature rather than a useless one.
+    PrevalenceThenFrequency,
+    /// `(min(prevalence, n_samples - prevalence) desc, kmer_u64 asc)`. The
+    /// right rule when the feature value is *binary presence*, where that
+    /// quantity is a monotone function of the feature's variance: a k-mer
+    /// present in every sample encodes to 1 everywhere and carries exactly
+    /// no information, and one present in half the samples carries the most
+    /// any binary feature can.
+    ///
+    /// Ties are broken by `kmer_u64` alone, deliberately **not** by
+    /// `total_freq`: depth is the quantity presence encoding exists to
+    /// ignore (see `KmerVectorizer.__init__`'s comment on
+    /// `representation`), and using it here would concentrate the
+    /// vocabulary in whichever locus happened to be sequenced deepest.
+    /// Ordering by the k-mer's own encoding instead scatters the selection
+    /// across the genome and stays deterministic.
+    BinaryInformativeness,
+}
+
 /// K-way merges every sample table's sorted `(kmer_u64, frequency)` stream
 /// (`setops::MultiTableMerge` -- see the module doc comment) and ranks the
-/// resulting distinct k-mers by `(prevalence desc, total_freq desc,
-/// kmer_u64 asc)`, the exact tie-break order
-/// `python/fastdna/sklearn.py::_select_vocabulary`'s own `np.lexsort((
-/// distinct, -total_freq, -prevalence))` already implements -- this is a
-/// drop-in replacement for that ranking (run without ever materializing
-/// the whole cohort's rows in memory at once), not a new ranking policy.
+/// resulting distinct k-mers by `ranking`, the exact tie-break order
+/// `python/fastdna/sklearn.py::_select_vocabulary` already implements for
+/// the corresponding `representation` -- this is a drop-in replacement for
+/// that ranking (run without ever materializing the whole cohort's rows in
+/// memory at once), not a new ranking policy.
 ///
 /// Returns `(kmer_u64, prevalence, total_freq)` as three parallel vectors,
 /// already in ranked (best-first) order -- there is nothing left for a
-/// caller to sort.
+/// caller to sort. `prevalence` and `total_freq` are reported for every
+/// returned k-mer whichever ranking chose it, so a caller can always see
+/// the tallies behind the order it got.
+///
+/// Under `BinaryInformativeness`, a k-mer present in *every* sample is
+/// dropped outright rather than ranked last: its column is constant, so it
+/// cannot inform any model, and returning it would let a `top_n` larger
+/// than the informative set quietly refill the vocabulary with the exact
+/// features that rule exists to exclude. The returned vocabulary is
+/// therefore sometimes shorter than `top_n`, which is the honest answer.
 ///
 /// `top_n`: `None` returns every distinct k-mer across `table_paths` (after
 /// `min_count`/other per-sample filtering, which already happened when
@@ -97,6 +136,7 @@ use crate::setops::{self, MultiTableMerge};
 pub fn rank_vocabulary(
     table_paths: &[PathBuf],
     top_n: Option<usize>,
+    ranking: VocabularyRanking,
 ) -> Result<(Vec<u64>, Vec<u32>, Vec<u32>)> {
     if table_paths.is_empty() {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
@@ -104,6 +144,23 @@ pub fn rank_vocabulary(
 
     let tables: Vec<KmerTable> = table_paths.iter().map(KmerTable::open).collect::<Result<_>>()?;
     setops::check_same_k(&tables)?;
+
+    // "Constant across the cohort" is a statement about a cohort. With a
+    // single table every k-mer is present in every sample, so
+    // `BinaryInformativeness` would score all of them zero and drop the
+    // lot, answering "which of this sample's k-mers matter" with nothing
+    // -- when that question does still have a good answer. Variance needs
+    // two samples to exist at all, so below two the count-shaped rule is
+    // the only one that means anything, and it is what runs.
+    // `python/fastdna/sklearn.py::_select_vocabulary` makes the identical
+    // exception, for the identical reason -- the equivalence tests in
+    // `python/tests/test_sklearn.py` cover one-sample cohorts too.
+    let n_samples = table_paths.len() as u32;
+    let ranking = if n_samples < 2 {
+        VocabularyRanking::PrevalenceThenFrequency
+    } else {
+        ranking
+    };
 
     let merge = MultiTableMerge::new(&tables)?;
 
@@ -113,15 +170,16 @@ pub fn rank_vocabulary(
             // dropped as the merge streams -- this path's memory really is
             // O(distinct k-mers), which is the honest cost of "return
             // everything" (see the doc comment above).
-            let mut ranked: Vec<(RankKey, u64)> = Vec::new();
+            let mut ranked: Vec<Candidate> = Vec::new();
             for row in merge {
                 let row = row?;
-                let key = rank_key(&row);
-                ranked.push((key, row.kmer));
+                if let Some(candidate) = rank_candidate(&row, ranking, n_samples) {
+                    ranked.push(candidate);
+                }
             }
-            // Descending by key: the same (prevalence desc, total_freq
-            // desc, kmer asc) order `rank_key` encodes.
-            ranked.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+            // Descending by key: the "greater is better" order
+            // `rank_candidate` encodes for whichever ranking is in force.
+            ranked.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.0));
             Ok(unzip_ranked(ranked))
         }
         Some(top_n) => {
@@ -134,52 +192,100 @@ pub fn rank_vocabulary(
             // `top_n` candidates seen so far, at any point in the merge --
             // the same online top-k selection `_select_vocabulary`'s own
             // `np.lexsort` cannot do without the whole array resident.
-            let mut heap: BinaryHeap<std::cmp::Reverse<(RankKey, u64)>> =
+            let mut heap: BinaryHeap<std::cmp::Reverse<Candidate>> =
                 BinaryHeap::with_capacity(top_n.saturating_add(1));
             for row in merge {
                 let row = row?;
-                let key = rank_key(&row);
-                heap.push(std::cmp::Reverse((key, row.kmer)));
+                let Some(candidate) = rank_candidate(&row, ranking, n_samples) else {
+                    continue;
+                };
+                heap.push(std::cmp::Reverse(candidate));
                 if heap.len() > top_n {
                     heap.pop();
                 }
             }
-            let mut ranked: Vec<(RankKey, u64)> = heap.into_iter().map(|std::cmp::Reverse(item)| item).collect();
-            ranked.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+            let mut ranked: Vec<Candidate> = heap.into_iter().map(|std::cmp::Reverse(item)| item).collect();
+            ranked.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.0));
             Ok(unzip_ranked(ranked))
         }
     }
 }
 
-/// `(prevalence, total_freq, Reverse(kmer))` -- ordinary tuple ordering on
-/// this triple is exactly `_select_vocabulary`'s ranking rule with
-/// "greater is better" semantics throughout: higher prevalence ranks
-/// first, ties broken by higher total_freq, remaining ties broken by
-/// *smaller* `kmer_u64` (the deterministic tie-break `_select_vocabulary`
-/// itself uses `distinct` -- ascending -- for). `Reverse(kmer)` turns
-/// "smaller kmer is better" into "bigger `Reverse(kmer)` is better", so a
-/// plain `Ord`/`cmp` on this triple answers "which candidate ranks first"
-/// directly, with no bespoke comparator needed at either call site above.
+/// `(primary, secondary, Reverse(kmer))`, with "greater is better"
+/// semantics throughout, so a plain `Ord`/`cmp` on the triple answers
+/// "which candidate ranks first" directly and neither call site above
+/// needs a bespoke comparator. What the two leading fields *hold* depends
+/// on the `VocabularyRanking` in force (see `rank_candidate`); the last
+/// field never does: `Reverse(kmer)` turns "smaller `kmer_u64` is better"
+/// into "bigger `Reverse(kmer)` is better", which is the deterministic
+/// final tie-break both rankings share -- and the one
+/// `_select_vocabulary` itself spells `distinct` (ascending) in its
+/// `np.lexsort`.
 type RankKey = (u32, u32, std::cmp::Reverse<u64>);
 
-fn rank_key(row: &setops::MergedRow) -> RankKey {
+/// A candidate k-mer: the key that decides where it ranks, followed by the
+/// three values `rank_vocabulary` returns for it.
+///
+/// The tallies ride alongside the key rather than being read back out of
+/// it, because under `BinaryInformativeness` the key no longer *contains*
+/// them (its primary field is `min(prevalence, n_samples - prevalence)`),
+/// and the returned `prevalence`/`total_freq` must be the real tallies
+/// under either ranking. Ordering still only ever consults the key: it
+/// ends in `Reverse(kmer)`, which is distinct for every candidate, so no
+/// comparison reaches the trailing fields.
+type Candidate = (RankKey, u64, u32, u32);
+
+/// Scores one merged row under `ranking`, or `None` if that ranking
+/// excludes it from the vocabulary outright.
+///
+/// The only exclusion is `BinaryInformativeness`'s: a k-mer present in all
+/// `n_samples` samples encodes to 1 in every one of them, so its column is
+/// constant and cannot inform any model. Ranking it last would not be
+/// enough -- a `top_n` larger than the informative set would refill the
+/// vocabulary with exactly those k-mers -- so it is dropped here, before
+/// the top-`n` selection ever sees it. See `VocabularyRanking`'s own doc
+/// comment for why prevalence n/2 is the maximum and why the tie-break
+/// deliberately skips `total_freq`.
+fn rank_candidate(
+    row: &setops::MergedRow,
+    ranking: VocabularyRanking,
+    n_samples: u32,
+) -> Option<Candidate> {
     let prevalence = row.per_table.iter().filter(|c| c.is_some()).count() as u32;
     let total_freq = row.per_table.iter().flatten().fold(0u32, |acc, &c| acc.saturating_add(c));
-    (prevalence, total_freq, std::cmp::Reverse(row.kmer))
+
+    let key = match ranking {
+        VocabularyRanking::PrevalenceThenFrequency => {
+            (prevalence, total_freq, std::cmp::Reverse(row.kmer))
+        }
+        VocabularyRanking::BinaryInformativeness => {
+            // A merged row exists only because some table has this k-mer,
+            // so `prevalence >= 1` and this saturating difference is a
+            // real subtraction; informativeness reaches 0 only at
+            // `prevalence == n_samples`, the constant column dropped
+            // below.
+            let informativeness = prevalence.min(n_samples.saturating_sub(prevalence));
+            if informativeness == 0 {
+                return None;
+            }
+            (informativeness, 0, std::cmp::Reverse(row.kmer))
+        }
+    };
+
+    Some((key, row.kmer, prevalence, total_freq))
 }
 
-/// Splits a ranked `(key, kmer)` list (already in best-first order) back
-/// into the three parallel vectors `rank_vocabulary` returns, recovering
-/// `prevalence`/`total_freq` from the same `RankKey` that decided the
-/// order -- so there is exactly one place (`rank_key`) that packs them
-/// together and exactly one (`this function`) that unpacks them, instead
-/// of two call sites separately reaching into a `MergedRow` and risking
-/// disagreement about what "prevalence" means.
-fn unzip_ranked(ranked: Vec<(RankKey, u64)>) -> (Vec<u64>, Vec<u32>, Vec<u32>) {
+/// Splits a ranked `Candidate` list (already in best-first order) back
+/// into the three parallel vectors `rank_vocabulary` returns -- so there
+/// is exactly one place (`rank_candidate`) that computes a k-mer's
+/// prevalence and total_freq and exactly one (this function) that unpacks
+/// them, instead of two call sites separately reaching into a `MergedRow`
+/// and risking disagreement about what "prevalence" means.
+fn unzip_ranked(ranked: Vec<Candidate>) -> (Vec<u64>, Vec<u32>, Vec<u32>) {
     let mut kmers = Vec::with_capacity(ranked.len());
     let mut prevalence = Vec::with_capacity(ranked.len());
     let mut total_freq = Vec::with_capacity(ranked.len());
-    for ((prev, freq, _), kmer) in ranked {
+    for (_, kmer, prev, freq) in ranked {
         kmers.push(kmer);
         prevalence.push(prev);
         total_freq.push(freq);
@@ -325,7 +431,7 @@ mod tests {
 
     #[test]
     fn rank_vocabulary_of_empty_table_paths_is_three_empty_vectors() {
-        let (kmers, prevalence, total_freq) = rank_vocabulary(&[], None).unwrap();
+        let (kmers, prevalence, total_freq) = rank_vocabulary(&[], None, VocabularyRanking::PrevalenceThenFrequency).unwrap();
         assert!(kmers.is_empty());
         assert!(prevalence.is_empty());
         assert!(total_freq.is_empty());
@@ -335,7 +441,7 @@ mod tests {
     fn rank_vocabulary_of_a_single_table_ranks_its_own_kmers() {
         let a = build_table("rank_single_a", 4, &[1, 1, 1, 2]);
 
-        let (kmers, prevalence, total_freq) = rank_vocabulary(std::slice::from_ref(&a), None).unwrap();
+        let (kmers, prevalence, total_freq) = rank_vocabulary(std::slice::from_ref(&a), None, VocabularyRanking::PrevalenceThenFrequency).unwrap();
         // Both k-mers are present in exactly one (the only) sample, so
         // prevalence ties at 1 and total_freq breaks the tie: kmer 1 (3
         // occurrences) ranks before kmer 2 (1 occurrence).
@@ -359,7 +465,7 @@ mod tests {
         });
         let b = build_table("rank_prevalence_b", 4, &[1]);
 
-        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone()], None).unwrap();
+        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone()], None, VocabularyRanking::PrevalenceThenFrequency).unwrap();
         assert_eq!(kmers, vec![1, 2], "prevalence must dominate total_freq in the ranking");
         assert_eq!(prevalence, vec![2, 1]);
         assert_eq!(total_freq, vec![2, 100]);
@@ -375,7 +481,7 @@ mod tests {
         let a = build_table("rank_tiebreak_a", 4, &[1, 2]);
         let b = build_table("rank_tiebreak_b", 4, &[2, 1]);
 
-        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone()], None).unwrap();
+        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone()], None, VocabularyRanking::PrevalenceThenFrequency).unwrap();
         assert_eq!(kmers, vec![1, 2]);
         assert_eq!(prevalence, vec![2, 2]);
         assert_eq!(total_freq, vec![2, 2]);
@@ -387,7 +493,7 @@ mod tests {
     fn rank_vocabulary_top_n_none_returns_every_distinct_kmer() {
         let a = build_table("rank_topn_none_a", 4, &[1, 2, 3, 4, 5]);
 
-        let (kmers, ..) = rank_vocabulary(std::slice::from_ref(&a), None).unwrap();
+        let (kmers, ..) = rank_vocabulary(std::slice::from_ref(&a), None, VocabularyRanking::PrevalenceThenFrequency).unwrap();
         assert_eq!(kmers.len(), 5);
 
         cleanup(&[a]);
@@ -408,7 +514,7 @@ mod tests {
         ];
         let a = build_table("rank_topn_truncate_a", 4, &entries);
 
-        let (kmers, prevalence, total_freq) = rank_vocabulary(std::slice::from_ref(&a), Some(3)).unwrap();
+        let (kmers, prevalence, total_freq) = rank_vocabulary(std::slice::from_ref(&a), Some(3), VocabularyRanking::PrevalenceThenFrequency).unwrap();
         assert_eq!(kmers, vec![5, 4, 3], "top 3 by total_freq, best first");
         assert_eq!(prevalence, vec![1, 1, 1]);
         assert_eq!(total_freq, vec![5, 4, 3]);
@@ -420,7 +526,7 @@ mod tests {
     fn rank_vocabulary_top_n_larger_than_distinct_count_returns_everything() {
         let a = build_table("rank_topn_oversized_a", 4, &[1, 2, 3]);
 
-        let (kmers, ..) = rank_vocabulary(std::slice::from_ref(&a), Some(1000)).unwrap();
+        let (kmers, ..) = rank_vocabulary(std::slice::from_ref(&a), Some(1000), VocabularyRanking::PrevalenceThenFrequency).unwrap();
         assert_eq!(kmers.len(), 3);
 
         cleanup(&[a]);
@@ -436,7 +542,7 @@ mod tests {
         let a = build_table("rank_topn_tiebreak_a", 4, &[1, 2, 3]);
         let b = build_table("rank_topn_tiebreak_b", 4, &[2, 1]);
 
-        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone()], Some(2)).unwrap();
+        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone()], Some(2), VocabularyRanking::PrevalenceThenFrequency).unwrap();
         assert_eq!(kmers, vec![1, 2], "kmer 3 (prevalence 1) must lose to the tied pair (prevalence 2)");
         assert_eq!(prevalence, vec![2, 2]);
         assert_eq!(total_freq, vec![2, 2]);
@@ -449,7 +555,7 @@ mod tests {
         let a = build_table("rank_empty_member_a", 4, &[]);
         let b = build_table("rank_empty_member_b", 4, &[7, 7]);
 
-        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone()], None).unwrap();
+        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone()], None, VocabularyRanking::PrevalenceThenFrequency).unwrap();
         assert_eq!(kmers, vec![7]);
         assert_eq!(prevalence, vec![1]);
         assert_eq!(total_freq, vec![2]);
@@ -462,7 +568,7 @@ mod tests {
         let a = build_table("rank_all_empty_a", 4, &[]);
         let b = build_table("rank_all_empty_b", 4, &[]);
 
-        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone()], None).unwrap();
+        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone()], None, VocabularyRanking::PrevalenceThenFrequency).unwrap();
         assert!(kmers.is_empty());
         assert!(prevalence.is_empty());
         assert!(total_freq.is_empty());
@@ -475,7 +581,7 @@ mod tests {
         let a = build_table("rank_mismatched_k_a", 4, &[1]);
         let b = build_table("rank_mismatched_k_b", 6, &[1]);
 
-        match rank_vocabulary(&[a.clone(), b.clone()], None) {
+        match rank_vocabulary(&[a.clone(), b.clone()], None, VocabularyRanking::PrevalenceThenFrequency) {
             Err(crate::error::FastDnaError::InvalidConfig { reason, .. }) => {
                 assert!(reason.contains('k'), "{reason}");
             }
@@ -515,12 +621,141 @@ mod tests {
             reference.into_iter().map(|(k, (prev, freq))| (k, prev, freq)).collect();
         expected.sort_unstable_by(|x, y| y.1.cmp(&x.1).then(y.2.cmp(&x.2)).then(x.0.cmp(&y.0)));
 
-        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone(), c.clone()], None).unwrap();
+        let (kmers, prevalence, total_freq) = rank_vocabulary(&[a.clone(), b.clone(), c.clone()], None, VocabularyRanking::PrevalenceThenFrequency).unwrap();
         let actual: Vec<(u64, u32, u32)> =
             kmers.iter().zip(&prevalence).zip(&total_freq).map(|((&k, &p), &f)| (k, p, f)).collect();
         assert_eq!(actual, expected);
 
         cleanup(&[a, b, c]);
+    }
+
+    // -- rank_vocabulary, BinaryInformativeness ----------------------------
+    //
+    // The ranking a presence/absence matrix needs (see
+    // `VocabularyRanking`'s doc comment). Its Python counterpart is
+    // `python/fastdna/sklearn.py::_select_vocabulary`'s `representation ==
+    // "presence"` branch, and `python/tests/test_review_findings_2026_09_
+    // 02.py` pins the defect that made the split necessary.
+
+    /// A cohort of `n_samples` tables where `kmer` is present in exactly
+    /// `prevalence` of them -- the shape every test below needs, with the
+    /// sample tables built through the real counting + export path like
+    /// every other test here.
+    fn cohort_with_prevalences(name: &str, n_samples: usize, kmer_prevalences: &[(u64, usize)]) -> Vec<PathBuf> {
+        (0..n_samples)
+            .map(|sample| {
+                let entries: Vec<u64> = kmer_prevalences
+                    .iter()
+                    .filter(|(_, prevalence)| sample < *prevalence)
+                    .map(|(kmer, _)| *kmer)
+                    .collect();
+                build_table(&format!("{name}_{sample}"), 4, &entries)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn binary_ranking_drops_kmers_present_in_every_sample() {
+        // kmer 1 is in all 4 samples: presence-encoded it is 1 in every
+        // row, variance zero. It must not appear at all -- not even last.
+        let paths = cohort_with_prevalences("binary_drop", 4, &[(1, 4), (2, 2), (3, 1)]);
+
+        let (kmers, prevalence, _) =
+            rank_vocabulary(&paths, None, VocabularyRanking::BinaryInformativeness).unwrap();
+
+        assert_eq!(kmers, vec![2, 3], "the all-present k-mer must be dropped, not ranked last");
+        assert_eq!(prevalence, vec![2, 1]);
+
+        cleanup(&paths);
+    }
+
+    #[test]
+    fn binary_ranking_prefers_half_present_over_nearly_universal() {
+        // Informativeness is min(prevalence, n - prevalence) over n = 4:
+        // kmer 2 (prevalence 2) scores 2; kmer 1 (prevalence 3) and kmer 3
+        // (prevalence 1) both score 1 and tie, broken by ascending kmer.
+        // Note kmer 1 would have ranked FIRST under
+        // PrevalenceThenFrequency -- that inversion is the whole point.
+        let paths = cohort_with_prevalences("binary_half", 4, &[(1, 3), (2, 2), (3, 1)]);
+
+        let (kmers, prevalence, _) =
+            rank_vocabulary(&paths, None, VocabularyRanking::BinaryInformativeness).unwrap();
+
+        assert_eq!(kmers, vec![2, 1, 3]);
+        assert_eq!(prevalence, vec![2, 3, 1], "the reported tallies stay the real ones");
+
+        cleanup(&paths);
+    }
+
+    #[test]
+    fn binary_ranking_ignores_total_freq_when_breaking_ties() {
+        // Both k-mers sit at prevalence 1 of 2, so informativeness ties.
+        // kmer 7 carries 100x the depth of kmer 3 and still ranks behind
+        // it: depth is exactly what presence encoding exists to ignore,
+        // so the tie-break is the k-mer's own encoding, ascending.
+        let a = build_table("binary_tie_a", 4, &{
+            let mut v = vec![3];
+            v.extend(std::iter::repeat_n(7, 100));
+            v
+        });
+        let b = build_table("binary_tie_b", 4, &[9, 9]);
+
+        let (kmers, _, total_freq) =
+            rank_vocabulary(&[a.clone(), b.clone()], None, VocabularyRanking::BinaryInformativeness).unwrap();
+
+        assert_eq!(kmers, vec![3, 7, 9]);
+        assert_eq!(total_freq, vec![1, 100, 2], "depth is reported, just not ranked on");
+
+        cleanup(&[a, b]);
+    }
+
+    #[test]
+    fn binary_ranking_returns_fewer_than_top_n_when_the_informative_set_is_smaller() {
+        // The reason the constants are dropped rather than ranked last: a
+        // generous top_n would otherwise refill the vocabulary with
+        // exactly the all-ones columns this ranking exists to exclude.
+        let paths = cohort_with_prevalences("binary_short", 3, &[(1, 3), (2, 3), (3, 1)]);
+
+        let (kmers, ..) =
+            rank_vocabulary(&paths, Some(50), VocabularyRanking::BinaryInformativeness).unwrap();
+
+        assert_eq!(kmers, vec![3], "a short vocabulary is the honest answer here");
+
+        cleanup(&paths);
+    }
+
+    #[test]
+    fn binary_ranking_top_n_keeps_the_most_informative_n() {
+        // The bounded-heap path (Some(top_n)) must select on the same key
+        // the full-sort path does -- n = 4, so kmer 2 (prevalence 2)
+        // scores 2 and outranks both prevalence-3 and prevalence-1 k-mers.
+        let paths = cohort_with_prevalences("binary_topn", 4, &[(1, 3), (2, 2), (3, 1)]);
+
+        let (kmers, ..) =
+            rank_vocabulary(&paths, Some(1), VocabularyRanking::BinaryInformativeness).unwrap();
+
+        assert_eq!(kmers, vec![2]);
+
+        cleanup(&paths);
+    }
+
+    #[test]
+    fn binary_ranking_of_a_single_sample_falls_back_to_prevalence_ranking() {
+        // Every k-mer in a one-sample cohort is trivially "present in
+        // every sample", so applying the binary rule literally would
+        // return nothing. Below two samples there is no variance to rank
+        // by, so the count-shaped rule runs instead -- the identical
+        // exception `_select_vocabulary` makes.
+        let a = build_table("binary_single", 4, &[1, 1, 1, 2]);
+
+        let (kmers, prevalence, total_freq) =
+            rank_vocabulary(std::slice::from_ref(&a), None, VocabularyRanking::BinaryInformativeness).unwrap();
+
+        assert_eq!(kmers, vec![1, 2], "ranked by depth, exactly as PrevalenceThenFrequency would");
+        assert_eq!(prevalence, vec![1, 1]);
+        assert_eq!(total_freq, vec![3, 1]);
+
+        cleanup(&[a]);
     }
 
     // -- project_onto_vocabulary -------------------------------------------
@@ -652,7 +887,7 @@ mod tests {
         let a = build_table("roundtrip_a", 4, &[1, 1, 2, 3]);
         let b = build_table("roundtrip_b", 4, &[1, 2, 2, 4]);
 
-        let (vocabulary, ..) = rank_vocabulary(&[a.clone(), b.clone()], Some(2)).unwrap();
+        let (vocabulary, ..) = rank_vocabulary(&[a.clone(), b.clone()], Some(2), VocabularyRanking::PrevalenceThenFrequency).unwrap();
         // kmer 1: prevalence 2, total_freq 3. kmer 2: prevalence 2,
         // total_freq 3. Tied -> ascending kmer -> [1, 2].
         assert_eq!(vocabulary, vec![1, 2]);

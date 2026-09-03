@@ -2292,10 +2292,31 @@ fn cohort_presence_matrix(
     Ok(dict.into())
 }
 
+/// Maps `rank_cohort_vocabulary`'s `ranking` string onto the Rust enum.
+///
+/// Rejects anything else as `InvalidConfig` rather than falling back to a
+/// default: the two rankings disagree about which k-mers are worth keeping
+/// at all, so a typo that quietly selected the other one would return a
+/// well-formed vocabulary that answers a different question -- the failure
+/// mode `python/tests/test_review_findings_2026_09_02.py` exists to pin.
+fn parse_vocabulary_ranking(ranking: &str) -> PyResult<cohort_vocab::VocabularyRanking> {
+    match ranking {
+        "prevalence" => Ok(cohort_vocab::VocabularyRanking::PrevalenceThenFrequency),
+        "binary" => Ok(cohort_vocab::VocabularyRanking::BinaryInformativeness),
+        other => Err(FastDnaError::InvalidConfig {
+            parameter: "ranking",
+            reason: format!("expected \"prevalence\" or \"binary\", got {other:?}"),
+        }
+        .into()),
+    }
+}
+
 /// The schema of `rank_cohort_vocabulary`'s returned `pyarrow.RecordBatch`:
 /// one row per selected k-mer, already in ranked (best-first) order -- see
-/// `cohort_vocab::rank_vocabulary`'s own doc comment for the ranking rule
-/// (`prevalence` desc, `total_freq` desc, `kmer_u64` asc).
+/// `cohort_vocab::rank_vocabulary`'s own doc comment for the two ranking
+/// rules its `ranking` argument selects between. `prevalence` and
+/// `total_freq` are the real per-k-mer tallies under either one, even when
+/// the ranking that ran did not order by them.
 fn cohort_vocab_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("kmer_u64", DataType::UInt64, false),
@@ -2321,17 +2342,33 @@ fn cohort_vocab_schema() -> Arc<Schema> {
 /// own docstring for why `disk_backed` exists and how it interacts with
 /// `chunk_size`.
 ///
+/// `ranking` names which of `cohort_vocab::VocabularyRanking`'s two rules
+/// orders the result: `"prevalence"` (the default, and the rule a
+/// count-valued matrix wants) or `"binary"` (the rule a presence/absence
+/// matrix wants, which also drops the k-mers present in every sample --
+/// see `parse_vocabulary_ranking`). A string rather than an integer or a
+/// bool because this crosses into Python, where the caller
+/// (`KmerVectorizer._learn_vocabulary_disk_backed`) already has
+/// `representation` as a string and a wrong value should fail by name
+/// rather than by silently meaning the other rule.
+///
 /// Released under `py.allow_threads` like every other bulk operation in
 /// this module (`ktab_union` and friends): merging several real k-mer
 /// tables is I/O- and CPU-bound work with nothing Python-specific in it,
 /// and holding the GIL for it would freeze the calling interpreter for a
 /// cohort-sized run.
 #[pyfunction]
-#[pyo3(signature = (table_paths, top_n=None))]
-fn rank_cohort_vocabulary(py: Python<'_>, table_paths: Vec<String>, top_n: Option<usize>) -> PyResult<PyObject> {
+#[pyo3(signature = (table_paths, top_n=None, ranking="prevalence"))]
+fn rank_cohort_vocabulary(
+    py: Python<'_>,
+    table_paths: Vec<String>,
+    top_n: Option<usize>,
+    ranking: &str,
+) -> PyResult<PyObject> {
+    let ranking = parse_vocabulary_ranking(ranking)?;
     let paths: Vec<PathBuf> = table_paths.into_iter().map(PathBuf::from).collect();
     let (kmers, prevalence, total_freq) =
-        py.allow_threads(|| cohort_vocab::rank_vocabulary(&paths, top_n))?;
+        py.allow_threads(|| cohort_vocab::rank_vocabulary(&paths, top_n, ranking))?;
 
     let batch = in_memory_batch(
         cohort_vocab_schema(),

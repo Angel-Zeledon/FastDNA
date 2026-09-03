@@ -16,6 +16,22 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **Python: `fastdna.sklearn.EmptyVocabularyWarning`** -- `fit()` avisa
+  cuando la regla de `presence` no deja ningún feature en pie, es decir
+  cuando *toda* k-mer de la cohorte está en todas las muestras. Nombrar la
+  causa en el momento del `fit()` evita que el síntoma aparezca varias
+  llamadas después como una matriz `(n_samples, 0)` y un error de
+  scikit-learn que no menciona ni la cohorte ni el motivo. Se exporta en
+  `fastdna.sklearn.__all__` (parte del contrato) para que se pueda filtrar
+  o convertir en error.
+
+- **Rust: `cohort_vocab::VocabularyRanking`** -- las dos reglas de ranking
+  de vocabulario, explícitas como parámetro de `rank_vocabulary` en vez de
+  constantes, precisamente para que la ruta en memoria (NumPy) y la ruta
+  en disco (Rust) no puedan divergir. `rank_cohort_vocabulary` gana un
+  tercer argumento `ranking` (`"prevalence"` por defecto, `"binary"` para
+  presencia) que rechaza cualquier otro valor en vez de caer al default.
+
 - **Python: nuevo módulo `fastdna.design` con `check_design()`** -- responde
   si un experimento *puede* producir un resultado, antes de correrlo. Solo
   necesita la forma del diseño (etiquetas, número de features, grupos,
@@ -686,6 +702,54 @@ La superficie con compatibilidad garantizada es:
     y los rechazos de validación cruzada de flags).
 
 ### Fixed
+
+- **Python: `KmerVectorizer` con `representation="presence"` (el default)
+  seleccionaba exactamente las k-mers constantes.** Dos decisiones bien
+  razonadas por separado y degeneradas juntas. `_select_vocabulary` rankeaba
+  por prevalencia descendente -- una k-mer presente en todas las muestras es
+  una señal más confiable que una con profundidad enorme en una sola --, y
+  `presence` codifica 0/1 para ser inmune a la profundidad de secuenciación.
+  Juntas garantizan que el tope del ranking sea el conjunto de k-mers
+  presentes en *todas* las muestras, cuyo valor codificado es 1 en todas
+  ellas: varianza cero, información cero. Medido sobre la primera cohorte
+  real del estudio (80 genomas de *S. pneumoniae*, k=31): **460.795 k-mers
+  presentes en los 80**. Con `top_features=500` (lo que usa la encuesta) o
+  10.000 (el ejemplo de la propia docstring), la matriz que llegaba al
+  clasificador era literalmente de unos.
+
+  Lo que producía aguas abajo, y por qué ningún test lo alcanzaba:
+  `fastdna.audit()` devolvía `score_random = 0.5000`,
+  `score_lineage = 0.5000`, `gap = 0.0000` -- un informe con todos sus
+  campos en rango que se lee como "esta cohorte no tiene fuga". Misma firma
+  que los otros ocho defectos que encontró esta validación: *la salida
+  equivocada estaba bien formada*.
+
+  El arreglo va en la regla de ranking, no en un filtro añadido después:
+  descartar solo las constantes promovería las presentes en 79 de 80
+  muestras, cuya varianza es 0,0123. Para un feature binario la
+  informatividad *es* la varianza, máxima en prevalencia n/2, así que
+  `presence` rankea ahora por `min(prevalence, n_samples - prevalence)` y
+  descarta de raíz las constantes -- el mismo criterio de *minor sample
+  count* (el análogo del conteo de alelo menor) que `fastdna.gwas` ya
+  aplicaba al truncar por `max_kmers`. Las representaciones con valor de
+  conteo (`count`/`relative`/`clr`) conservan el ranking por prevalencia:
+  ahí una k-mer universal sí varía, en profundidad, y el argumento original
+  sigue en pie. El desempate de `presence` es por `kmer_u64` ascendente y
+  deliberadamente **no** por `total_freq`: la profundidad es justo lo que
+  esta codificación existe para ignorar. Con menos de dos muestras no hay
+  varianza que rankear y se aplica la regla de conteo.
+
+  Ambos caminos cambian a la vez: la ruta `disk_backed=True` lo implementa
+  en Rust (`cohort_vocab::VocabularyRanking`, seleccionado por el argumento
+  `ranking` nuevo de `_core.rank_cohort_vocabulary`), y los tests de
+  equivalencia disk-backed/in-memory de `test_sklearn.py` fallan si las dos
+  implementaciones se separan.
+
+  Efecto medido hoy sobre un fixture independiente
+  (`python/tests/test_genomic_model.py`: 12 muestras, marcador de 40 pb,
+  `top_features=500`): con la regla anterior la matriz era de unos y
+  `P(positivo | positivo retenido)` daba **0,5000 exacto**; con la nueva da
+  **0,98**. Fijado por `python/tests/test_review_findings_2026_09_02.py`.
 
 - **Python: `fastdna.datasets.load_amr()` descargaba en silencio el 26% de
   cada genoma.** El endpoint `genome_sequence` de BV-BRC está respaldado por

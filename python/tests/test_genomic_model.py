@@ -69,6 +69,22 @@ _OTHER_REFERENCE = _random_sequence(3000, random.Random(99))
 _MARKER = _random_sequence(40, random.Random(777))
 _MARKER_OFFSET = 60  # position within each 150 bp read the marker overwrites
 VEC_K = 21
+#: A real feature budget, not `top_features=None`, because the marker is
+#: not the only thing these samples differ by: at a 1% mutation rate each
+#: replicate carries thousands of private k-mers, and an unbounded
+#: vocabulary hands the classifier ~63,000 features for 12 samples --
+#: enough that the 20 marker k-mers, the only signal a held-out sample
+#: shares, are diluted to a coin flip (measured on this fixture:
+#: P(positive | held-out positive) = 0.49 unbounded, 0.98 at 500 features).
+#: 500 is above the 169 k-mers that occur in exactly the 6 positives, so
+#: the budget never has to choose among them.
+#:
+#: The budget is also what makes this fixture sensitive to the ranking
+#: rule at all: with the pre-2026-09-02 prevalence-first ranking, these
+#: same 500 features were the 500 k-mers present in ALL 12 samples,
+#: presence-encoded to a matrix of literal ones, and the model scored
+#: exactly 0.5 (see python/tests/test_review_findings_2026_09_02.py).
+VEC_TOP_FEATURES = 500
 FLAGGER_K = 15  # matches test_anomaly.py's own proven-working parameters
 FLAGGER_SKETCH_SIZE = 200
 
@@ -111,7 +127,7 @@ def labeled_cohort(tmp_path):
 @pytest.fixture
 def fitted_model(labeled_cohort):
     paths, y = labeled_cohort
-    vectorizer = KmerVectorizer(k=VEC_K, min_count=1, top_features=None)
+    vectorizer = KmerVectorizer(k=VEC_K, min_count=1, top_features=VEC_TOP_FEATURES)
     X = vectorizer.fit_transform(paths, y)
     estimator = LogisticRegression(max_iter=1000).fit(X, y)
     return GenomicModel(
@@ -126,7 +142,7 @@ def fitted_model(labeled_cohort):
 
 def test_construction_rejects_an_estimator_with_no_predict(labeled_cohort):
     paths, y = labeled_cohort
-    vectorizer = KmerVectorizer(k=VEC_K, top_features=None).fit(paths)
+    vectorizer = KmerVectorizer(k=VEC_K, top_features=VEC_TOP_FEATURES).fit(paths)
 
     with pytest.raises(TypeError, match="predict"):
         GenomicModel(object(), vectorizer, paths)
@@ -148,7 +164,7 @@ def test_construction_requires_at_least_four_training_paths(tmp_path, labeled_co
     # single-class LogisticRegression error.
     two_paths = [paths[0], paths[6]]
     two_labels = np.array([y[0], y[6]])
-    vectorizer = KmerVectorizer(k=VEC_K, top_features=None).fit(two_paths)
+    vectorizer = KmerVectorizer(k=VEC_K, top_features=VEC_TOP_FEATURES).fit(two_paths)
     X = vectorizer.transform(two_paths)
     estimator = LogisticRegression().fit(X, two_labels)
 
@@ -264,7 +280,7 @@ def test_fit_classmethod_produces_a_working_model(tmp_path, labeled_cohort):
     model = GenomicModel.fit(
         paths,
         y,
-        vectorizer=KmerVectorizer(k=VEC_K, top_features=None),
+        vectorizer=KmerVectorizer(k=VEC_K, top_features=VEC_TOP_FEATURES),
         estimator=LogisticRegression(max_iter=1000),
         k=FLAGGER_K,
         sketch_size=FLAGGER_SKETCH_SIZE,
@@ -284,7 +300,7 @@ def test_fit_classmethod_does_not_mutate_the_estimator_passed_in(labeled_cohort)
     GenomicModel.fit(
         paths,
         y,
-        vectorizer=KmerVectorizer(k=VEC_K, top_features=None),
+        vectorizer=KmerVectorizer(k=VEC_K, top_features=VEC_TOP_FEATURES),
         estimator=original_estimator,
         k=FLAGGER_K,
         sketch_size=FLAGGER_SKETCH_SIZE,

@@ -57,7 +57,7 @@ from sklearn.utils.validation import check_is_fitted
 import fastdna
 from fastdna import _column_as_array, _core, _decode_kmers
 
-__all__ = ["KmerVectorizer", "DepthConfoundingWarning"]
+__all__ = ["KmerVectorizer", "DepthConfoundingWarning", "EmptyVocabularyWarning"]
 
 _VALID_REPRESENTATIONS = ("presence", "count", "relative", "clr")
 
@@ -66,6 +66,24 @@ class DepthConfoundingWarning(UserWarning):
     """Sequencing depth varies enough across samples that a model trained
     on raw counts (`representation="count"`) may be learning depth instead
     of biology. See `KmerVectorizer`'s `representation` parameter."""
+
+
+class EmptyVocabularyWarning(UserWarning):
+    """`fit()` selected no features at all.
+
+    Reachable only under `representation="presence"`, whose ranking drops
+    the k-mers present in every sample because their 0/1 column is constant
+    (see `KmerVectorizer._select_vocabulary`). An empty vocabulary means
+    *every* k-mer in the cohort was such a k-mer -- the samples share all
+    of their k-mer content at this `k` and `min_count`.
+
+    Warned about rather than tolerated silently because the alternative is
+    an `(n_samples, 0)` matrix, which fails several rows further down the
+    pipeline with an error that names neither the cohort nor the cause. The
+    usual reasons are a `k` small enough that every sample covers the whole
+    k-mer space, a cohort whose samples are duplicates of each other, or a
+    handful of reads per sample -- not a bug in the ranking.
+    """
 
 
 class _CohortCounts(NamedTuple):
@@ -263,6 +281,14 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
         union of observed k-mers is already modest; the numeric default
         exists for the common case where it is not, as a hard limit on
         matrix width (matching the design doc's own default of 10,000).
+
+        Which k-mers fill the budget depends on `representation`, because
+        the two encodings disagree about what makes a feature useful --
+        see that parameter below and `_select_vocabulary` for the two
+        rules. Under `"presence"` the vocabulary may come back *shorter*
+        than `top_features`: the k-mers present in every sample are
+        dropped, and if the cohort has fewer informative k-mers than the
+        budget, that shorter vocabulary is the whole informative set.
     threads : int or None, default None
         Forwarded to `fastdna.count()` for each sample; `None` uses the
         core's own default thread count per call.
@@ -424,7 +450,15 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
         observed in this sample or not) and is immune to sequencing depth
         by construction -- the default because a linear model over raw
         counts can otherwise separate samples by depth rather than
-        biology (see the module-level rationale in `__init__`).
+        biology (see the module-level rationale in `__init__`). It also
+        selects a different vocabulary: under a 0/1 encoding a k-mer
+        present in every sample is a constant column, so `"presence"`
+        ranks by `min(prevalence, n_samples - prevalence)` -- the feature's
+        variance, maximised at prevalence n/2 -- and drops the constants,
+        while the count-valued representations keep ranking by descending
+        prevalence, where universal presence is a virtue rather than a
+        degeneracy. `_select_vocabulary` documents both rules and why the
+        split exists.
         `"count"` is the raw per-sample frequency, and warns
         (`DepthConfoundingWarning`) when depth varies more than 3x across
         the fitted samples. `"relative"` divides each sample's counts by
@@ -522,8 +556,9 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
         TypeError
             If `X` is a single path rather than an iterable of them.
         ValueError
-            If `X` is empty, contains a duplicate path, or `self.top_features`
-            is not a positive int or None.
+            If `X` is empty, contains a duplicate path, `self.top_features`
+            is not a positive int or None, or `self.representation` is not
+            one of the four recognised values.
         """
         paths = _validate_paths(X, "fit")
         if not paths:
@@ -545,6 +580,18 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
             not isinstance(self.chunk_size, (int, np.integer)) or isinstance(self.chunk_size, bool) or self.chunk_size <= 0
         ):
             raise _core.InvalidConfigError(f"chunk_size must be a positive int or None, got {self.chunk_size!r}")
+        if self.representation not in _VALID_REPRESENTATIONS:
+            # Checked at fit time, not only in `_project`/`_project_disk_
+            # backed` where the value is finally *used*: since the
+            # vocabulary rule itself now depends on `representation` (see
+            # `_select_vocabulary`), an unrecognised value would otherwise
+            # take the count-shaped branch by default and produce a
+            # perfectly well-formed vocabulary chosen by the wrong rule,
+            # only to raise several minutes of counting later.
+            raise ValueError(
+                f"representation must be one of {list(_VALID_REPRESENTATIONS)}, "
+                f"got {self.representation!r}"
+            )
         if self.disk_backed and self.chunk_size is not None:
             raise _core.InvalidConfigError(
                 "disk_backed=True and chunk_size are mutually exclusive: disk_backed already "
@@ -667,22 +714,30 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
         amount -- see `disk_backed`'s docstring in `__init__` for the full
         comparison.
 
-        The ranking itself -- `(prevalence desc, total_freq desc, kmer_u64
-        asc)` -- is `_select_vocabulary`'s exact rule, reimplemented
-        Rust-side rather than called into from here: `_select_vocabulary`
-        operates on already-materialized NumPy arrays, and this path's
-        entire purpose is to never materialize the cohort that way. See
-        `cohort_vocab::rank_vocabulary`'s own doc comment for why it is a
-        drop-in replacement for that ranking, not a new policy -- the
-        result assigned below is used exactly as `_select_vocabulary`'s
-        own output would be.
+        The ranking itself is `_select_vocabulary`'s exact rule --
+        including its split by `representation` -- reimplemented Rust-side
+        rather than called into from here: `_select_vocabulary` operates on
+        already-materialized NumPy arrays, and this path's entire purpose
+        is to never materialize the cohort that way. `ranking=` below
+        selects the same rule `_select_vocabulary` would have applied to
+        this `representation`: `"binary"` (rank by `min(prevalence,
+        n_samples - prevalence)`, drop the k-mers present in every sample)
+        for presence encoding, `"prevalence"` (prevalence desc, total_freq
+        desc, kmer_u64 asc) for the count-valued ones. See
+        `cohort_vocab::rank_vocabulary`'s own doc comment for why each is a
+        drop-in replacement for that rule, not a new policy -- the result
+        assigned below is used exactly as `_select_vocabulary`'s own output
+        would be, and `python/tests/test_sklearn.py`'s disk-backed
+        equivalence tests fail if the two implementations drift apart.
         """
+        ranking = "binary" if self.representation == "presence" else "prevalence"
         with self._disk_backed_sample_tables(keys) as table_paths:
-            batch = _core.rank_cohort_vocabulary(table_paths, self.top_features)
+            batch = _core.rank_cohort_vocabulary(table_paths, self.top_features, ranking)
 
         self.vocabulary_ = np.asarray(batch.column("kmer_u64"))
         self._feature_sequences_ = _decode_kmers(self.vocabulary_, self.k)
         self.n_features_in_ = len(self.vocabulary_)
+        self._warn_if_vocabulary_is_empty(len(keys))
 
     def _learn_vocabulary(self, counts):
         """Ranks the cohort's k-mers and assigns `vocabulary_`,
@@ -731,7 +786,7 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
         # a Python `+=` loop over the same integers would have produced.
         total_freq = np.bincount(row_code, weights=np.asarray(counts.frequencies), minlength=n_distinct)
 
-        self._select_vocabulary(distinct, prevalence, total_freq)
+        self._select_vocabulary(distinct, prevalence, total_freq, len(counts.row_counts))
 
     def _learn_vocabulary_streaming(self, keys):
         """The `chunk_size`-chunked equivalent of `_learn_vocabulary`:
@@ -812,30 +867,74 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
                 minlength=n_running,
             )
 
-        self._select_vocabulary(running_kmers, running_prevalence, running_total_freq)
+        self._select_vocabulary(running_kmers, running_prevalence, running_total_freq, len(keys))
 
-    def _select_vocabulary(self, distinct, prevalence, total_freq):
-        """Ranks `distinct` k-mers by `(prevalence, total_freq)` and
-        assigns `vocabulary_`, `_feature_sequences_` and `n_features_in_`
-        -- the one implementation of the selection rule shared by
-        `_learn_vocabulary` (single pass) and `_learn_vocabulary_streaming`
-        (chunked), so which of the two ran is never visible in the result.
+    def _select_vocabulary(self, distinct, prevalence, total_freq, n_samples):
+        """Ranks `distinct` k-mers and assigns `vocabulary_`,
+        `_feature_sequences_` and `n_features_in_` -- the one
+        implementation of the selection rule shared by `_learn_vocabulary`
+        (single pass) and `_learn_vocabulary_streaming` (chunked), so which
+        of the two ran is never visible in the result.
 
-        Prevalence (a.k.a. document frequency), not summed raw frequency,
-        is the primary selection criterion -- matching the design doc's
-        own choice (§7.6: "Ranked by descending prevalence"). A k-mer
-        present at moderate depth in *every* training sample is a more
-        trustworthy, sample-general signal than one present at enormous
-        depth in a single sample and absent from the rest (a PCR
-        duplicate, a contaminant, a library-prep artifact unique to one
-        file) -- the latter would dominate a total-frequency ranking
-        without being a feature that generalizes across samples at all,
-        which is the entire purpose of selecting features in the first
-        place. Ties in prevalence are broken by total_freq (still a
-        meaningful tiebreaker: among equally prevalent k-mers, more total
-        signal is preferable), and remaining ties by the raw `kmer_u64`
-        value purely for determinism, so `fit()` on identical input
-        always yields an identical `vocabulary_`.
+        Which rule runs depends on `self.representation`, because the two
+        encodings do not agree on what makes a k-mer worth keeping. The
+        `disk_backed` path implements the identical pair Rust-side
+        (`cohort_vocab::VocabularyRanking`, selected by
+        `_learn_vocabulary_disk_backed`'s `ranking=` argument), and
+        `python/tests/test_sklearn.py`'s disk-backed equivalence tests fail
+        if the two ever disagree.
+
+        **Count-valued representations** (`"count"`, `"relative"`, `"clr"`)
+        rank by prevalence (a.k.a. document frequency), not by summed raw
+        frequency -- matching the design doc's own choice (§7.6: "Ranked by
+        descending prevalence"). A k-mer present at moderate depth in
+        *every* training sample is a more trustworthy, sample-general
+        signal than one present at enormous depth in a single sample and
+        absent from the rest (a PCR duplicate, a contaminant, a
+        library-prep artifact unique to one file) -- the latter would
+        dominate a total-frequency ranking without being a feature that
+        generalizes across samples at all, which is the entire purpose of
+        selecting features in the first place. Ties in prevalence are
+        broken by total_freq (still a meaningful tiebreaker: among equally
+        prevalent k-mers, more total signal is preferable), and remaining
+        ties by the raw `kmer_u64` value purely for determinism, so `fit()`
+        on identical input always yields an identical `vocabulary_`.
+
+        **`"presence"`** (the default) ranks by `min(prevalence, n_samples
+        - prevalence)` instead, and drops the k-mers present in every
+        sample outright. Under a 0/1 encoding that quantity *is* the
+        feature's variance up to a constant: a k-mer present in all
+        `n_samples` samples encodes to 1 in every row, carries exactly no
+        information, and a k-mer present in half of them carries the most
+        a binary feature can. This is the same minor-sample-count rule --
+        the minor-allele-count analogue -- that `fastdna.gwas`'s own
+        `max_kmers` truncation already ranks by, for the same reason.
+
+        The two defaults were individually well-reasoned and jointly
+        degenerate before this split existed: prevalence-first ranking puts
+        the core genome at the top, presence encoding makes the core genome
+        constant, and a `top_features` budget smaller than the core genome
+        (460,795 k-mers in all 80 genomes of the study's first real cohort)
+        therefore produced a matrix of literal ones. `audit()` reported
+        that as `score_random = score_lineage = 0.5000, gap = 0.0000` --
+        well-formed, in range, and meaning nothing. See
+        `python/tests/test_review_findings_2026_09_02.py`, which pins it.
+
+        Dropping the constants, rather than merely ranking them last,
+        is what makes the guarantee hold at any budget: ranked last, a
+        `top_features` larger than the informative set refills the
+        vocabulary with exactly the features the rule exists to exclude.
+        The returned vocabulary is therefore sometimes shorter than
+        `top_features`, which is the honest answer -- there were only that
+        many features that could inform anything.
+
+        With `n_samples < 2` the presence rule is skipped: variance across
+        samples needs at least two samples to exist, and every k-mer in a
+        one-sample cohort is trivially "present in every sample", so
+        applying it there would return an empty vocabulary for a question
+        (which of this sample's k-mers matter) that prevalence-then-
+        frequency still answers sensibly. `cohort_vocab::rank_vocabulary`
+        makes the identical exception.
 
         Both tallies are computed with one hash pass over the stacked
         cohort rather than a Python loop: `dictionary_encode` assigns each
@@ -855,6 +954,12 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
             Sample count for each entry in `distinct`.
         total_freq : np.ndarray
             Summed raw frequency for each entry in `distinct`.
+        n_samples : int
+            How many samples were fitted. Not derivable from `prevalence`
+            (`prevalence.max()` is only `n_samples` when some k-mer happens
+            to be in every sample), and the presence rule above is defined
+            in terms of it, so it is passed in by each caller from the
+            cohort it just tallied.
 
         Returns
         -------
@@ -862,9 +967,24 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
             Sets `self.vocabulary_`, `self._feature_sequences_`, and
             `self.n_features_in_`.
         """
-        # `lexsort` takes its primary key last, so this is exactly the
-        # `(-prevalence, -total_freq, kmer)` ordering described above.
-        ranked = np.lexsort((distinct, -total_freq, -prevalence))
+        if self.representation == "presence" and n_samples > 1:
+            # Positions into `distinct`, so the `informativeness == 0`
+            # entries (present in every sample) are gone before any
+            # top_features cap is applied rather than after it.
+            informativeness = np.minimum(prevalence, n_samples - prevalence)
+            informative = np.flatnonzero(informativeness)
+            # `lexsort` takes its primary key last: informativeness desc,
+            # ties by `kmer_u64` asc. Deliberately NOT by total_freq --
+            # depth is the quantity presence encoding exists to ignore, and
+            # tie-breaking on it would concentrate the vocabulary in
+            # whichever locus happened to be sequenced deepest.
+            ranked = informative[
+                np.lexsort((distinct[informative], -informativeness[informative]))
+            ]
+        else:
+            # `lexsort` takes its primary key last, so this is exactly the
+            # `(-prevalence, -total_freq, kmer)` ordering described above.
+            ranked = np.lexsort((distinct, -total_freq, -prevalence))
         if self.top_features is not None:
             ranked = ranked[: self.top_features]
 
@@ -880,6 +1000,36 @@ class KmerVectorizer(TransformerMixin, BaseEstimator):
         # thousand of its rows.
         self._feature_sequences_ = _decode_kmers(self.vocabulary_, self.k)
         self.n_features_in_ = len(self.vocabulary_)
+        self._warn_if_vocabulary_is_empty(n_samples)
+
+    def _warn_if_vocabulary_is_empty(self, n_samples):
+        """Warns when `fit()` selected nothing, naming why.
+
+        Called from both places a vocabulary is assigned
+        (`_select_vocabulary` for the in-memory and chunked paths,
+        `_learn_vocabulary_disk_backed` for the Rust-side one) so the two
+        cannot diverge on whether the user hears about it.
+
+        Only the presence rule can produce this: it is the only one that
+        drops candidates (the constants), so under any other
+        representation an empty vocabulary means an empty cohort, which
+        `_validated_fit_paths` already rejected.
+        """
+        if len(self.vocabulary_) or self.representation != "presence" or n_samples < 2:
+            return
+        warnings.warn(
+            f"representation='presence' selected 0 features: every k-mer counted across "
+            f"these {n_samples} samples is present in all of them, so every column would "
+            f"have been constant (see EmptyVocabularyWarning). transform() will return an "
+            f"(n_samples, 0) matrix. Raise k above {self.k} so k-mers become sample-"
+            f"specific, check the samples are not duplicates of one another, or use "
+            f"representation='count' if depth itself is the signal.",
+            EmptyVocabularyWarning,
+            # fit()/fit_transform() -> _learn_vocabulary* -> here (the
+            # disk-backed path has the same depth), so 3 frames out is the
+            # caller who wrote the fit() call.
+            stacklevel=3,
+        )
 
     def _project(self, counts, n_samples):
         """The sparse `(n_samples, len(vocabulary_))` matrix for an
