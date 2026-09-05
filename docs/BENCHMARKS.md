@@ -377,6 +377,33 @@ whole signature space is narrower than the bin count, there is nothing for
 any packing to spread. What can gate it is the balance the packing actually
 achieves on the warm-up sample, which is measurable before counting starts.
 
+### After the promotion: what `auto` does now
+
+`auto` measures that balance on the first 20,000 records and refuses binned
+above `pipeline::MAX_ACCEPTABLE_BIN_SKEW` (3.0). The two populations are a
+factor of 27 apart, so the threshold is not a fine judgement:
+
+| input | measured balance | strategy `auto` picks | time | peak RSS |
+|---|---:|---|---:|---:|
+| 2.14 GB shotgun | 1.20x | `binned` | **9.88 s** | 3.43 GB |
+| 392 MB shotgun | 1.21x | `binned` | 1.55 s | 978 MB |
+| 734 MB amplicon-shaped | 32.71x | `in-memory` | 0.85 s | 693 MB |
+
+Against the same runs before the promotion, on the same machine and files:
+the 2.14 GB shotgun took **24.10 s at 7.31 GB**, so the default path is now
+**2.4x faster at 47% of the memory**, with byte-identical Parquet output.
+The amplicon case is faster too (0.85 s against 2.20 s), for a different
+reason: `available_system_memory_bytes` had no macOS implementation, so
+every Mac was budgeted at a flat 4 GiB regardless of its real memory, and
+that budget alone was routing a run that fits comfortably in RAM to the disk
+strategy. It now reads `hw.memsize`.
+
+Both numbers below the headline are worth keeping in view: the sampling
+costs one bounded prefix read (20,000 records, replayed into the run rather
+than re-read), and the balance it measured is printed on the `Strategy Used`
+line so a run that was announced as `binned` and finished as something else
+says why.
+
 ## Worker-buffer bound: measured effect by input shape
 
 `KmerCounter` bounds each worker's raw k-mer buffer at 2,000,000 buffered

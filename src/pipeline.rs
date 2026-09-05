@@ -719,6 +719,18 @@ pub struct StrategyDecision {
     /// built from this struct can say so, instead of silently attributing
     /// an environment-driven choice to the estimator.
     pub env_override_applied: bool,
+    /// True when neither `policy.strategy` nor `FASTDNA_STRATEGY` named a
+    /// strategy and the estimate chose on its own. Only an automatic choice
+    /// is second-guessed by the bin-balance check in
+    /// `process_stream_parallel_with_policy`: a caller who asked for a
+    /// strategy by name gets the one they asked for.
+    pub auto_selected: bool,
+    /// How lopsided the binned strategy's bins would be on this input's
+    /// first `BIN_BALANCE_SAMPLE_RECORDS` records
+    /// (`DynamicBinMap::predicted_skew`), when that was measured. `None`
+    /// when nothing measured it -- which is every run that did not have
+    /// binned as its automatic choice.
+    pub bin_balance: Option<f64>,
 }
 
 /// Decides which counting strategy a run should use, without running
@@ -779,12 +791,42 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
         _ => None,
     });
 
-    let (strategy, env_override_applied) = match policy.strategy {
-        Some(s) => (s, false),
+    // The binned strategy's predicted peak, for the same question asked of
+    // the in-memory one above. Evaluated at the defaults the binned path
+    // actually runs with (`BinnedConfig::new(k).sanitized()`), so the
+    // prediction is of the run that would happen, not of a hypothetical
+    // configuration.
+    let binned_defaults = BinnedConfig::new(config.k).sanitized();
+    let binned_peak_bytes = mem_estimate::estimate_binned_peak_bytes(
+        estimated_occurrences,
+        config.num_threads,
+        binned_defaults.num_bins,
+        binned_defaults.chunk_bytes,
+    );
+
+    let (strategy, env_override_applied, auto_selected) = match policy.strategy {
+        Some(s) => (s, false, false),
         None => match env_strategy {
-            Some(s) => (s, true),
+            Some(s) => (s, true, false),
             None => {
-                let auto = if policy.estimated_input_bytes.is_some() && in_memory_peak_bytes > budget_bytes {
+                // Binned first, when it fits: measured at 2.9x faster than
+                // the in-memory strategy and at half its peak on 840M
+                // occurrences (`docs/BENCHMARKS.md`), with byte-identical
+                // output. It is chosen only for an input whose size is
+                // known, exactly as `Disk` is -- a stream (`-`) gives the
+                // estimator nothing to work with, and the strategy that
+                // needs no estimate to be safe is the one that should run
+                // blind.
+                //
+                // This choice is provisional in a way the other two are
+                // not: `process_stream_parallel_with_policy` measures the
+                // input's actual bin balance before committing, and
+                // downgrades if the bins cannot spread. See
+                // `MAX_ACCEPTABLE_BIN_SKEW`.
+                let sized_input = policy.estimated_input_bytes.is_some();
+                let auto = if sized_input && binned_peak_bytes <= budget_bytes {
+                    CountStrategy::Binned
+                } else if sized_input && in_memory_peak_bytes > budget_bytes {
                     CountStrategy::Disk
                 } else {
                     CountStrategy::InMemory
@@ -793,7 +835,7 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
                 // budget -- when `policy.max_ram_bytes` is set it wins at
                 // the `.or(env_max_ram)` above and the env value had no
                 // effect on the decision.
-                (auto, policy.max_ram_bytes.is_none() && env_max_ram.is_some())
+                (auto, policy.max_ram_bytes.is_none() && env_max_ram.is_some(), true)
             }
         },
     };
@@ -809,10 +851,12 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
     // which makes that specific line the one they are most likely to be
     // reading, and the worst one to leave wrong.
     //
-    // The automatic decision above is deliberately untouched by this: it
-    // still branches on `in_memory_peak_bytes` alone, so which strategy
-    // `auto` picks is bit-identical to before. Only the reported figure
-    // moves, and only for a strategy `auto` cannot select.
+    // The automatic decision above used to be untouched by this -- it
+    // branched on `in_memory_peak_bytes` alone and `auto` could not select
+    // binned at all. That changed on 2026-09-05, once the binned model was
+    // calibrated against real runs and the bin-balance guard existed to
+    // catch the input shape it loses on; `auto` now evaluates both models
+    // and this line reports whichever strategy that produced.
     //
     // `Disk` keeps the in-memory model's figure. That is also not the right
     // number for it -- the whole point of spilling is that peak RSS stops
@@ -835,7 +879,18 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
         CountStrategy::InMemory | CountStrategy::Disk => in_memory_peak_bytes,
     };
 
-    StrategyDecision { strategy, estimated_occurrences, estimated_peak_bytes, budget_bytes, env_override_applied }
+    StrategyDecision {
+        strategy,
+        estimated_occurrences,
+        estimated_peak_bytes,
+        budget_bytes,
+        env_override_applied,
+        auto_selected,
+        // Never measured here: `resolve_strategy` is pure and reads no
+        // input. `process_stream_parallel_with_policy` fills this in when
+        // it samples.
+        bin_balance: None,
+    }
 }
 
 /// How a disk-strategy worker failed. A real `FastDnaError` (a spill-file
@@ -1354,6 +1409,163 @@ fn process_stream_parallel_binned<S: RecordSource>(
     Ok((counter, master_qc, total_reads))
 }
 
+/// Reads a bounded prefix of `reader` and reports how well the binned
+/// strategy's bins would balance on it, returning the records so the run can
+/// replay them (see [`Prefixed`]).
+///
+/// The measurement is `DynamicBinMap::predicted_skew` over exactly the
+/// histogram `process_stream_parallel_binned`'s own warm-up would build, so
+/// this cannot disagree with the map the run then uses. `None` means the
+/// sample was empty or had nothing to pack -- an input too small to say
+/// anything about, which the caller treats as "no objection".
+///
+/// Quality trimming and homopolymer compression are applied to the sampled
+/// sequences exactly as the counting path would, because both change which
+/// minimizers appear; the *records* are returned untouched, so replaying
+/// them through the real path trims them once, not twice.
+fn sample_bin_balance<S: RecordSource>(
+    reader: &mut S,
+    config: &PipelineConfig,
+) -> Result<(Vec<FastqRecord>, Option<f64>)> {
+    let binned_config = BinnedConfig::new(config.k).sanitized();
+    let mut histogram = SignatureHistogram::new();
+    let mut sampled: Vec<FastqRecord> = Vec::with_capacity(64);
+    let mut hpc_buf: Vec<u8> = Vec::new();
+    let mut trim_buf = FastqRecord::default();
+
+    for _ in 0..BIN_BALANCE_SAMPLE_RECORDS {
+        let mut record = FastqRecord::default();
+        match reader.next_record_into(&mut record) {
+            Ok(true) => {
+                trim_buf.clone_from(&record);
+                trim_buf.quality_trim_end(config.min_quality, config.quality_window);
+                let seq: &[u8] = if config.hpc {
+                    kmer::homopolymer_compress_into(&trim_buf.seq, &mut hpc_buf);
+                    &hpc_buf
+                } else {
+                    &trim_buf.seq
+                };
+                histogram.observe_sequence(seq, config.k, binned_config.m);
+                sampled.push(record);
+            }
+            Ok(false) => break,
+            // A read error here is the run's error: the same record would
+            // fail a moment later in the producer, and reporting it now
+            // keeps the failure attributable to the file rather than to the
+            // sampling.
+            Err(FastqReadError::Io(source_err)) => {
+                return Err(FastDnaError::Io { path: PathBuf::new(), source: source_err })
+            }
+            Err(FastqReadError::Malformed(reason)) => {
+                return Err(FastDnaError::MalformedFastq {
+                    path: PathBuf::new(),
+                    record: sampled.len() as u64 + 1,
+                    reason,
+                })
+            }
+        }
+    }
+
+    let balance = histogram.build_bin_map(binned_config.num_bins).predicted_skew();
+    Ok((sampled, balance))
+}
+
+/// Where a run goes when the binned strategy is refused: the same choice the
+/// automatic chooser would have made if binned had never been a candidate.
+fn fallback_from_binned(
+    policy: &MemoryPolicy,
+    decision: &StrategyDecision,
+    threads: usize,
+) -> CountStrategy {
+    let in_memory_peak =
+        mem_estimate::estimate_peak_bytes(decision.estimated_occurrences, threads);
+    if policy.estimated_input_bytes.is_some() && in_memory_peak > decision.budget_bytes {
+        CountStrategy::Disk
+    } else {
+        CountStrategy::InMemory
+    }
+}
+
+/// A record source that yields a buffer of already-read records first, then
+/// delegates to the source they came from.
+///
+/// Exists so the automatic chooser can *look* at the input before committing
+/// to a strategy: `process_stream_parallel_with_policy` reads a bounded
+/// prefix to measure how well the binned strategy's bins would balance
+/// (`bin_balance_of`), and whichever strategy then runs has to see those
+/// records too. Buffering them and replaying them is what makes the check
+/// free of a second pass -- the alternative, re-opening the input, does not
+/// work for a stream (`-`, stdin) at all.
+///
+/// `current_source` reports the *inner* source's position, which is ahead of
+/// the record being replayed while the buffer drains. That only affects
+/// which record number an I/O error names, and only for the first
+/// `BIN_BALANCE_SAMPLE_RECORDS` records of a run.
+struct Prefixed<S> {
+    buffered: std::vec::IntoIter<FastqRecord>,
+    inner: S,
+}
+
+impl<S: RecordSource> RecordSource for Prefixed<S> {
+    fn next_record(&mut self) -> crate::fastq::ReadResult<Option<FastqRecord>> {
+        match self.buffered.next() {
+            Some(record) => Ok(Some(record)),
+            None => self.inner.next_record(),
+        }
+    }
+
+    fn next_record_into(&mut self, record: &mut FastqRecord) -> crate::fastq::ReadResult<bool> {
+        match self.buffered.next() {
+            Some(buffered) => {
+                *record = buffered;
+                Ok(true)
+            }
+            None => self.inner.next_record_into(record),
+        }
+    }
+
+    fn set_keep_ids(&mut self, keep: bool) {
+        self.inner.set_keep_ids(keep);
+    }
+
+    fn current_source(&self) -> Option<(PathBuf, u64)> {
+        self.inner.current_source()
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.inner.validate()
+    }
+}
+
+/// How many records the automatic chooser reads to measure bin balance.
+///
+/// The same bound `ADAPTIVE_SAMPLE_RECORDS` uses for building the bin map,
+/// and for the same reason: it is enough records to see an input's signature
+/// composition and small enough that buffering them costs a few megabytes.
+/// Deliberately the same constant rather than a second knob -- the sample
+/// this measures balance on is the sample the map would be built from.
+const BIN_BALANCE_SAMPLE_RECORDS: usize = ADAPTIVE_SAMPLE_RECORDS;
+
+/// The worst bin balance the automatic chooser will accept before refusing
+/// the binned strategy.
+///
+/// Measured, not chosen for roundness. On 2026-09-05, over the first 20,000
+/// records of each input (`docs/BENCHMARKS.md`):
+///
+/// | input | measured balance | binned vs in-memory |
+/// |---|---:|---|
+/// | 2.14 GB shotgun, 840M occurrences | **1.20x** | 2.9x faster, half the memory |
+/// | 392 MB shotgun, 144M occurrences | **1.21x** | 1.4x faster |
+/// | 734 MB amplicon-shaped, 330M occurrences | **32.71x** | 3.4x slower, 2.8x more memory |
+///
+/// The two populations are a factor of 27 apart, so the threshold is not a
+/// fine judgement -- anything between about 2 and 25 separates them. 3.0 is
+/// close to the good end on purpose: the cost of refusing binned on an
+/// input that would have been fine is one run at the old speed, and the
+/// cost of accepting it on an input like the amplicon is a run that is
+/// slower *and* heavier than every alternative.
+const MAX_ACCEPTABLE_BIN_SKEW: f64 = 3.0;
+
 /// Streams a FASTQ source and returns its canonical k-mer counts, choosing
 /// between FastDNA's counting strategies automatically (or as forced
 /// by `policy`) and reporting which one ran.
@@ -1366,7 +1578,7 @@ fn process_stream_parallel_binned<S: RecordSource>(
 /// `MemoryPolicy::default()` here to reproduce that same in-memory-only
 /// behavior while additionally getting a `CountStrategy` back.
 pub fn process_stream_parallel_with_policy<S: RecordSource>(
-    reader: S,
+    mut reader: S,
     config: PipelineConfig,
     source: &Path,
     progress: ProgressFn<'_>,
@@ -1375,7 +1587,35 @@ pub fn process_stream_parallel_with_policy<S: RecordSource>(
 ) -> Result<(KmerCounter, QcSummary, u64, StrategyDecision)> {
     validate_config(&config)?;
     reader.validate()?;
-    let decision = resolve_strategy(&policy, &config);
+    let mut decision = resolve_strategy(&policy, &config);
+
+    // The binned strategy is the fastest one this crate has on
+    // high-diversity input and the slowest on low-diversity input, and the
+    // difference is not visible in anything the chooser above can see:
+    // `docs/BENCHMARKS.md` measures 2.9x faster on a shotgun file and 3.4x
+    // slower on an amplicon-shaped one that is not small. What separates
+    // them is whether the minimizer signatures spread across the bins, so
+    // that is measured here -- on a bounded prefix of the real input, before
+    // committing -- rather than guessed from byte counts.
+    //
+    // Only when the chooser picked binned on its own: an explicit
+    // `--strategy binned` or `FASTDNA_STRATEGY=binned` means the caller has
+    // asked for it by name and is owed the strategy they asked for, not a
+    // second opinion.
+    let mut prefix: Vec<FastqRecord> = Vec::new();
+    if decision.strategy == CountStrategy::Binned && decision.auto_selected {
+        let (sampled, balance) = sample_bin_balance(&mut reader, &config)?;
+        prefix = sampled;
+        match balance {
+            Some(skew) if skew > MAX_ACCEPTABLE_BIN_SKEW => {
+                decision.strategy = fallback_from_binned(&policy, &decision, config.num_threads);
+                decision.bin_balance = Some(skew);
+            }
+            other => decision.bin_balance = other,
+        }
+    }
+
+    let reader = Prefixed { buffered: prefix.into_iter(), inner: reader };
 
     let (counter, qc, total_reads) = match decision.strategy {
         CountStrategy::InMemory => process_stream_parallel(reader, config, source, progress, cancel)?,
@@ -1487,33 +1727,92 @@ mod tests {
         assert_eq!(unique.len(), names.len(), "two strategies share a name");
     }
 
-    /// The automatic arm chooses between `InMemory` and `Disk` and nothing
-    /// else. Promoting the binned strategy is §5 step 6 of
-    /// `docs/design-minimizer-counting.md` -- a separate decision, gated on
-    /// a real sample having been counted correctly and a per-bin occupancy
-    /// report examined -- so `auto` must not be able to reach it by any
-    /// combination of estimate and budget.
+    /// The automatic arm's rules, after binned was promoted on 2026-09-05
+    /// (`docs/design-minimizer-counting.md` 5 step 6's decision, reversed
+    /// once the memory model was calibrated and the bin-balance guard
+    /// existed):
+    ///
+    /// - An input of **unknown size** never gets binned. A stream gives the
+    ///   estimator nothing, and the strategy that is safe without an
+    ///   estimate is the one that should run blind.
+    /// - A sized input gets **binned when its predicted peak fits the
+    ///   budget**, because it is measured at 2.9x the in-memory strategy's
+    ///   speed and half its peak, with byte-identical output.
+    /// - Otherwise the old rule stands: disk if in-memory would not fit,
+    ///   in-memory if it would.
+    ///
+    /// The guard that makes this safe is not in `resolve_strategy` and
+    /// cannot be: it needs to look at the input. See
+    /// `process_stream_parallel_with_policy` and `MAX_ACCEPTABLE_BIN_SKEW`.
     #[test]
-    fn the_automatic_chooser_never_selects_the_binned_strategy() {
-        for input_bytes in [None, Some(0u64), Some(1), Some(4096), Some(2_140_000_000), Some(100 << 30)] {
-            for threads in [1usize, 8, 64] {
-                for max_ram in [None, Some(0u64), Some(1), Some(1 << 40)] {
-                    let policy = MemoryPolicy {
-                        strategy: None,
-                        max_ram_bytes: max_ram,
-                        estimated_input_bytes: input_bytes,
-                    };
-                    let config = PipelineConfig { num_threads: threads, ..PipelineConfig::default() };
-                    let decision = resolve_strategy(&policy, &config);
-                    assert_ne!(
-                        decision.strategy,
-                        CountStrategy::Binned,
-                        "auto reached the opt-in binned strategy at {input_bytes:?} bytes, \
-                         {threads} threads, budget {max_ram:?}"
-                    );
-                }
+    fn the_automatic_chooser_selects_binned_only_for_a_sized_input_that_fits() {
+        for threads in [1usize, 8, 64] {
+            let config = PipelineConfig { num_threads: threads, ..PipelineConfig::default() };
+
+            // Unknown size: never binned, whatever the budget says.
+            for max_ram in [None, Some(0u64), Some(1), Some(1 << 40)] {
+                let policy =
+                    MemoryPolicy { strategy: None, max_ram_bytes: max_ram, estimated_input_bytes: None };
+                let decision = resolve_strategy(&policy, &config);
+                assert_ne!(
+                    decision.strategy,
+                    CountStrategy::Binned,
+                    "auto chose binned for an input of unknown size ({threads} threads, \
+                     budget {max_ram:?})"
+                );
             }
+
+            // A sized input with room: binned.
+            let policy = MemoryPolicy {
+                strategy: None,
+                max_ram_bytes: Some(64 << 30),
+                estimated_input_bytes: Some(2_140_000_000),
+            };
+            assert_eq!(
+                resolve_strategy(&policy, &config).strategy,
+                CountStrategy::Binned,
+                "auto passed over binned for a sized input with a 64 GiB budget \
+                 ({threads} threads)"
+            );
+
+            // A sized input with no room for either in-memory or binned:
+            // disk, exactly as before.
+            let policy = MemoryPolicy {
+                strategy: None,
+                max_ram_bytes: Some(1),
+                estimated_input_bytes: Some(100 << 30),
+            };
+            assert_eq!(
+                resolve_strategy(&policy, &config).strategy,
+                CountStrategy::Disk,
+                "auto must still fall back to disk when nothing fits ({threads} threads)"
+            );
         }
+    }
+
+    /// `auto_selected` is what tells
+    /// `process_stream_parallel_with_policy` whether it may second-guess the
+    /// strategy with the bin-balance check. It must be true only for a
+    /// choice the estimate made on its own -- a caller who named a strategy
+    /// gets the one they named.
+    #[test]
+    fn auto_selected_is_true_only_when_nothing_forced_the_strategy() {
+        let config = PipelineConfig::default();
+        let sized = Some(2_140_000_000u64);
+
+        let automatic = MemoryPolicy {
+            strategy: None,
+            max_ram_bytes: Some(64 << 30),
+            estimated_input_bytes: sized,
+        };
+        assert!(resolve_strategy(&automatic, &config).auto_selected);
+
+        let forced = MemoryPolicy {
+            strategy: Some(CountStrategy::Binned),
+            max_ram_bytes: Some(64 << 30),
+            estimated_input_bytes: sized,
+        };
+        assert!(!resolve_strategy(&forced, &config).auto_selected);
     }
 
     /// Forcing the binned strategy through `policy` must be honoured and
@@ -1597,15 +1896,20 @@ mod tests {
         );
     }
 
-    /// The counterpart guarantee: introducing a second memory model must not
-    /// have moved the automatic chooser. For every strategy `auto` can
-    /// actually reach, the reported peak is still exactly
-    /// `mem_estimate::estimate_peak_bytes` -- the same value the branch that
-    /// picks between `InMemory` and `Disk` is computed from -- across the
-    /// same input/thread/budget grid
-    /// `the_automatic_chooser_never_selects_the_binned_strategy` sweeps.
+    /// The counterpart guarantee, restated for what it is now: whichever
+    /// strategy `auto` reaches, the reported peak is **that strategy's own
+    /// model**, never another's.
+    ///
+    /// Until 2026-09-05 this test asserted something stronger and simpler --
+    /// that every automatic decision reported `estimate_peak_bytes`, because
+    /// `auto` could only reach the two strategies that model covers. Binned
+    /// being promoted is exactly what makes that no longer the right
+    /// assertion: a run reported with the in-memory model's figure while the
+    /// binned strategy runs would be off by more than the footprint it is
+    /// predicting, which is the mistake the `estimated_peak_bytes` match
+    /// arm was written to prevent in the first place.
     #[test]
-    fn automatic_decisions_still_report_the_in_memory_model_unchanged() {
+    fn every_automatic_decision_reports_its_own_strategys_model() {
         for input_bytes in [None, Some(0u64), Some(4096), Some(2_140_000_000), Some(100 << 30)] {
             for threads in [1usize, 8, 64] {
                 for max_ram in [None, Some(0u64), Some(1 << 40)] {
@@ -1616,11 +1920,21 @@ mod tests {
                     };
                     let config = PipelineConfig { num_threads: threads, ..PipelineConfig::default() };
                     let decision = resolve_strategy(&policy, &config);
+                    let binned_defaults = BinnedConfig::new(config.k).sanitized();
+                    let expected = match decision.strategy {
+                        CountStrategy::Binned => mem_estimate::estimate_binned_peak_bytes(
+                            decision.estimated_occurrences,
+                            threads,
+                            binned_defaults.num_bins,
+                            binned_defaults.chunk_bytes,
+                        ),
+                        _ => mem_estimate::estimate_peak_bytes(decision.estimated_occurrences, threads),
+                    };
                     assert_eq!(
-                        decision.estimated_peak_bytes,
-                        mem_estimate::estimate_peak_bytes(decision.estimated_occurrences, threads),
-                        "the reported peak drifted from the in-memory model at \
-                         {input_bytes:?} bytes, {threads} threads, budget {max_ram:?}"
+                        decision.estimated_peak_bytes, expected,
+                        "the reported peak is not {}'s own model at {input_bytes:?} bytes, \
+                         {threads} threads, budget {max_ram:?}",
+                        decision.strategy.as_str()
                     );
                 }
             }

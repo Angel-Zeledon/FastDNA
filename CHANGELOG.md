@@ -23,7 +23,57 @@ La superficie con compatibilidad garantizada es:
 > `fastdna.gwas`, `fastdna.metagenomics` o cualquier otro módulo de esa
 > lista, se refiere a código que ya no existe.
 
+### Changed
+
+- **El contador ahora elige la estrategia particionada por minimizers
+  (`binned`) por defecto.** Estaba implementada, correcta y probada desde el
+  2026-08-25, pero `auto` no podía seleccionarla: faltaba el modelo de
+  memoria calibrado y quedaba viva la preocupación R3 (desbalance de bins en
+  datos reales). Ambas cosas se resolvieron con medición:
+
+  - El modelo (`mem_estimate::estimate_binned_peak_bytes`) se calibró contra
+    ocho corridas reales -- dos tamaños de entrada x cuatro números de hilos.
+    Era estructural y nunca medido, y estaba mal en las dos direcciones a la
+    vez: **sub-predecía 26-29%** las corridas de 840M ocurrencias y
+    **sobre-predecía 11-19%** las de 144M. Dos errores estructurales lo
+    causaban (el merge suponía liberado el store de super-k-mers, y la base
+    venía del ajuste de la estrategia en memoria) y un factor de calibración
+    nombrado cubre el resto. Residuales de 0,0% a +11,1%, sin sub-predecir
+    ningún punto: un modelo que dice que una corrida cabe cuando no cabe es
+    como una máquina se queda sin memoria a los veinte minutos.
+  - R3 **no** lo resolvía el mapa adaptativo por sí solo. En una entrada de
+    baja complejidad (tipo amplicón, 734 MB, 330M ocurrencias) `binned`
+    resultó **3,4x más lenta y 2,8x más pesada** que contar en memoria: si
+    el espacio de firmas es más estrecho que el número de bins, ningún
+    empaquetado puede repartirlo. El tamaño de la entrada no sirve de
+    criterio, así que `auto` **mide** el balance que el empaquetado logra
+    sobre un prefijo acotado de la entrada real y rechaza `binned` por
+    encima de `MAX_ACCEPTABLE_BIN_SKEW`. Medido: 1,20x en shotgun contra
+    32,71x en amplicón -- las dos poblaciones están a un factor de 27.
+
+  Efecto en el camino por defecto, misma máquina y mismo archivo:
+  **24,10 s / 7,31 GB -> 9,88 s / 3,43 GB** sobre 840.000.000 de
+  ocurrencias, con salida Parquet byte-idéntica. Forzar `--strategy binned`
+  sigue funcionando y ahora salta la comprobación de balance, que es lo que
+  significa forzar.
+
+- **`--strategy` cambia de significado en `auto`** (documentado en
+  `fastdna --help`), y el reporte final imprime el balance medido cuando lo
+  hubo, para que una corrida anunciada como `binned` que terminó siendo otra
+  cosa diga por qué.
+
 ### Added
+
+- **macOS: detección de memoria del sistema.**
+  `mem_estimate::available_system_memory_bytes` no tenía implementación en
+  macOS y caía al fijo de 4 GiB, así que **cualquier Mac quedaba presupuestado
+  en 4 GiB tuviera 8 GB o 192 GB** -- y eso solo bastaba para mandar al disco
+  corridas que caben holgadas en RAM. Ahora lee `hw.memsize` vía
+  `sysctlbyname` (binding escrito a mano, sin dependencia nueva, igual que el
+  de `GlobalMemoryStatusEx` en Windows). Es memoria **total**, no disponible
+  como en Linux y Windows: la diferencia está documentada en la propia
+  función en vez de escondida.
+
 
 - **Python: `fastdna.sklearn.EmptyVocabularyWarning`** -- `fit()` avisa
   cuando la regla de `presence` no deja ningún feature en pie, es decir

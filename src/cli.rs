@@ -366,12 +366,15 @@ pub struct CountArgs {
     #[arg(long, value_name = "SIZE", value_parser = parse_byte_size)]
     pub max_ram: Option<u64>,
 
-    /// Force a specific counting strategy instead of letting the memory
-    /// estimate choose. "auto" (the default) picks based on the estimated
-    /// peak memory versus --max-ram; "memory", "disk" and "binned" force
-    /// one strategy outright, for benchmarking and debugging. "binned" is
-    /// the experimental minimizer-partitioned strategy and "auto" never
-    /// selects it.
+    /// Force a specific counting strategy instead of letting the estimate
+    /// choose. "auto" (the default) prefers the minimizer-partitioned
+    /// "binned" strategy when the input's size is known, its predicted peak
+    /// fits --max-ram, and a sample of the input shows its bins would
+    /// actually balance; it falls back to "memory", or to "disk" when
+    /// neither fits. "memory", "disk" and "binned" force one strategy
+    /// outright and skip every one of those checks -- including the
+    /// bin-balance one, so forcing "binned" on low-diversity input (an
+    /// amplicon panel) is measurably slower than not forcing it.
     #[arg(long, value_enum, default_value = "auto")]
     pub strategy: CliStrategy,
 

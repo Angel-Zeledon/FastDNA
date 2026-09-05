@@ -144,13 +144,24 @@ FastDNA as the *fastest* of the three, was **retracted on 2026-08-25** after
 a stricter re-measurement. The retracted numbers and why they were wrong are
 in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-The cause is diagnosed rather than guessed: FastDNA materializes and sorts
+The cause was diagnosed rather than guessed: FastDNA materialized and sorted
 every one of the 840,000,000 k-mer *occurrences*, while KMC3's own run
 output reports it sorts 70,635,757 super-k-mers -- an 11.9x reduction in
-what moves through memory. `--strategy binned` implements the same
-super-k-mer partitioning
+what moves through memory.
+
+**That is fixed as of 2026-09-05**, and the table above therefore measures a
+default path FastDNA no longer has. The same super-k-mer partitioning
 ([`docs/design-minimizer-counting.md`](docs/design-minimizer-counting.md))
-and is correct but not yet what `auto` selects.
+had been implemented and correct but opt-in; it is now what `auto` selects
+whenever the input's size is known, its predicted peak fits the budget, and
+a 20,000-record sample shows its bins actually balance. On the same 2.14 GB
+file, on an Apple M3 Pro, that took the default path from **24.10 s at
+7.31 GB to 9.88 s at 3.43 GB** with byte-identical output.
+
+The head-to-head against KMC3 and FASTK has **not** been re-run since, and
+the honest reading of this table is that it is now a lower bound on
+FastDNA's standing rather than a measurement of it. Re-running it is the
+next benchmark this project owes.
 
 ### Correctness, checked against the field's own tools
 

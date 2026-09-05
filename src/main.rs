@@ -422,7 +422,18 @@ fn run(args: CountArgs) -> Result<()> {
     }
 
     println!("--------------------------------------------------");
-    println!("Strategy Used: {}", decision.strategy.as_str());
+    // The measured bin balance, when the automatic chooser looked at it.
+    // Printed because it is the reason a run that was announced as `binned`
+    // may have finished as something else: the banner above reports the
+    // prediction, made before any input was read, and this line reports what
+    // actually ran and what changed the answer.
+    match decision.bin_balance {
+        Some(skew) => println!(
+            "Strategy Used: {} (measured bin balance {skew:.2}x)",
+            decision.strategy.as_str()
+        ),
+        None => println!("Strategy Used: {}", decision.strategy.as_str()),
+    }
     println!("Total Reads: {total_reads}");
     println!(
         "Total k-mers Indexed: {} | Distinct k-mers: {}",

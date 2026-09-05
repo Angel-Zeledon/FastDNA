@@ -1,14 +1,29 @@
 # Design: minimizer-partitioned super-k-mer counting
 
-Status: **steps 0-4 done and correct; step 6's real-data gate found R3 (bin
-skew on real data) confirmed, and R3 has since been fixed** with a
-data-adaptive bin map (`src/adaptive_bins.rs`, step 6 follow-up under §5).
-`binned` remains an opt-in, documented, non-default strategy: fixing R3
-removes the one blocker step 6 named, but step 5's calibrated memory model
-was never built, so promotion to what `auto` selects has not been
-reconsidered. This document is the argument that decided whether we
-implement. See the updates below for the gate measurement and the fix; the
-rest of the document is unchanged from the proposal.
+Status: **complete and promoted (2026-09-05).** Steps 0-4 landed as
+described; step 6's real-data gate confirmed the R3 bin-skew risk and it was
+fixed with a data-adaptive bin map (`src/adaptive_bins.rs`); step 5's
+calibrated memory model was built on 2026-09-05 against eight measured runs,
+and `binned` is now what `auto` selects for a sized input whose predicted
+peak fits the budget.
+
+What made promotion safe was not the memory model alone. R3 turned out to
+survive the adaptive bin map: on a low-complexity amplicon-shaped input the
+signature space is narrower than the bin count, so no packing can spread it,
+and `binned` measured **3.4x slower and 2.8x heavier** than in-memory
+counting there. The chooser therefore measures the balance the packing
+actually achieves on a bounded prefix of the real input
+(`DynamicBinMap::predicted_skew`, `pipeline::MAX_ACCEPTABLE_BIN_SKEW`) and
+declines binned when it cannot balance -- 1.20x on shotgun data against
+32.71x on the amplicon, a factor of 27 between the two populations.
+
+Measured effect on the default path: 840,000,000 k-mer occurrences went from
+24.10 s / 7.31 GB to **9.88 s / 3.43 GB**, byte-identical output. See
+`docs/BENCHMARKS.md`.
+
+This document is the argument that decided whether we implement. See the
+updates below for the gate measurement and the fix; the rest is unchanged
+from the proposal.
 
 Date: 2026-08-25.
 

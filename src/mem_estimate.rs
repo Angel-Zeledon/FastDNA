@@ -543,7 +543,70 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::ffi::{c_char, c_void, CStr};
+
+    // Hand-written binding for `sysctlbyname` (libSystem), for the same
+    // reason the Windows arm above hand-writes `GlobalMemoryStatusEx`
+    // rather than pulling in the `windows` crate: this crate takes no new
+    // runtime dependency for a two-line platform query. The signature
+    // matches the documented BSD ABI exactly.
+    extern "C" {
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *mut c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+
+    /// **Total** physical memory, not available memory -- and that is a real
+    /// difference from the other two platforms, stated rather than hidden.
+    ///
+    /// Linux reads `MemAvailable` and Windows reads `ullAvailPhys`; both
+    /// answer "how much could a new allocation actually get right now".
+    /// macOS has no equivalent single sysctl. The honest options were
+    /// `hw.memsize` (total, one call, no unsafe beyond this binding) or
+    /// `host_statistics64(HOST_VM_INFO64)` (free + inactive + purgeable,
+    /// several mach types and a much larger unsafe surface for a number
+    /// that is itself a heuristic sum). This takes the first.
+    ///
+    /// What that costs: on a machine already using most of its RAM, the
+    /// budget derived from this (half of total, per
+    /// `DEFAULT_BUDGET_FRACTION`) is more generous than the same machine
+    /// would get on Linux, so the automatic chooser may pick an in-memory
+    /// run that has to page. What it buys: before this existed, macOS fell
+    /// through to `FALLBACK_MAX_RAM_BYTES` and **every** Mac was budgeted at
+    /// a flat 4 GiB regardless of having 8 GB or 192 GB -- which on the
+    /// machine this was written on routed a run that fits comfortably in
+    /// memory to the disk strategy, at three times the wall clock.
+    pub fn available_system_memory_bytes() -> Option<u64> {
+        let mut bytes: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: `name` is a NUL-terminated C string; `oldp` points at a
+        // `u64` and `oldlenp` at its size, which is what `hw.memsize`
+        // returns; `newp`/`newlen` are the documented "do not set" values.
+        const NAME: &CStr = c"hw.memsize";
+        let rc = unsafe {
+            sysctlbyname(
+                NAME.as_ptr() as *const c_char,
+                &mut bytes as *mut u64 as *mut c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && len == std::mem::size_of::<u64>() && bytes > 0 {
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod imp {
     pub fn available_system_memory_bytes() -> Option<u64> {
         None

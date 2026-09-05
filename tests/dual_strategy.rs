@@ -240,29 +240,48 @@ fn all_strategies_agree_on_reads_that_yield_no_kmers() {
     assert_all_strategies_agree(&fastq, 2, 31, 1);
 }
 
-/// `auto` must never reach the binned strategy, however extreme the
-/// estimate: promoting it is a separate decision
-/// (`docs/design-minimizer-counting.md` Â§5 step 6, gated on a real sample
-/// being counted correctly first). Checked here, at the seam a user
-/// actually crosses, as well as in `pipeline.rs`'s own unit tests.
+/// What `auto` may and may not reach, checked at the seam a user actually
+/// crosses as well as in `pipeline.rs`'s own unit tests.
+///
+/// Binned was promoted on 2026-09-05 (measured at 2.9x the in-memory
+/// strategy's speed and half its peak, `docs/BENCHMARKS.md`), so this no
+/// longer asserts that `auto` cannot reach it. Two rules survive and are
+/// what this pins now: an input of unknown size never gets binned, and an
+/// input that fits nothing still falls back to disk.
 #[test]
-fn the_automatic_chooser_never_reaches_the_binned_strategy() {
+fn the_automatic_chooser_respects_the_promotion_rules_for_binned() {
     let _guard = SERIALIZE_TESTS.lock().unwrap_or_else(|p| p.into_inner());
-    for input_bytes in [None, Some(1u64), Some(1_000_000), Some(100 << 30)] {
-        for max_ram in [None, Some(1u64), Some(1 << 40)] {
-            let policy = MemoryPolicy {
-                strategy: None,
-                max_ram_bytes: max_ram,
-                estimated_input_bytes: input_bytes,
-            };
-            let decision = resolve_strategy(&policy, &config(31, 8));
-            assert_ne!(
-                decision.strategy,
-                CountStrategy::Binned,
-                "auto selected the opt-in binned strategy for {input_bytes:?} bytes against {max_ram:?}"
-            );
-        }
+    for max_ram in [None, Some(1u64), Some(1 << 40)] {
+        let policy =
+            MemoryPolicy { strategy: None, max_ram_bytes: max_ram, estimated_input_bytes: None };
+        assert_ne!(
+            resolve_strategy(&policy, &config(31, 8)).strategy,
+            CountStrategy::Binned,
+            "auto chose binned for an input of unknown size against {max_ram:?}"
+        );
     }
+
+    let starved = MemoryPolicy {
+        strategy: None,
+        max_ram_bytes: Some(1),
+        estimated_input_bytes: Some(100 << 30),
+    };
+    assert_eq!(
+        resolve_strategy(&starved, &config(31, 8)).strategy,
+        CountStrategy::Disk,
+        "auto must still reach disk when neither in-memory nor binned fits"
+    );
+
+    let roomy = MemoryPolicy {
+        strategy: None,
+        max_ram_bytes: Some(64 << 30),
+        estimated_input_bytes: Some(1_000_000),
+    };
+    assert_eq!(
+        resolve_strategy(&roomy, &config(31, 8)).strategy,
+        CountStrategy::Binned,
+        "auto passed over binned for a sized input with room to spare"
+    );
 }
 
 /// `FASTDNA_STRATEGY=binned` is the second of the two ways in, and the only

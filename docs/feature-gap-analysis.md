@@ -285,8 +285,12 @@ at the end). Companion documents: `ml-genomics-roadmap.md` (ML side),
     under both modes, FASTA-to-FASTQ output, multi-file input, real gzip
     output, `min_fraction` validation), `tests/read_filter_cli.rs` (7 tests,
     real-binary `count -> filter` end to end).
-- **S5. Minimizer/super-k-mer partitioning.** **Shipped, deliberately
-  opt-in.** `src/binned.rs`, `src/minimizer.rs`, `src/superkmer.rs`,
+- **S5. Minimizer/super-k-mer partitioning.** **Shipped and promoted to the
+  default (2026-09-05).** `auto` selects it for a sized input whose
+  predicted peak fits the budget and whose sampled bin balance is under
+  `pipeline::MAX_ACCEPTABLE_BIN_SKEW`; measured at 2.4x the previous
+  default's speed and half its memory on 840M occurrences. The paragraph
+  below describes the state before that decision. `src/binned.rs`, `src/minimizer.rs`, `src/superkmer.rs`,
   `src/adaptive_bins.rs` all exist with substantial test coverage;
   `src/cli.rs::CliStrategy::Binned` exposes it as `--strategy binned` /
   `FASTDNA_STRATEGY=binned`. `pipeline::resolve_strategy`'s `Auto` never
