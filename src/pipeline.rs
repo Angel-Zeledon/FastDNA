@@ -78,7 +78,9 @@ fn recycle_depth(num_threads: usize) -> usize {
 
 /// A worker's result: its private counter and QC state, or the message from
 /// a panic that occurred while it was processing (see `catch_unwind` below).
-type WorkerOutcome = std::result::Result<(KmerCounter, QcSummary), String>;
+/// Generic over the sink so the same worker body serves both k-mer
+/// widths; see `CountSink`.
+type WorkerOutcome<C> = std::result::Result<(C, QcSummary), String>;
 
 /// Extracts a human-readable message from a caught panic payload.
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -133,8 +135,19 @@ fn failing_location<S: RecordSource>(
 /// `process_stream_parallel` -- same checks, same order, same error
 /// values -- not a behavior change.
 fn validate_config(config: &PipelineConfig) -> Result<()> {
-    if config.k == 0 || config.k > 32 {
-        return Err(FastDnaError::InvalidK { k: config.k });
+    validate_config_for(config, 32)
+}
+
+/// `validate_config`, told which engine is asking.
+///
+/// `max_k` is the calling sink's own `MAX_K` rather than a constant: the
+/// narrow engine tops out at 32 because two bits per base fill a `u64`
+/// there, and the wide one at 64 for the same reason in a `u128`. A single
+/// hard-coded 32 here would have made the wide path reject every input it
+/// exists to accept.
+fn validate_config_for(config: &PipelineConfig, max_k: usize) -> Result<()> {
+    if config.k == 0 || config.k > max_k {
+        return Err(FastDnaError::InvalidK { k: config.k, max: max_k });
     }
 
     // With zero consumer tasks, `receiver` is never dropped, the channel never
@@ -383,6 +396,185 @@ fn spawn_producer<S: RecordSource>(
     })
 }
 
+/// Which k-mer encoding a run should use.
+///
+/// Two engines, chosen by `k`: `kmer.rs`/`counter.rs` pack two bits per
+/// base into a `u64` and stop at 32 bases; `wide_kmer.rs`/`wide_counter.rs`
+/// do the same in a `u128` and stop at 64. They are separate rather than
+/// one generic engine for the reasons `wide_kmer.rs`'s module doc gives --
+/// chiefly that the narrow path is the one measured exactly equal to KMC3,
+/// and re-validating a generic rewrite of it is a larger job than writing
+/// a second engine beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountEngine {
+    /// `1 <= k <= 32`.
+    Narrow,
+    /// `1 <= k <= 64`. Accepts the narrow range too, which is what makes a
+    /// differential check on real data possible: counting one file both
+    /// ways at `k = 31` must produce the same k-mers, and
+    /// `wide_kmer.rs`'s own test asserts that on synthetic input.
+    Wide,
+}
+
+impl CountEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CountEngine::Narrow => "narrow",
+            CountEngine::Wide => "wide",
+        }
+    }
+}
+
+/// What a caller asked for, before `k` is taken into account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngineChoice {
+    /// Pick by `k`. The default, and what every existing caller gets.
+    #[default]
+    Auto,
+    Narrow,
+    Wide,
+}
+
+/// Resolves the engine a run will use, or explains why the request cannot
+/// be honoured.
+///
+/// `Auto` routes by `k` alone: at or below 32 the narrow engine is both
+/// faster and the one with external validation behind it, so it wins;
+/// above that only the wide engine can represent the k-mer at all.
+///
+/// Forcing is honoured where it is possible and refused where it is not,
+/// with the refusal naming the flag that fixes it:
+///
+/// * `Narrow` with `k > 32` cannot work -- 33 bases do not fit in a `u64`
+///   -- so it is an error rather than a silent upgrade. A caller who named
+///   an engine gets that engine or an explanation, never a different one.
+/// * `Wide` with `k <= 32` is allowed. It is slower and has no external
+///   validation of its own, and it is exactly what a differential check
+///   needs, so it is available rather than second-guessed.
+/// * Any `k` above 64 is outside both engines, and is `InvalidK` rather
+///   than an engine complaint: no flag fixes it.
+pub fn resolve_engine(choice: EngineChoice, k: usize) -> Result<CountEngine> {
+    if k == 0 || k > crate::wide_kmer::MAX_WIDE_K {
+        return Err(FastDnaError::InvalidK { k, max: crate::wide_kmer::MAX_WIDE_K });
+    }
+    match choice {
+        EngineChoice::Auto => {
+            Ok(if k <= 32 { CountEngine::Narrow } else { CountEngine::Wide })
+        }
+        EngineChoice::Wide => Ok(CountEngine::Wide),
+        EngineChoice::Narrow if k <= 32 => Ok(CountEngine::Narrow),
+        EngineChoice::Narrow => Err(FastDnaError::InvalidConfig {
+            parameter: "engine",
+            reason: format!(
+                "k={k} needs more than the 64 bits the narrow engine packs a k-mer into \
+                 (2 bits per base, so 32 bases at most). Use --engine wide (or --engine auto, \
+                 which picks it for you above k=32), or lower k to 32 or less."
+            ),
+        }),
+    }
+}
+
+/// The per-worker counting state, abstracted over k-mer width.
+///
+/// # Why this trait exists, and why it is this small
+///
+/// The in-memory pipeline's worker body is about ninety lines, and almost
+/// all of it is the argument for why it cannot deadlock: `catch_unwind`
+/// around the body, drain-and-discard on panic *and* on cancellation so a
+/// producer blocked on a full channel always has someone reading, batch
+/// recycling, and progress accounted per batch rather than per record.
+/// Exactly three lines of it depend on how wide a k-mer is.
+///
+/// Supporting `k > 32` (`wide_kmer.rs`) meant either duplicating those
+/// ninety lines -- two copies of a deadlock argument, which is how one of
+/// them eventually stops being true -- or abstracting the three. This is
+/// the three.
+///
+/// The narrow path's behaviour is unchanged by construction:
+/// `process_stream_parallel` still takes and returns exactly what it did,
+/// and monomorphisation gives `NarrowSink` the same code the concrete
+/// version had. `docs/BENCHMARKS.md` records a measurement confirming that
+/// rather than assuming it.
+trait CountSink: Send {
+    /// The largest `k` this sink's encoding can hold. `validate_config`
+    /// checks against this rather than against a constant, so the two
+    /// engines cannot disagree with the checker about their own range.
+    const MAX_K: usize;
+
+    /// What the worker pool folds down to. The narrow sink hands back a
+    /// `KmerCounter` (still lazily finalizable, which `export.rs` relies
+    /// on); the wide one hands back an already-finished table.
+    type Output: Send;
+
+    /// A fresh sink for one worker.
+    fn worker() -> Self;
+
+    /// Extracts every canonical k-mer of `seq` at width `k` and counts it.
+    ///
+    /// The scratch buffer lives inside the sink rather than in the worker
+    /// body: it is allocated once per worker and refilled per record,
+    /// which is the allocation the `_into` extraction forms exist for, and
+    /// its element type is the one thing that differs between widths.
+    fn absorb(&mut self, seq: &[u8], k: usize);
+
+    /// Folds every worker's sink into the run's answer.
+    fn merge_all(sinks: Vec<Self>) -> Self::Output
+    where
+        Self: Sized;
+}
+
+/// `k <= 32`: `kmer.rs` and `counter.rs`, the path validated exactly
+/// against KMC3.
+struct NarrowSink {
+    counter: KmerCounter,
+    scratch: Vec<u64>,
+}
+
+impl CountSink for NarrowSink {
+    const MAX_K: usize = 32;
+    type Output = KmerCounter;
+
+    fn worker() -> Self {
+        Self { counter: KmerCounter::with_capacity(131_072), scratch: Vec::new() }
+    }
+
+    fn absorb(&mut self, seq: &[u8], k: usize) {
+        kmer::extract_canonical_kmers_into(seq, k, &mut self.scratch);
+        self.counter.insert_batch(&self.scratch);
+    }
+
+    fn merge_all(sinks: Vec<Self>) -> KmerCounter {
+        KmerCounter::merge_all(sinks.into_iter().map(|sink| sink.counter).collect())
+    }
+}
+
+/// `33 <= k <= 64`: `wide_kmer.rs` and `wide_counter.rs`.
+struct WideSink {
+    counter: crate::wide_counter::WideKmerCounter,
+    scratch: Vec<u128>,
+}
+
+impl CountSink for WideSink {
+    const MAX_K: usize = crate::wide_kmer::MAX_WIDE_K;
+    type Output = crate::wide_counter::WideCounts;
+
+    fn worker() -> Self {
+        Self { counter: crate::wide_counter::WideKmerCounter::new(), scratch: Vec::new() }
+    }
+
+    fn absorb(&mut self, seq: &[u8], k: usize) {
+        crate::wide_kmer::extract_canonical_kmers_into(seq, k, &mut self.scratch);
+        self.counter.insert_batch(&self.scratch);
+    }
+
+    fn merge_all(sinks: Vec<Self>) -> crate::wide_counter::WideCounts {
+        crate::wide_counter::WideKmerCounter::merge_all(
+            sinks.into_iter().map(|sink| sink.counter).collect(),
+        )
+        .finish()
+    }
+}
+
 pub fn process_stream_parallel<S: RecordSource>(
     reader: S,
     config: PipelineConfig,
@@ -390,7 +582,43 @@ pub fn process_stream_parallel<S: RecordSource>(
     progress: ProgressFn<'_>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(KmerCounter, QcSummary, u64)> {
-    validate_config(&config)?;
+    process_stream_parallel_with_sink::<S, NarrowSink>(reader, config, source, progress, cancel)
+}
+
+/// The same streaming count, for `33 <= k <= 64`, through `wide_kmer.rs`
+/// and `wide_counter.rs`.
+///
+/// Identical in every respect except the width of a k-mer: same producer,
+/// same channel and backpressure, same cancellation and panic handling,
+/// same quality trimming and homopolymer compression. It returns an
+/// already-finished `WideCounts` rather than a `KmerCounter` because the
+/// wide counter has no lazy finalization to preserve (`wide_counter.rs`
+/// explains why it does not need any).
+///
+/// `pipeline`'s automatic strategy chooser does not reach this: the disk
+/// and binned strategies are `u64`-shaped throughout (`disk_spill.rs`
+/// spills 8-byte keys, `binned.rs` packs super-k-mers two bits per base
+/// into a store sized for them), so wide counting is in-memory only. That
+/// is a real limitation and `resolve_engine` states it where a caller will
+/// see it rather than leaving it to be discovered.
+pub fn process_stream_parallel_wide<S: RecordSource>(
+    reader: S,
+    config: PipelineConfig,
+    source: &Path,
+    progress: ProgressFn<'_>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(crate::wide_counter::WideCounts, QcSummary, u64)> {
+    process_stream_parallel_with_sink::<S, WideSink>(reader, config, source, progress, cancel)
+}
+
+fn process_stream_parallel_with_sink<S: RecordSource, C: CountSink>(
+    reader: S,
+    config: PipelineConfig,
+    source: &Path,
+    progress: ProgressFn<'_>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(C::Output, QcSummary, u64)> {
+    validate_config_for(&config, C::MAX_K)?;
     // The source gets a say too: an input list that can produce nothing at
     // all is a caller mistake, and a run that counted zero reads in silence
     // is indistinguishable from a real sample that happened to be empty.
@@ -465,21 +693,21 @@ pub fn process_stream_parallel<S: RecordSource>(
     //    producer thread it lives on -- would block forever, the same
     //    deadlock item A guards against. Draining keeps the channel moving
     //    until the producer itself notices the flag and drops `Sender`.
-    let results: Vec<WorkerOutcome> = (0..config.num_threads)
+    let results: Vec<WorkerOutcome<C>> = (0..config.num_threads)
         .into_par_iter()
         .map(|_| {
             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                let mut local_counter = KmerCounter::with_capacity(131_072);
+                // The sink owns both the counting table and the k-mer
+                // scratch buffer, allocated once per worker instead of
+                // once per record. `extract_canonical_kmers` allocates a
+                // fresh `Vec` on every call, so the per-record form costs
+                // one malloc/free pair per read -- ~7 million of them on a
+                // 2.14 GB FASTQ. The `_into` variant the sink calls clears
+                // and refills that buffer, which reaches its high-water
+                // mark within the first few reads and never allocates
+                // again. See `CountSink` for why this is behind a trait.
+                let mut sink = C::worker();
                 let mut local_qc = QcSummary::default();
-                // Worker-owned k-mer scratch, allocated once per worker
-                // instead of once per record. `extract_canonical_kmers`
-                // allocates a fresh `Vec<u64>` on every call, so the
-                // per-record form costs one malloc/free pair per read --
-                // ~7 million of them on a 2.14 GB FASTQ. The `_into`
-                // variant clears and refills this buffer, which reaches its
-                // high-water mark within the first few reads and never
-                // allocates again.
-                let mut canon_kmers: Vec<u64> = Vec::new();
                 // Only ever populated when `hpc` is set; otherwise k-mer
                 // extraction reads `record.seq` directly, so a run with the
                 // flag off pays no allocation and no extra pass at all.
@@ -510,8 +738,7 @@ pub fn process_stream_parallel<S: RecordSource>(
                         } else {
                             &record.seq
                         };
-                        kmer::extract_canonical_kmers_into(seq, k, &mut canon_kmers);
-                        local_counter.insert_batch(&canon_kmers);
+                        sink.absorb(seq, k);
                     }
 
                     // Hand the record buffers back so the producer can refill
@@ -537,7 +764,7 @@ pub fn process_stream_parallel<S: RecordSource>(
                     }
                 }
 
-                (local_counter, local_qc)
+                (sink, local_qc)
             }));
 
             match outcome {
@@ -571,7 +798,7 @@ pub fn process_stream_parallel<S: RecordSource>(
         .map_err(|_| FastDnaError::Internal { detail: "FASTQ reader thread panicked".to_string() })??;
 
     let mut worker_panic: Option<String> = None;
-    let mut counters: Vec<KmerCounter> = Vec::with_capacity(results.len());
+    let mut counters: Vec<C> = Vec::with_capacity(results.len());
     // `QcSummary::merge` is O(1) -- five `u64` additions -- so it is folded
     // in right here, sequentially, exactly as the disk strategy already
     // does. A k-way form of it would buy nothing, and doing it here rather
@@ -582,8 +809,8 @@ pub fn process_stream_parallel<S: RecordSource>(
     let mut master_qc = QcSummary::default();
     for outcome in results {
         match outcome {
-            Ok((counter, qc)) => {
-                counters.push(counter);
+            Ok((sink, qc)) => {
+                counters.push(sink);
                 master_qc.merge(&qc);
             }
             Err(detail) => {
@@ -626,7 +853,7 @@ pub fn process_stream_parallel<S: RecordSource>(
     // multiplying it. The per-entry comparison count is unchanged too --
     // an entry crossing `log2(workers)` merge levels at one compare each
     // is the same `log(sources)` the k-way heap charges it.
-    let master_counter = KmerCounter::merge_all(counters);
+    let master_counter = C::merge_all(counters);
 
     master_qc.finalize();
 

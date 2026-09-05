@@ -184,7 +184,7 @@ impl GenomeSketch {
         // silent garbage instead of the error `count()` and
         // `estimate_cardinality` already raise for the same mistake.
         if k == 0 || k > 32 {
-            return Err(FastDnaError::InvalidK { k });
+            return Err(FastDnaError::InvalidK { k, max: 32 });
         }
         if sketch_size == 0 {
             return Err(FastDnaError::InvalidConfig {
@@ -637,7 +637,7 @@ impl FracSketch {
         source: &Path,
     ) -> Result<Self> {
         if k == 0 || k > 32 {
-            return Err(FastDnaError::InvalidK { k });
+            return Err(FastDnaError::InvalidK { k, max: 32 });
         }
         if scale == 0 {
             return Err(FastDnaError::InvalidConfig {
@@ -1051,7 +1051,7 @@ mod tests {
     fn from_reader_rejects_an_out_of_range_k_instead_of_an_empty_sketch() {
         for bad_k in [0usize, 33] {
             match GenomeSketch::from_reader(reader_over(&["ACGTACGT"]), 128, bad_k, Path::new("s.fastq")) {
-                Err(FastDnaError::InvalidK { k }) => assert_eq!(k, bad_k),
+                Err(FastDnaError::InvalidK { k, .. }) => assert_eq!(k, bad_k),
                 other => panic!("k={bad_k} must be InvalidK, got {other:?}"),
             }
         }

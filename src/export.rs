@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
-use arrow::array::{ArrayRef, StringArray, UInt32Array, UInt64Array};
+use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, StringArray, UInt32Array, UInt64Array};
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -72,6 +72,174 @@ pub fn counts_schema(with_sequence: bool) -> Arc<Schema> {
     }
     fields.push(Field::new("frequency", DataType::UInt32, false));
     Arc::new(Schema::new(fields))
+}
+
+/// The Parquet schema of a **wide** count table (`33 <= k <= 64`).
+///
+/// `kmer_bits` is a 16-byte fixed-size binary column, not a `u64`: Arrow
+/// has no 128-bit integer type, and the two alternatives -- a pair of
+/// `u64` columns, or the decoded sequence as the key -- both lose the one
+/// property that matters. A `(hi, lo)` pair is only sorted if a reader
+/// knows to compare it lexicographically as a pair, and a string key costs
+/// `k` bytes a row instead of 16. Big-endian 16-byte keys sort bytewise
+/// exactly as the `u128` they encode sorts numerically
+/// (`wide_kmer::to_key_bytes`), so "the file is sorted by its key column"
+/// is true for a reader that never decodes anything.
+pub fn wide_counts_schema(with_sequence: bool) -> Arc<Schema> {
+    let mut fields = vec![Field::new("kmer_bits", DataType::FixedSizeBinary(16), false)];
+    if with_sequence {
+        fields.push(Field::new("kmer_sequence", DataType::Utf8, false));
+    }
+    fields.push(Field::new("frequency", DataType::UInt32, false));
+    Arc::new(Schema::new(fields))
+}
+
+/// Writes a wide count table to Parquet.
+///
+/// The narrow writer's `ChunkBuffers` assembles Arrow's column buffers by
+/// hand to avoid copying decoded bases twice -- an optimisation with
+/// measurements behind it (see that type's own doc comment). It is
+/// deliberately **not** ported here: those numbers were taken on the
+/// narrow path, `k > 32` is a capability most runs never reach for, and
+/// porting a measured optimisation to a path with no measurements would
+/// turn a justified decision into an assumed one. This uses Arrow's own
+/// builders, and says so.
+///
+/// Footer metadata mirrors the narrow writer's, with
+/// `ktab::SORTED_BY_WIDE_VALUE` naming the key column -- see that
+/// constant for why a wide table is rejected by `KmerTable::open` rather
+/// than silently misread.
+pub fn export_wide_counts_parquet<P: AsRef<Path>>(
+    counts: &crate::wide_counter::WideCounts,
+    output_path: P,
+    k: usize,
+    with_sequence: bool,
+) -> Result<usize> {
+    let path = output_path.as_ref();
+    let (file, pending) = AtomicFile::create(path)?;
+    let schema = wide_counts_schema(with_sequence);
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![
+            KeyValue::new(
+                ktab::SORTED_BY_KEY.to_string(),
+                Some(ktab::SORTED_BY_WIDE_VALUE.to_string()),
+            ),
+            KeyValue::new(ktab::K_KEY.to_string(), Some(k.to_string())),
+        ]))
+        .build();
+
+    let mut writer =
+        ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| export_err(path, e))?;
+    let chunk_size = 131_072;
+    let mut total_written = 0;
+
+    let mut keys = FixedSizeBinaryBuilder::with_capacity(chunk_size, 16);
+    let mut frequencies: Vec<u32> = Vec::with_capacity(chunk_size);
+    let mut sequences: Vec<String> = Vec::new();
+    let mut decoded: Vec<u8> = Vec::new();
+
+    for (kmer, count) in counts.iter() {
+        // The builder's only failure mode is a value of the wrong length,
+        // and `to_key_bytes` returns exactly 16 by its type. Mapping the
+        // error rather than unwrapping keeps the crate's `unwrap_used`
+        // denial satisfied without claiming the case is unreachable.
+        keys.append_value(crate::wide_kmer::to_key_bytes(kmer))
+            .map_err(|e| export_err(path, e))?;
+        frequencies.push(count);
+        if with_sequence {
+            decoded.clear();
+            crate::wide_kmer::decode_kmer_into(kmer, k, &mut decoded);
+            sequences.push(String::from_utf8_lossy(&decoded).into_owned());
+        }
+
+        if frequencies.len() >= chunk_size {
+            total_written += flush_wide_chunk(
+                &mut writer,
+                &schema,
+                &mut keys,
+                &mut frequencies,
+                &mut sequences,
+                with_sequence,
+                path,
+            )?;
+        }
+    }
+
+    if !frequencies.is_empty() {
+        total_written += flush_wide_chunk(
+            &mut writer,
+            &schema,
+            &mut keys,
+            &mut frequencies,
+            &mut sequences,
+            with_sequence,
+            path,
+        )?;
+    }
+
+    writer.close().map_err(|e| export_err(path, e))?;
+    pending.commit()?;
+    Ok(total_written)
+}
+
+/// Writes one chunk of a wide table and clears the builders.
+#[allow(clippy::too_many_arguments)]
+fn flush_wide_chunk(
+    writer: &mut ArrowWriter<File>,
+    schema: &Arc<Schema>,
+    keys: &mut FixedSizeBinaryBuilder,
+    frequencies: &mut Vec<u32>,
+    sequences: &mut Vec<String>,
+    with_sequence: bool,
+    path: &Path,
+) -> Result<usize> {
+    let rows = frequencies.len();
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(keys.finish())];
+    if with_sequence {
+        columns.push(Arc::new(StringArray::from(std::mem::take(sequences))));
+    }
+    columns.push(Arc::new(UInt32Array::from(std::mem::take(frequencies))));
+
+    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(|e| export_err(path, e))?;
+    writer.write(&batch).map_err(|e| export_err(path, e))?;
+    Ok(rows)
+}
+
+/// Writes a wide count table as CSV.
+///
+/// Columns: `kmer_sequence,frequency`. The 16-byte binary key the Parquet
+/// form stores is not written, and not because it was forgotten: in a text
+/// file a packed `u128` is a number nobody can act on, while the decoded
+/// bases are the thing a CSV reader actually wants. The narrow CSV writer
+/// includes `kmer_u64` because a 64-bit integer is what its whole API is
+/// keyed by (`KmerTable`, `query`, the Python surface); no wide equivalent
+/// of those exists yet, so the integer would be a column with no consumer.
+pub fn export_wide_counts_csv<P: AsRef<Path>>(
+    counts: &crate::wide_counter::WideCounts,
+    output_path: P,
+    k: usize,
+) -> Result<usize> {
+    let path = output_path.as_ref();
+    let (file, pending) = AtomicFile::create(path)?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "kmer_sequence,frequency").map_err(|e| export_err(path, e))?;
+
+    let mut decoded: Vec<u8> = Vec::with_capacity(k);
+    let mut written = 0;
+    for (kmer, count) in counts.iter() {
+        decoded.clear();
+        crate::wide_kmer::decode_kmer_into(kmer, k, &mut decoded);
+        writer.write_all(&decoded).map_err(|e| export_err(path, e))?;
+        writeln!(writer, ",{count}").map_err(|e| export_err(path, e))?;
+        written += 1;
+    }
+
+    writer.flush().map_err(|e| export_err(path, e))?;
+    drop(writer);
+    pending.commit()?;
+    Ok(written)
 }
 
 /// The column buffers one Parquet chunk is assembled in, held in exactly the
@@ -667,6 +835,52 @@ pub fn export_histogram<P: AsRef<Path>>(
         .map_err(|e| io_err(path, e))?;
     }
 
+    writer.flush().map_err(|e| io_err(path, e))?;
+    drop(writer);
+    pending.commit()?;
+    Ok(())
+}
+
+/// [`export_histogram`] for a spectrum a caller already has, rather than
+/// for a `KmerCounter` it must be derived from.
+///
+/// The wide engine's count table is not a `KmerCounter` and never will be
+/// (`wide_counter.rs`), but the file it should produce is byte-for-byte
+/// the same kind of file -- so the *writing* is shared here and only the
+/// aggregation differs. `max_depth` is applied the same way `spectrum`
+/// applies it: depths above the cap are folded into the cap's own bucket,
+/// not dropped, which is what makes the last row of a capped histogram
+/// mean "this depth or deeper" rather than silently losing the tail.
+pub fn export_histogram_pairs<P: AsRef<Path>>(
+    pairs: impl IntoIterator<Item = (u32, u64)>,
+    output_path: P,
+    format: HistogramFormat,
+    max_depth: Option<u32>,
+) -> Result<()> {
+    let mut capped: FxHashMap<u32, u64> = FxHashMap::default();
+    for (depth, distinct) in pairs {
+        let depth = match max_depth {
+            Some(cap) => depth.min(cap),
+            None => depth,
+        };
+        *capped.entry(depth).or_insert(0) += distinct;
+    }
+    let mut sorted: Vec<(u32, u64)> = capped.into_iter().collect();
+    sorted.sort_unstable_by_key(|&(depth, _)| depth);
+
+    let path = output_path.as_ref();
+    let (file, pending) = AtomicFile::create(path)?;
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    if format == HistogramFormat::Csv {
+        writeln!(writer, "coverage_depth,kmer_distinct_count").map_err(|e| io_err(path, e))?;
+    }
+    for (depth, distinct) in sorted {
+        match format {
+            HistogramFormat::Csv => writeln!(writer, "{depth},{distinct}"),
+            HistogramFormat::GenomeScope => writeln!(writer, "{depth} {distinct}"),
+        }
+        .map_err(|e| io_err(path, e))?;
+    }
     writer.flush().map_err(|e| io_err(path, e))?;
     drop(writer);
     pending.commit()?;

@@ -42,7 +42,7 @@ fn the_documented_public_modules_are_reachable() {
 
     assert_eq!(CountStrategy::InMemory.as_str(), "in-memory");
 
-    let err = FastDnaError::InvalidK { k: 99 };
+    let err = FastDnaError::InvalidK { k: 99, max: 32 };
     assert!(err.to_string().contains("99"));
 
     match KmerTable::open("does-not-exist-anywhere.parquet") {

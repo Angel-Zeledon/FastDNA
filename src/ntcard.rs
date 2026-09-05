@@ -370,7 +370,7 @@ fn estimate_spectrum_from_source<S: RecordSource>(
     max_frequency: Option<u32>,
 ) -> Result<SpectrumEstimate> {
     if k == 0 || k > 32 {
-        return Err(FastDnaError::InvalidK { k });
+        return Err(FastDnaError::InvalidK { k, max: 32 });
     }
 
     let mut sketch = NtCardSketch::new(precision)?;

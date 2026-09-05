@@ -23,6 +23,8 @@ pub mod read_profile;
 pub mod setops;
 pub mod similarity;
 pub mod sketch;
+pub mod wide_counter;
+pub mod wide_kmer;
 
 // Implementation. Reachable from anywhere inside the crate, from nowhere
 // outside it.

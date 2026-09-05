@@ -96,6 +96,17 @@ pub const SORTED_BY_KEY: &str = "fastdna.sorted_by";
 /// The only value `SORTED_BY_KEY` is ever written with: every k-mer table
 /// this crate writes is sorted by its `kmer_u64` column.
 pub const SORTED_BY_VALUE: &str = "kmer_u64";
+/// The `SORTED_BY_KEY` value a **wide** table carries (`33 <= k <= 64`,
+/// `wide_kmer.rs`). A separate value, not a separate contract: the key
+/// column is 16 big-endian bytes rather than a `u64`, and big-endian is
+/// chosen precisely so byte order is still numeric order, which is what
+/// keeps "sorted by the key column" meaning the same thing for both.
+///
+/// `KmerTable::open` accepts only `SORTED_BY_VALUE`, so a wide table is
+/// rejected by name rather than misread as a narrow one -- the operations
+/// built on `KmerTable` (`query`, `union`/`intersect`/`diff`, `filter`,
+/// `similarity`) are all `u64`-keyed and do not yet have wide forms.
+pub const SORTED_BY_WIDE_VALUE: &str = "kmer_bits";
 /// Parquet key-value metadata key recording the `k` every row's `kmer_u64`
 /// was packed with. Needed because a raw `u64` cannot be decoded (or a
 /// query sequence encoded) without knowing `k` -- unlike the counts schema
@@ -195,8 +206,12 @@ impl KmerTable {
             .ok_or_else(|| {
                 load_reason(
                     &path,
-                    "missing a non-nullable kmer_u64: uint64 column -- this is not a FastDNA k-mer \
-                     table (or --with-sequence encoded k-mer_u64 under a different type)"
+                    "missing a non-nullable kmer_u64: uint64 column. A table written at k>32 \
+                     keys on a 16-byte kmer_bits column instead (see SORTED_BY_WIDE_VALUE): the \
+                     operations built on KmerTable -- query, union/intersect/diff, filter, \
+                     similarity -- are all u64-keyed and have no wide form yet, so a wide table \
+                     is refused here rather than misread. Anything else is not a FastDNA k-mer \
+                     table at all"
                         .to_string(),
                 )
             })?;

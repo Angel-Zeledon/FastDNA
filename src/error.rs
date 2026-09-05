@@ -26,7 +26,7 @@ pub enum FastDnaError {
     /// A FASTQ record that could not be parsed, located precisely.
     MalformedFastq { path: PathBuf, record: u64, reason: String },
     /// `k` outside the 1..=32 range imposed by 2-bit packing.
-    InvalidK { k: usize },
+    InvalidK { k: usize, max: usize },
     /// A cohort directory containing no recognizable FASTQ files.
     NoSamplesFound { dir: PathBuf },
     /// A dense matrix that would exceed the configured byte limit.
@@ -90,8 +90,14 @@ impl fmt::Display for FastDnaError {
                 record,
                 reason
             ),
-            FastDnaError::InvalidK { k } => {
-                write!(f, "invalid k-mer size {k}: k must be between 1 and 32 inclusive")
+            FastDnaError::InvalidK { k, max } => {
+                // `max` rather than a literal 32: since the wide engine
+                // landed there are two limits, and a message that names
+                // the wrong one is worse than a vague one -- a user told
+                // "k must be between 1 and 32" after asking for k=65 would
+                // reasonably conclude k=41 is unavailable too, when it is
+                // exactly what `--engine wide` counts.
+                write!(f, "invalid k-mer size {k}: k must be between 1 and {max} inclusive")
             }
             FastDnaError::NoSamplesFound { dir } => write!(
                 f,
@@ -169,7 +175,7 @@ mod tests {
 
     #[test]
     fn invalid_k_message_states_the_valid_range() {
-        let msg = FastDnaError::InvalidK { k: 99 }.to_string();
+        let msg = FastDnaError::InvalidK { k: 99, max: 32 }.to_string();
         assert!(msg.contains("99"));
         assert!(msg.contains("1") && msg.contains("32"), "must state the 1..=32 range: {msg}");
     }
@@ -265,6 +271,6 @@ mod tests {
     #[test]
     fn non_exhaustive_does_not_block_construction_inside_the_crate() {
         let _ = FastDnaError::Cancelled;
-        let _ = FastDnaError::InvalidK { k: 5 };
+        let _ = FastDnaError::InvalidK { k: 5, max: 32 };
     }
 }

@@ -223,7 +223,7 @@ fn estimate_cardinality_from_reader<R: BufRead>(
     source: &Path,
 ) -> Result<f64> {
     if k == 0 || k > 32 {
-        return Err(FastDnaError::InvalidK { k });
+        return Err(FastDnaError::InvalidK { k, max: 32 });
     }
 
     let mut hll = HyperLogLog::new(precision)?;

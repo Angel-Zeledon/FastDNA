@@ -13,7 +13,8 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use fastdna_core::cli::{
-    CardArgs, Cli, CliDistMetric, CliHistogramFormat, CliOutputFormat, CliStrategy, Command,
+    CardArgs, Cli, CliDistMetric, CliEngine, CliHistogramFormat, CliOutputFormat, CliStrategy,
+    Command,
     CountArgs, DiffArgs, DistArgs, FilterArgs, IntersectArgs, MatrixArgs, PeekArgs, ProfileArgs,
     QueryArgs, SimilarityArgs, SketchArgs, SpectrumArgs, UnionArgs,
 };
@@ -25,7 +26,8 @@ use fastdna_core::hll;
 use fastdna_core::ktab::{self, KmerTable};
 use fastdna_core::ntcard;
 use fastdna_core::pipeline::{
-    process_stream_parallel_with_policy, CountStrategy, MemoryPolicy, PipelineConfig,
+    process_stream_parallel_with_policy, CountEngine, CountStrategy, EngineChoice,
+    MemoryPolicy, PipelineConfig,
 };
 use fastdna_core::preview;
 use fastdna_core::progress::Progress;
@@ -310,6 +312,19 @@ fn run(args: CountArgs) -> Result<()> {
         hpc: args.hpc,
     };
 
+    // Resolved before anything is read, so a request that cannot work
+    // (`--engine narrow` at k=41) fails immediately rather than after the
+    // first pass over a 2 GB file.
+    let engine = fastdna_core::pipeline::resolve_engine(
+        match args.engine {
+            CliEngine::Auto => EngineChoice::Auto,
+            CliEngine::Narrow => EngineChoice::Narrow,
+            CliEngine::Wide => EngineChoice::Wide,
+        },
+        args.kmer_size,
+    )?;
+    println!("Engine:         {} k-mers", engine.as_str());
+
     let estimated_input_bytes = estimate_total_input_bytes(&inputs);
 
     let policy = MemoryPolicy {
@@ -329,6 +344,21 @@ fn run(args: CountArgs) -> Result<()> {
     // other -- "record which one was used so it is visible rather than
     // mysterious" means this has to be the actual decision, not a
     // approximation of it.
+    if engine == CountEngine::Wide {
+        // The wide engine has one strategy, so there is no decision to
+        // report here and no `--strategy` to honour: `wide_counter.rs`
+        // counts in memory, and `disk_spill.rs`/`binned.rs` are 8-byte-key
+        // machinery throughout. Said out loud rather than left for a user
+        // to infer from a flag that quietly did nothing.
+        if args.strategy != CliStrategy::Auto {
+            println!("Strategy:       in-memory (--strategy is ignored above k=32)");
+        } else {
+            println!("Strategy:       in-memory (the wide engine's only strategy)");
+        }
+        println!("--------------------------------------------------");
+        return run_count_wide(args, inputs, config);
+    }
+
     let preview_decision = fastdna_core::pipeline::resolve_strategy(&policy, &config);
     println!(
         "Strategy:       {} (estimated peak {}, budget {})",
@@ -441,6 +471,98 @@ fn run(args: CountArgs) -> Result<()> {
         "Total k-mers Indexed: {} | Distinct k-mers: {}",
         counter.total_kmers(),
         counter.distinct_kmers()
+    );
+    println!("Records Written to Disk: {records_written}");
+
+    Ok(())
+}
+
+/// The `k > 32` half of `run`, from the point the two paths stop sharing.
+///
+/// A separate function rather than branches threaded through `run`: the
+/// wide path has no strategy decision to report, a different count table
+/// type, and its own exporters, so interleaving the two would put an
+/// `if engine == Wide` on almost every line of a long function. What it
+/// does share -- argument validation, the banner, the input list, the
+/// progress spinner's shape, and the QC and histogram outputs -- it shares
+/// by being called after those have already run or by calling the same
+/// functions the narrow path calls.
+fn run_count_wide(args: CountArgs, inputs: Vec<InputSpec>, config: PipelineConfig) -> Result<()> {
+    let start_time = Instant::now();
+    let pb = spinner("Analyzing genomic reads in streaming...");
+
+    let source_label = inputs
+        .first()
+        .map(|i| i.display_path())
+        .unwrap_or_else(|| PathBuf::from("<inputs>"));
+    let fastq_reader = MultiSourceReader::new(inputs);
+
+    let bar = pb.clone();
+    let on_progress = move |event: Progress| {
+        if let Progress::ReadsProcessed(n) = event {
+            bar.set_message(format!("Analyzing genomic reads... {n} processed"));
+        }
+    };
+
+    let (mut counts, qc, total_reads) = fastdna_core::pipeline::process_stream_parallel_wide(
+        fastq_reader,
+        config,
+        &source_label,
+        Some(&on_progress),
+        None,
+    )
+    .inspect_err(|_| pb.abandon())?;
+
+    let elapsed = start_time.elapsed().as_secs_f64();
+    pb.finish_with_message(format!("Processing completed in {elapsed:.2}s"));
+
+    let (dropped_min, dropped_max) = counts.prune(args.min_count, args.max_count);
+    if dropped_min > 0 || dropped_max > 0 {
+        println!(
+            "Filtered: {dropped_min} k-mers below --min-count, {dropped_max} above --max-count"
+        );
+    }
+
+    let pb_export = spinner("Compressing and writing to disk (Parquet/CSV)...");
+    let export_start = Instant::now();
+    let wants_parquet = args
+        .output
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"));
+    let records_written = if wants_parquet {
+        export::export_wide_counts_parquet(&counts, &args.output, args.kmer_size, args.with_sequence)
+            .inspect_err(|_| pb_export.abandon())?
+    } else {
+        export::export_wide_counts_csv(&counts, &args.output, args.kmer_size)
+            .inspect_err(|_| pb_export.abandon())?
+    };
+    let export_elapsed = export_start.elapsed().as_secs_f64();
+    pb_export.finish_with_message(format!("Export completed in {export_elapsed:.2}s"));
+
+    qc.export_json(&args.qc)?;
+    println!("QC report written to: {}", args.qc.display());
+
+    if let Some(histogram_path) = &args.histogram {
+        let format = match args.histogram_format {
+            CliHistogramFormat::Csv => export::HistogramFormat::Csv,
+            CliHistogramFormat::GenomeScope => export::HistogramFormat::GenomeScope,
+        };
+        export::export_histogram_pairs(
+            counts.histogram(),
+            histogram_path,
+            format,
+            args.histogram_max,
+        )?;
+        println!("Histogram written to: {}", histogram_path.display());
+    }
+
+    println!("--------------------------------------------------");
+    println!("Strategy Used: in-memory (wide)");
+    println!("Total Reads: {total_reads}");
+    println!(
+        "Total k-mers Indexed: {} | Distinct k-mers: {}",
+        counts.total_kmers(),
+        counts.distinct_kmers()
     );
     println!("Records Written to Disk: {records_written}");
 

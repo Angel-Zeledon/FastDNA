@@ -384,7 +384,24 @@ at the end). Companion documents: `ml-genomics-roadmap.md` (ML side),
     `ntcard_matches_the_exact_spectrum_within_a_measured_tolerance` test and
     its module doc comment for the full characterization and why these are
     per-run, not universally-guaranteed, bounds.
-  - **Still open, deliberately deferred**: k > 32 support via `u128`
+  - **Shipped 2026-09-05, to k=64 rather than KMC3's 256**: `k > 32` via
+    `u128` k-mers (`src/wide_kmer.rs`, `src/wide_counter.rs`, `--engine`).
+    Two bits per base in 128 bits is 64 bases; going further needs a
+    byte-array key, which changes the sort, the Parquet schema and every
+    comparison in the counter, and is a different project. What the
+    paragraph below predicted -- that this "would require changing the
+    2-bit-per-`u64` representation at its core, which cascades into
+    `counter.rs`" -- is exactly what was avoided: the narrow engine is
+    untouched, and the wide one sits beside it. The cascade the paragraph
+    feared is real, which is why nothing generic was attempted.
+
+    Still narrow-only, and refused by name rather than misread
+    (`ktab::SORTED_BY_WIDE_VALUE`): `query`, `union`/`intersect`/`diff`,
+    `filter`, `similarity`, sketching, and the Python API. A wide table is
+    a Parquet file keyed on 16 big-endian bytes; those operations are all
+    `u64`-keyed.
+
+  - **The original deferral, for the record**: k > 32 support via `u128`
     k-mers. This would require changing the 2-bit-per-base `u64` k-mer
     representation at its core (`src/kmer.rs`'s encoding/rolling-extraction
     functions), which cascades into `src/counter.rs` (the table that stores

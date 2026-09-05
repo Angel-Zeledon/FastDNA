@@ -71,7 +71,14 @@ fn rejects_k_above_the_packing_limit_before_reading() {
     );
 
     match result {
-        Err(FastDnaError::InvalidK { k }) => assert_eq!(k, 33),
+        // `max` is asserted too, not just `k`: `process_stream_parallel`
+        // is the narrow entry point, so the limit it reports must be its
+        // own 32 and not the wide engine's 64. A message naming the wrong
+        // engine's limit is how a user concludes k=41 is unavailable.
+        Err(FastDnaError::InvalidK { k, max }) => {
+            assert_eq!(k, 33);
+            assert_eq!(max, 32, "the narrow entry point must report the narrow limit");
+        }
         other => panic!("expected InvalidK, got {other:?}"),
     }
 }
@@ -85,7 +92,7 @@ fn rejects_k_of_zero() {
         None,
         None,
     );
-    assert!(matches!(result, Err(FastDnaError::InvalidK { k: 0 })));
+    assert!(matches!(result, Err(FastDnaError::InvalidK { k: 0, .. })));
 }
 
 #[test]

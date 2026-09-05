@@ -22,6 +22,19 @@ pub enum CliStrategy {
     Binned,
 }
 
+/// User-facing choice of k-mer encoding, forwarded into
+/// `pipeline::EngineChoice`. A separate enum from that one for the same
+/// reason `CliStrategy` is separate from `CountStrategy`: how the flag is
+/// spelled is a CLI decision, and the library type stays free to be named
+/// for what it is.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CliEngine {
+    #[default]
+    Auto,
+    Narrow,
+    Wide,
+}
+
 /// User-facing choice of spectrum file format, forwarded into
 /// `export::HistogramFormat`. A separate enum from that one so the CLI's
 /// spelling of the values (`csv`, `genomescope`) is a CLI decision and the
@@ -322,9 +335,27 @@ pub struct CountArgs {
     #[arg(short, long, value_name = "FILE", default_value = "kmer_counts.parquet")]
     pub output: PathBuf,
 
-    /// Length of k-mers (1 <= k <= 32)
+    /// Length of k-mers. 1-32 on the default engine, up to 64 with the
+    /// wide one (see --engine, which picks it automatically above 32).
     #[arg(short, long, default_value_t = 31)]
     pub kmer_size: usize,
+
+    /// Which k-mer encoding to count with. "auto" (the default) picks by
+    /// k: the narrow engine packs two bits per base into a u64 and so
+    /// stops at k=32, and above that the wide engine does the same in a
+    /// u128, up to k=64.
+    ///
+    /// Forcing is for two cases. "narrow" pins a run to the engine that is
+    /// validated exactly against KMC3 and refuses k>32 rather than
+    /// silently upgrading. "wide" runs the u128 engine even at k<=32,
+    /// which is slower and is how you check the two engines agree on real
+    /// data rather than only in the test suite.
+    ///
+    /// The wide engine counts in memory only: the disk and binned
+    /// strategies pack 8-byte keys throughout, so --strategy is ignored
+    /// above k=32.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub engine: CliEngine,
 
     /// Minimum Phred quality score cutoff (0-93; typical data uses 0-40)
     #[arg(short = 'q', long, default_value_t = 20.0, value_parser = parse_min_quality)]

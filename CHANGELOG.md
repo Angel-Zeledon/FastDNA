@@ -64,6 +64,57 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **`k > 32`: un segundo motor, no una generalización del que ya había.**
+  `--engine auto|narrow|wide`. `auto` (el default) enruta por `k`: hasta 32
+  el motor estrecho (`kmer.rs`/`counter.rs`, dos bits por base en un `u64`),
+  y de 33 a 64 el ancho (`wide_kmer.rs`/`wide_counter.rs`, lo mismo en un
+  `u128`).
+
+  **Por qué dos motores y no uno genérico.** El camino `u64` es el que está
+  medido *exactamente* igual a KMC3 sobre lecturas reales y el que describe
+  cada número de `docs/BENCHMARKS.md`. Hacerlo genérico pondría todos esos
+  resultados otra vez en duda: la monomorfización *debería* preservar el
+  código generado, pero "debería" no es sobre lo que descansa un número
+  validado. El motor ancho se sienta al lado, y el estrecho no cambia.
+
+  **Lo que impide que se separen**: `wide_matches_the_narrow_engine_exactly_
+  where_they_overlap` compara los dos motores k-mer a k-mer en todo
+  `k ≤ 32`, incluyendo alrededor de bases ambiguas, y
+  `tests/wide_engine.rs` repite la comparación *de punta a punta por el
+  binario real* sobre un FASTQ. Así el motor ancho hereda la validación
+  contra KMC3 en el rango solapado. Por eso `--engine wide` se acepta
+  también por debajo de 32: es la forma de hacer esa comprobación sobre
+  datos propios, no solo en la suite.
+
+  **Forzar se respeta o se explica, nunca se corrige en silencio**:
+  `--engine narrow` con `k=41` es un error que nombra la bandera que lo
+  arregla, no una promoción callada al motor ancho.
+
+  **Límites, dichos en vez de descubiertos.** Hasta k=64, no los 256 de
+  KMC3: dos bits por base en 128 bits son 64 bases, y pasar de ahí exige
+  una clave de bytes que cambia el orden, el esquema Parquet y cada
+  comparación del contador. Y el motor ancho cuenta **solo en memoria**:
+  `disk_spill.rs` y `binned.rs` son maquinaria de claves de 8 bytes de
+  principio a fin, así que `--strategy` no aplica por encima de k=32 y el
+  CLI lo dice en vez de ignorar la bandera.
+
+  La tabla ancha es Parquet con `kmer_bits` (16 bytes big-endian, de modo
+  que el orden de bytes *es* el orden numérico y el fichero sigue estando
+  ordenado para quien no lo decodifique) y `fastdna.sorted_by=kmer_bits`.
+  Las operaciones con clave `u64` -- `query`, `union`/`intersect`/`diff`,
+  `filter`, `similarity`, sketching, la API de Python -- la **rechazan por
+  nombre** en vez de malinterpretarla, y el error explica cuál es.
+
+### Changed
+
+- **`FastDnaError::InvalidK` lleva ahora el límite del que habla**
+  (`InvalidK { k, max }`). Con dos motores, un mensaje fijo en 32 miente:
+  a quien pedía `k=65` se le respondía "k debe estar entre 1 y 32", de lo
+  que se sigue razonablemente que `k=41` tampoco está disponible -- cuando
+  es exactamente lo que cuenta `--engine wide`. Es un cambio rompedor del
+  enum público, que el 0.x permite y esta línea declara.
+
+
 - **`fastdna similarity`: similitud exacta entre tablas de k-mers contadas.**
   Jaccard, contención asimétrica (las dos direcciones) y la disimilitud de
   Bray-Curtis ponderada por abundancia, entre dos o más tablas `.parquet`.

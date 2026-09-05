@@ -104,6 +104,13 @@ territory even pre-1.0.
 
 1. **K-mer encoding** (`src/kmer.rs`): each base is 2 bits
    (`A=00 C=01 G=10 T=11`), so a k-mer (`1 <= k <= 32`) fits in a `u64`.
+   Above 32, a **second engine** (`src/wide_kmer.rs` + `src/wide_counter.rs`,
+   `u128`, `33 <= k <= 64`) does the same job; `--engine`/
+   `pipeline::resolve_engine` routes between them. It is a parallel
+   implementation rather than a generic one on purpose -- the `u64` path is
+   the one measured exactly equal to KMC3, and `wide_kmer.rs`'s module doc
+   gives the full argument. `wide_matches_the_narrow_engine_exactly_where_
+   they_overlap` is what keeps the two from drifting.
    Extraction is a rolling bit-shift window (O(n), not O(n·k)); an ambiguous
    base (non-ACGTU, mainly `N`) resets the accumulator rather than
    corrupting a spanning k-mer. Reverse-complement is branchless bit-twiddling
@@ -170,6 +177,10 @@ territory even pre-1.0.
   reuse `discover_samples` but escalate an unpaired file to a hard error
   (vs. cohort listing's warn-and-continue), since `--paired-dir` runs
   unattended across many samples.
+- `wide_kmer.rs`, `wide_counter.rs` -- the `k > 32` engine (`u128`,
+  `33 <= k <= 64`). In-memory only: `disk_spill.rs` and `binned.rs` are
+  8-byte-key machinery throughout, so `--strategy` does not apply above
+  k=32 and the CLI says so rather than ignoring the flag silently.
 - `read_profile.rs` (backs `profile`),
   `qc.rs`, `preview.rs` (backs `peek`), `export.rs` (Parquet/CSV writers),
   `atomic.rs` (write-then-rename; deliberately left `pub` because an
