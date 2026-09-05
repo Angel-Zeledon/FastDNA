@@ -35,7 +35,3 @@ colliding into one count.
 ## Choosing a `min_count` threshold
 
 ::: fastdna.spectrum
-
-## Counting sequences already in memory
-
-::: fastdna.interop

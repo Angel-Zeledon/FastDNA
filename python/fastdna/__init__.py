@@ -8,8 +8,6 @@ the Rust/Python boundary, per the packaging design (docs/superpowers/specs/
 """
 
 import os
-import sys
-import types as _types
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Sequence, Union
 
 import pyarrow as pa
@@ -49,8 +47,6 @@ __all__ = [
     # Re-exported at the bottom of this module (see the comment there).
     "CohortCounts",
     "count_cohort",
-    "audit",
-    "explain",
 ]
 
 # The path type accepted anywhere in the package: a `str`, or anything
@@ -1184,82 +1180,3 @@ def estimate_spectrum(
 # early binding matters here.
 from .cohort_counts import CohortCounts, count_cohort  # noqa: E402
 
-# `fastdna.audit(...)` and `fastdna.explain(...)` -- the two functions this
-# package's own differentiator (docs/audit/ml-gaps.md's "unified thesis")
-# is built around -- were previously reachable only via `from fastdna.audit
-# import audit` / `from fastdna.explain import explain`, one import per
-# function, from a submodule whose name collides with the function itself
-# (`fastdna.audit.audit`, not `fastdna.audit(...)`). Re-exported here so
-# the natural spelling works.
-#
-# LAZY (PEP 562 module `__getattr__`), not a plain top-level `from .audit
-# import audit`: both `audit.py` and `explain.py` import `numpy` at module
-# scope, and `python/tests/test_optional_dependencies.py` genuinely
-# enforces, in a subprocess with a `sys.meta_path` import blocker (not just
-# "numpy happens to already be in sys.modules" -- that check gives a false
-# pass whenever numpy is already resident from an unrelated earlier import
-# in the same process, which is every real test run), that a bare `import
-# fastdna` succeeds with none of scikit-learn/scipy/numpy/pandas/etc.
-# installed at all. `import pyarrow` (line ~13 above) does NOT transitively
-# require numpy to be installed -- it only opportunistically uses it if
-# already present -- so that contract genuinely depends on this being lazy.
-#
-# Two earlier attempts at this both had real bugs, both stemming from the
-# same root cause: `fastdna.audit`/`fastdna.explain` and the *submodules*
-# `python/fastdna/audit.py`/`explain.py` share a name, and Python's import
-# machinery binds an imported submodule onto its parent package (as a
-# plain instance attribute, in `fastdna.__dict__`) as a side effect of
-# *any* `import fastdna.audit` or `from fastdna.audit import ...` anywhere
-# in the process -- not just ones written in this file.
-#
-# Attempt 1: a plain PEP 562 `__getattr__` doing `from .audit import audit`
-# and returning it. `__getattr__` is only ever consulted on a `__dict__`
-# miss, and the `from .audit import audit` statement itself already causes
-# that miss to stop happening (it binds the submodule into `__dict__` as
-# a side effect, before the `return` below even runs) -- so this returned
-# the right callable on the FIRST access and the submodule (not callable)
-# on every access after.
-#
-# Attempt 2: the same `__getattr__`, but explicitly overwriting
-# `globals()["audit"]` with the function after importing it, to win back
-# `__dict__` from the submodule the import machinery had just bound there.
-# This fixed repeated access *through this module's own `__getattr__`* --
-# but anything elsewhere that imports the submodule directly (e.g. a test
-# file's own `from fastdna.audit import AuditReport, audit`, which several
-# already do) binds `fastdna.audit` = the submodule *before* this
-# `__getattr__` is ever entered for it, since regular attribute lookup
-# already finds something and never falls back to `__getattr__` at all.
-#
-# The actual fix: `audit`/`explain` as `@property` on a small `ModuleType`
-# subclass, swapped in for this module's own class below. A property is a
-# *data descriptor* on the class, which Python's attribute lookup always
-# checks BEFORE the instance's own `__dict__` -- so it wins over whatever
-# any import machinery anywhere binds into `fastdna.__dict__["audit"]`,
-# unconditionally, every access, not just the ones routed through this
-# module's own code. Each access re-imports (an already-imported submodule
-# is a cheap `sys.modules` dict lookup, not real work) rather than caching,
-# so there is nothing to keep in sync and no reintroduction of either bug
-# above is possible by construction.
-class _LazyReexportsModule(_types.ModuleType):
-    @property
-    def audit(self):
-        from .audit import audit as _audit
-
-        return _audit
-
-    @property
-    def explain(self):
-        from .explain import explain as _explain
-
-        return _explain
-
-    def __dir__(self):
-        # The default module `__dir__` only lists `self.__dict__` -- it
-        # does not walk the type's own attributes the way the generic
-        # `object.__dir__` does, so `audit`/`explain` (defined on the
-        # class, never on the instance) would otherwise stay invisible to
-        # `dir(fastdna)` and IDE completion even though they work fine.
-        return sorted(set(super().__dir__()) | {"audit", "explain"})
-
-
-sys.modules[__name__].__class__ = _LazyReexportsModule

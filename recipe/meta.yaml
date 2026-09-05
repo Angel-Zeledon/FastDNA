@@ -105,10 +105,9 @@ about:
     cardinality estimation, quality-control reports, and frequency
     spectra in both CSV and GenomeScope-compatible form.
 
-    The Python layer adds a scikit-learn compatible k-mer vectorizer,
-    lineage-aware cross-validation for population-structure-safe model
-    evaluation, genome profiling from the k-mer spectrum, containment-based
-    taxonomic classification, cohort embedding and assembly QC.
+    The Python layer exposes the same engine: counting a sample or a whole
+    cohort, sketching and comparison, k-mer tables with set operations,
+    and read filtering against a reference table -- all handing back Arrow.
 
     See the project README for benchmarks against KMC3 and FastK, the
     Python API reference, and stated limitations.

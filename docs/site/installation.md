@@ -78,13 +78,11 @@ Note the deliberate absence of `--features python` here — see above.
 ## Optional extras
 
 The package declares two extras in `pyproject.toml`. Neither is needed to
-count k-mers; every module that uses a heavy dependency imports it lazily,
-inside the one function that needs it, so plain `import fastdna` never pulls
-in scikit-learn, matplotlib or shap.
+count k-mers, and `import fastdna` pulls in nothing beyond `pyarrow`.
 
 | Extra | Command | What it is for |
 |---|---|---|
-| `test` | `pip install ".[test]"` | Running `pytest python/tests`. Brings in numpy, pandas, polars, duckdb, scipy, scikit-learn, matplotlib, shap, biopython and pytest. |
+| `test` | `pip install ".[test]"` | Running `pytest python/tests`. Brings in numpy, polars, duckdb, tqdm and pytest. |
 | `docs` | `pip install ".[docs]"` | Building this site with `mkdocs build`. |
 
 !!! note "Installing an extra also builds the package"
@@ -107,11 +105,9 @@ in scikit-learn, matplotlib or shap.
     That is what `.github/workflows/docs.yml` does, which is why the docs job
     needs no Rust toolchain and no `maturin` step.
 
-Individual analysis modules state their own optional requirements in their
-docstrings — for example `fastdna.cv` imports `scipy` lazily inside
-`lineage_groups()` and scikit-learn inside `LineageKFold`, and
-`fastdna.plotting` imports `matplotlib` inside each drawing function and
-raises an `ImportError` naming the package if it is missing.
+`numpy` is the only optional package any module reaches for, and it is
+imported lazily inside the functions that need it, so `import fastdna`
+works without it.
 
 ## Checking that it worked
 

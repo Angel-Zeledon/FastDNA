@@ -1,11 +1,19 @@
 # Feature-gap analysis: FastDNA vs. KMC3, FastK, Jellyfish, Mash/sourmash, ntCard
 
-> **Status, 2026-09-05**: this list is a researched *menu*, not a set of
-> commitments -- see `docs/goal-audit-leakage-not-completeness.md`, which
-> supersedes the goal doc cited in the audit note below. An item earns its
-> place by being needed for the leakage-audit claim, not by being an open
-> row here. The research and the status audits stay useful exactly as they
-> are.
+> **Status, 2026-09-05**: this is a researched *menu*, not a set of
+> commitments -- see `docs/goal-fast-kmer-counter.md`, which supersedes the
+> goal doc cited in the audit note below. It is the one gap document that
+> survived the removal of the ML layer, because its subject is the counting
+> engine and its neighbours rather than anything that was removed. An item
+> earns its place by being counting, and by being checkable against one of
+> the tools in the title.
+>
+> Cross-references below to `ml-genomics-roadmap.md`,
+> `ml-differentiation-roadmap.md` and
+> `goal-most-complete-genomics-ml-library.md` point at documents deleted on
+> that date; they are left in place rather than rewritten, because editing
+> the body would misrepresent when the analysis was done. Read them as
+> "there used to be a companion document here".
 
 > **Audit pass, 2026-08-27**: every status marker below was re-checked against
 > the actual code on this date (not just against other planning docs), per

@@ -15,7 +15,7 @@
 #
 # mkdocstrings' Python handler reads the package *statically* (via griffe),
 # so building this site does NOT require the `fastdna._core` Rust extension
-# to be compiled, nor scikit-learn/scipy/matplotlib/shap to be installed.
+# to be compiled, nor any optional scientific package to be installed.
 # That is deliberate: the docs job in .github/workflows/docs.yml needs no
 # Rust toolchain and no maturin build. Do not switch the handler to dynamic
 # analysis without also giving that job a compiled extension module.
@@ -147,8 +147,7 @@ plugins:
             members_order: source
             filters: ["!^_"]
             # These classes document their constructor parameters in the
-            # class docstring (scikit-learn convention, e.g.
-            # `fastdna.sklearn.KmerVectorizer`), so the `__init__` entry
+            # class docstring rather than on `__init__`, so that entry
             # would otherwise render as an undocumented duplicate.
             merge_init_into_class: true
             inherited_members: false
@@ -162,7 +161,4 @@ nav:
   - API reference:
       - Counting: api/counting.md
       - Sketching and comparison: api/sketching.md
-      - Cohorts and features: api/cohorts.md
-      - Evaluation and validation: api/evaluation.md
-      - Models and workflows: api/models.md
-      - Genomics utilities: api/genomics.md
+      - Cohorts: api/cohorts.md

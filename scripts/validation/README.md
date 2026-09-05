@@ -9,21 +9,11 @@ are published. Run on a schedule by
 
 The test suites answer "does the code do what its author intended". These
 answer "is what the author intended actually right", which no amount of unit
-testing can reach. Every finding of the session that created this directory
-came from here rather than from the ~1,700 tests, and each was invisible to
-assertions about *shape*:
-
-- `load_amr` was returning the first 25 contigs of every assembly -- 26% of
-  an *E. coli* genome. The truncated FASTA starts with `>`, is multi-contig
-  and parses fine. Only comparing its base count against the species' known
-  genome size distinguishes it.
-- `audit()`'s default `lineage_threshold` put 198 of 200 genomes in their
-  own lineage, leaving `LineageKFold` nothing to block on -- and still
-  returned a small, well-formed `gap` that reads as "no leakage". The same
-  constant merges a different cohort into 15 groups where 38 sequence types
-  exist. A plausible number is not a correct one.
-- `genomescope`'s end-to-end test accepted any answer between 2,500 and
-  10,000 bp on a synthetic 5 kb genome, so its central claim could not fail.
+testing can reach. Every serious defect found in this project came from here
+rather than from the test suite, and each was invisible to assertions about
+*shape*: a truncated FASTA still starts with `>`, a well-formed number is
+still a number. A plausible answer is not a correct one, and only a source
+of truth outside the code can tell the two apart.
 
 `scripts/bench/` is the neighbouring directory and answers a third question
 -- how fast -- against baselines this project wrote itself, on generated
@@ -31,22 +21,11 @@ data. Useful, and not a correctness check.
 
 ## The scripts
 
-Two layers. The first compares against an **external implementation** of the
-same algorithm; the second, where no reference tool exists, compares against
-**truth that was constructed** -- data built so the right answer is known
-before the module runs.
-
 | script | checks | against |
 |---|---|---|
 | `kmc3_equivalence.py` | k-mer counting | KMC3 3.2.4, **exact equality** |
-| `estimator_accuracy.py` | HyperLogLog, ntCard, genome size | the exact count, and GenomeScope2 |
+| `estimator_accuracy.py` | HyperLogLog, ntCard spectrum | the exact count from the same file |
 | `sketch_vs_mash.py` | MinHash distances | Mash 2.3 |
-| `assembly_qc_vs_merqury.py` | assembly QV | Merqury 1.4.1 |
-| `taxonomy_real_species.py` | species classification | published species identity |
-| `lineage_leakage_experiment.py` | the leakage audit end to end | MLST as ground truth |
-| `known_truth_checks.py` | 22 modules with no reference tool | constructed truth |
-| `leakage_calibration.py` | does the audit's gap track leakage *magnitude* | injected leakage, swept |
-| `leakage_survey.py` | the study itself, many cohorts | -- it produces the result |
 
 Reference tools arrive as **pinned biocontainers**, not manual builds, so a
 rerun a year from now compares against the same versions rather than
@@ -64,20 +43,6 @@ Docker is required for every script that names an external tool. Data
 downloads are cached under `~/.fastdna/` and shared between scripts, so the
 first run is slow and later ones are not.
 
-`leakage_survey.py` is the long one -- roughly four hours for 30 cohorts --
-and is built to be interrupted:
-
-```bash
-python scripts/validation/leakage_survey.py --list                 # candidates
-python scripts/validation/leakage_survey.py --max-cohorts 30 --json survey.json
-python scripts/validation/leakage_survey.py --json survey.json     # resumes
-```
-
-Finished cohorts are skipped on a re-run, and counted cohorts are cached
-under `--cache-dir` (default `cache/cohort_counts/`, ~150 MB each) so a
-re-run that changes the *analysis* rather than the cohorts starts at the
-audit instead of at counting.
-
 ## What "passing" means here
 
 Each script asserts the tightest claim its subject can actually support, and
@@ -86,7 +51,8 @@ the difference matters:
 - **Exact equality** for counting. With trimming off and singletons kept,
   FastDNA and KMC3 solve the identical problem, so any difference is a bug.
 - **A stated bound** for the estimators, taken from each one's own
-  documentation rather than from what it happens to score.
+  documentation rather than from what it happens to score. A stated bound
+  that nothing measures is a promise, not a property.
 - **Bias and scaling** for MinHash. Demanding equality there would demand
   FastDNA reproduce Mash's *sampling noise*; what a correct implementation
   owes instead is no systematic offset, and error that shrinks as
@@ -98,7 +64,7 @@ failures are worse than no script.
 
 ## What is not covered
 
-Listed in `docs/validation-real-data.md` under "What Track C does not
-cover": no Kraken 2 head-to-head, no diploid genome-size case, and no read
-set with real 3'-end quality decay -- which means the quality-trimming path
-is exercised by none of these.
+No read set with real 3'-end quality decay, which means the quality-trimming
+path is exercised by none of these -- the one gap in this directory that is
+about the counting engine itself rather than about something the project no
+longer ships.

@@ -32,7 +32,6 @@
 // is the only scope that reaches generated code here too.
 #![allow(unexpected_cfgs)]
 
-use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -41,13 +40,10 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-// The counts table builds Arrow's layout directly (see `build_record_batch`);
-// the translation tables use builders, because their row count is not known
-// before streaming (see `translate_file`). Both forms are needed here.
-use arrow::array::{
-    ArrayRef, Float64Builder, Int8Builder, StringArray, StringBuilder, UInt32Array, UInt32Builder,
-    UInt64Array,
-};
+// The counts table builds Arrow's layout directly (see `build_record_batch`),
+// which is why the raw buffer types appear alongside the builders: a table
+// whose row count is known up front does not need a builder's growth.
+use arrow::array::{ArrayRef, StringArray, StringBuilder, UInt32Array, UInt64Array};
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::pyarrow::ToPyArrow;
@@ -58,9 +54,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
 
-use crate::chimera_scan;
 use crate::cohort;
-use crate::cohort_vocab;
 use crate::counter::KmerCounter;
 use crate::error::FastDnaError;
 use crate::export;
@@ -75,9 +69,7 @@ use crate::read_filter;
 use crate::read_profile;
 use crate::setops;
 use crate::sketch::{FracSketch, GenomeSketch};
-use crate::translate::{self, Frame, StopHandling, TranslationTable};
 use crate::hll;
-use crate::metagenomics;
 use crate::ntcard;
 
 // The base every FastDNA-specific exception inherits from, alongside
@@ -164,8 +156,6 @@ class IoError(FastDnaError, OSError):
     '''An I/O failure other than the path simply not existing.'''
 class MatrixTooLargeError(FastDnaError, MemoryError):
     '''The requested dense matrix would exceed the configured byte limit.'''
-class VocabTooLargeError(FastDnaError, MemoryError):
-    '''The requested vocabulary table would exceed the configured byte limit.'''
 class ExportError(FastDnaError, RuntimeError):
     '''Serialization or writer failure while exporting results.'''
 class InternalError(FastDnaError, RuntimeError):
@@ -186,7 +176,6 @@ const EXCEPTION_LEAF_NAMES: &[&str] = &[
     "IoNotFoundError",
     "IoError",
     "MatrixTooLargeError",
-    "VocabTooLargeError",
     "ExportError",
     "InternalError",
 ];
@@ -291,7 +280,6 @@ impl From<FastDnaError> for PyErr {
             // not an internal failure -- ValueError-family, not RuntimeError.
             FastDnaError::Load { .. } => "LoadError",
             FastDnaError::MatrixTooLarge { .. } => "MatrixTooLargeError",
-            FastDnaError::VocabTooLarge { .. } => "VocabTooLargeError",
             FastDnaError::Export { .. } => "ExportError",
             FastDnaError::Internal { .. } => "InternalError",
             FastDnaError::Cancelled => unreachable!("handled above, before the message is built"),
@@ -1671,65 +1659,6 @@ fn estimate_spectrum(
     Ok(dict.into())
 }
 
-/// The schema of the frame-translation table `translate_sequences()` and
-/// `translate_file()` hand back.
-///
-/// **Column contract** (stated here for the same reason
-/// `export::counts_schema` states its own: everything downstream reads
-/// these names, so they are an API):
-///
-/// - `sequence_id`: the record's identifier. For `translate_file` this is
-///   the FASTA/FASTQ header with its `>`/`@` marker stripped and truncated
-///   at the first whitespace -- the accession, the way BLAST and SAM define
-///   it, not the whole description line. For `translate_sequences` it is
-///   whatever id the caller supplied.
-/// - `frame`: `+1`, `+2`, `+3`, `-1`, `-2`, `-3`. Signed, so `Int8` rather
-///   than the `UInt8` the other integer columns in this crate use; negative
-///   means the reverse-complement strand.
-/// - `protein`: the translated amino-acid sequence, `*` for a stop and `X`
-///   for an untranslatable codon (see `translate::AMBIGUOUS_AA`). May be
-///   empty -- a sequence shorter than one codon in that frame translates to
-///   nothing, and that is a row with an empty string, not a missing row,
-///   so a caller can always find every (sequence, frame) pair they asked
-///   for.
-///
-/// Rows are emitted sequence-major: every requested frame of the first
-/// sequence, then every frame of the second, and so on. Unlike
-/// `counts_schema`, this schema lives here rather than in `export.rs`
-/// because nothing writes it to Parquet -- it exists only as an in-memory
-/// Arrow table crossing this boundary, so putting it in `export.rs` would
-/// imply a file format that does not exist.
-fn proteins_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("sequence_id", DataType::Utf8, false),
-        Field::new("frame", DataType::Int8, false),
-        Field::new("protein", DataType::Utf8, false),
-    ]))
-}
-
-/// The schema of the amino-acid k-mer table `protein_kmers()` hands back.
-///
-/// **Column contract:**
-///
-/// - `sequence_id`: which protein the k-mer came from. Counts are *per
-///   protein*, not pooled across the input -- pooling is a one-line
-///   group-by on the caller's side, whereas un-pooling is impossible once
-///   done here.
-/// - `aa_kmer`: the k-mer as literal amino-acid letters. **Not canonical**
-///   -- see `translate::amino_acid_kmers` for why proteins cannot be
-///   canonicalized the way DNA k-mers are. `MA` and `AM` are distinct rows.
-/// - `count`: occurrences of that k-mer within that protein.
-///
-/// Rows are protein-major and, within a protein, sorted by `aa_kmer`, so
-/// the table is byte-identical across runs on the same input.
-fn aa_kmers_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("sequence_id", DataType::Utf8, false),
-        Field::new("aa_kmer", DataType::Utf8, false),
-        Field::new("count", DataType::UInt32, false),
-    ]))
-}
-
 /// Wraps an Arrow `RecordBatch` construction failure the same way
 /// `build_record_batch` above does: a schema/length mismatch is an `Export`
 /// failure against a synthetic path, not an I/O error.
@@ -1739,407 +1668,6 @@ fn in_memory_batch(schema: Arc<Schema>, columns: Vec<ArrayRef>) -> Result<Record
         reason: e.to_string(),
         source: Some(Box::new(e)),
     })
-}
-
-/// Resolves the caller's `table`/`frames`/`to_stop` arguments into the
-/// core's own types once, up front, so an invalid id or frame is a
-/// `ValueError` before any sequence is read rather than partway through a
-/// large file.
-fn resolve_translation_args(
-    frames: &[i8],
-    table: u8,
-    to_stop: bool,
-) -> Result<(&'static TranslationTable, Vec<Frame>, StopHandling), FastDnaError> {
-    let table = TranslationTable::from_id(table)?;
-    let resolved: Vec<Frame> =
-        frames.iter().map(|&f| Frame::from_i8(f)).collect::<Result<Vec<_>, _>>()?;
-    if resolved.is_empty() {
-        return Err(FastDnaError::InvalidConfig {
-            parameter: "frames",
-            reason: "at least one reading frame must be requested".to_string(),
-        });
-    }
-    let stop_handling =
-        if to_stop { StopHandling::StopAtFirst } else { StopHandling::Translate };
-    Ok((table, resolved, stop_handling))
-}
-
-/// Builds a `proteins_schema` batch one translated frame at a time.
-///
-/// Shared by `translate_sequences` and `translate_file` so the two cannot
-/// drift into producing differently-shaped tables --
-/// `python/tests/test_translate.py` asserts they agree, and this is what
-/// makes that hold structurally rather than by coincidence.
-///
-/// **What this replaced, and what it costs instead.** The previous form
-/// collected `Vec<(String, i8, String)>` and then walked it to fill the
-/// Arrow builders. Per row that was two heap allocations and two frees --
-/// the sequence id, cloned once for *each* requested frame, and the protein
-/// `String` -- plus a 56-byte tuple moved into a vector that existed only to
-/// be walked once. Rows now go straight into the builders, so per row: no
-/// allocation, and the id and protein bytes are copied once (they were
-/// copied once anyway, out of the temporaries). For a file of N records in
-/// six frames that is `12 * N` allocations and `12 * N` frees removed.
-///
-/// Arrow's `StringBuilder` is already the "one contiguous value buffer plus
-/// offsets" representation, so nothing needs to change there. What does
-/// change is who grows: the intermediate row vector used to grow by
-/// doubling and the builders were then sized exactly, whereas the builders
-/// now do the growing. That is the one part of this that is a swap rather
-/// than a removal, and it is a favourable one -- growth copies plain bytes,
-/// where the row vector's growth copied 56-byte tuples *and* every row cost
-/// two `malloc`/`free` pairs on top.
-struct ProteinsBatchBuilder {
-    ids: StringBuilder,
-    frames: Int8Builder,
-    proteins: StringBuilder,
-    /// Reused by every `push`: `translate_into` clears and refills it, so
-    /// translating N sequences in F frames allocates this buffer once
-    /// instead of `N * F` times.
-    scratch: Vec<u8>,
-}
-
-impl ProteinsBatchBuilder {
-    /// For a caller that knows its row count up front (`translate_sequences`
-    /// does: ids times frames).
-    fn with_capacity(rows: usize) -> Self {
-        ProteinsBatchBuilder {
-            ids: StringBuilder::with_capacity(rows, rows * 16),
-            frames: Int8Builder::with_capacity(rows),
-            proteins: StringBuilder::with_capacity(rows, rows * 64),
-            scratch: Vec::new(),
-        }
-    }
-
-    /// For a caller streaming an input of unknown length (`translate_file`).
-    fn new() -> Self {
-        ProteinsBatchBuilder {
-            ids: StringBuilder::new(),
-            frames: Int8Builder::new(),
-            proteins: StringBuilder::new(),
-            scratch: Vec::new(),
-        }
-    }
-
-    /// Translates one (sequence, frame) pair and appends it as a row.
-    fn push(
-        &mut self,
-        id: &str,
-        sequence: &[u8],
-        frame: Frame,
-        table: &TranslationTable,
-        stop_handling: StopHandling,
-    ) {
-        translate::translate_into(sequence, frame, table, stop_handling, &mut self.scratch);
-        self.ids.append_value(id);
-        self.frames.append_value(frame.as_i8());
-        // Every byte in `scratch` came from an NCBI `AAs` row or from
-        // `translate::AMBIGUOUS_AA`, so this always succeeds. It is the same
-        // check `translate` runs internally via `String::from_utf8`, moved
-        // here rather than added: what is saved is the `String` that used to
-        // carry the result the two feet from there to `append_value`.
-        self.proteins.append_value(std::str::from_utf8(&self.scratch).unwrap_or_default());
-    }
-
-    fn finish(mut self) -> Result<RecordBatch, FastDnaError> {
-        in_memory_batch(
-            proteins_schema(),
-            vec![
-                Arc::new(self.ids.finish()) as ArrayRef,
-                Arc::new(self.frames.finish()) as ArrayRef,
-                Arc::new(self.proteins.finish()) as ArrayRef,
-            ],
-        )
-    }
-}
-
-/// The identifier part of a FASTA/FASTQ header: the marker byte (`>` or
-/// `@`) dropped, then everything up to the first whitespace.
-///
-/// A header line is `>accession free text description`, and the accession
-/// is the part every other tool keys on. Keeping the whole line would make
-/// `sequence_id` unjoinable against anything else the user has, and would
-/// put arbitrary text into a column callers group by.
-///
-/// Borrows from `header` whenever it is valid UTF-8, which every real
-/// header is; only genuinely malformed bytes take the owned branch that
-/// `from_utf8_lossy` allocates for its replacement characters. Returning
-/// `String` meant `into_owned()` on an otherwise-`Borrowed` `Cow`: one
-/// allocation, one copy and one free per record, for bytes that were about
-/// to be copied into an Arrow buffer anyway.
-fn header_to_sequence_id(header: &[u8]) -> Cow<'_, str> {
-    let without_marker = match header.first() {
-        Some(b'>') | Some(b'@') => &header[1..],
-        _ => header,
-    };
-    let end = without_marker
-        .iter()
-        .position(|b| b.is_ascii_whitespace())
-        .unwrap_or(without_marker.len());
-    String::from_utf8_lossy(&without_marker[..end])
-}
-
-/// Translates in-memory sequences in the requested reading frames,
-/// returning a `pyarrow.RecordBatch` under `proteins_schema` (see there for
-/// the column contract).
-///
-/// `ids` and `sequences` are parallel lists; a length mismatch is a
-/// `ValueError` rather than a `zip()` that silently truncates to the
-/// shorter one and mislabels every protein after the first divergence.
-///
-/// Released under `py.allow_threads` like the other bulk work in this
-/// module: translating a few million bases holds no Python state and would
-/// otherwise freeze the calling interpreter for its duration.
-#[pyfunction]
-#[pyo3(signature = (ids, sequences, frames, table=1, to_stop=false))]
-fn translate_sequences(
-    py: Python<'_>,
-    ids: Vec<String>,
-    sequences: Vec<String>,
-    frames: Vec<i8>,
-    table: u8,
-    to_stop: bool,
-) -> PyResult<PyObject> {
-    if ids.len() != sequences.len() {
-        return Err(PyValueError::new_err(format!(
-            "ids and sequences must have the same length -- got {} ids but {} sequences. \
-             Zipping them short would attach the wrong id to every protein after the \
-             mismatch, so this is refused rather than truncated.",
-            ids.len(),
-            sequences.len()
-        )));
-    }
-
-    let batch = py.allow_threads(move || {
-        let (table, frames, stop_handling) = resolve_translation_args(&frames, table, to_stop)?;
-        let mut builder = ProteinsBatchBuilder::with_capacity(ids.len() * frames.len());
-        // `iter()`, not `into_iter()`: the id is appended straight into the
-        // Arrow buffer, so it no longer has to be cloned once per requested
-        // frame -- six sequences' worth of `String` allocation per sequence
-        // in the common six-frame call.
-        for (id, sequence) in ids.iter().zip(sequences.iter()) {
-            for frame in &frames {
-                builder.push(id, sequence.as_bytes(), *frame, table, stop_handling);
-            }
-        }
-        builder.finish()
-    })?;
-
-    batch.to_pyarrow(py)
-}
-
-/// Streams a FASTA/FASTQ(.gz) file through the same reader the counting
-/// pipeline uses and translates every record in the requested frames,
-/// returning a `pyarrow.RecordBatch` under `proteins_schema`.
-///
-/// Reuses `open_fastq_reader` (and therefore `FastqReader`'s own
-/// content-based FASTA/FASTQ sniffing and gzip handling) rather than
-/// growing a second file-reading path: a file that `count()` can read must
-/// be a file this can read, and the only way to guarantee that is for both
-/// to go through the same reader.
-///
-/// Unlike `count()`, the whole result is materialized in memory -- a
-/// protein is a third the length of its DNA, but six frames of it is twice
-/// the input size, so this is for genes, contigs and modest read sets
-/// rather than for a whole sequencing run.
-#[pyfunction]
-#[pyo3(signature = (path, frames, table=1, to_stop=false))]
-fn translate_file(
-    py: Python<'_>,
-    path: String,
-    frames: Vec<i8>,
-    table: u8,
-    to_stop: bool,
-) -> PyResult<PyObject> {
-    let path_buf = PathBuf::from(path);
-
-    let batch = py.allow_threads(move || {
-        let (table, frames, stop_handling) = resolve_translation_args(&frames, table, to_stop)?;
-        let mut reader = open_fastq_reader(&path_buf)?;
-
-        let mut builder = ProteinsBatchBuilder::new();
-        let mut record_number: u64 = 0;
-        loop {
-            let record = reader.next_record().map_err(|e| FastDnaError::MalformedFastq {
-                path: path_buf.clone(),
-                record: record_number + 1,
-                reason: e.to_string(),
-            })?;
-            let Some(record) = record else { break };
-            record_number += 1;
-
-            let id = header_to_sequence_id(&record.id);
-            for frame in &frames {
-                builder.push(id.as_ref(), &record.seq, *frame, table, stop_handling);
-            }
-        }
-        builder.finish()
-    })?;
-
-    batch.to_pyarrow(py)
-}
-
-/// Counts amino-acid k-mers in each of `proteins`, returning a
-/// `pyarrow.RecordBatch` under `aa_kmers_schema` (see there for the column
-/// contract, and `translate::amino_acid_kmers` for why these k-mers are not
-/// canonical and do not share `kmer.rs`'s packed representation).
-#[pyfunction]
-#[pyo3(signature = (ids, proteins, k=3))]
-fn protein_kmers(
-    py: Python<'_>,
-    ids: Vec<String>,
-    proteins: Vec<String>,
-    k: usize,
-) -> PyResult<PyObject> {
-    if ids.len() != proteins.len() {
-        return Err(PyValueError::new_err(format!(
-            "ids and proteins must have the same length -- got {} ids but {} proteins. \
-             Zipping them short would attach the wrong id to every k-mer after the \
-             mismatch, so this is refused rather than truncated.",
-            ids.len(),
-            proteins.len()
-        )));
-    }
-
-    let batch = py.allow_threads(move || {
-        // Straight into the builders. The previous form collected
-        // `Vec<(String, String, u32)>` first, which cost per row: one
-        // `String` for the id (cloned once per k-mer of the protein), one
-        // `String` for the k-mer itself, and a 56-byte tuple pushed into a
-        // vector that was then walked once to fill these very builders. All
-        // three are gone -- `count_amino_acid_kmers_borrowed` hands back
-        // k-mers that borrow from the protein, and both strings are copied
-        // exactly once, into the Arrow value buffers they were destined for.
-        let mut id_builder = StringBuilder::new();
-        let mut kmer_builder = StringBuilder::new();
-        let mut count_builder = UInt32Builder::new();
-        for (id, protein) in ids.iter().zip(proteins.iter()) {
-            for (aa_kmer, count) in translate::count_amino_acid_kmers_borrowed(protein, k)? {
-                id_builder.append_value(id);
-                kmer_builder.append_value(aa_kmer);
-                count_builder.append_value(count);
-            }
-        }
-
-        in_memory_batch(
-            aa_kmers_schema(),
-            vec![
-                Arc::new(id_builder.finish()) as ArrayRef,
-                Arc::new(kmer_builder.finish()) as ArrayRef,
-                Arc::new(count_builder.finish()) as ArrayRef,
-            ],
-        )
-    })?;
-
-    batch.to_pyarrow(py)
-}
-
-/// The Python-visible k-mer -> lowest-common-ancestor database behind
-/// `fastdna.metagenomics`. Wraps `metagenomics::KmerDatabase`; every
-/// algorithm, format and validation decision lives there, with no PyO3
-/// dependency, so all of it stays testable under `cargo test` alone.
-#[pyclass(name = "KmerDatabase", module = "fastdna._core")]
-struct PyKmerDatabase {
-    inner: metagenomics::KmerDatabase,
-}
-
-#[pymethods]
-impl PyKmerDatabase {
-    /// Loads a database written by `save`.
-    ///
-    /// Released under `py.allow_threads` like every other bulk operation in
-    /// this module: a database is hundreds of megabytes of file to read and
-    /// validate, and holding the GIL for it would freeze the calling
-    /// interpreter with no way to interrupt it.
-    #[staticmethod]
-    fn load(py: Python<'_>, path: String) -> PyResult<PyKmerDatabase> {
-        let inner = py.allow_threads(|| metagenomics::KmerDatabase::load(path))?;
-        Ok(PyKmerDatabase { inner })
-    }
-
-    fn save(&self, py: Python<'_>, path: String) -> PyResult<()> {
-        py.allow_threads(|| self.inner.save(path))?;
-        Ok(())
-    }
-
-    #[getter]
-    fn k(&self) -> usize {
-        self.inner.k()
-    }
-
-    /// The number of distinct canonical k-mers in the table.
-    #[getter]
-    fn n_kmers(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Resident bytes. Exposed rather than left to be discovered by OOM:
-    /// this representation costs 12 bytes per k-mer and does not scale to
-    /// RefSeq, and a user planning a reference set needs to be able to see
-    /// the number before committing to one.
-    #[getter]
-    fn memory_bytes(&self) -> usize {
-        self.inner.memory_bytes()
-    }
-
-    /// Classifies every read of a FASTA/FASTQ(.gz) file, returning a
-    /// `pyarrow.RecordBatch` with columns `read_id`, `tax_id`,
-    /// `confidence`, `n_kmers`, `n_classified_kmers`.
-    #[pyo3(signature = (reads, confidence_threshold=0.0))]
-    fn classify(&self, py: Python<'_>, reads: String, confidence_threshold: f64) -> PyResult<PyObject> {
-        let batch = py.allow_threads(|| {
-            let rows = self.inner.classify_path(&reads, confidence_threshold)?;
-            metagenomics::classification_batch(&rows)
-        })?;
-        batch.to_pyarrow(py)
-    }
-
-    /// Aggregates a list of per-read taxon ids into the abundance report.
-    ///
-    /// Takes the ids rather than the classification table itself: pulling
-    /// one column out of an Arrow table is a line of pyarrow on the Python
-    /// side, and keeping it there rather than teaching this binding to
-    /// consume an Arrow table keeps the FFI surface to what genuinely needs
-    /// compiling on five platforms.
-    fn abundance(&self, py: Python<'_>, tax_ids: Vec<u32>) -> PyResult<PyObject> {
-        let batch = py.allow_threads(|| self.inner.abundance_batch(&tax_ids))?;
-        batch.to_pyarrow(py)
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "KmerDatabase(k={}, n_kmers={}, taxa={}, memory_bytes={})",
-            self.inner.k(),
-            self.inner.len(),
-            self.inner.taxonomy().len(),
-            self.inner.memory_bytes()
-        )
-    }
-}
-
-/// Builds a k-mer -> lowest-common-ancestor database from a reference
-/// FASTA and a taxonomy TSV, optionally saving it to `output`.
-///
-/// The database is returned whether or not `output` is given, so a caller
-/// that wants to build and classify in one session never pays a save and a
-/// reload for it.
-#[pyfunction]
-#[pyo3(signature = (reference, taxonomy, k=31, output=None))]
-fn build_database(
-    py: Python<'_>,
-    reference: String,
-    taxonomy: String,
-    k: usize,
-    output: Option<String>,
-) -> PyResult<PyKmerDatabase> {
-    let inner = py.allow_threads(|| -> Result<metagenomics::KmerDatabase, FastDnaError> {
-        let db = metagenomics::KmerDatabase::build(&reference, &taxonomy, k)?;
-        if let Some(output) = &output {
-            db.save(output)?;
-        }
-        Ok(db)
-    })?;
-    Ok(PyKmerDatabase { inner })
 }
 
 /// The schema of `cohort_presence_matrix`'s `"triples"` batch: one row per
@@ -2292,235 +1820,6 @@ fn cohort_presence_matrix(
     Ok(dict.into())
 }
 
-/// Maps `rank_cohort_vocabulary`'s `ranking` string onto the Rust enum.
-///
-/// Rejects anything else as `InvalidConfig` rather than falling back to a
-/// default: the two rankings disagree about which k-mers are worth keeping
-/// at all, so a typo that quietly selected the other one would return a
-/// well-formed vocabulary that answers a different question -- the failure
-/// mode `python/tests/test_review_findings_2026_09_02.py` exists to pin.
-fn parse_vocabulary_ranking(ranking: &str) -> PyResult<cohort_vocab::VocabularyRanking> {
-    match ranking {
-        "prevalence" => Ok(cohort_vocab::VocabularyRanking::PrevalenceThenFrequency),
-        "binary" => Ok(cohort_vocab::VocabularyRanking::BinaryInformativeness),
-        other => Err(FastDnaError::InvalidConfig {
-            parameter: "ranking",
-            reason: format!("expected \"prevalence\" or \"binary\", got {other:?}"),
-        }
-        .into()),
-    }
-}
-
-/// The schema of `rank_cohort_vocabulary`'s returned `pyarrow.RecordBatch`:
-/// one row per selected k-mer, already in ranked (best-first) order -- see
-/// `cohort_vocab::rank_vocabulary`'s own doc comment for the two ranking
-/// rules its `ranking` argument selects between. `prevalence` and
-/// `total_freq` are the real per-k-mer tallies under either one, even when
-/// the ranking that ran did not order by them.
-fn cohort_vocab_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("kmer_u64", DataType::UInt64, false),
-        Field::new("prevalence", DataType::UInt32, false),
-        Field::new("total_freq", DataType::UInt32, false),
-    ]))
-}
-
-/// K-way merges every sample table named in `table_paths` (each a sorted
-/// `(kmer_u64, frequency)` Parquet table -- see `ktab.rs`) and ranks the
-/// resulting distinct k-mers, returning a `pyarrow.RecordBatch` under
-/// `cohort_vocab_schema` (`kmer_u64`/`prevalence`/`total_freq`), already in
-/// ranked (best-first) order -- nothing left for the caller to sort. The
-/// Python-visible counterpart of `cohort_vocab::rank_vocabulary`; see that
-/// function's own doc comment for the streaming merge, the tie-break rule,
-/// and the bounded-memory guarantee `top_n` provides.
-///
-/// `python/fastdna/sklearn.py::KmerVectorizer`'s `disk_backed=True`
-/// vocabulary-learning path calls this directly on each training sample's
-/// own per-sample Parquet table, instead of `_learn_vocabulary`/`_learn_
-/// vocabulary_streaming`'s approach of holding the cohort's rows (fully, or
-/// `chunk_size` at a time) in Python-side Arrow arrays. See that module's
-/// own docstring for why `disk_backed` exists and how it interacts with
-/// `chunk_size`.
-///
-/// `ranking` names which of `cohort_vocab::VocabularyRanking`'s two rules
-/// orders the result: `"prevalence"` (the default, and the rule a
-/// count-valued matrix wants) or `"binary"` (the rule a presence/absence
-/// matrix wants, which also drops the k-mers present in every sample --
-/// see `parse_vocabulary_ranking`). A string rather than an integer or a
-/// bool because this crosses into Python, where the caller
-/// (`KmerVectorizer._learn_vocabulary_disk_backed`) already has
-/// `representation` as a string and a wrong value should fail by name
-/// rather than by silently meaning the other rule.
-///
-/// Released under `py.allow_threads` like every other bulk operation in
-/// this module (`ktab_union` and friends): merging several real k-mer
-/// tables is I/O- and CPU-bound work with nothing Python-specific in it,
-/// and holding the GIL for it would freeze the calling interpreter for a
-/// cohort-sized run.
-#[pyfunction]
-#[pyo3(signature = (table_paths, top_n=None, ranking="prevalence"))]
-fn rank_cohort_vocabulary(
-    py: Python<'_>,
-    table_paths: Vec<String>,
-    top_n: Option<usize>,
-    ranking: &str,
-) -> PyResult<PyObject> {
-    let ranking = parse_vocabulary_ranking(ranking)?;
-    let paths: Vec<PathBuf> = table_paths.into_iter().map(PathBuf::from).collect();
-    let (kmers, prevalence, total_freq) =
-        py.allow_threads(|| cohort_vocab::rank_vocabulary(&paths, top_n, ranking))?;
-
-    let batch = in_memory_batch(
-        cohort_vocab_schema(),
-        vec![
-            Arc::new(UInt64Array::from(kmers)) as ArrayRef,
-            Arc::new(UInt32Array::from(prevalence)) as ArrayRef,
-            Arc::new(UInt32Array::from(total_freq)) as ArrayRef,
-        ],
-    )?;
-    batch.to_pyarrow(py)
-}
-
-/// The schema of `project_cohort_onto_vocabulary`'s returned
-/// `pyarrow.RecordBatch`: one row per nonzero `(sample, vocabulary k-mer)`
-/// entry, in COO form -- `scipy.sparse.csr_matrix` accepts `(data, (row,
-/// col))` triples in any order, so no particular ordering is promised here
-/// (matches `cohort_triples_schema`'s own contract, above).
-fn cohort_projection_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("row", DataType::UInt32, false),
-        Field::new("col", DataType::UInt32, false),
-        Field::new("value", DataType::UInt32, false),
-    ]))
-}
-
-/// Projects every sample table in `table_paths` onto the fixed
-/// `vocabulary` (a list of `kmer_u64` codes, typically `rank_cohort_
-/// vocabulary`'s own `kmer_u64` column), returning a `pyarrow.RecordBatch`
-/// under `cohort_projection_schema` (`row`/`col`/`value`) -- one COO entry
-/// per `(sample, vocabulary k-mer)` pair actually present in that sample's
-/// table. The Python-visible counterpart of `cohort_vocab::project_onto_
-/// vocabulary`; see that function's own doc comment for the memory bound
-/// this exists to provide (one sample's own table plus the vocabulary
-/// lookup resident at a time, never the whole cohort at once) and for why
-/// `col` matches `vocabulary`'s own given order rather than a re-sorted
-/// one.
-///
-/// Released under `py.allow_threads` for the same reason as `rank_cohort_
-/// vocabulary` and every other bulk table operation in this module.
-#[pyfunction]
-fn project_cohort_onto_vocabulary(
-    py: Python<'_>,
-    table_paths: Vec<String>,
-    vocabulary: Vec<u64>,
-) -> PyResult<PyObject> {
-    let paths: Vec<PathBuf> = table_paths.into_iter().map(PathBuf::from).collect();
-    let (rows, cols, values) =
-        py.allow_threads(|| cohort_vocab::project_onto_vocabulary(&paths, &vocabulary))?;
-
-    let batch = in_memory_batch(
-        cohort_projection_schema(),
-        vec![
-            Arc::new(UInt32Array::from(rows)) as ArrayRef,
-            Arc::new(UInt32Array::from(cols)) as ArrayRef,
-            Arc::new(UInt32Array::from(values)) as ArrayRef,
-        ],
-    )?;
-    batch.to_pyarrow(py)
-}
-
-/// The schema of the table `scan_chimeras()` hands back -- see `chimera_
-/// scan.rs`'s module doc comment for the detection algorithm this table is
-/// the output of.
-///
-/// **Column contract:**
-///
-/// - `contig_id`: `"{file stem}::{header accession}"`
-///   (`chimera_scan::read_contigs`), unique across every file
-///   `scan_chimeras()` was given.
-/// - `position`: 0-based position in the contig where a candidate
-///   breakpoint's "before" window ends and "after" window begins.
-/// - `divergence`: the raw Jensen-Shannon divergence (bits, base-2 log,
-///   `[0, 1]`) between the two windows' canonical k-mer composition -- the
-///   magnitude of the compositional shift.
-/// - `confidence`: see `chimera_scan::Breakpoint::confidence`'s own doc
-///   comment for the exact scoring rule.
-///
-/// Rows are file-major, then contig-major within a file, then
-/// position-ascending within a contig -- a plain long/tidy table, one row
-/// per candidate breakpoint, shaped so it can be joined later against
-/// taxonomic annotation by `contig_id`.
-fn chimeras_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("contig_id", DataType::Utf8, false),
-        Field::new("position", DataType::UInt32, false),
-        Field::new("divergence", DataType::Float64, false),
-        Field::new("confidence", DataType::Float64, false),
-    ]))
-}
-
-/// Scans every contig of every file in `paths` for composition-based
-/// chimera candidates (`chimera_scan::scan_paths`), returning a
-/// `pyarrow.RecordBatch` under `chimeras_schema`.
-///
-/// `threshold=None` (the default) returns the *unfiltered* divergence
-/// profile -- every candidate breakpoint on the `window`/`step` grid, one
-/// row each, `confidence == divergence` -- which is what a calibration
-/// sweep needs to see the raw curve rather than a pre-thresholded one.
-/// Pass a threshold in `[0, 1]` (Jensen-Shannon divergence, bits) to get
-/// flagged, clustered breakpoints instead -- see `chimera_scan.rs`'s
-/// module doc comment for the exact clustering rule.
-///
-/// `k` defaults to `4` (tetranucleotide composition), this technique's
-/// namesake and this project's calibrated default -- not `fastdna.count`'s
-/// own `k=31` default, which would make every window's k-mer set nearly
-/// unique and the composition comparison meaningless.
-///
-/// Raises `InvalidConfigError` (via `FastDnaError::InvalidConfig`,
-/// `chimera_scan::ChimeraScanParams::validate`) for a bad `window`/`step`/
-/// `k`/`threshold` combination, before any file is opened.
-///
-/// Released under `py.allow_threads` like every other bulk operation in
-/// this module: scanning a directory of MAGs is I/O- and CPU-bound work
-/// that holds no Python state.
-#[pyfunction]
-#[pyo3(signature = (paths, window, step, k=4, threshold=None))]
-fn scan_chimeras(
-    py: Python<'_>,
-    paths: Vec<String>,
-    window: usize,
-    step: usize,
-    k: usize,
-    threshold: Option<f64>,
-) -> PyResult<PyObject> {
-    let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    let params = chimera_scan::ChimeraScanParams { window, step, k, threshold };
-
-    let breakpoints = py.allow_threads(move || chimera_scan::scan_paths(&path_bufs, &params))?;
-
-    let mut contig_ids = StringBuilder::new();
-    let mut positions = UInt32Builder::with_capacity(breakpoints.len());
-    let mut divergences = Float64Builder::with_capacity(breakpoints.len());
-    let mut confidences = Float64Builder::with_capacity(breakpoints.len());
-    for bp in &breakpoints {
-        contig_ids.append_value(&bp.contig_id);
-        positions.append_value(bp.position);
-        divergences.append_value(bp.divergence);
-        confidences.append_value(bp.confidence);
-    }
-
-    let batch = in_memory_batch(
-        chimeras_schema(),
-        vec![
-            Arc::new(contig_ids.finish()) as ArrayRef,
-            Arc::new(positions.finish()) as ArrayRef,
-            Arc::new(divergences.finish()) as ArrayRef,
-            Arc::new(confidences.finish()) as ArrayRef,
-        ],
-    )?;
-    batch.to_pyarrow(py)
-}
-
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
@@ -2534,7 +1833,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFilterStats>()?;
     m.add_class::<PyPairedFilterStats>()?;
     m.add_class::<PyProfileStats>()?;
-    m.add_class::<PyKmerDatabase>()?;
     m.add_function(wrap_pyfunction!(count, m)?)?;
     m.add_function(wrap_pyfunction!(peek, m)?)?;
     m.add_function(wrap_pyfunction!(build_info, m)?)?;
@@ -2545,19 +1843,12 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_frac_sketch, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_cardinality, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_spectrum, m)?)?;
-    m.add_function(wrap_pyfunction!(translate_sequences, m)?)?;
-    m.add_function(wrap_pyfunction!(translate_file, m)?)?;
-    m.add_function(wrap_pyfunction!(protein_kmers, m)?)?;
-    m.add_function(wrap_pyfunction!(build_database, m)?)?;
     m.add_function(wrap_pyfunction!(cohort_presence_matrix, m)?)?;
-    m.add_function(wrap_pyfunction!(rank_cohort_vocabulary, m)?)?;
-    m.add_function(wrap_pyfunction!(project_cohort_onto_vocabulary, m)?)?;
     m.add_function(wrap_pyfunction!(ktab_union, m)?)?;
     m.add_function(wrap_pyfunction!(ktab_intersect, m)?)?;
     m.add_function(wrap_pyfunction!(ktab_diff, m)?)?;
     m.add_function(wrap_pyfunction!(filter_reads, m)?)?;
     m.add_function(wrap_pyfunction!(filter_reads_paired, m)?)?;
     m.add_function(wrap_pyfunction!(profile_reads, m)?)?;
-    m.add_function(wrap_pyfunction!(scan_chimeras, m)?)?;
     Ok(())
 }

@@ -35,7 +35,7 @@ print(table.column_names)
     file it weighs 1,667 MB against 430 MB for `kmer_u64` and 215 MB for
     `frequency` — 2.6x the other two columns combined — while decoding it
     accounts for most of the ~17% of wall time the table-building step costs.
-    Every ML-facing module in this package works in `u64` space and never
+    Every module in this package works in `u64` space and never
     reads it.
 
     Ask for it with `count(..., with_sequence=True)`, or add it afterwards
@@ -150,96 +150,26 @@ k-mers via HyperLogLog in a fixed 16 KB (at the default `precision=14`, a
 
 ## Cohort work: count once, reuse everywhere
 
-Counting is by far the most expensive thing this package does, and
-scikit-learn's `Pipeline`/`cross_val_score`/`GridSearchCV` call `fit()` and
-`transform()` at *every* split — so a naive 5-fold cross-validation reads the
-cohort's FASTQ files five times over. `count_cohort()` counts each sample
-exactly once; `KmerVectorizer(counts=...)` then slices that stack per fold
-instead of recounting:
+Counting is by far the most expensive thing this package does, and a
+consumer that re-reads a sample's FASTQ every time it needs its k-mers pays
+that cost again each time. `count_cohort()` counts each sample exactly once
+and hands back one artifact that slices per sample:
 
 ```python
 import fastdna
-from fastdna.sklearn import KmerVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
 
-counts = fastdna.count_cohort("samples/", k=31, min_count=5)
-# CohortCounts: every sample's table, stacked end to end, frozen
+counts = fastdna.count_cohort(paths, k=31, min_count=5)
+print(counts.sample_ids[:3])
 
-pipe = Pipeline([
-    ("kmers", KmerVectorizer(k=31, min_count=5, top_features=10_000, counts=counts)),
-    ("clf",   LogisticRegression(max_iter=1000)),
-])
-pipe.fit(train_paths, train_labels)
+one = counts.subset(["SRR001"])       # that sample's rows, no recount
+print(one.kmers, one.frequencies)
 ```
 
-Counting ahead of time does not reopen the leakage door: a k-mer's count in
-one sample looks at nothing but that sample. The decision that *could* leak —
-which k-mers become features — still happens only inside `fit()`, on the
-training fold's rows alone.
-
-## Cross-validate against population structure, not around it
-
-Bacterial and viral cohorts are clonal. A random CV split scatters members of
-one clone across the train/test boundary, so the "held-out" fold contains
-near-copies of the training data and the model can score highly by
-recognizing the lineage rather than the phenotype. FastDNA already has the
-all-pairs Mash distances needed to stand in for a phylogeny, in seconds
-rather than the hours a real tree would take:
-
-```python
-from fastdna.cv import lineage_groups, LineageKFold
-from sklearn.model_selection import cross_val_score
-
-cv = LineageKFold(n_splits=5, paths=paths)
-scores = cross_val_score(pipe, paths, labels, cv=cv)
-
-# Or derive the labels yourself and reuse them across several evaluations,
-# so the cohort is sketched once rather than once per splitter:
-groups = lineage_groups(paths, distance_threshold=0.01)   # one integer label per sample
-cv = LineageKFold(n_splits=5, groups=groups)
-```
-
-`LineageKFold` requires exactly one of `paths=` or `groups=` — it will not
-silently fall back to random folds. It is `GroupKFold` underneath; the
-contribution is that the groups come from the genomes themselves, so the
-caller does not need a phylogeny nobody built.
-
-Expect scores to go **down** relative to random CV. That drop is the finding,
-not a regression: the honest estimate is the one you can defend.
-[`fastdna.audit.audit()`](api/evaluation.md#fastdna.audit) measures exactly
-that gap — it runs both a random and a lineage-blocked scheme and reports how
-much of the score survives — and
-[`fastdna.cv`](api/evaluation.md#fastdna.cv) documents what this technique
-cannot fix (a cohort where the phenotype is perfectly confounded with lineage
-has no honest split, and `permutation_importance_pvalues` will report p = 1.0
-rather than pretend otherwise).
-
-## The whole association study in one call
-
-[`AssociationWorkflow`](api/models.md#fastdna.workflow) composes the six
-modules a k-mer association study normally needs, in the right order, with
-the sample-id bookkeeping done once and correctly:
-
-```python
-from fastdna.workflow import AssociationWorkflow
-
-workflow = AssociationWorkflow(fastq_paths, phenotype, n_splits=5)
-result = workflow.run()
-
-print(result.classifier.explain())              # rules as literal DNA sequences
-print(result.precision_recall.average_precision)
-workflow.plot_significance()                    # needs matplotlib
-workflow.plot_population_structure()            # needs matplotlib + scipy
-```
-
-It is a convenience layer, not a new capability: it calls the same public
-functions a hand-written script would, keeps every intermediate artifact, and
-suppresses none of the underlying warnings — the screening step still raises
-`ScreeningOnlyWarning`, the rule model's `predict_proba` is still a hard 0/1
-decision, and the calibration report still raises
-`UncalibratedScoresWarning` when it should. Every stage is skippable or
-replaceable.
+The artifact is frozen and cheap to share: `deepcopy` returns the same
+object rather than duplicating a table that can run to hundreds of millions
+of rows. `save()`/`load()` put it in a single Parquet file, so the counting
+survives the process that did it — and the file is still a valid k-mer table
+to any reader that has never heard of `CohortCounts`.
 
 ## The command-line interface
 
@@ -289,8 +219,6 @@ which is the single source of truth for the CLI surface.
 
 ## Where to go from here
 
-The [API reference](api/counting.md) covers every public function, class and
-submodule — including areas not touched above: metagenomic classification
-against a k-mer/LCA database, Merqury-style reference-free assembly QC,
-GenomeScope-style genome profiling, six-frame translation, MIC regression,
-interpretable rule models, and HTML reporting.
+The [API reference](api/counting.md) covers every public function and class:
+counting, sketching and comparison, cardinality and spectrum estimation,
+k-mer tables with set operations, and cohort counting.

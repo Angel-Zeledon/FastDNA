@@ -14,6 +14,15 @@ La superficie con compatibilidad garantizada es:
 
 ## [Unreleased]
 
+> **Aviso, 2026-09-05.** Muchas de las entradas de *Added*, *Changed* y
+> *Fixed* de abajo describen la capa de ML, que se eliminó el 2026-09-05
+> antes de que ninguna versión la publicara (ver *Removed*). Se dejan
+> escritas porque son el registro del trabajo y de los defectos que
+> encontró, pero **no describen nada que se pueda instalar**: si una
+> entrada nombra `fastdna.sklearn`, `fastdna.audit`, `fastdna.cv`,
+> `fastdna.gwas`, `fastdna.metagenomics` o cualquier otro módulo de esa
+> lista, se refiere a código que ya no existe.
+
 ### Added
 
 - **Python: `fastdna.sklearn.EmptyVocabularyWarning`** -- `fit()` avisa
@@ -802,6 +811,54 @@ La superficie con compatibilidad garantizada es:
 - Empaquetado del wheel (ver `pyproject.toml` en *Changed*).
 
 ### Removed
+
+- **La capa de machine learning entera.** 31 módulos de Python
+  (`sklearn`, `audit`, `cv`, `explain`, `interpret`, `gwas`, `mic`,
+  `embed`, `design`, `evaluation`, `calibration`, `anomaly`,
+  `active_learning`, `genomic_model`, `rules`, `multiomics`, `datasets`,
+  `equivalence`, `validate_generated`, `metagenomics`, `taxonomy`,
+  `chimeras`, `annotate`, `translate`, `genomescope`, `assembly_qc`,
+  `interop`, `plotting`, `report`, `provenance`, `workflow`), 4 módulos de
+  Rust (`metagenomics.rs`, `chimera_scan.rs`, `translate.rs`,
+  `cohort_vocab.rs`) y todo lo que existía para servirlos: sus bindings en
+  `ffi.rs`, sus tests, sus scripts de validación y sus documentos de
+  roadmap.
+
+  **Esto rompe el contrato.** Cualquiera que importe alguno de esos módulos
+  queda roto, sin período de deprecación. La versión 0.x lo permite; la
+  honestidad exige decirlo así y no llamarlo "enfoque". Lo eliminado está
+  en la historia de git en `60b5f82` y se puede recuperar de ahí.
+
+  **Por qué.** Los nueve defectos serios que encontró este proyecto entre
+  el 2026-08-31 y el 2026-09-05 estaban todos en esa capa, ninguno era
+  alcanzable por los ~1.750 tests que existían, y cada uno se encontró
+  contrastando un módulo ya entregado contra una verdad calculada fuera de
+  él. Comparten una firma: *la salida equivocada estaba bien formada*. En
+  el mismo período, el motor de conteo se comparó contra KMC3 sobre
+  lecturas reales y dio **igualdad exacta** (19.062.700 distintos,
+  163.051.083 totales). Una de las dos mitades está validada; la otra
+  producía respuestas bien formadas y equivocadas más rápido de lo que se
+  podían cazar. El razonamiento completo, con las cifras, está en
+  `docs/goal-fast-kmer-counter.md`.
+
+  Lo que queda es el CLI actual y su equivalente en Python: `count`,
+  `sketch`, `dist`, `card`, `peek`, `query`, `union`, `intersect`, `diff`,
+  `filter`, `matrix`, `profile`, `spectrum`.
+
+- **Python: `fastdna.audit` y `fastdna.explain` salen de
+  `fastdna.__all__`**, junto con la maquinaria de re-exportación perezosa
+  que existía para que `fastdna.audit(...)` funcionara pese al choque de
+  nombres con el submódulo. `__all__` queda en 18 nombres, todos de conteo.
+
+- **`FastDnaError::VocabTooLarge` y su `VocabTooLargeError` en Python.** Ya
+  no había forma de provocarlo: lo lanzaba únicamente el camino de
+  vocabulario que se fue con `cohort_vocab.rs`. `MatrixTooLarge` se queda,
+  que sí sigue vivo en `cohort/matrix.rs`.
+
+- **Extras de `pyproject.toml`:** `scikit-learn`, `scipy`, `shap`,
+  `umap-learn`, `biopython`, `matplotlib` y `pandas` salen del extra
+  `test`. Ningún módulo del paquete importa ya ninguno de ellos; `numpy` es
+  el único opcional que queda y se importa perezosamente.
 
 - `src/cms.rs` eliminado por completo -- el `pub mod cms;` correspondiente
   desaparece de `src/lib.rs`. Rompe a cualquier consumidor externo de

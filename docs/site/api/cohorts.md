@@ -1,14 +1,7 @@
-# Cohorts and features
+# Cohorts
 
-Turning a directory of FASTQ files into a feature matrix a model can be
-fitted on — and doing it without counting the same file eleven times.
-
-The ordering here is the order the pieces are used: count the cohort once
-(`CohortCounts`), project it onto a learned vocabulary
-(`fastdna.sklearn.KmerVectorizer`), optionally join it to other omics or
-clinical layers (`fastdna.multiomics`), collapse columns that are
-indistinguishable in this cohort (`fastdna.equivalence`), and hand the
-evidence to established association tooling (`fastdna.gwas`).
+Counting many samples once, and slicing that result per sample afterwards,
+instead of re-reading a file every time some consumer needs its k-mers.
 
 ## Counting a cohort once
 
@@ -24,19 +17,3 @@ evidence to established association tooling (`fastdna.gwas`).
 ::: fastdna.count_cohort
 
 ::: fastdna.CohortCounts
-
-## scikit-learn integration
-
-::: fastdna.sklearn
-
-## Joining other data by sample ID
-
-::: fastdna.multiomics
-
-## Collapsing indistinguishable features
-
-::: fastdna.equivalence
-
-## Association: evidence out, statistics elsewhere
-
-::: fastdna.gwas

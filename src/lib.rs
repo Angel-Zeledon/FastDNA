@@ -3,10 +3,8 @@
 // The public surface. These are the modules a consumer of `fastdna_core`
 // is expected to name, and the ones the `[[bin]]`, the `python` feature's
 // `ffi` and the `wasm` feature all reach through.
-pub mod chimera_scan;
 pub mod cli;
 pub mod cohort;
-pub mod cohort_vocab;
 pub mod counter;
 pub mod error;
 pub mod export;
@@ -15,7 +13,6 @@ pub mod hll;
 pub mod kmer;
 pub mod ktab;
 pub mod mem_estimate;
-pub mod metagenomics;
 pub mod ntcard;
 pub mod pipeline;
 pub mod preview;
@@ -25,7 +22,6 @@ pub mod read_filter;
 pub mod read_profile;
 pub mod setops;
 pub mod sketch;
-pub mod translate;
 
 // Implementation. Reachable from anywhere inside the crate, from nowhere
 // outside it.

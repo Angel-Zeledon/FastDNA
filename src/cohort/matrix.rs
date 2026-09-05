@@ -4,6 +4,18 @@
 //! `RecordBatch` (`ffi.rs::build_record_batch`'s `kmer_u64`/`kmer_sequence`/
 //! `frequency` columns).
 //!
+//! # A note on the `gwas.py` references below
+//!
+//! `python/fastdna/gwas.py` was removed on 2026-09-05 with the rest of the
+//! ML layer (`docs/goal-fast-kmer-counter.md`). Every reference to it in
+//! this module is left standing on purpose: this code exists *because* of
+//! what that module did, and its ranking rule, its `min_count`/`min_samples`
+//! defaults and its truncation warning were all chosen to match it exactly.
+//! Rewriting the comments to hide that would delete the reasoning and keep
+//! only the conclusion. Read them as "the Python module this replaced".
+//! The `fastdna matrix` CLI verb is what this backs today, and it never
+//! depended on the Python side.
+//!
 //! # Why this exists
 //!
 //! `python/fastdna/gwas.py::cohort_presence_matrix` used to call

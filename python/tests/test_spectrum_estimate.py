@@ -87,31 +87,3 @@ def test_invalid_k_raises_valueerror(tmp_path):
 
     with pytest.raises(ValueError):
         fastdna.estimate_spectrum(str(path), k=99)
-
-
-def test_is_directly_consumable_by_genomescope_profile_genome(tmp_path):
-    # The contract this module exists to satisfy: the estimated spectrum
-    # must be swappable in wherever an exact `KmerCounts.spectrum()` is
-    # accepted. A single repeated template at a plausible depth is enough
-    # to exercise the real `profile_genome` code path end to end (not to
-    # assert a particular genome-size answer, which is `test_genomescope.py`'s
-    # job against an *exact* spectrum).
-    from fastdna.genomescope import profile_genome
-
-    reads = ["ACGTTGCAACCGGTTAGATCGATCGATCGGATCC" * 5] * 30
-    path = write_fastq(tmp_path, reads)
-
-    spectrum = fastdna.estimate_spectrum(str(path), k=21)
-
-    # A `ValueError` here ("no coverage peak", likely given how little
-    # distinct signal this tiny repeated-template fixture has) is an
-    # expected, documented outcome -- what this test actually guards
-    # against is a `TypeError`/shape error, which would mean the estimated
-    # spectrum's dict did *not* interoperate with the exact-spectrum
-    # contract `profile_genome` expects.
-    try:
-        profile = profile_genome(spectrum, k=21)
-    except ValueError:
-        pass
-    else:
-        assert profile.k == 21

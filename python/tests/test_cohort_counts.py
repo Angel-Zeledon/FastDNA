@@ -1,9 +1,10 @@
 """fastdna.count_cohort() / CohortCounts: count once, reuse everywhere.
 
-The two tests that matter are the equivalence (the fast path cannot change
-the answer) and the read-count (the fast path has to actually be fast).
-Without the second, this module could be doing nothing useful and the
-other tests would still pass.
+The type exists so a cohort is counted once and then sliced, rather than
+re-read by every consumer. What has to hold is that a slice matches what
+counting that sample alone would have produced, that the artifact is
+immutable and cheap to share, and that a saved cohort reloads to exactly
+the same rows.
 """
 from __future__ import annotations
 
@@ -12,21 +13,12 @@ import pytest
 import fastdna
 from fastdna import _core
 
-# Guarded, and in this order, on purpose: a bare `import numpy` above the
-# `importorskip`s (the shape test_sklearn.py and others used to have) makes
-# pytest raise during *collection* rather than skipping in an environment
-# with none of these installed -- see
+# Guarded, not imported at module scope, on purpose: a bare `import numpy`
+# makes pytest raise during *collection* rather than skipping in an
+# environment without it -- see
 # `test_optional_dependencies.py::test_the_test_suite_itself_collects_in_the_environment_ci_builds`,
 # which exists specifically to catch a module reintroducing this.
-pytest.importorskip("sklearn")
-pytest.importorskip("scipy")
 np = pytest.importorskip("numpy")
-
-from sklearn.linear_model import LogisticRegression  # noqa: E402
-from sklearn.model_selection import cross_val_score  # noqa: E402
-from sklearn.pipeline import make_pipeline  # noqa: E402
-
-from fastdna.sklearn import KmerVectorizer  # noqa: E402
 
 
 def _cohort(tmp_path, n=12):
@@ -159,94 +151,17 @@ def test_counts_artifact_is_immutable(tmp_path):
 
 
 def test_deepcopy_of_the_artifact_returns_the_same_object(tmp_path):
-    """sklearn's clone() falls back to copy.deepcopy() for any constructor
-    param that is not itself an estimator -- KmerVectorizer(counts=...)
-    hits exactly that path on every cross_val_score/GridSearchCV fold.
-    Deep-copying the whole k-mer table on every fold would duplicate a
-    real cohort's multi-hundred-million-row table 5-10+ times over and can
-    exhaust memory outright; since the artifact is frozen and meant to be
-    shared (see the module docstring), deepcopy must be a no-op identity.
+    """Deep-copying the artifact must be a no-op identity: it is frozen and
+    meant to be shared (see the module docstring), and a real cohort's
+    multi-hundred-million-row table copied once per consumer can exhaust
+    memory outright. Any caller that hands the artifact to a framework
+    which deep-copies its arguments hits exactly this path.
     """
     import copy
 
     paths = _cohort(tmp_path, n=2)
     counts = fastdna.count_cohort(paths, k=11)
     assert copy.deepcopy(counts) is counts
-
-
-def test_cloning_a_pipeline_with_the_artifact_does_not_duplicate_it(tmp_path):
-    """The actual failure mode this guards against: cloning a Pipeline
-    holding KmerVectorizer(counts=...), as every cross_val_score fold
-    does, must not deep-copy the shared artifact."""
-    from sklearn.base import clone
-
-    paths = _cohort(tmp_path, n=2)
-    counts = fastdna.count_cohort(paths, k=11)
-    pipe = make_pipeline(
-        KmerVectorizer(k=11, top_features=50, representation="count", counts=counts),
-        LogisticRegression(max_iter=200),
-    )
-
-    cloned = clone(pipe)
-
-    assert cloned.steps[0][1].counts is counts
-
-
-def test_vectorizer_with_artifact_matches_vectorizer_with_paths(tmp_path):
-    """The equivalence check: the fast path cannot change the answer."""
-    paths = _cohort(tmp_path, n=8)
-    counts = fastdna.count_cohort(paths, k=11)
-
-    from_paths = KmerVectorizer(k=11, top_features=200, representation="count").fit_transform(paths)
-    from_artifact = KmerVectorizer(
-        k=11, top_features=200, representation="count", counts=counts
-    ).fit_transform(list(counts.sample_ids))
-
-    assert from_paths.shape == from_artifact.shape
-    np.testing.assert_array_equal(from_paths.toarray(), from_artifact.toarray())
-
-
-def test_cross_validation_with_the_artifact_never_recounts(tmp_path, monkeypatch):
-    """The point of the whole module, measured directly: with the
-    artifact, a 3-fold cross-validation must make ZERO calls to
-    fastdna.count(). Without it, it makes one per sample per fold.
-    """
-    paths = _cohort(tmp_path, n=9)
-    counts = fastdna.count_cohort(paths, k=11)
-    y = np.array([0, 1, 0, 1, 0, 1, 0, 1, 0])
-
-    calls = {"n": 0}
-    real_count = fastdna.count
-
-    def counting_spy(*args, **kwargs):
-        calls["n"] += 1
-        return real_count(*args, **kwargs)
-
-    monkeypatch.setattr(fastdna, "count", counting_spy)
-    monkeypatch.setattr("fastdna.sklearn.fastdna.count", counting_spy)
-
-    pipeline = make_pipeline(
-        KmerVectorizer(k=11, top_features=200, counts=counts),
-        LogisticRegression(max_iter=1000),
-    )
-    cross_val_score(pipeline, list(counts.sample_ids), y, cv=3)
-
-    assert calls["n"] == 0, (
-        f"cross-validation with counts= read {calls['n']} FASTQ files; with the "
-        "artifact it must read none"
-    )
-
-
-# ---------------------------------------------------------------------------
-# save() / load(): the same "count once" saving, extended across processes.
-#
-# The equivalence test is the one that matters -- a cache that returns
-# something *close* to the original is worse than no cache, because every
-# downstream number would be quietly wrong rather than obviously broken. The
-# rejection tests exist because that failure mode is silent by nature: an
-# inconsistent `row_counts` slices samples apart at the wrong offsets and
-# still produces a plausible-looking result.
-# ---------------------------------------------------------------------------
 
 
 def test_save_load_round_trip_is_exact(tmp_path):
@@ -285,22 +200,6 @@ def test_a_loaded_cohort_subsets_to_the_same_rows(tmp_path):
     assert restored.row_counts == original.row_counts
     assert restored.kmers.equals(original.kmers)
     assert restored.frequencies.equals(original.frequencies)
-
-
-def test_a_loaded_cohort_vectorizes_identically(tmp_path):
-    """End to end: the cached cohort must produce the same feature matrix,
-    which is the only property a caller actually depends on."""
-    paths = _cohort(tmp_path, n=6)
-    counts = fastdna.count_cohort(paths, k=11)
-    target = tmp_path / "cohort.parquet"
-    counts.save(target)
-    restored = fastdna.CohortCounts.load(target)
-
-    ids = list(counts.sample_ids)
-    a = KmerVectorizer(k=11, top_features=50, counts=counts).fit_transform(ids)
-    b = KmerVectorizer(k=11, top_features=50, counts=restored).fit_transform(ids)
-
-    np.testing.assert_array_equal(a.toarray(), b.toarray())
 
 
 def test_load_rejects_a_plain_kmer_table(tmp_path):

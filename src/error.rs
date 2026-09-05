@@ -31,8 +31,6 @@ pub enum FastDnaError {
     NoSamplesFound { dir: PathBuf },
     /// A dense matrix that would exceed the configured byte limit.
     MatrixTooLarge { estimated_bytes: u64, limit: u64 },
-    /// A prevalence table that would exceed the configured byte limit.
-    VocabTooLarge { estimated_bytes: u64, limit: u64 },
     /// Two sketches built with different `k` cannot be compared.
     MismatchedK { left: usize, right: usize },
     /// Two `FracSketch`es built with different `scale` cannot be compared:
@@ -110,11 +108,6 @@ impl fmt::Display for FastDnaError {
                 f,
                 "dense matrix would need {estimated_bytes} bytes, over the {limit} byte limit; \
                  lower `top_features` to keep fewer k-mer columns, or raise the byte limit"
-            ),
-            FastDnaError::VocabTooLarge { estimated_bytes, limit } => write!(
-                f,
-                "vocabulary table would need {estimated_bytes} bytes, over the {limit} byte limit; \
-                 raise `min_count` to drop rare k-mers, or raise the byte limit"
             ),
             FastDnaError::MismatchedK { left, right } => {
                 write!(f, "cannot compare sketches built with different k: {left} and {right}")
@@ -199,17 +192,14 @@ mod tests {
         assert!(msg.contains("4000000000"));
     }
 
-    /// These messages reach both the CLI and Python (as `MemoryError`).
-    /// They used to name four flags -- `--top-features`, `--format sparse`,
-    /// `--min-count` as the vocabulary remedy, and `--approx-vocab` -- of
-    /// which only `--min-count` exists, and none of which means anything
-    /// to a caller coming in through Python.
+    /// This message reaches both the CLI and Python (as `MemoryError`).
+    /// It used to name flags -- `--top-features`, `--format sparse`,
+    /// `--approx-vocab` -- none of which exists in `cli.rs`, and none of
+    /// which means anything to a caller coming in through Python.
     #[test]
     fn size_limit_messages_do_not_name_flags_that_do_not_exist() {
         let messages = [
             FastDnaError::MatrixTooLarge { estimated_bytes: 8_000_000_000, limit: 4_000_000_000 }
-                .to_string(),
-            FastDnaError::VocabTooLarge { estimated_bytes: 8_000_000_000, limit: 4_000_000_000 }
                 .to_string(),
         ];
 
@@ -223,7 +213,6 @@ mod tests {
         }
 
         assert!(messages[0].contains("top_features"), "{}", messages[0]);
-        assert!(messages[1].contains("min_count"), "{}", messages[1]);
     }
 
     /// `Io` already exposed its cause; `Export` and `Load` flattened it to

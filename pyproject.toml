@@ -44,37 +44,25 @@ dynamic = ["version"]
 # that test module uses `pytest.importorskip` so their absence skips rather
 # than fails.
 # Test-only extras. None is a runtime dependency of the `fastdna` package:
-# every module needing one is opt-in, or imports it lazily inside the single
-# function that uses it. `shap` matters most -- it pulls in numba and
-# llvmlite, which many users cannot install.
-# `biopython` backs `python/tests/test_interop.py`'s claim that
-# `fastdna.interop` accepts real Biopython `SeqRecord` objects, not just the
-# hand-written fake used when biopython is absent. Without it in this extra,
-# that headline claim is only ever verified because biopython happened to
-# already be installed on whichever machine ran the tests -- never in a
-# clean CI environment. `matplotlib` backs `python/fastdna/plotting.py` and
-# `genomescope.plot_spectrum_fit`'s own tests, both of which otherwise skip
-# via `pytest.importorskip` rather than genuinely exercising the drawing code.
+# `numpy` is used lazily by the modules that need it, and everything else
+# here backs a test rather than the library.
 # `tqdm` backs `python/fastdna/_progress.py`'s `progress=True` path (a live
 # bar during `count()`, see `make_progress_adapter`/`_tqdm_sink`) -- without
 # it declared here, that path is a soft dependency with no extra that
 # actually installs it, so it is only ever exercised on a machine where some
-# unrelated extra (e.g. `shap`) happened to pull tqdm in transitively.
+# unrelated package happened to pull tqdm in transitively.
+#
+# The scikit-learn/scipy/shap/umap-learn/biopython/matplotlib/pandas stack
+# that used to live here went with the ML layer (2026-09-05, see CHANGELOG):
+# nothing in this package imports any of them any more.
 [project.optional-dependencies]
 test = [
-    "biopython",
     "duckdb>=1.0",
-    "matplotlib",
     "numpy",
-    "pandas>=2.0",
     "polars>=1.0",
     "pytest>=7",
     "pytest-timeout>=2.1",
-    "scikit-learn>=1.3",
-    "scipy>=1.10",
-    "shap",
     "tqdm",
-    "umap-learn>=0.5",
 ]
 # Docs-only: builds the MkDocs site (`mkdocs.yml`, pages under `docs/site/`).
 # None of these is a runtime dependency of the `fastdna` package.

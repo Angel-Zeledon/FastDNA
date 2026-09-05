@@ -3,7 +3,7 @@
 # This workflow deliberately does NOT build the Rust extension. mkdocstrings'
 # Python handler reads `python/fastdna/` statically via griffe, so the API
 # reference is generated from the source tree itself -- no maturin, no Rust
-# toolchain, no pyarrow/scikit-learn/scipy/matplotlib install, and no risk of
+# toolchain, no pyarrow or scientific-stack install, and no risk of
 # the docs build inheriting a native-build failure that wheels.yml already
 # covers. If the handler is ever switched to dynamic (import-based) analysis,
 # this job has to grow a `maturin develop --features python` step first.

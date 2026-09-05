@@ -382,9 +382,9 @@ pub struct CountArgs {
     /// computes), and on the benchmark file it is 1,667 MB against 430 MB
     /// for `kmer_u64` and 215 MB for `frequency` -- 2.6x the other two
     /// columns combined, and the majority of the ~17% of a run's wall
-    /// time the export step costs. Every ML-facing consumer this crate
-    /// ships (`fastdna.sklearn`, `.cv`, `.gwas`) works in `u64` space and
-    /// never reads it. Pass this flag to get it back, or reconstruct it
+    /// time the export step costs. Every consumer in this crate and its
+    /// Python API works in `u64` space and never reads it. Pass this flag
+    /// to get it back, or reconstruct it
     /// from `kmer_u64` in Python via `KmerCounts.with_sequence()` without
     /// rereading the FASTQ.
     #[arg(long)]
@@ -877,8 +877,9 @@ impl FilterArgs {
 /// export_cohort_matrix_parquet`) -- the CLI verb and generic,
 /// FastDNA-tool-independent file artifact `docs/feature-gap-analysis.md`'s
 /// S6 named as the one piece still missing once the matrix-building engine
-/// and its Python wiring (`python/fastdna/gwas.py::cohort_presence_matrix`)
-/// had already landed.
+/// had already landed. (It also had a Python binding, removed with the ML
+/// layer on 2026-09-05; the CLI verb was always the artifact-producing
+/// half and is unaffected.)
 ///
 /// Two ways to name the cohort, mutually exclusive (`MatrixArgs::validate`):
 /// `--input DIR` reuses `cohort::discover_samples`'s R1/R2 pairing (the same
@@ -903,7 +904,7 @@ pub struct MatrixArgs {
 
     /// One file per sample, named explicitly -- no automatic R1/R2 pairing.
     /// The sample id is derived from each file's name the same way
-    /// `python/fastdna/gwas.py::_sample_id_from_path` does (a trailing
+    /// `python/fastdna/cohort_counts.py::_sample_id_from_path` does (a trailing
     /// `.gz` stripped first, then the remaining extension), so a sample id
     /// computed here agrees with the one that Python entry point would
     /// compute for the same file. Mutually exclusive with `--input`.
@@ -925,19 +926,17 @@ pub struct MatrixArgs {
     pub min_quality: f64,
 
     /// Per-sample minimum depth for a k-mer to count as observed at all.
-    /// Defaults to 2, not `count`'s 1: matches `python/fastdna/gwas.py::
-    /// cohort_presence_matrix`'s own default and its stated reasoning --
-    /// at realistic coverage a depth-1 k-mer is overwhelmingly likely a
-    /// sequencing error, and each one would otherwise become a private,
-    /// cohort-meaningless column.
+    /// Defaults to 2, not `count`'s 1, for the reason `cohort::matrix`
+    /// states: at realistic coverage a depth-1 k-mer is overwhelmingly
+    /// likely a sequencing error, and each one would otherwise become a
+    /// private, cohort-meaningless column.
     #[arg(short = 'm', long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
     pub min_count: u32,
 
     /// A k-mer must be observed in at least this many samples to become a
-    /// column of the matrix. Defaults to 2, matching `gwas.py::cohort_
-    /// presence_matrix`'s own default -- a k-mer private to a single sample
-    /// carries no cohort-level signal and is usually a residual sequencing
-    /// error `--min-count` did not catch.
+    /// column of the matrix. Defaults to 2: a k-mer private to a single
+    /// sample carries no cohort-level signal and is usually a residual
+    /// sequencing error `--min-count` did not catch.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
     pub min_samples: u32,
 

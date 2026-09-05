@@ -946,11 +946,11 @@ fn run_filter_paired(args: FilterArgs) -> Result<()> {
 }
 
 /// Derives a sample id from a file name for `fastdna matrix --sample`,
-/// matching `python/fastdna/gwas.py::_sample_id_from_path`'s convention
+/// matching `python/fastdna/cohort_counts.py::_sample_id_from_path`'s convention
 /// exactly (a trailing `.gz` stripped first, then the remaining extension)
 /// so a sample id computed here and one computed there agree for the same
 /// file -- e.g. a cohort built once with this CLI verb and cross-checked
-/// once against `gwas.py` names the same sample the same way.
+/// once against the Python API names the same sample the same way.
 fn sample_id_from_path(path: &Path) -> String {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let without_gz = if name.to_ascii_lowercase().ends_with(".gz") {

@@ -37,20 +37,18 @@ made before the run starts, by a calibrated peak-memory estimator, and
 printed. Counting is **exact** under both strategies: the key is the k-mer
 itself, not a hash of it, so no two k-mers can collide into one count.
 
-**The analysis layer (pure Python).** Everything that can be expressed in
-Python on top of the stable FFI surface lives in Python, not in Rust —
-29 submodules covering sketching-based comparison, cohort feature matrices
-for scikit-learn, leakage-aware cross-validation, association screening,
-interpretable rule models, metagenomic classification, assembly QC, genome
-profiling and reporting. None of it adds a new file format or a new Rust
-surface. The full list is in the [API reference](api/counting.md).
+**The Python API is the same engine, not a second one.** `count()`,
+`count_cohort()`, sketching and comparison, k-mer tables with set
+operations, and read filtering against a reference table all hand back
+Arrow, zero-copy, from the Rust core. Nothing in the Python layer adds a
+file format or a Rust surface of its own. The full list is in the
+[API reference](api/counting.md).
 
-The layer with no equivalent in KMC3, FastK or Jellyfish is the machine
-learning one: `fastdna.cv.lineage_groups` derives cross-validation folds
-from the cohort's *own* Mash distances, so a held-out fold is not full of
-near-clones of the training fold. See
-[`fastdna.cv`](api/evaluation.md#fastdna.cv) for why that matters and what
-it does not fix.
+Between 2026-08-24 and 2026-09-05 this package also carried a machine
+learning layer — a scikit-learn vectorizer, lineage-aware cross-validation,
+a leakage audit, association screening, metagenomic classification and
+more. It was removed deliberately, and the reasoning is in
+[`docs/goal-fast-kmer-counter.md`](https://github.com/Angel-Zeledon/FastDNA/blob/master/docs/goal-fast-kmer-counter.md).
 
 ## How fast, concretely
 
@@ -86,8 +84,8 @@ decision — including the comparison of narrow tools against broad ones in
 this exact ecosystem — is in
 [`docs/philosophy-narrow-not-broad.md`](https://github.com/Angel-Zeledon/FastDNA/blob/master/docs/philosophy-narrow-not-broad.md).
 
-"Complete" here means complete *within* k-mer territory. It also means this
-site documents what the package does today, and says so plainly when
+"Complete" here means complete *within* counting territory. It also means
+this site documents what the package does today, and says so plainly when
 something is planned rather than shipped.
 
 ## Where to go next

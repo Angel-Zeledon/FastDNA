@@ -11,34 +11,33 @@ and WASM (`src/wasm.rs`). The Rust core counts canonical k-mers from FASTQ
 files with quality trimming, in parallel, and hands results to Python as a
 zero-copy Arrow table.
 
-**Current mission** (`docs/goal-audit-leakage-not-completeness.md`,
-2026-09-05, supersedes `docs/goal-most-complete-genomics-ml-library.md`):
-be **the tool that measures whether a genomics ML result survives lineage
-blocking, and that is audited hard enough to be believed when it says so.**
-Effort goes to the audit triad (`gap`/`confounding`/`explain`) and its
-trustworthiness — calibration against injected truth, negative controls,
-and guards that withhold a number rather than return a meaningless one —
-plus the leakage survey (`scripts/validation/leakage_survey.py`) and the
-counting engine that feeds it.
+**Current mission** (`docs/goal-fast-kmer-counter.md`, 2026-09-05): be a
+**fast, exact k-mer counter and the small set of capabilities that are
+counting** — sketching and distance, cardinality and spectrum estimation,
+k-mer tables with set operations, read filtering against a reference table,
+cohort counting, QC, preview. That is exactly the CLI surface (`count`,
+`sketch`, `dist`, `card`, `peek`, `query`, `union`, `intersect`, `diff`,
+`filter`, `matrix`, `profile`, `spectrum`) and the Python API mirroring it.
 
-**Adding modules is out of scope.** `docs/feature-gap-analysis.md`,
-`docs/ml-genomics-roadmap.md` and `docs/ml-differentiation-roadmap.md` are
-a researched menu, not commitments; a new module has to be needed for the
-claim above. This is not a deletion program — what ships stays, keeps its
-tests, and stops generating new work. Also out of scope, unchanged:
-sequence alignment, pangenome graphs, general genomic interval algebra
-(`minimap2`/`vg`/`bedtools`'s territory — no code reuse with the k-mer
-engine).
+**The machine-learning layer was removed on 2026-09-05** — 31 Python
+modules and 4 Rust modules (`sklearn`, `audit`, `cv`, `explain`, `gwas`,
+`mic`, `embed`, `datasets`, `metagenomics`, `taxonomy`, `translate`,
+`chimeras`, `genomescope`, `assembly_qc`, and the rest). Do not reintroduce
+it, and do not treat its absence as a gap to close. The reasoning, with the
+numbers behind it, is in `docs/goal-fast-kmer-counter.md`; the short version
+is that every serious defect this project ever found was in that layer and
+none was in the counting engine, which is exactly equal to KMC3 on real
+data.
 
-The reason this reversed on 2026-09-05 is worth knowing before proposing
-work: nine defects were found between 2026-08-31 and 2026-09-03, none
-reachable by the ~1,750 tests, and **every one was a missing control on an
-already-shipped module, not a missing module.** They share a signature —
-the wrong output was well-formed (a truncated FASTA still starts with `>`;
-an all-constant feature matrix still audits to a tidy `gap = 0.0000`). When
-you add something here, the question that has actually caught defects is
-"what outside this code says the answer is right?", not "what else is
-missing?".
+**The rule for anything new**: it has to be k-mer counting, or an operation
+on counted k-mers, *and* it has to be checkable against something outside
+this repository. If the only way to know an answer is right is to read this
+project's own code, it does not belong here. `scripts/validation/` is where
+that check lives.
+
+Out of scope, unchanged and never contested: sequence alignment, pangenome
+graphs, general genomic interval algebra (`minimap2`/`vg`/`bedtools`'s
+territory — no code reuse with the k-mer engine).
 
 ## Build & test commands
 
@@ -72,13 +71,15 @@ tests import the compiled `fastdna._core` extension, not source.
 **Clippy warning ratchet:** `Cargo.toml` denies `unwrap_used`, `expect_used`,
 `print_stdout`, `print_stderr` outright — those must stay clean. Beyond
 that, CI doesn't require zero warnings; it fails only if the count of
-distinct warning *sites* exceeds a hardcoded baseline (currently 8) recorded
-in `ci.yml`. Don't add `#[allow(...)]` to silence a preexisting one; either
+distinct warning *sites* exceeds a hardcoded baseline (currently 6) recorded
+in `ci.yml`. It also fails if the count drops below it without the baseline
+being lowered, so a removal that takes a warning site with it has to update
+`ci.yml` too. Don't add `#[allow(...)]` to silence a preexisting one; either
 fix it or leave it as counted debt.
 
-**Network-dependent tests:** `python/tests/test_datasets.py` hits real
-BV-BRC/HIVDB endpoints and is marked `@pytest.mark.network`. Deselect with
-`pytest -m "not network"` when offline.
+**Network-dependent tests:** none any more — the dataset loaders went with
+the ML layer. `scripts/validation/` is where anything that touches the
+network or Docker lives, and it runs on a schedule, not on push.
 
 ## Architecture
 
@@ -169,7 +170,7 @@ territory even pre-1.0.
   reuse `discover_samples` but escalate an unpaired file to a hard error
   (vs. cohort listing's warn-and-continue), since `--paired-dir` runs
   unattended across many samples.
-- `metagenomics.rs`, `chimera_scan.rs`, `translate.rs`, `read_profile.rs`,
+- `read_profile.rs` (backs `profile`),
   `qc.rs`, `preview.rs` (backs `peek`), `export.rs` (Parquet/CSV writers),
   `atomic.rs` (write-then-rename; deliberately left `pub` because an
   existing integration test names it directly — see the comment in
@@ -178,31 +179,30 @@ territory even pre-1.0.
 
 ### Python package (`python/fastdna/`)
 
-Thin, feature-specific modules layered over the compiled core — each is
-independently import-guarded (`pytest.importorskip` in tests; optional
-extras like `shap`, `umap-learn`, `biopython`, `matplotlib` are soft
-dependencies, never required to import `fastdna` itself). Notable ones
-beyond core counting: `sklearn.py` (`KmerVectorizer`, scikit-learn
-compatible), `embed.py` (`embed_cohort`), `cv.py` (leakage-safe
-cross-validation / lineage grouping — several of its functions accept
-either raw FASTQ paths or a `CohortCounts` to skip re-reading files),
-`audit.py` (`fastdna.audit()` — leakage-curve + model-differentiation
-auditing), `cohort_counts.py` (`CohortCounts`, the in-memory counted-cohort
-type multiple modules now accept in place of paths), `mic.py`
-(`MicRegressor`), `datasets.py` (real labeled cohorts — BV-BRC AMR, Stanford
-HIVDB — cached under `~/.fastdna/datasets`), `genomescope.py`,
-`taxonomy.py`, `gwas.py`, `multiomics.py`, `explain.py`/`interpret.py`,
-`spectrum.py` (backs `KmerCounts.suggest_min_count()`'s valley-finding
-logic — see its module docstring for the exact rule before changing it).
+Deliberately small — four modules, and three of them are thin:
 
-`python/tests/conftest.py` registers a stub `fastdna._core` when the
-compiled extension is missing, so pure-Python tests (e.g.
-`active_learning`) can run without a Rust build — but this means a broken
-`maturin develop` can look like a passing (partial) suite locally; CI
-explicitly asserts the real compiled extension is imported before running
-tests (see the `Assert the real compiled extension is importable` step in
-`ci.yml`) — do the same sanity check locally if tests are unexpectedly
-skipping/passing.
+- `__init__.py` — the whole public API (`__all__`): `count`, `peek`,
+  `build_info`, `KmerCounts`, sketching (`sketch`/`Sketch`/`load_sketch`/
+  `sketch_from_kmers`, and the FracSketch trio), `KmerTable`, `compare`/
+  `compare_all`, `estimate_cardinality`, `estimate_spectrum`, plus
+  `CohortCounts`/`count_cohort` re-exported from `cohort_counts.py`.
+- `cohort_counts.py` — `CohortCounts`, the counted-cohort artifact: count a
+  cohort once, slice it per sample, `save()`/`load()` it as one Parquet
+  file that is still a valid k-mer table to a reader that has never heard
+  of the type.
+- `spectrum.py` — backs `KmerCounts.suggest_min_count()`'s valley-finding
+  logic; see its module docstring for the exact rule before changing it.
+- `_progress.py` — the `progress=True` callback plumbing (`tqdm` is a soft
+  dependency).
+
+`numpy` is the only optional package anything reaches for, and it is
+imported lazily inside the functions that need it, so `import fastdna`
+works without it. `python/tests/conftest.py` registers a stub
+`fastdna._core` when the compiled extension is missing — which means a
+broken `maturin develop` can look like a passing (partial) suite locally;
+CI explicitly asserts the real compiled extension is imported before
+running tests (the `Assert the real compiled extension is importable` step
+in `ci.yml`). Do the same check locally if tests are unexpectedly skipping.
 
 ### Tests with special conventions
 

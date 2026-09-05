@@ -30,13 +30,9 @@
 //!    "Deliberately not copying" list rejects FastK's/KMC's own binary
 //!    formats for the same reason). A `.parquet` k-mer table opens today in
 //!    pandas, polars, DuckDB and Spark with zero code from this crate,
-//!    which is a direct, load-bearing win for a tool whose whole claim is
-//!    that its numbers can be checked by someone else
-//!    (`docs/goal-audit-leakage-not-completeness.md`; the earlier
-//!    "most complete library" framing this cited is superseded, but the
-//!    argument is unchanged and if anything stronger -- an audit artefact
-//!    nobody else can open is not an audit artefact). A custom binary
-//!    format would not extend that reach at all.
+//!    which is a direct, load-bearing win for a counter whose output is
+//!    meant to be read by other tools (`docs/goal-fast-kmer-counter.md`).
+//!    A custom binary format would not extend that reach at all.
 //! 3. **Parquet row-group statistics genuinely support pruned point
 //!    lookups**, which was confirmed rather than assumed before committing
 //!    to this design (per this task's own instruction): `parquet::arrow::

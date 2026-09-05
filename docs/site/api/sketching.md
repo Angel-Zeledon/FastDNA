@@ -36,7 +36,3 @@ serviceable stand-in for a phylogeny at the resolution that question needs.
 ::: fastdna.compare
 
 ::: fastdna.compare_all
-
-## Visualizing a cohort
-
-::: fastdna.embed

@@ -121,14 +121,15 @@ jobs:
         shell: bash
         run: cargo test --all-targets
 
-      # THE 8 PREEXISTING CLIPPY WARNINGS -- what this step does and why.
+      # THE 6 PREEXISTING CLIPPY WARNINGS -- what this step does and why.
       #
-      # `cargo clippy --all-targets` on this tree warns at exactly 8
-      # locations, all preexisting, all recorded in
-      # `docs/audit/00-inventario.md` and `docs/CHECKPOINT-2026-08-26.md`:
-      # src/metagenomics.rs:1118, src/binned.rs:553, src/counter.rs:905,
+      # `cargo clippy --all-targets` on this tree warns at exactly 6
+      # locations, all preexisting: src/binned.rs:553, src/counter.rs:1112,
       # src/minimizer.rs:682, src/superkmer.rs:388, src/superkmer.rs:480,
-      # src/translate.rs:424 (which carries two), tests/dual_strategy.rs:75.
+      # tests/dual_strategy.rs:75. It was 8 until 2026-09-05, when the ML
+      # layer was removed and took src/metagenomics.rs and src/translate.rs
+      # (one site each) with it -- the baseline moved because the code did,
+      # not because anything was fixed or silenced.
       # None is `deny`-level; the four lints `Cargo.toml` actually denies
       # (`unwrap_used`, `expect_used`, `print_stdout`, `print_stderr`) are
       # already clean and already fail the build on their own, without help
@@ -137,7 +138,7 @@ jobs:
       # Two obvious approaches were rejected:
       #
       #   * `-D warnings`. This makes the job red on its very first run, for
-      #     8 problems that predate it. A CI job that is red on day one gets
+      #     6 problems that predate it. A CI job that is red on day one gets
       #     ignored by day three, and then it is worse than no job at all,
       #     because the red is now background noise hiding the next real
       #     failure.
@@ -153,16 +154,13 @@ jobs:
       # only if the count goes ABOVE the recorded baseline. Preexisting
       # debt stays visible and does not block; new debt does block.
       #
-      # WHAT "8" COUNTS, precisely, because the source of that number is
-      # ambiguous by one and getting it wrong is the one way this design
-      # could still be red on day one. `docs/audit/00-inventario.md` says
-      # "8 avisos" and then lists eight locations, one of them annotated
-      # `src/translate.rs:424:27 (x2)`. Read one way that is 8 diagnostics
-      # at 8 places; read the other it is 9, because that one span carries
-      # two. The two readings agree on exactly one number: eight distinct
-      # source locations. So that is what this step ratchets -- unique
-      # (file, line, column) sites -- and the baseline is 8 under either
-      # reading.
+      # WHAT THE NUMBER COUNTS, precisely: unique (file, line, column)
+      # sites, not diagnostics. The distinction was load-bearing when the
+      # baseline was first set -- one span then carried two lints, so the
+      # same tree could be read as 8 sites or 9 diagnostics -- and it stays
+      # the definition now that both readings coincide at 6, because the
+      # same span can acquire a second lint at any time without the code
+      # getting worse.
       #
       # The raw diagnostic total is printed next to the site count on every
       # run, so the ambiguity resolves itself in the log the first time this
@@ -225,7 +223,7 @@ jobs:
           # known to warn. Lower it whenever warnings are fixed -- that is
           # the point of a ratchet. Raise it only together with a comment
           # here naming the new warning and why it is being accepted.
-          BASELINE = 8
+          BASELINE = 6
 
           sites = {}
           with open(os.environ["CLIPPY_JSON"], encoding="utf-8", errors="replace") as fh:
@@ -323,8 +321,9 @@ jobs:
   python:
     name: Python (maturin develop + pytest)
     runs-on: ubuntu-latest
-    # maturin's debug build plus ~700 tests plus the `[test]` extra (which
-    # drags in numba/llvmlite via shap) is the long pole of this workflow.
+    # maturin's debug build is the long pole of this workflow; the test
+    # suite itself runs in seconds now that the extras are four small
+    # packages rather than the scikit-learn/shap/numba stack.
     timeout-minutes: 45
 
     steps:
@@ -386,23 +385,18 @@ jobs:
       #
       # WHICH PYTHON EXTRAS ARE INSTALLED, and why it matters:
       # `--extras test` installs the full `[project.optional-dependencies]
-      # test` list from pyproject.toml -- biopython, duckdb, matplotlib,
-      # numpy, pandas, polars, pytest, pytest-timeout, scikit-learn, scipy,
-      # shap, umap-learn -- which is the same set `wheels.yml` gets via
+      # test` list from pyproject.toml -- duckdb, numpy, polars, pytest,
+      # pytest-timeout, tqdm -- which is the same set `wheels.yml` gets via
       # `pip install "<wheel>[test]"`. That list covers every module the
       # suite reaches for with `pytest.importorskip`; the only other name
       # skipped on is `pyarrow`, which is a real runtime dependency and
       # arrives with the package itself.
       #
       # Installing the full set rather than a lean subset is the deliberate
-      # choice. `docs/CHECKPOINT-2026-08-26.md` records what the lean
-      # option actually costs: with only pyarrow/pandas/scikit-learn/scipy
-      # present, the suite reports "652 passed, 40 skipped" -- about 40
-      # tests, including essentially all of test_plotting.py and the
-      # biopython, polars, duckdb, umap and shap paths, quietly not running.
-      # A green CI run that silently skipped 40 tests is the failure mode
-      # this workflow exists to prevent, so it pays the install time. The
-      # same session measured 699 passed with full extras.
+      # choice: a test that silently skips is a test that is not running,
+      # and a green run built out of skips is the failure mode this
+      # workflow exists to prevent. That was expensive when the list
+      # included shap (numba, llvmlite) and is nearly free now.
       #
       # NOT installed, on purpose: the `docs` extra (mkdocs, mkdocs-material,
       # mkdocstrings), which belongs to the documentation build and pulls in

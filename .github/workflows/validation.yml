@@ -5,7 +5,7 @@
 # `ci.yml` is the gate: it runs on every push, finishes in minutes, and
 # needs no network beyond fetching crates and wheels. Everything here breaks
 # all three of those properties on purpose -- it pulls ~100 MB of real
-# sequencing data from ENA, pulls three biocontainers from quay.io, and
+# sequencing data from ENA, pulls two biocontainers from quay.io, and
 # takes tens of minutes. Putting that on the per-push path would make the
 # gate slow AND flaky for reasons that have nothing to do with the change
 # under test (ENA being down is not a regression in this repository).
@@ -40,9 +40,9 @@ permissions:
 
 jobs:
   validate:
-    name: FastDNA vs KMC3, Mash, GenomeScope2
+    name: FastDNA vs KMC3 and Mash
     runs-on: ubuntu-latest
-    # Generous: a cold run downloads ~100 MB of reads plus three
+    # Generous: a cold run downloads ~100 MB of reads plus two
     # biocontainers, builds with `--release` (fat LTO, one codegen unit --
     # Cargo.toml documents that this is deliberately slow), and then runs
     # several full k-mer counts. It should finish well inside this; the
@@ -89,68 +89,35 @@ jobs:
           python scripts/validation/kmc3_equivalence.py \
             --json "${RUNNER_TEMP}/kmc3.json"
 
-      # The three approximate answers, each against its own documented
-      # bound, plus genome size against the real GenomeScope2.
+      # The two approximate answers, each against its own documented bound
+      # and against the exact count of the same file.
       - name: Estimators are inside their documented bounds
         run: |
           python scripts/validation/estimator_accuracy.py \
             --json "${RUNNER_TEMP}/estimators.json"
 
-      # Needs assemblies rather than reads, so it reuses the AMR cohort
-      # loader. `--n-samples 8` keeps the download small: this checks
-      # agreement with Mash, which needs a handful of genuinely different
-      # genomes, not a large cohort.
+      # Mash needs a handful of genuinely different genomes, not a large
+      # cohort. Five reference assemblies straight from NCBI: stable
+      # versioned paths (each URL was verified to resolve when this step was
+      # written), no dataset loader, no API key, and small enough that the
+      # download is not the slow part of this job.
       - name: Sketch distances agree with Mash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          from fastdna.datasets import load_amr
-          cohort = load_amr("Escherichia coli", "ciprofloxacin", n_samples=8, random_state=0)
-          out = Path("mash_genomes")
-          out.mkdir(exist_ok=True)
-          for path in cohort.paths:
-              (out / Path(path).name).write_bytes(Path(path).read_bytes())
-          print(f"staged {len(cohort.paths)} genomes in {out}")
-          PY
-          python scripts/validation/sketch_vs_mash.py --genomes mash_genomes
-
-      # Reuses the assembly staged for the Mash step and the reads the
-      # earlier steps already cached, so this adds a Merqury run rather than
-      # another download. Merqury is the slowest single step here (meryl
-      # counts the whole read set again, in its own format).
-      - name: Assembly QV agrees with Merqury
-        run: |
           set -euo pipefail
-          ASM=$(ls mash_genomes/*.fna | head -1)
-          READS="${HOME}/.fastdna/validation/DRR002015_1.fastq.gz"
-          python scripts/validation/assembly_qc_vs_merqury.py \
-            --assembly "$ASM" --reads "$READS"
-
-      # Cheap next to the steps above (assemblies, not read sets) and the
-      # only one whose ground truth is an organism's published identity
-      # rather than another tool's output.
-      - name: Taxonomy calls real species correctly
-        run: python scripts/validation/taxonomy_real_species.py
-
-      # The only step here that needs neither network nor Docker: it builds
-      # its cohorts in a temp directory. It lives in this workflow anyway
-      # because it takes minutes, not seconds, and because it belongs next to
-      # the other "is the answer right" checks rather than among the unit
-      # tests. Three replicates rather than ten: enough to catch a
-      # regression at the extremes, which is what a scheduled run is for.
-      - name: The leakage detector still tracks injected leakage
-        run: |
-          python scripts/validation/leakage_calibration.py \
-            --lambdas 0.0 1.0 --replicates 3 \
-            --n-lineages 6 --per-lineage 25 --top-features 1000 \
-            --json "${RUNNER_TEMP}/calibration.json"
-
-      # Eighteen module claims checked against a constructed truth. Needs
-      # neither network nor Docker, and runs in a couple of minutes -- but
-      # it belongs beside the other "is the answer right" checks rather than
-      # among the unit tests, which is the distinction this workflow draws.
-      - name: Module claims hold against constructed truth
-        run: python scripts/validation/known_truth_checks.py
+          mkdir -p mash_genomes
+          base=https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF
+          for path in \
+            000/005/845/GCF_000005845.2_ASM584v2 \
+            000/006/945/GCF_000006945.2_ASM694v2 \
+            000/009/045/GCF_000009045.1_ASM904v1 \
+            000/013/425/GCF_000013425.1_ASM1342v1 \
+            000/006/765/GCF_000006765.1_ASM676v1 ; do
+            name=$(basename "$path")
+            curl -fsSL "$base/$path/${name}_genomic.fna.gz" \
+              | gunzip > "mash_genomes/${name}.fna"
+          done
+          ls -la mash_genomes
+          python scripts/validation/sketch_vs_mash.py --genomes mash_genomes
 
       # Uploaded even on failure: the JSON is what a human compares against
       # the previous run to see whether a number moved a little or a lot.

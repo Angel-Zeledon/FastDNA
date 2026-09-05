@@ -146,18 +146,21 @@ sequencing data rather than generated input**, by scripts committed under
 |---|---|---|
 | k-mer counting | KMC3 3.2.4 | **exact match** at k=31, 21 and 15 |
 | MinHash distances | Mash 2.3 | r = 0.997, no systematic bias |
-| genome size | GenomeScope2 2.0.1 | within 0.29% |
-| assembly QV | Merqury 1.4.1 | 18.4192 vs 18.4205 |
 | HyperLogLog cardinality | the exact count | −0.26% (bound: ~0.8%) |
 | ntCard spectrum | the exact histogram | −0.6% / +2.0% / −1.5% at f1/f2/f3 |
 
-Measured on ENA `DRR002015` (*E. coli*, 2,343,637 reads) and 8 BV-BRC
-assemblies; reference tools run from pinned biocontainers, so a rerun later
-compares against the same versions. The counting comparison allows **no
-tolerance at all** -- with trimming off and singletons kept, both tools solve
-the identical problem, so any difference would be a bug. Full methodology,
-including what each comparison can and cannot establish, is in
-[`docs/validation-real-data.md`](docs/validation-real-data.md).
+Measured on ENA `DRR002015` (*E. coli*, 2,343,637 reads) and five NCBI
+reference assemblies; reference tools run from pinned biocontainers, so a
+rerun later compares against the same versions. The counting comparison
+allows **no tolerance at all** -- with trimming off and singletons kept,
+both tools solve the identical problem, so any difference would be a bug.
+What each comparison can and cannot establish is documented in
+[`scripts/validation/README.md`](scripts/validation/README.md).
+
+Two further comparisons -- genome size against GenomeScope2 (within 0.29%)
+and assembly QV against Merqury (18.4192 vs 18.4205) -- were measured on
+2026-09-01 against modules removed on 2026-09-05. The numbers stood; the
+code they checked is gone.
 
 ---
 
@@ -630,50 +633,6 @@ Python -- as Arrow, in-process, without a serialization step or a
 subprocess -- fastest when the sample fits in memory, and degrading to an
 exact disk-partitioned mode rather than failing when it does not.
 
----
-
-## Auditing a genomic model: is the result real?
-
-A model trained on bacterial genomes can score well by recognising which
-clone each sample belongs to, rather than by learning any biology. The
-scores look identical either way. FastDNA answers that with three numbers,
-each measuring something the others cannot -- and each calibrated against a
-known answer rather than asserted:
-
-| question | field | how it was verified |
-|---|---|---|
-| How much leakage does this **cohort** make available? | `AuditReport.confounding` | Spearman **1.000** against injected leakage |
-| How much did **this model** take? | `AuditReport.gap` | 0.000 for transferable signal, +0.427 for pure lineage |
-| Is **this feature** biology or a clone marker? | `explain()` | 3 lineages vs 1, `lineage_restricted` correct |
-
-```python
-report = fastdna.audit(pipeline, paths, phenotype)
-print(report.confounding)   # the cohort could have fooled a model
-print(report.gap)           # ...and whether this one let it
-```
-
-The verification injects a known quantity of leakage and checks that what
-comes back tracks it, which is the only way to know whether a reported
-number is the *right* number -- on real data nobody knows the true answer.
-Full method and results in
-[`docs/validation-real-data.md`](docs/validation-real-data.md) (Tracks E and
-F); the sweep is `scripts/validation/leakage_calibration.py`.
-
-**Read `confounding` and `gap` as a pair.** High confounding with a small
-gap is the informative combination and the easiest to misread: the cohort
-*could* have fooled a model, and this particular one resisted. That is a
-fact about the model, not a clearance for the next one.
-
-Two limits, stated because a validation table that lists only successes is
-the failure mode this project exists to name. `gap` is a threshold detector,
-not a linear meter -- it stays flat until population structure supplies most
-of the phenotype, which is why `confounding` is the number to read for
-partial leakage. And a positive gap can also be produced by overfitting
-alone: read `score_random` alongside it, since a large gap on a model that
-never beat chance is capacity, not leakage.
-
----
-
 ## Python API reference
 
 ### `fastdna.count(path, *, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=100_000) -> KmerCounts`
@@ -913,10 +872,18 @@ Implemented and documented above: counting with automatic memory/disk
 strategy selection (CLI), MinHash sketching
 (`fastdna.sketch`/`compare`/`compare_all`), and HyperLogLog cardinality
 estimation (`fastdna.estimate_cardinality`). The Python package also ships
-newer modules not yet covered by this README's API reference -- among them
-a scikit-learn-compatible `KmerVectorizer` (`fastdna.sklearn`) and cohort
-embedding (`fastdna.embed.embed_cohort`); see their module docstrings until
-this README catches up.
+`count_cohort()`/`CohortCounts` (count a cohort once, slice it per sample)
+and `KmerTable` with set operations; see their module docstrings until this
+README catches up.
+
+**Removed on 2026-09-05:** the machine-learning layer -- a scikit-learn
+vectorizer, lineage-aware cross-validation, a leakage audit, association
+screening, metagenomic classification, taxonomy, assembly QC, genome
+profiling and more, 31 Python modules in all. FastDNA is a k-mer counter
+and the operations that are counting; the reasoning, with the numbers
+behind it, is in
+[`docs/goal-fast-kmer-counter.md`](docs/goal-fast-kmer-counter.md). Anyone
+who needs that code can take it from the git history at `60b5f82`.
 
 Still ahead:
 
