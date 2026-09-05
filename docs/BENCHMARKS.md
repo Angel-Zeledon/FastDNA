@@ -404,6 +404,62 @@ than re-read), and the balance it measured is printed on the `Strategy Used`
 line so a run that was announced as `binned` and finished as something else
 says why.
 
+## The `k > 32` engine, and what it costs (2026-09-05)
+
+`src/wide_kmer.rs` + `src/wide_counter.rs` count `33 <= k <= 64` in `u128`
+instead of `u64`. Same machine and file as the section above
+(`mid.fastq`: 144,000,000 k-mer occurrences, 9,213,849 distinct at k=31).
+
+**Correctness first.** At `k = 31` both engines are defined, and they
+return the same count -- 9,213,849 distinct, byte for byte the same answer
+-- which is what `--engine wide` exists to let anyone check on their own
+data rather than trusting the test suite.
+
+| engine | k | time | peak RSS |
+|---|---:|---:|---:|
+| narrow (`u64`) | 31 | **1.87 s** | **750 MiB** |
+| wide (`u128`), 1 thread | 31 | 5.62 s | 793 MiB |
+| wide, 4 threads | 31 | 2.54 s | 2,002 MiB |
+| wide, 11 threads | 31 | 3.36 s | 4,152 MiB |
+| wide, 11 threads | 41 | 4.57 s | 4,130 MiB |
+| wide, 11 threads | 63 | 3.94 s | 4,298 MiB |
+
+Three things worth reading off it:
+
+- **The width costs about 3x in time** at one thread, which is `u128`
+  arithmetic and is the price of the capability, not a defect.
+- **Larger k is not slower.** k=63 finishes faster than k=31 because a
+  150-base read yields 88 k-mers instead of 120 -- fewer instances to sort.
+- **Four threads beats eleven**, on both axes (2.54 s / 2,002 MiB against
+  3.36 s / 4,152 MiB). Peak memory scales with `threads x distinct` because
+  every worker holds its own table, and the wide engine has no `binned`
+  equivalent to share one. The time inversion was not predicted; the likely
+  cause is the sequential fold in `merge_all`, which was not measured in
+  isolation and so is not claimed.
+
+### Two guesses the measurements killed
+
+The first working version of the wide counter cost **4,438 MiB at one
+thread**. Two hypotheses about why were wrong before one was right, and
+both were cheap to test:
+
+1. *"Memory scales with `threads x distinct`, as it does for the narrow
+   in-memory strategy."* Falsified in one run: one thread cost 4,438 MiB
+   and eleven cost 4,713 MiB.
+2. *"The raw instance buffer is not actually being bounded."* Falsified by
+   a test asserting its capacity stays near its threshold across 40M
+   insertions -- which is now a permanent regression test, since a buffer
+   that silently grows would put peak memory back on input size.
+
+What it actually was: memory scaled with *occurrences* at ~26 bytes each,
+the signature of repeatedly allocating and freeing a large buffer rather
+than of holding one. `compact` allocated a fresh merge target on each of
+~72 compactions, and the allocator does not hand freed pages back promptly.
+Reusing two buffers that alternate took it to 1,187 MiB; storing the table
+as parallel arrays rather than `Vec<(u128, u32)>` -- 32 bytes of which 12
+are alignment padding -- took it to 793 MiB, at which point the wide engine
+costs about what the narrow one does per thread.
+
 ## Worker-buffer bound: measured effect by input shape
 
 `KmerCounter` bounds each worker's raw k-mer buffer at 2,000,000 buffered

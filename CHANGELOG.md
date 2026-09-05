@@ -25,6 +25,33 @@ La superficie con compatibilidad garantizada es:
 
 ### Changed
 
+- **El contador ancho: 5,6x menos memoria, tras medirlo.** El módulo se
+  entregó diciendo "no medido, y por tanto no afirmado". Medirlo dio
+  4.438 MiB de pico con un solo hilo sobre 144M ocurrencias, y dos
+  hipótesis mías salieron falsas antes de acertar:
+
+  1. *"Escala con hilos × distintas"* — falsa en una corrida: 1 hilo
+     costaba 4.438 MiB y 11 costaban 4.713 MiB.
+  2. *"El buffer crudo no se está acotando"* — falsa, y la comprobación
+     quedó como test de regresión permanente (que la *capacidad* siga cerca
+     de su umbral tras 40M inserciones; un buffer que crece en silencio
+     devolvería el pico a depender del tamaño de la entrada).
+
+  Lo que era: escalaba con **ocurrencias**, a ~26 bytes cada una — la firma
+  de asignar y liberar un buffer grande repetidamente, no de retener uno.
+  `compact` pedía un destino de merge nuevo en cada una de ~72
+  compactaciones. Reutilizar dos buffers que se alternan lo dejó en
+  1.187 MiB; guardar la tabla como arrays paralelos en vez de
+  `Vec<(u128, u32)>` (32 bytes de los que 12 son relleno de alineación) lo
+  dejó en **793 MiB**, que es aproximadamente lo que cuesta el motor
+  estrecho por hilo.
+
+  Con 4 hilos son 2.002 MiB **y 2,54 s**, más rápido que con 11 (4.152 MiB,
+  3,36 s). Esa inversión no la predije: el borrador del comentario decía lo
+  contrario y la medición lo contradijo, así que el doc dice lo que dice la
+  tabla. Todo en `docs/BENCHMARKS.md`.
+
+
 - **El contador ahora elige la estrategia particionada por minimizers
   (`binned`) por defecto.** Estaba implementada, correcta y probada desde el
   2026-08-25, pero `auto` no podía seleccionarla: faltaba el modelo de

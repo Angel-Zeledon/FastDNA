@@ -16,16 +16,60 @@
 //! and the buffer bound was fit to how many 8-byte instances fit a cache
 //! level. Porting that machinery and *assuming* the tuning still holds
 //! would be exactly the kind of unmeasured claim this repository keeps
-//! finding in itself. So this counter does the simple, obviously-correct
-//! thing -- append, sort, compact -- and says plainly that it has not been
-//! tuned:
+//! finding in itself. So this counter does the simple thing -- append,
+//! sort, compact -- and everything it does beyond that was put there by a
+//! measurement rather than by analogy.
 //!
-//! **Not measured, and therefore not claimed:** that this is fast. It is
-//! correct, its memory is bounded the same way the narrow counter's is,
-//! and `k > 32` is a capability most runs never reach for. If wide
-//! counting becomes hot, the honest next step is to benchmark it and port
-//! whichever of `counter.rs`'s optimisations the numbers justify -- not to
-//! port them speculatively now.
+//! # What was measured, and what it cost
+//!
+//! On `mid.fastq` (144,000,000 k-mer occurrences, 9,213,849 distinct,
+//! `k = 31` so the narrow engine can be compared against directly), peak
+//! RSS and wall clock as this file changed:
+//!
+//! | | 1 thread | 11 threads |
+//! |---|---:|---:|
+//! | first working version | 7.98 s / 4,438 MiB | 4.11 s / 4,713 MiB |
+//! | reusing the merge buffer | 5.58 s / 1,187 MiB | 4.60 s / 4,402 MiB |
+//! | + parallel arrays | **5.62 s / 793 MiB** | **3.36 s / 4,152 MiB** |
+//! | *the narrow engine, same file* | *1.87 s / 750 MiB* | *1.87 s / 750 MiB* |
+//!
+//! Both changes came from measurements that contradicted a guess. The
+//! first version's memory did not scale with threads (1 thread cost as
+//! much as 11) and did not scale with distinct k-mers either -- it scaled
+//! with *occurrences*, at ~26 bytes each, which is the signature of
+//! repeatedly allocating and freeing a large buffer rather than of holding
+//! one. See `scratch_kmers` and `table_kmers` for the two fixes.
+//!
+//! # What is still true, and is a real limit
+//!
+//! At one thread this counter now costs about what the narrow one costs
+//! (793 MiB against 750 MiB) and about three times the time -- which is
+//! the `u128` arithmetic, and is the price of the capability.
+//!
+//! At eleven it costs 4,152 MiB, because peak memory here scales with
+//! `threads * distinct_kmers`: every worker holds its own table. That is
+//! the same term the narrow *in-memory* strategy has, and the narrow
+//! engine has a way out of it (`binned.rs` partitions by minimizer so the
+//! store is shared rather than replicated). **The wide engine has no such
+//! strategy.**
+//!
+//! Which makes thread count the only lever, and it does not behave the way
+//! a thread count usually does. Measured on the same file:
+//!
+//! | threads | time | peak RSS |
+//! |---:|---:|---:|
+//! | 1 | 5.62 s | 793 MiB |
+//! | 4 | **2.54 s** | **2,002 MiB** |
+//! | 11 | 3.36 s | 4,152 MiB |
+//!
+//! Four threads is *both* faster than eleven and half its memory. The
+//! first draft of this paragraph predicted the opposite -- fewer threads
+//! trading wall clock for memory -- and the measurement contradicted it,
+//! so this is what the table says rather than what the reasoning did. The
+//! likely cause is the sequential fold in `merge_all`: eleven tables cost
+//! more to merge than four, and past some point that outweighs what the
+//! extra workers won. Likely, not established; nothing here measured the
+//! fold in isolation.
 //!
 //! # Shape
 //!
@@ -59,8 +103,31 @@ pub struct WideKmerCounter {
     /// `Vec` and not a hash map (`docs/BENCHMARKS.md` records the 9x this
     /// choice was worth for the narrow engine).
     raw: Vec<u128>,
-    /// Compacted `(kmer, count)` pairs, sorted by k-mer.
-    table: Vec<(u128, u32)>,
+    /// Compacted counts, sorted by k-mer, as two parallel arrays rather
+    /// than one `Vec<(u128, u32)>`.
+    ///
+    /// Not a style preference: `(u128, u32)` has 16-byte alignment, so the
+    /// tuple occupies **32 bytes to carry 20** -- 37% of the table is
+    /// padding. At 11 workers over 9.2M distinct k-mers that padding alone
+    /// is 1.2 GiB. `counter.rs`'s finalized table is split for the same
+    /// reason, and `WideCounts` already was, so this also removes the
+    /// `unzip` that `finish` used to pay.
+    table_kmers: Vec<u128>,
+    table_counts: Vec<u32>,
+    /// The buffers [`Self::compact`] merges into, swapped with the table
+    /// rather than allocated fresh.
+    ///
+    /// Measured, not guessed. Allocating a new merge target on every
+    /// compaction meant ~72 allocate-grow-free cycles on a 144M-occurrence
+    /// file, each up to the full table size, and peak RSS came out at
+    /// **4,497 MiB against a table that holds 294 MiB** -- the allocator
+    /// does not hand freed pages back promptly (the same effect
+    /// `mem_estimate.rs`'s binned calibration factor absorbs), so the
+    /// high-water marks accumulate instead of overlapping. Swapping two
+    /// buffers that each grow once to their final size turns 72 large
+    /// allocations into 2.
+    scratch_kmers: Vec<u128>,
+    scratch_counts: Vec<u32>,
     total: u64,
 }
 
@@ -93,36 +160,74 @@ impl WideKmerCounter {
         }
         self.raw.sort_unstable();
 
-        let mut merged: Vec<(u128, u32)> = Vec::with_capacity(self.table.len() + self.raw.len() / 2);
-        let mut table = std::mem::take(&mut self.table).into_iter().peekable();
-        let mut raw = self.raw.drain(..).peekable();
+        // Reused, not reallocated: see `scratch_kmers`' own doc comment for
+        // the measurement that made this worth doing. Both sides are read
+        // by index rather than consumed, because consuming the table would
+        // drop the very allocation this is trying to keep alive.
+        let mut merged_kmers = std::mem::take(&mut self.scratch_kmers);
+        let mut merged_counts = std::mem::take(&mut self.scratch_counts);
+        merged_kmers.clear();
+        merged_counts.clear();
+        merged_kmers.reserve(self.table_kmers.len() + self.raw.len() / 2);
+        merged_counts.reserve(self.table_kmers.len() + self.raw.len() / 2);
+
+        let (kmers, counts, raw) = (&self.table_kmers, &self.table_counts, &self.raw);
+        let (mut ti, mut ri) = (0usize, 0usize);
+
+        // Consumes the run of `value` at `ri`, returning its length.
+        let run_from = |raw: &[u128], ri: &mut usize, value: u128| -> u32 {
+            let mut run = 0u32;
+            while *ri < raw.len() && raw[*ri] == value {
+                *ri += 1;
+                run = run.saturating_add(1);
+            }
+            run
+        };
 
         loop {
-            match (table.peek().map(|&(k, _)| k), raw.peek().copied()) {
+            match (kmers.get(ti).copied(), raw.get(ri).copied()) {
                 (None, None) => break,
                 (Some(tk), Some(rk)) if tk < rk => {
-                    merged.push(table.next().unwrap_or((tk, 0)));
+                    merged_kmers.push(tk);
+                    merged_counts.push(counts[ti]);
+                    ti += 1;
                 }
                 (Some(tk), Some(rk)) if rk < tk => {
-                    merged.push((rk, run_length(&mut raw, rk)));
+                    merged_kmers.push(rk);
+                    merged_counts.push(run_from(raw, &mut ri, rk));
                 }
                 (Some(tk), Some(_)) => {
                     // Equal: the table's existing count plus this buffer's
                     // run of the same k-mer.
-                    let (_, existing) = table.next().unwrap_or((tk, 0));
-                    let run = run_length(&mut raw, tk);
-                    merged.push((tk, existing.saturating_add(run)));
+                    let existing = counts[ti];
+                    ti += 1;
+                    let run = run_from(raw, &mut ri, tk);
+                    merged_kmers.push(tk);
+                    merged_counts.push(existing.saturating_add(run));
                 }
                 (Some(tk), None) => {
-                    merged.push(table.next().unwrap_or((tk, 0)));
+                    merged_kmers.push(tk);
+                    merged_counts.push(counts[ti]);
+                    ti += 1;
                 }
                 (None, Some(rk)) => {
-                    merged.push((rk, run_length(&mut raw, rk)));
+                    merged_kmers.push(rk);
+                    merged_counts.push(run_from(raw, &mut ri, rk));
                 }
             }
         }
 
-        self.table = merged;
+        // `clear`, not a reallocation: the raw buffer's capacity is the
+        // bound `RAW_FINALIZE_THRESHOLD` names, and giving it back would
+        // mean re-growing it on the next batch.
+        self.raw.clear();
+        // The finished merge becomes the table; the table's own allocations
+        // become the next compaction's merge targets. Two of each,
+        // alternating, each grown once.
+        std::mem::swap(&mut self.table_kmers, &mut merged_kmers);
+        std::mem::swap(&mut self.table_counts, &mut merged_counts);
+        self.scratch_kmers = merged_kmers;
+        self.scratch_counts = merged_counts;
     }
 
     /// Folds several workers' counters into one.
@@ -137,11 +242,19 @@ impl WideKmerCounter {
         for mut counter in counters {
             counter.compact();
             out.total += counter.total;
-            if out.table.is_empty() {
-                out.table = counter.table;
+            if out.table_kmers.is_empty() {
+                out.table_kmers = counter.table_kmers;
+                out.table_counts = counter.table_counts;
                 continue;
             }
-            out.table = merge_sorted_tables(std::mem::take(&mut out.table), counter.table);
+            let (kmers, counts) = merge_sorted_tables(
+                std::mem::take(&mut out.table_kmers),
+                std::mem::take(&mut out.table_counts),
+                counter.table_kmers,
+                counter.table_counts,
+            );
+            out.table_kmers = kmers;
+            out.table_counts = counts;
         }
         out
     }
@@ -149,49 +262,59 @@ impl WideKmerCounter {
     /// Consumes the counter and returns its finished table.
     pub fn finish(mut self) -> WideCounts {
         self.compact();
-        let total = self.total;
-        let (kmers, counts) = self.table.into_iter().unzip();
-        WideCounts { kmers, counts, total }
+        WideCounts { kmers: self.table_kmers, counts: self.table_counts, total: self.total }
     }
 }
 
-/// How many times the value at the head of `raw` repeats, consuming them.
-fn run_length(raw: &mut std::iter::Peekable<std::vec::Drain<'_, u128>>, value: u128) -> u32 {
-    let mut run: u32 = 0;
-    while raw.peek() == Some(&value) {
-        raw.next();
-        run = run.saturating_add(1);
-    }
-    run
-}
+/// Merges two sorted count tables, summing counts for k-mers in both.
+///
+/// Takes and returns parallel arrays for the same reason the table is
+/// stored that way -- see `WideKmerCounter::table_kmers`.
+fn merge_sorted_tables(
+    left_kmers: Vec<u128>,
+    left_counts: Vec<u32>,
+    right_kmers: Vec<u128>,
+    right_counts: Vec<u32>,
+) -> (Vec<u128>, Vec<u32>) {
+    let capacity = left_kmers.len() + right_kmers.len();
+    let mut out_kmers = Vec::with_capacity(capacity);
+    let mut out_counts = Vec::with_capacity(capacity);
+    let (mut l, mut r) = (0usize, 0usize);
 
-/// Merges two sorted `(kmer, count)` tables, summing counts for k-mers in
-/// both.
-fn merge_sorted_tables(left: Vec<(u128, u32)>, right: Vec<(u128, u32)>) -> Vec<(u128, u32)> {
-    let mut out = Vec::with_capacity(left.len() + right.len());
-    let mut l = left.into_iter().peekable();
-    let mut r = right.into_iter().peekable();
     loop {
-        match (l.peek().map(|&(k, _)| k), r.peek().map(|&(k, _)| k)) {
+        match (left_kmers.get(l).copied(), right_kmers.get(r).copied()) {
             (None, None) => break,
-            (Some(lk), Some(rk)) if lk < rk => out.extend(l.next()),
+            (Some(lk), Some(rk)) if lk < rk => {
+                out_kmers.push(lk);
+                out_counts.push(left_counts[l]);
+                l += 1;
+            }
             (Some(lk), Some(rk)) if rk < lk => {
                 let _ = lk;
-                out.extend(r.next())
+                out_kmers.push(rk);
+                out_counts.push(right_counts[r]);
+                r += 1;
             }
-            (Some(_), Some(_)) => {
-                let (kmer, lc) = match l.next() {
-                    Some(entry) => entry,
-                    None => break,
-                };
-                let rc = r.next().map_or(0, |(_, c)| c);
-                out.push((kmer, lc.saturating_add(rc)));
+            (Some(lk), Some(_)) => {
+                out_kmers.push(lk);
+                out_counts.push(left_counts[l].saturating_add(right_counts[r]));
+                l += 1;
+                r += 1;
             }
-            (Some(_), None) => out.extend(l.next()),
-            (None, Some(_)) => out.extend(r.next()),
+            (Some(lk), None) => {
+                out_kmers.push(lk);
+                out_counts.push(left_counts[l]);
+                l += 1;
+            }
+            (None, Some(rk)) => {
+                out_kmers.push(rk);
+                out_counts.push(right_counts[r]);
+                r += 1;
+            }
         }
     }
-    out
+
+    (out_kmers, out_counts)
 }
 
 /// A finished wide count table: distinct k-mers in ascending order, with
@@ -369,6 +492,32 @@ mod tests {
             WideKmerCounter::merge_all(vec![WideKmerCounter::new(), one, WideKmerCounter::new()])
                 .finish();
         assert_eq!(merged.iter().collect::<Vec<_>>(), vec![(4, 2), (8, 1)]);
+    }
+
+    /// The bound the whole design rests on: a worker's raw buffer must
+    /// stay near `RAW_FINALIZE_THRESHOLD` however many occurrences pass
+    /// through it, or peak memory becomes a function of input size and the
+    /// counter is unusable on a real file. Asserted on the *capacity*, not
+    /// the length -- a `Vec` that is drained but keeps a gigabyte of
+    /// capacity costs exactly as much as a full one.
+    #[test]
+    fn the_raw_buffer_stays_bounded_however_many_occurrences_arrive() {
+        let mut counter = WideKmerCounter::new();
+        // 20x the threshold, in realistic per-record batches, over a
+        // distinct set far larger than any batch so compaction cannot
+        // collapse it into nothing.
+        let distinct = 5_000_000u128;
+        for batch_start in (0..40_000_000u128).step_by(120) {
+            let batch: Vec<u128> = (0..120).map(|i| (batch_start + i) % distinct).collect();
+            counter.insert_batch(&batch);
+        }
+        assert!(
+            counter.raw.capacity() <= RAW_FINALIZE_THRESHOLD * 2,
+            "raw buffer grew to {} entries ({} MiB) against a {RAW_FINALIZE_THRESHOLD}-entry \
+             bound -- peak memory now scales with input size",
+            counter.raw.capacity(),
+            counter.raw.capacity() * std::mem::size_of::<u128>() / (1024 * 1024)
+        );
     }
 
     #[test]
