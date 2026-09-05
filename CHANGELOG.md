@@ -64,6 +64,35 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **`fastdna similarity`: similitud exacta entre tablas de k-mers contadas.**
+  Jaccard, contención asimétrica (las dos direcciones) y la disimilitud de
+  Bray-Curtis ponderada por abundancia, entre dos o más tablas `.parquet`.
+
+  Es lo que `dist` no puede dar: `dist` compara *sketches* MinHash, que son
+  aproximados por construcción y descartan los conteos, así que Bray-Curtis
+  no es computable ahí ni siquiera en principio. Y es lo que KMC3 no da:
+  `kmc_tools` calcula las operaciones de conjunto, pero ninguna herramienta
+  de esa familia reporta similitud.
+
+  **Una sola pasada de merge para todos los pares.** `setops::MultiTableMerge`
+  ya entrega, por cada k-mer distinta, el conteo de cada tabla; todas las
+  estadísticas de todos los pares son sumas corrientes sobre ese mismo flujo,
+  así que N tablas cuestan un merge, no `N*(N-1)/2`. Solo se tocan los pares
+  que **comparten** la k-mer: los conteos exclusivos se derivan
+  (`only_a == |A| - shared`), de modo que una k-mer presente en 2 de 200
+  tablas cuesta una actualización y no 19.900.
+
+  **Verificado contra KMC3**, no solo contra tests propios: sobre dos mitades
+  de un mismo set de lecturas (solapamiento real, Jaccard 0,783),
+  `scripts/validation/similarity_vs_kmc_tools.py` compara |A|, |B| y |A∩B|
+  contra `kmc_tools intersect` y cada ratio derivado. Coinciden **exactamente**
+  — k-mer a k-mer y a nueve decimales. Corre en el workflow de validación.
+
+  Los casos degenerados están decididos y documentados en vez de devolver
+  NaN: dos tablas vacías dan jaccard 1,0 y Bray-Curtis 0,0 (idénticas por
+  vacuidad), y la contención desde una tabla vacía es 1,0.
+
+
 - **macOS: detección de memoria del sistema.**
   `mem_estimate::available_system_memory_bytes` no tenía implementación en
   macOS y caía al fijo de 4 GiB, así que **cualquier Mac quedaba presupuestado

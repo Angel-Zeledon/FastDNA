@@ -26,6 +26,7 @@ data. Useful, and not a correctness check.
 | `kmc3_equivalence.py` | k-mer counting | KMC3 3.2.4, **exact equality** |
 | `estimator_accuracy.py` | HyperLogLog, ntCard spectrum | the exact count from the same file |
 | `sketch_vs_mash.py` | MinHash distances | Mash 2.3 |
+| `similarity_vs_kmc_tools.py` | exact Jaccard and containment between tables | KMC3's own set operations, **exact equality** |
 
 Reference tools arrive as **pinned biocontainers**, not manual builds, so a
 rerun a year from now compares against the same versions rather than

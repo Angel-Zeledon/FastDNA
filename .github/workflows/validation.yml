@@ -119,6 +119,17 @@ jobs:
           ls -la mash_genomes
           python scripts/validation/sketch_vs_mash.py --genomes mash_genomes
 
+      # KMC3 does not report similarity, but `kmc_tools` computes the set
+      # operations it is made of, so it can be the oracle for `fastdna
+      # similarity`'s exact Jaccard and containment. Two halves of one read
+      # set, so the overlap is large and partial rather than trivially 0
+      # or 1.
+      - name: Exact similarity agrees with KMC3's set operations
+        run: |
+          python scripts/validation/similarity_vs_kmc_tools.py \
+            --reads-per-half 100000 \
+            --json "${RUNNER_TEMP}/similarity.json"
+
       # Uploaded even on failure: the JSON is what a human compares against
       # the previous run to see whether a number moved a little or a lot.
       - name: Upload validation results

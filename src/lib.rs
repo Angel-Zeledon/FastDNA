@@ -21,6 +21,7 @@ pub mod qc;
 pub mod read_filter;
 pub mod read_profile;
 pub mod setops;
+pub mod similarity;
 pub mod sketch;
 
 // Implementation. Reachable from anywhere inside the crate, from nowhere

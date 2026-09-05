@@ -16,6 +16,14 @@
 //! ```text
 //! cargo run --release --example parse_only_ceiling -- FILE
 //! ```
+
+// Same carve-out `src/main.rs` takes, and for the same reason: the
+// crate-wide `print_stdout`/`print_stderr` denials in `Cargo.toml` exist to
+// keep the *library* silent, and a measurement tool whose entire output is
+// the measurement is not the library. Without this, `cargo clippy
+// --all-targets` fails outright -- which is how this was found.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::time::Instant;
 
 use fastdna_core::fastq::{FastqReader, FastqRecord};

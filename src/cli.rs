@@ -268,6 +268,12 @@ pub enum Command {
     /// tolerance) from one or more others -- reference subtraction / host
     /// removal (`docs/feature-gap-analysis.md`'s S2, `src/setops.rs`).
     Diff(DiffArgs),
+    /// Exact pairwise similarity between two or more already-counted k-mer
+    /// tables: Jaccard, asymmetric containment (both directions), and the
+    /// abundance-weighted Bray-Curtis dissimilarity, which needs real
+    /// counts and so cannot be computed by `dist`'s MinHash sketches
+    /// (`src/similarity.rs`).
+    Similarity(SimilarityArgs),
     /// Streams a FASTQ/FASTA input against a reference k-mer table and
     /// writes reads that should be kept (host/contaminant removal, or
     /// targeted enrichment -- see `FilterArgs`'s doc comment for the full
@@ -748,6 +754,34 @@ pub struct DiffArgs {
     /// genome, before a k-mer counts as real contamination.
     #[arg(long, value_name = "COUNT", default_value_t = 0)]
     pub max_subtract_count: u32,
+}
+
+/// `fastdna similarity`: exact pairwise similarity between two or more
+/// already-counted k-mer tables (see `similarity::pairwise_similarity`'s
+/// doc comment for the metrics, the one-pass algorithm, and how the
+/// degenerate cases -- empty tables, disjoint tables -- are defined).
+///
+/// Unlike `fastdna dist`, which compares MinHash *sketches* (`sketch.rs`,
+/// approximate), this operates on the exact counted tables `fastdna count`
+/// already wrote, and reports the abundance-weighted Bray-Curtis
+/// dissimilarity a sketch's presence/absence hashes cannot compute at all,
+/// exactly or otherwise.
+#[derive(Args, Debug)]
+pub struct SimilarityArgs {
+    /// Two or more sorted k-mer tables (`.parquet` files written by
+    /// `fastdna count`, or by `union`/`intersect`/`diff`). `num_args = 2..`
+    /// for the same reason `UnionArgs::input` requires it: a similarity
+    /// between fewer than two tables is not a comparison.
+    #[arg(short, long, value_name = "FILE", num_args = 2.., required = true)]
+    pub input: Vec<PathBuf>,
+
+    /// Optional output path for the result table (CSV, one row per
+    /// unordered pair: `sample_a,sample_b,shared,only_a,only_b,jaccard,
+    /// containment_ab,containment_ba,bray_curtis`). Without this flag the
+    /// same rows print to stdout instead, matching `fastdna dist`'s own
+    /// convention so this composes with a shell pipe the same way.
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
 }
 
 /// `fastdna filter`: streams a FASTQ/FASTA input against a reference k-mer

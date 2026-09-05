@@ -15,7 +15,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use fastdna_core::cli::{
     CardArgs, Cli, CliDistMetric, CliHistogramFormat, CliOutputFormat, CliStrategy, Command,
     CountArgs, DiffArgs, DistArgs, FilterArgs, IntersectArgs, MatrixArgs, PeekArgs, ProfileArgs,
-    QueryArgs, SketchArgs, SpectrumArgs, UnionArgs,
+    QueryArgs, SimilarityArgs, SketchArgs, SpectrumArgs, UnionArgs,
 };
 use fastdna_core::cohort;
 use fastdna_core::error::{FastDnaError, Result};
@@ -32,6 +32,7 @@ use fastdna_core::progress::Progress;
 use fastdna_core::read_filter;
 use fastdna_core::read_profile;
 use fastdna_core::setops;
+use fastdna_core::similarity::{self, PairSimilarity};
 use fastdna_core::sketch::GenomeSketch;
 
 /// A `.gz` input's on-disk size is compressed, not the decompressed size
@@ -64,6 +65,7 @@ fn main() -> ExitCode {
         Some(Command::Union(args)) => run_union(args),
         Some(Command::Intersect(args)) => run_intersect(args),
         Some(Command::Diff(args)) => run_diff(args),
+        Some(Command::Similarity(args)) => run_similarity(args),
         Some(Command::Filter(args)) => run_filter(args),
         Some(Command::Matrix(args)) => run_matrix(args),
         Some(Command::Profile(args)) => run_profile(args),
@@ -785,6 +787,81 @@ fn run_diff(args: DiffArgs) -> Result<()> {
     println!("Distinct k-mers written: {written} ({elapsed:.2}s)");
     println!("Output: {}", args.output.display());
 
+    Ok(())
+}
+
+/// `fastdna similarity`: thin console-output wrapper around `similarity::
+/// pairwise_similarity` (see `cli::SimilarityArgs`'s doc comment).
+///
+/// Follows `run_dist`'s stdout/`--output` convention exactly, and for the
+/// same reason: the status banner goes to stderr, and the result table
+/// (CSV, one row per unordered pair) goes to stdout unless `--output`
+/// names a file, so `fastdna similarity ... | column -s, -t` and similar
+/// pipes work the same way `fastdna dist` already does. `open_tables`'s
+/// input order becomes each row's `sample_a`/`sample_b` labels, the same
+/// "label by the path it was opened from" convention `run_dist` uses for
+/// sketches.
+fn run_similarity(args: SimilarityArgs) -> Result<()> {
+    eprintln!("==================================================");
+    eprintln!(" FastDNA: Pairwise Similarity                      ");
+    eprintln!("==================================================");
+    eprintln!("Inputs: {}", args.input.len());
+    eprintln!("--------------------------------------------------");
+
+    let tables = open_tables(&args.input)?;
+    let labels: Vec<String> = args.input.iter().map(|p| p.display().to_string()).collect();
+
+    let pairs = similarity::pairwise_similarity(&tables)?;
+
+    match &args.output {
+        Some(path) => {
+            // Write-to-temp-then-rename, the same discipline `run_dist`
+            // already follows for its own result table.
+            let (file, pending) = fastdna_core::atomic::AtomicFile::create(path)?;
+            let mut writer = BufWriter::new(file);
+            write_similarity_table(&mut writer, &labels, &pairs)
+                .map_err(|e| FastDnaError::Io { path: path.clone(), source: e })?;
+            writer.flush().map_err(|e| FastDnaError::Io { path: path.clone(), source: e })?;
+            drop(writer);
+            pending.commit()?;
+            eprintln!("Similarity table written to: {}", path.display());
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            write_similarity_table(&mut handle, &labels, &pairs)
+                .map_err(|e| FastDnaError::Internal { detail: e.to_string() })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Writes the `sample_a,sample_b,shared,only_a,only_b,jaccard,
+/// containment_ab,containment_ba,bray_curtis` CSV body shared by
+/// `run_similarity`'s file and stdout paths, mirroring `write_dist_table`
+/// so the two destinations can never format a row differently.
+fn write_similarity_table<W: Write>(
+    w: &mut W,
+    labels: &[String],
+    pairs: &[PairSimilarity],
+) -> std::io::Result<()> {
+    writeln!(w, "sample_a,sample_b,shared,only_a,only_b,jaccard,containment_ab,containment_ba,bray_curtis")?;
+    for p in pairs {
+        writeln!(
+            w,
+            "{},{},{},{},{},{},{},{},{}",
+            labels[p.index_a],
+            labels[p.index_b],
+            p.shared,
+            p.only_a,
+            p.only_b,
+            p.jaccard,
+            p.containment_ab,
+            p.containment_ba,
+            p.bray_curtis
+        )?;
+    }
     Ok(())
 }
 
