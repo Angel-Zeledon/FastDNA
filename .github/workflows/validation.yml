@@ -128,3 +128,53 @@ jobs:
           name: validation-results
           path: ${{ runner.temp }}/*.json
           if-no-files-found: warn
+
+  # A separate job, not another step above, for two reasons: a benchmark
+  # that regresses must not read as a correctness failure, and this one
+  # needs a machine rather than a network -- it is the only thing in this
+  # repository whose result depends on what hardware it ran on.
+  benchmark:
+    name: Head to head vs KMC3
+    runs-on: ubuntu-latest
+    # x86-64 by definition on a GitHub-hosted ubuntu runner, which is the
+    # entire reason this job exists rather than a make target a developer
+    # runs: KMC3 and FASTK ship x86-64 Linux binaries, so on the arm64 Macs
+    # this project is developed on they run emulated, and an emulated
+    # competitor makes FastDNA look good for a reason that is not speed.
+    # `scripts/bench/head_to_head.py` refuses to report timings off x86-64
+    # for that reason; here it does not have to.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install numpy for the read generator
+        run: python -m pip install --quiet numpy
+
+      - name: Build the release binary
+        run: cargo build --release
+
+      # A 6 Mbp reference at 30x is ~390 MB and 144,000,000 k-mer
+      # occurrences -- large enough that the strategies separate (the
+      # binned path is measurably ahead of the in-memory one at this size,
+      # see docs/BENCHMARKS.md) and small enough to fit a runner's 14 GB of
+      # disk alongside KMC3's working directory. The 2.14 GB file the
+      # historical table used does not fit here with room for KMC3's
+      # scratch, and a benchmark that dies on a full disk measures nothing.
+      - name: FastDNA vs KMC3, natively, on the same file
+        run: |
+          python scripts/bench/head_to_head.py \
+            --genome-size 6000000 \
+            --json "${RUNNER_TEMP}/head_to_head.json"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: head-to-head
+          path: ${{ runner.temp }}/head_to_head.json
+          if-no-files-found: warn
