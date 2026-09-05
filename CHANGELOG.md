@@ -25,6 +25,32 @@ La superficie con compatibilidad garantizada es:
 
 ### Changed
 
+- **El merge entre bins ahora es paralelo** (`counter::k_way_merge_sorted_
+  counts_parallel`). Era la mayor porción secuencial que quedaba en una
+  corrida binned: 1,88 s en un core contra 2,76 s de todo el conteo por bin
+  repartido en once. Se parte por **rango de claves**, no por fuente — cada
+  rango toma un tramo contiguo de cada tabla ordenada por búsqueda binaria,
+  los rangos se mezclan por separado y se concatenan en orden. Así conserva
+  la propiedad de una sola pasada que el doc del merge secuencial defiende
+  frente al árbol de reducciones por pares.
+
+  Los puntos de corte son cuantiles de una muestra de las claves reales, no
+  divisiones iguales del rango `u64`: las k-mers canónicas no se distribuyen
+  uniformemente y una muestra de baja complejidad le daría a un worker casi
+  todo el trabajo — el mismo modo de fallo que hubo que medir para el
+  balance de bins.
+
+  **Paraleliza mal, y ese es el hallazgo**: 1,88 → 1,48 s, un 1,8x con once
+  partes, porque el merge lee 645 MB y escribe 645 MB y está limitado por
+  ancho de banda, no por comparaciones. Un intento de quitar los 0,40 s de
+  concatenación copiando en paralelo sobre rebanadas disjuntas **no mejoró
+  nada** (`vec![_; n]` inicializa a cero esos 645 MB), así que se mantuvo la
+  copia secuencial, más simple. De punta a punta la diferencia queda dentro
+  de la varianza entre corridas, así que no se afirma nada end-to-end.
+  Salida byte-idéntica, verificada por SHA-256 sobre el archivo de 840M
+  ocurrencias, y un test diferencial fija que las dos versiones coinciden.
+
+
 - **El contador ancho: 5,6x menos memoria, tras medirlo.** El módulo se
   entregó diciendo "no medido, y por tanto no afirmado". Medirlo dio
   4.438 MiB de pico con un solo hilo sobre 144M ocurrencias, y dos

@@ -404,6 +404,88 @@ than re-read), and the balance it measured is printed on the `Strategy Used`
 line so a run that was announced as `binned` and finished as something else
 says why.
 
+## Where a binned run's time actually goes (2026-09-05)
+
+Profiled rather than reasoned about, because two reasoned guesses had
+already been wrong. `/usr/bin/sample` over a live run on `large.fastq`
+(840,000,000 k-mer occurrences), leaves grouped by what they do, as a share
+of non-idle samples:
+
+| | share of work |
+|---|---:|
+| sorting (phase 2's per-bin sort) | **39.5%** |
+| the rest of `BinStore::finish` | 22.2% |
+| minimizer computation (phase 1) | 19.6% |
+| writing super-k-mers (phase 1) | 11.5% |
+| FASTQ parsing | 1.6% |
+| `memcpy` | 1.2% |
+| allocator | 0.8% |
+
+And the same run split by phase, timed directly rather than sampled:
+
+| threads | total | phase 1 | per-bin counting | cross-bin merge |
+|---:|---:|---:|---:|---:|
+| 1 | 26.33 s | 21.63 s | 2.94 s | 1.76 s |
+| 4 | 12.18 s | 7.55 s | 2.92 s | 1.71 s |
+| 8 | 10.24 s | 5.65 s | 2.76 s | 1.83 s |
+| 11 | 10.22 s | 5.53 s | 2.81 s | 1.88 s |
+
+Three findings, two of them things this document previously got wrong:
+
+- **Parsing is not the bottleneck, and a guess said it would be.** After
+  the binned promotion made counting 2.4x faster, the single-threaded
+  producer *should* have grown to a large share of the run --
+  `design-minimizer-counting.md`'s own step-0 gate puts the threshold for
+  "build parallel parsing instead" at ~36%. Measured with
+  `examples/parse_only_ceiling.rs`: **0.76 s for 2.3 GB, 3,030 MB/s, 7.7%**
+  of a 9.9 s run. Not close.
+- **Parquet export costs nothing measurable.** Writing 478 MB against
+  writing 456 bytes (`-m 100`) is the same wall clock. The 17% figure this
+  document reports for the in-memory strategy on the older machine does not
+  carry over.
+- **Per-bin counting does not respond to `--threads` at all** (2.94 s at
+  one thread, 2.81 s at eleven). `BinStore::finish` parallelises over the
+  *global* rayon pool, which is sized by core count, while `--threads`
+  sizes only phase 1's worker pool. So `-t 1` does not give a
+  single-threaded run, and does not bound phase 2's memory the way it
+  bounds phase 1's. Recorded here as a known discrepancy between what the
+  flag says and what it does.
+
+### The cross-bin merge, parallelised
+
+At 1.88 s on one core against 2.76 s for all of phase 2's counting across
+eleven, the merge was the largest serial stretch left. It is now split by
+*key range* rather than by source -- each range picks one contiguous slice
+out of every sorted bin table (binary search, no scanning), the ranges
+merge independently, and they concatenate in order. That keeps the
+single-pass property `k_way_merge_sorted_counts`'s doc comment defends
+against a pairwise reduction tree, which would rewrite every entry once per
+level.
+
+Split points are quantiles of a sample of the real keys, not equal
+divisions of the `u64` range: canonical k-mers are not uniformly
+distributed, and a low-complexity sample would hand one worker most of the
+data -- the same failure mode the bin balance itself had to be measured for.
+
+| | time |
+|---|---:|
+| sequential merge | 1.88 s |
+| parallel merge (11 parts) | 1.06 s |
+| + concatenating the parts | 0.40 s |
+| **total** | **1.48 s** |
+
+**It parallelises badly, and that is the finding.** Eleven-way splitting
+bought 1.8x, not 11x, because the merge reads 645 MB and writes 645 MB and
+is bound by memory bandwidth rather than by comparisons. An attempt to
+remove the 0.40 s concatenation by splitting the destination into disjoint
+slices and copying on every core was **no faster at all**: allocating that
+destination with `vec![_; n]` zero-initialises 645 MB, which costs about
+what the copy it replaced did. The simpler sequential copy was kept.
+
+End to end the 0.4 s is inside run-to-run variance (runs on this machine
+span 9.3-11.0 s), so no end-to-end claim is made from it. The merge's own
+before/after is what was measured.
+
 ## The `k > 32` engine, and what it costs (2026-09-05)
 
 `src/wide_kmer.rs` + `src/wide_counter.rs` count `33 <= k <= 64` in `u128`

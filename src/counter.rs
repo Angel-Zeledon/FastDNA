@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
 use std::sync::{Mutex, MutexGuard};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 /// Outcome of a `prune` call, for reporting what a filter removed.
@@ -540,18 +541,155 @@ pub(crate) fn k_way_merge_sorted_counts(mut sources: Vec<Vec<(u64, u32)>>) -> Ve
     match sources.len() {
         0 => return Vec::new(),
         // A single source is already exactly what a merge of one source
-        // produces; skip the heap machinery entirely.
+        // produces; skip the heap machinery entirely, and hand back its
+        // allocation rather than copying it.
         1 => return sources.remove(0),
         _ => {}
     }
 
+    let slices: Vec<&[(u64, u32)]> = sources.iter().map(Vec::as_slice).collect();
+    merge_slices(&slices)
+}
+
+/// Below this many entries a parallel merge is not worth its setup.
+///
+/// The split-point sample, the per-part range searches and the final
+/// concatenation are all fixed costs; on a small merge they exceed what
+/// the parallelism saves. 4,000,000 is deliberately conservative -- the
+/// merge this exists for handles 53.8 million.
+const PARALLEL_MERGE_MIN_ENTRIES: usize = 4_000_000;
+
+/// [`k_way_merge_sorted_counts`], split across `parts` workers.
+///
+/// # Why this exists
+///
+/// Measured, on the 840,000,000-occurrence benchmark file with the binned
+/// strategy: per-bin counting takes 2.8 s across every available core, and
+/// **the cross-bin merge takes 1.9 s on one core** -- 19% of the whole run,
+/// and the largest single-threaded stretch left in it. It does not shrink
+/// when threads are added because there is nothing in it to add them to.
+///
+/// # How it stays one k-way merge rather than becoming a tree
+///
+/// `k_way_merge_sorted_counts`'s own doc comment argues at length against a
+/// pairwise reduction tree: every entry gets rewritten once per level, and
+/// at benchmark scale that was ~1.7 GB of extra copying. This keeps the
+/// single-pass property and parallelises a different axis -- the *key
+/// range*, not the source list.
+///
+/// Every source is already sorted, so a key range picks out one contiguous
+/// slice of each (found by binary search, no scanning). The slices for one
+/// range can be merged with no knowledge of any other range, and the ranges
+/// concatenate in order because they were cut in key order. Each entry is
+/// therefore still visited exactly once by the merge itself; the only
+/// addition is one copy of the finished output into a single allocation,
+/// which is a linear `memcpy` rather than another comparison pass.
+///
+/// # Where the split points come from
+///
+/// Not from dividing the `u64` range into equal parts. Canonical k-mers are
+/// not uniformly distributed -- a low-complexity sample can concentrate
+/// them arbitrarily -- and equal *value* ranges would then hand one worker
+/// most of the data, which is the same failure the binned strategy's own
+/// bin balance had to be measured for. The boundaries are quantiles of a
+/// sample of the actual keys, so they follow the data's distribution
+/// whatever it is.
+pub(crate) fn k_way_merge_sorted_counts_parallel(
+    sources: Vec<Vec<(u64, u32)>>,
+    parts: usize,
+) -> Vec<(u64, u32)> {
     let total_len: usize = sources.iter().map(Vec::len).sum();
+    if sources.len() <= 1 || parts <= 1 || total_len < PARALLEL_MERGE_MIN_ENTRIES {
+        return k_way_merge_sorted_counts(sources);
+    }
+
+    let bounds = split_bounds(&sources, parts);
+    if bounds.is_empty() {
+        return k_way_merge_sorted_counts(sources);
+    }
+
+    let chunks: Vec<Vec<(u64, u32)>> = (0..=bounds.len())
+        .into_par_iter()
+        .map(|part| {
+            let lower = part.checked_sub(1).and_then(|i| bounds.get(i).copied());
+            let upper = bounds.get(part).copied();
+            let slices: Vec<&[(u64, u32)]> = sources
+                .iter()
+                .map(|source| {
+                    let start = match lower {
+                        Some(bound) => source.partition_point(|&(kmer, _)| kmer < bound),
+                        None => 0,
+                    };
+                    let end = match upper {
+                        Some(bound) => source.partition_point(|&(kmer, _)| kmer < bound),
+                        None => source.len(),
+                    };
+                    &source[start..end]
+                })
+                .collect();
+            merge_slices(&slices)
+        })
+        .collect();
+
+    // The parts are disjoint, sorted and already in key order, so
+    // assembling them is a copy rather than a merge. It is sequential, and
+    // that was measured rather than assumed: the copy takes 0.40 s of the
+    // merge's 1.48 s, and splitting the destination into one disjoint
+    // `&mut [_]` per part so the copy runs on every core made it **no
+    // faster at all** -- allocating the destination with `vec![_; n]`
+    // zero-initialises 645 MB, which costs about what the copy it replaced
+    // did. The simpler form is kept.
+    let mut merged: Vec<(u64, u32)> = Vec::with_capacity(total_len);
+    for chunk in &chunks {
+        merged.extend_from_slice(chunk);
+    }
+    merged
+}
+
+/// `parts - 1` ascending keys that cut the merged output into roughly equal
+/// pieces, taken as quantiles of a strided sample of the sources' own keys.
+///
+/// Returns fewer boundaries than asked for -- possibly none -- when the
+/// sample cannot supply that many distinct keys. The caller treats an empty
+/// result as "not worth splitting".
+fn split_bounds(sources: &[Vec<(u64, u32)>], parts: usize) -> Vec<u64> {
+    let total_len: usize = sources.iter().map(Vec::len).sum();
+    // ~64 sample keys per part: enough for the quantiles to track the
+    // distribution, few enough that sampling and sorting them is noise
+    // against the merge itself.
+    let wanted = parts.saturating_mul(64).max(1);
+    let stride = (total_len / wanted).max(1);
+
+    let mut sample: Vec<u64> = Vec::with_capacity(wanted + sources.len());
+    for source in sources {
+        sample.extend(source.iter().step_by(stride).map(|&(kmer, _)| kmer));
+    }
+    sample.sort_unstable();
+    sample.dedup();
+    if sample.len() < parts {
+        return Vec::new();
+    }
+
+    let mut bounds = Vec::with_capacity(parts - 1);
+    for part in 1..parts {
+        let index = sample.len() * part / parts;
+        match sample.get(index) {
+            Some(&key) if bounds.last() != Some(&key) => bounds.push(key),
+            _ => {}
+        }
+    }
+    bounds
+}
+
+/// The heap merge itself, over borrowed slices.
+///
+/// Shared by the sequential and parallel entry points so there is exactly
+/// one implementation of "sum the counts of equal keys across sorted
+/// sources" -- two would be two things to keep agreeing.
+fn merge_slices(sources: &[&[(u64, u32)]]) -> Vec<(u64, u32)> {
+    let total_len: usize = sources.iter().map(|source| source.len()).sum();
     let mut merged: Vec<(u64, u32)> = Vec::with_capacity(total_len);
 
-    // Each heap entry is `Reverse((kmer, source index, index within that
-    // source))` -- `Reverse` turns `BinaryHeap`'s natural max-heap into the
-    // min-heap a merge needs, and the two indices are enough to advance
-    // exactly the source a popped entry came from.
     let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> = BinaryHeap::with_capacity(sources.len());
     for (src_idx, src) in sources.iter().enumerate() {
         if let Some(&(kmer, _)) = src.first() {
@@ -575,30 +713,22 @@ pub(crate) fn k_way_merge_sorted_counts(mut sources: Vec<Vec<(u64, u32)>>) -> Ve
                 break;
             }
 
-            // Hoisted: the previous form indexed `sources[src_idx]` twice
-            // per entry (once to read the count, once to look up the next
-            // element), which is two bounds checks against `sources.len()`
-            // where one suffices -- one compare-and-branch pair removed per
-            // merged entry, over every entry of every source on every
-            // consolidation pass.
-            let src: &[(u64, u32)] = &sources[src_idx];
+            // Hoisted for the same reason the single-source form hoists it:
+            // one bounds check against `sources.len()` per entry instead of
+            // two.
+            let src: &[(u64, u32)] = sources[src_idx];
             count = count.saturating_add(src[elem_idx].1);
 
             let next_idx = elem_idx + 1;
             match src.get(next_idx) {
                 // Overwriting the root through `PeekMut` and letting its
-                // `Drop` re-sift replaces a `pop` (which sifts the hole all
-                // the way down to a leaf and then sifts the moved-in element
-                // back up) *plus* a `push` (another sift up) with a single
-                // sift down -- roughly half the heap element moves and
-                // comparisons, on every one of the tens of millions of
-                // entries a consolidation pass merges. Counted on the
-                // emitted assembly, the whole function shrank from 487 to
-                // 359 instructions, essentially all of it inlined heap
+                // `Drop` re-sift replaces a `pop` plus a `push` -- two sifts
+                // -- with a single sift down. Measured on the emitted
+                // assembly when this was first written: the function shrank
+                // from 487 to 359 instructions, essentially all of it heap
                 // restructuring that no longer happens.
                 Some(&(next_kmer, _)) => *top = Reverse((next_kmer, src_idx, next_idx)),
-                // Source exhausted: this is the one case that still has to
-                // shrink the heap.
+                // Source exhausted: the one case that still shrinks the heap.
                 None => {
                     PeekMut::pop(top);
                 }
@@ -1149,6 +1279,75 @@ impl Iterator for Iter<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The parallel merge must return exactly what the sequential one
+    /// returns -- same keys, same summed counts, same order -- on inputs
+    /// shaped like the ones it actually sees: many sorted sources with
+    /// overlapping keys.
+    ///
+    /// A differential test rather than a golden file, because the property
+    /// that matters is not "this output" but "the same output the reviewed,
+    /// long-standing implementation produces". Run across several part
+    /// counts, including 1 and more parts than there are distinct keys, so
+    /// the fallbacks and the degenerate splits are covered too.
+    #[test]
+    fn the_parallel_merge_agrees_with_the_sequential_one() {
+        let mut state = 0x2026_0905_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for (sources_count, per_source, key_space) in
+            [(2usize, 5usize, 8u64), (8, 50, 200), (64, 200, 5_000), (512, 40, 3_000)]
+        {
+            let sources: Vec<Vec<(u64, u32)>> = (0..sources_count)
+                .map(|_| {
+                    let mut keys: Vec<u64> = (0..per_source).map(|_| next() % key_space).collect();
+                    keys.sort_unstable();
+                    keys.dedup();
+                    keys.into_iter().map(|k| (k, (next() % 7 + 1) as u32)).collect()
+                })
+                .collect();
+
+            let expected = k_way_merge_sorted_counts(sources.clone());
+            for parts in [1usize, 2, 3, 7, 64] {
+                let actual = k_way_merge_sorted_counts_parallel(sources.clone(), parts);
+                assert_eq!(
+                    actual, expected,
+                    "{sources_count} sources x {per_source} keys over {key_space}, {parts} parts"
+                );
+            }
+        }
+    }
+
+    /// The parallel path is only taken above `PARALLEL_MERGE_MIN_ENTRIES`,
+    /// so the test above exercises the fallback rather than the split. This
+    /// one crosses that threshold, which is the only way to reach
+    /// `split_bounds` and the per-part range searches at all.
+    #[test]
+    fn the_parallel_merge_agrees_above_its_own_size_threshold() {
+        let sources_count = 32;
+        let per_source = PARALLEL_MERGE_MIN_ENTRIES / sources_count + 1_000;
+        let sources: Vec<Vec<(u64, u32)>> = (0..sources_count)
+            .map(|source| {
+                // Interleaved key spaces so sources genuinely overlap: a
+                // partition where each source owned a disjoint range would
+                // never exercise the count-summing path.
+                (0..per_source)
+                    .map(|i| ((i * sources_count + source) as u64, 1u32))
+                    .collect()
+            })
+            .collect();
+
+        let expected = k_way_merge_sorted_counts(sources.clone());
+        let actual = k_way_merge_sorted_counts_parallel(sources, 8);
+        assert_eq!(actual.len(), expected.len());
+        assert_eq!(actual, expected);
+    }
+
     use super::*;
 
     /// Builds a counter where k-mer `i` appears `i` times, for i in 1..=5.

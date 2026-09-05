@@ -67,7 +67,7 @@ use std::sync::Mutex;
 use rayon::prelude::*;
 
 use crate::adaptive_bins::{DynamicBinMap, SignatureHistogram};
-use crate::counter::k_way_merge_sorted_counts;
+use crate::counter::{k_way_merge_sorted_counts, k_way_merge_sorted_counts_parallel};
 use crate::fastq::FastqRecord;
 use crate::minimizer::{DEFAULT_M, DEFAULT_NUM_BINS};
 use crate::superkmer::{encode_record_into, for_each_superkmer, records, MAX_SUPER_KMER_BASES};
@@ -295,7 +295,14 @@ impl BinStore {
             .map_init(Vec::<u64>::new, |expanded, bin| self.count_bin(bin, k, expanded))
             .collect();
 
-        k_way_merge_sorted_counts(tables)
+        // Parallel, because this merge was measured at **1.9 s
+        // single-threaded** on the benchmark file against 2.8 s for all of
+        // phase 2's per-bin counting across every core -- the largest
+        // serial stretch left in a binned run. See
+        // `k_way_merge_sorted_counts_parallel` for how it is split without
+        // becoming the pairwise reduction tree that function's sequential
+        // twin argues against.
+        k_way_merge_sorted_counts_parallel(tables, rayon::current_num_threads())
     }
 
     /// The sequential form of [`finish`](Self::finish), for callers that are
