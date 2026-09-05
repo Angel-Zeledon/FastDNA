@@ -1,5 +1,12 @@
 # FastDNA x Machine Learning — feature roadmap
 
+> **Status, 2026-09-05**: this list is a researched *menu*, not a set of
+> commitments -- see `docs/goal-audit-leakage-not-completeness.md`, which
+> supersedes the goal doc cited in the audit note below. An item earns its
+> place by being needed for the leakage-audit claim, not by being an open
+> row here. The research and the status audits stay useful exactly as they
+> are.
+
 > **Audit pass, 2026-08-27**: every "Status" line below was re-checked
 > against the actual code on this date (not just against this doc's own
 > "dispatched" claims), per `docs/goal-most-complete-genomics-ml-library.md`'s

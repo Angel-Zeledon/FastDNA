@@ -1,5 +1,16 @@
 # Why FastDNA stays narrow: a decision record
 
+> **REINSTATED 2026-09-05.** The 2026-08-27 supersession recorded just below
+> was itself reversed; the current decision is
+> `docs/goal-audit-leakage-not-completeness.md`. "Stay narrow" holds again,
+> with a *different target* than this document named (auditing lineage
+> leakage, not one corner of k-mer counting) and for a new reason: nine
+> defects between 2026-08-31 and 2026-09-03, every one of them a missing
+> control on already-shipped surface. The outcome evidence below --
+> SAMtools/Biopython, AnnData/scikit-bio, `exon`+`biobear` dead vs
+> `oxbow`+`polars-bio` alive -- was never refuted in the interim, only
+> overruled.
+
 > **SUPERSEDED 2026-08-27.** The strategic conclusion below — "stay narrow,
 > ship the cheapest high-value items opportunistically" — has been reversed.
 > The active goal is now to become **the most complete library for genomics

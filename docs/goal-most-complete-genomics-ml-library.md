@@ -1,5 +1,19 @@
 # Goal: FastDNA becomes the most complete library for genomics ML
 
+> **SUPERSEDED 2026-09-05** by `docs/goal-audit-leakage-not-completeness.md`.
+> Nine defects found between 2026-08-31 and 2026-09-03 -- none of them
+> reachable by the ~1,750 tests, and every one a missing *control* on an
+> already-shipped module rather than a missing module -- retired the posture
+> below ("every Q/S/A/B item is a real commitment, in priority order, not a
+> menu"): it directs effort onto the axis that produced zero failures and
+> none onto the axis that produced nine.
+>
+> What still holds from this document: the boundary against alignment,
+> pangenome graphs and interval algebra (which it inherited unchanged from
+> `philosophy-narrow-not-broad.md`), and §"Why this changes the execution
+> posture" item 3 -- verify a planning doc's status claims against the
+> actual code before acting on them, which caught real drift twice.
+
 Date: 2026-08-27. Status: **active goal, supersedes the "stay narrow" conclusion
 in `docs/philosophy-narrow-not-broad.md`** (that document is kept for its still-valid
 technical corrections — the reverse-complement bit-trick derivation, and the

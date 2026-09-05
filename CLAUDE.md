@@ -11,14 +11,34 @@ and WASM (`src/wasm.rs`). The Rust core counts canonical k-mers from FASTQ
 files with quality trimming, in parallel, and hands results to Python as a
 zero-copy Arrow table.
 
-**Current mission** (`docs/goal-most-complete-genomics-ml-library.md`,
-supersedes `docs/philosophy-narrow-not-broad.md`): become the most complete
-library for genomics ML — closing every gap in
-`docs/feature-gap-analysis.md` and `docs/ml-differentiation-roadmap.md`.
-Explicitly out of scope regardless of that expansion: sequence alignment,
-pangenome graphs, general genomic interval algebra (`minimap2`/`vg`/
-`bedtools`'s territory — no code reuse with the k-mer engine, unrelated to
-the ML mission).
+**Current mission** (`docs/goal-audit-leakage-not-completeness.md`,
+2026-09-05, supersedes `docs/goal-most-complete-genomics-ml-library.md`):
+be **the tool that measures whether a genomics ML result survives lineage
+blocking, and that is audited hard enough to be believed when it says so.**
+Effort goes to the audit triad (`gap`/`confounding`/`explain`) and its
+trustworthiness — calibration against injected truth, negative controls,
+and guards that withhold a number rather than return a meaningless one —
+plus the leakage survey (`scripts/validation/leakage_survey.py`) and the
+counting engine that feeds it.
+
+**Adding modules is out of scope.** `docs/feature-gap-analysis.md`,
+`docs/ml-genomics-roadmap.md` and `docs/ml-differentiation-roadmap.md` are
+a researched menu, not commitments; a new module has to be needed for the
+claim above. This is not a deletion program — what ships stays, keeps its
+tests, and stops generating new work. Also out of scope, unchanged:
+sequence alignment, pangenome graphs, general genomic interval algebra
+(`minimap2`/`vg`/`bedtools`'s territory — no code reuse with the k-mer
+engine).
+
+The reason this reversed on 2026-09-05 is worth knowing before proposing
+work: nine defects were found between 2026-08-31 and 2026-09-03, none
+reachable by the ~1,750 tests, and **every one was a missing control on an
+already-shipped module, not a missing module.** They share a signature —
+the wrong output was well-formed (a truncated FASTA still starts with `>`;
+an all-constant feature matrix still audits to a tidy `gap = 0.0000`). When
+you add something here, the question that has actually caught defects is
+"what outside this code says the answer is right?", not "what else is
+missing?".
 
 ## Build & test commands
 
