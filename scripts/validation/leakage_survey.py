@@ -202,22 +202,24 @@ def candidate_cohorts() -> List[Dict]:
     return candidates
 
 
-def run_one(species: str, antibiotic: str, n_samples: int, top_features: int,
-            cache_dir: Optional[Path] = None) -> Dict:
-    """Download, count, audit. Returns a row, or a row carrying `error`."""
-    import warnings
+def cohort_labels(species: str, antibiotic: str, n_samples: int):
+    """`(cohort, y, groups, grouping)` -- everything about a cohort that is
+    decided before a single k-mer is counted.
 
+    Split out of `run_one` so a *second* experiment over the same cohorts
+    (`leakage_permutation_control.py`) reuses this derivation rather than
+    reimplementing it. The lineage grouping is the part that matters: two
+    scripts that disagreed about which genomes share a lineage would each
+    produce a perfectly plausible set of gaps that could not be compared to
+    the other's, and nothing in either output would say so.
+
+    Deliberately does no counting. `run_one` checks the design between this
+    call and `counts_for`, so a cohort whose design cannot answer the
+    question is refused before it is paid for.
+    """
     import numpy as np
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import Pipeline
 
-    from fastdna.audit import audit
     from fastdna.datasets import load_amr
-    from fastdna.design import check_design
-    from fastdna.sklearn import KmerVectorizer
-
-    warnings.filterwarnings("ignore")
-    started = time.monotonic()
 
     cohort = load_amr(species, antibiotic, n_samples=n_samples, random_state=0)
     y = np.asarray(cohort.phenotype).astype(int)
@@ -233,6 +235,27 @@ def run_one(species: str, antibiotic: str, n_samples: int, top_features: int,
         grouping = "mlst"
     else:
         groups, grouping = None, "sketch"
+
+    return cohort, y, groups, grouping
+
+
+def run_one(species: str, antibiotic: str, n_samples: int, top_features: int,
+            cache_dir: Optional[Path] = None) -> Dict:
+    """Download, count, audit. Returns a row, or a row carrying `error`."""
+    import warnings
+
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+
+    from fastdna.audit import audit
+    from fastdna.design import check_design
+    from fastdna.sklearn import KmerVectorizer
+
+    warnings.filterwarnings("ignore")
+    started = time.monotonic()
+
+    cohort, y, groups, grouping = cohort_labels(species, antibiotic, n_samples)
 
     design = check_design(
         y, n_features=top_features,
