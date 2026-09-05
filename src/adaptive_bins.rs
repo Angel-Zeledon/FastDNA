@@ -155,6 +155,15 @@ impl SignatureHistogram {
 pub struct DynamicBinMap {
     overrides: HashMap<u64, u32>,
     num_bins: usize,
+    /// The balance the packing below actually achieved on the sample:
+    /// heaviest bin's load divided by the mean load across *all* bins,
+    /// unoccupied ones included. `None` for [`Self::identity`], which did
+    /// no packing and therefore knows nothing about the input.
+    ///
+    /// Kept because it is the one number that says whether this strategy
+    /// can work on this input at all, and it is already computed here --
+    /// see [`Self::predicted_skew`].
+    predicted_skew: Option<f64>,
 }
 
 impl DynamicBinMap {
@@ -163,7 +172,7 @@ impl DynamicBinMap {
     /// adaptive sample uses, so today's behaviour is this type's zero case
     /// rather than a separate code path.
     pub fn identity(num_bins: usize) -> Self {
-        Self { overrides: HashMap::new(), num_bins }
+        Self { overrides: HashMap::new(), num_bins, predicted_skew: None }
     }
 
     /// Builds the greedy assignment described in the module doc comment.
@@ -206,7 +215,41 @@ impl DynamicBinMap {
             loads[lightest] = loads[lightest].saturating_add(weight);
         }
 
-        Self { overrides, num_bins }
+        // The balance actually achieved, measured on the sample rather than
+        // hoped for. The mean is taken over *every* bin, not only occupied
+        // ones, because an input whose whole signature space is narrower
+        // than `num_bins` cannot fill the rest no matter how good the
+        // packing is -- and that is exactly the input this number exists to
+        // identify. See `predicted_skew`.
+        let total: u64 = loads.iter().sum();
+        let max = loads.iter().copied().max().unwrap_or(0);
+        let predicted_skew = if total == 0 {
+            None
+        } else {
+            Some((max as f64) / ((total as f64) / (num_bins as f64)))
+        };
+
+        Self { overrides, num_bins, predicted_skew }
+    }
+
+    /// How lopsided the heaviest bin is against the average, as measured on
+    /// the sample this map was built from: `max_load / mean_load` over all
+    /// `num_bins` bins. 1.0 is perfect balance; `num_bins` is everything in
+    /// one bin.
+    ///
+    /// This is the load-balance question the whole partitioned strategy
+    /// depends on, answered before any counting happens. A high-diversity
+    /// shotgun sample packs to roughly 1; a low-diversity one (an amplicon
+    /// panel, a low-complexity metagenome) cannot, because LPT can only
+    /// spread the signatures the input actually contains -- an input with
+    /// fewer distinct signatures than bins leaves most bins empty by
+    /// construction, and the phase-2 worker holding the heavy bin becomes
+    /// the wall-clock and peak-memory bottleneck the partition existed to
+    /// remove.
+    ///
+    /// `None` when nothing was packed (`identity`, or an empty sample).
+    pub fn predicted_skew(&self) -> Option<f64> {
+        self.predicted_skew
     }
 
     /// The bin one signature routes to: the dedicated overflow bin for

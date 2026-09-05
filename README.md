@@ -117,22 +117,40 @@ k=31; all four count canonical k-mers and agree within 0.001%):
 That is roughly 18-25x faster than the fastest Python baseline on a single
 thread, and 44-63x faster on 8 threads.
 
-**Against the field's dedicated k-mer counters** (same 2.14 GB synthetic
-FASTQ, k=31, singletons included on all three):
+**Against the field's dedicated k-mer counters.** Same 2.14 GB synthetic
+FASTQ, k=31, singletons kept on all three (`kmc -ci1`, `FastK -t1`,
+`fastdna -m 1 -q 0`), all three run in the *same* environment (WSL2 Ubuntu,
+ext4, 8 threads) so no OS or filesystem difference is doing any of the work:
 
 | Tool | Time | Peak RAM | Distinct k-mers |
 |---|---:|---:|---:|
-| FASTK (2023) | 119.3 s | 2.99 GB | 53,776,394 |
-| **FastDNA** (in-memory strategy) | **~101 s** (median of 3) | **8.02 GB** | 53,774,150 |
-| KMC3 | 293.4 s | 9.77 GB | 53,776,394 |
+| **FASTK** | **38.3 s** | 2.86 GB | 53,776,394 |
+| KMC3 | 110.4 s | 9.06 GB | 53,776,394 |
+| FastDNA (in-memory strategy) | 388.2 s | 10.34 GB | 53,776,394 |
+| FastDNA (disk strategy) | 553.6 s | **1.21 GB** | 53,776,394 |
 
-FastDNA's in-memory strategy is the fastest of the three on this file and
-the most memory-hungry -- that trade, and what the disk strategy changes
-about it, is covered in
-[Memory use and limitations](#memory-use-and-limitations). The tiny count
-differences are FastDNA's quality trimming (the others don't trim), not a
-counting discrepancy; [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) has the
-cross-check that asserts this on demand.
+**FastDNA is slower than both dedicated counters** -- 10x behind FASTK and
+3.5x behind KMC3 here -- and the only one of the three whose peak memory is
+configurable against a budget. All four runs agree exactly on 53,776,394
+distinct k-mers out of 840,000,000 total, so correctness is not what is in
+question.
+
+Two things that qualify the numbers without rescuing them: that WSL2 VM had
+12 GB of RAM and FastDNA's in-memory peak was 10.34 GB, so that run was
+memory-constrained in a way the other two were not (the same source built
+natively for Windows on the same machine and file: 133.1 s, 8.34 GB, still
+3.5x behind FASTK); and an earlier version of this table, which reported
+FastDNA as the *fastest* of the three, was **retracted on 2026-08-25** after
+a stricter re-measurement. The retracted numbers and why they were wrong are
+in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+The cause is diagnosed rather than guessed: FastDNA materializes and sorts
+every one of the 840,000,000 k-mer *occurrences*, while KMC3's own run
+output reports it sorts 70,635,757 super-k-mers -- an 11.9x reduction in
+what moves through memory. `--strategy binned` implements the same
+super-k-mer partitioning
+([`docs/design-minimizer-counting.md`](docs/design-minimizer-counting.md))
+and is correct but not yet what `auto` selects.
 
 ### Correctness, checked against the field's own tools
 

@@ -292,6 +292,91 @@ counting happens as a one-time sort-and-compact pass on first read (see
 not new hardware, not a smaller test file -- is the entire difference
 between 920.7 s / 6.96 GB and ~101 s / 8.02 GB.
 
+## Strategy comparison on Apple silicon (2026-09-05)
+
+A second machine, and the first measurement of all three strategies against
+each other on the same input in the same environment.
+
+| | |
+|---|---|
+| CPU | Apple M3 Pro (`Mac15,6`), 11 threads |
+| RAM | 19 GB (18 GiB) |
+| OS | macOS (Darwin 25.6) |
+| Build | `cargo build --release` |
+
+Input: the same generator and seed as the WSL comparison above
+(`scripts/bench/generate_reads_large.py 35000000 30 150 large.fastq 9001`),
+2.14 GB, **840,000,000 k-mer occurrences**, `k=31`, `-m 1 -q 0`, default
+thread count.
+
+| Strategy | Time | Peak RSS | Distinct k-mers |
+|---|---:|---:|---:|
+| `memory` (what `auto` selects) | 24.10 s | 7.31 GB | 53,776,394 |
+| **`binned`** | **8.41 s** | **3.59 GB** | 53,776,394 |
+| `disk` | 40.67 s | 2.13 GB | 53,776,394 |
+
+All three Parquet outputs are **byte-identical** (SHA-256
+`5c1a51924554a883...`), which is the property `tests/dual_strategy.rs`
+asserts on synthetic input, confirmed here at 840M occurrences.
+
+**The minimizer-partitioned strategy is 2.9x faster than the default and
+uses half its memory, and `auto` never selects it.** That is the largest
+single speed result in this document, and it comes from code that has been
+in the tree, correct and opt-in, since 2026-08-25.
+
+### Scaling in threads and input size
+
+Both strategies, both files, four thread counts. `mid` is the same generator
+at seed 4242 (6 Mbp genome, 144,000,000 occurrences).
+
+| File | Strategy | 1 thread | 4 | 8 | 11 |
+|---|---|---:|---:|---:|---:|
+| mid | binned | 4.26 s / 891 MiB | 1.91 s / 915 | 1.55 s / 923 | 1.48 s / 951 |
+| mid | memory | 5.15 s / 785 MiB | 2.16 s / 1657 | 2.22 s / 2320 | 3.61 s / 2216 |
+| large | binned | 26.47 s / 3009 MiB | 11.28 s / 3372 | 8.99 s / 3407 | 9.56 s / 3287 |
+| large | memory | 48.71 s / 4744 MiB | 20.36 s / 5030 | 19.40 s / 6073 | 21.13 s / 6513 |
+
+Two things this shows that the single-configuration table cannot:
+
+- **`binned`'s memory is flat in threads and the in-memory strategy's is
+  not** -- 3,009 -> 3,287 MiB across 1 to 11 threads against 4,744 -> 6,513.
+  That is `docs/design-minimizer-counting.md` 3.6's central structural claim
+  (the store is a partition, not a per-worker replica), measured.
+- **The design's predicted ~3x memory cut did not survive.** The measured
+  ratio is **1.78x at 8 threads and 1.98x at 11**, not 3x. The advantage is
+  real and large; the published multiple was optimistic, and
+  `src/mem_estimate.rs`'s own test now pins the measured figure instead.
+
+These eight runs are what `estimate_binned_peak_bytes` was calibrated
+against on the same date -- it had been an explicitly structural,
+never-measured model until then, and it turned out to under-predict the
+840M-occurrence runs by 26-29% while over-predicting the 144M ones by
+11-19%. Both errors are gone; see that function's doc comment and
+`binned_estimate_matches_the_measured_runs_it_was_fit_to`.
+
+### Where `binned` loses, and why it is not promoted blindly
+
+The same three strategies on a **low-complexity** input: 1.5M reads of a
+single 250 bp conserved sequence with ~1% substitutions (734 MB,
+330,000,000 occurrences, only 1,469,132 distinct k-mers) -- an amplicon
+panel's shape, the case `docs/design-minimizer-counting.md` 6's R3 risk
+named and the reason promotion was declined in the first place.
+
+| Strategy | Time | Peak RSS |
+|---|---:|---:|
+| `memory` | **0.78 s** | **759 MB** |
+| `binned` | 2.67 s | 2,090 MB |
+
+**3.4x slower and 2.8x more memory** -- the exact inversion of the shotgun
+result, on an input that is not small. Counts are identical (1,469,132
+distinct; byte-identical Parquet).
+
+This is why input *size* cannot gate the promotion, and why the adaptive bin
+map (`src/adaptive_bins.rs`) does not by itself resolve it: when the input's
+whole signature space is narrower than the bin count, there is nothing for
+any packing to spread. What can gate it is the balance the packing actually
+achieves on the warm-up sample, which is measurable before counting starts.
+
 ## Worker-buffer bound: measured effect by input shape
 
 `KmerCounter` bounds each worker's raw k-mer buffer at 2,000,000 buffered

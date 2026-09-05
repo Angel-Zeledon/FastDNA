@@ -273,28 +273,70 @@ const DISTINCT_PER_OCCURRENCE: f64 = 0.0640178;
 /// headroom over this constant's own prediction.
 const SUPERKMER_BYTES_PER_OCCURRENCE: f64 = 1.035;
 
+/// Base RSS the binned strategy carries before any input-proportional
+/// structure exists, in bytes.
+///
+/// Separate from `BASE_OVERHEAD_BYTES` (777 MiB), which was fit to the
+/// *in-memory* strategy's runs: the binned path never allocates the
+/// per-worker raw buffers that dominate that constant, and measuring it
+/// directly (a 144M-occurrence run peaks at 891 MiB *total*, of which the
+/// store and table account for ~440 MiB) shows its floor is well under
+/// half. Fit jointly with `BINNED_CALIBRATION_FACTOR` below, over the same
+/// eight runs.
+const BINNED_BASE_OVERHEAD_BYTES: u64 = 320 * 1024 * 1024;
+
+/// Multiplies the structural sum below to match measured peak RSS.
+///
+/// **This is what makes the binned model calibrated rather than
+/// structural**, and it was fit on 2026-09-05 to eight release runs on
+/// macOS arm64 (Apple M3 Pro, 11 threads available, 19 GB RAM): two input
+/// sizes (144,000,000 and 840,000,000 k-mer occurrences, the `mid` and
+/// `large` benchmark files) x four thread counts (1, 4, 8, 11), peak RSS
+/// read from `/usr/bin/time -l`'s `maximum resident set size`.
+///
+/// It was chosen as the smallest factor that leaves **no** measured point
+/// under-predicted, because the one thing this number must never do is tell
+/// the automatic chooser a run fits when it does not. The residuals it
+/// leaves are reported by
+/// `binned_estimate_matches_the_measured_runs_it_was_fit_to` and range from
+/// 0.0% to +11.1% -- conservative everywhere, never optimistic anywhere.
+///
+/// What it absorbs, and why a bare structural sum could not: allocator
+/// retention (macOS does not return freed pages promptly, so peak RSS
+/// includes pages the program has already released), the Arrow/Parquet
+/// encode buffers the export step holds while the count table is still
+/// alive, and rayon's per-thread stacks. None of those is modelled term by
+/// term because none was measured term by term -- naming a single fitted
+/// factor is honest about that, where quietly inflating
+/// `SUPERKMER_BYTES_PER_OCCURRENCE` (which has its own derivation and its
+/// own test) to 3.6 would not be.
+const BINNED_CALIBRATION_FACTOR: f64 = 1.195;
+
 /// Predicts peak RSS in bytes for a **binned** counting run (`binned.rs` /
 /// `CountStrategy::Binned`) over `occurrences` total k-mer instances,
 /// `threads` workers, `num_bins` minimizer bins and `chunk_bytes` per open
 /// chunk.
 ///
-/// # This model is structural, not calibrated -- read this before trusting it
+/// # Calibrated on 2026-09-05, and what changed when it met a real run
 ///
-/// `estimate_peak_bytes` above is calibrated: its load-bearing constant was
-/// fit by least squares to five *measured* peak-RSS numbers from real
-/// release runs, and its own test reports the residual error against each of
-/// them. **This function has no such backing.** Every term below is derived
-/// from data structures read out of `binned.rs` and from
-/// `docs/design-minimizer-counting.md` 3.4/3.6/4.1's arithmetic; not one of
-/// them has been compared against an observed RSS of an actual binned run,
-/// because doing that needs a native release build on the benchmark input,
-/// which the environment this was written in did not have -- the same
-/// constraint 7's R3 records for the `DRR021372` re-measurement.
-/// `docs/PERFORMANCE_PLAN.md` workstream 6 explicitly permits an
-/// "honestly-labeled structural" model in place of a calibrated one; this is
-/// that, and the label is not decoration. It predicts what the design says
-/// the code should do, which is exactly the thing a measurement would be
-/// needed to falsify.
+/// This model was structural until 2026-09-05: every term derived from
+/// `binned.rs`'s data structures and `docs/design-minimizer-counting.md`
+/// 3.4/3.6/4.1's arithmetic, with nothing compared against an observed RSS,
+/// because the environment it was written in had no native release build to
+/// measure. That measurement has now been made -- eight release runs, two
+/// input sizes x four thread counts (see `BINNED_CALIBRATION_FACTOR`) -- and
+/// the structural version was wrong in both directions at once: it
+/// **under-predicted the 840M-occurrence runs by 26-29%** and
+/// **over-predicted the 144M-occurrence ones by 11-19%**.
+///
+/// Two things were wrong, and both are fixed above rather than papered over:
+/// the merge phase assumed the super-k-mer store had been released by then
+/// and it has not, and the base overhead was inherited from the in-memory
+/// strategy's 777 MiB fit when the binned path never allocates the
+/// per-worker raw buffers that number was mostly made of. With the store
+/// counted in the merge and a base fit to this path's own floor, one
+/// calibration factor covers the remainder and no measured point is
+/// under-predicted.
 ///
 /// What it is nonetheless good for: the automatic chooser needs a
 /// conservative, monotone answer to "could this run fit?", and this model's
@@ -359,7 +401,7 @@ pub fn estimate_binned_peak_bytes(
     // (worker, bin) pair.
     let store_bytes = ((occurrences as f64) * SUPERKMER_BYTES_PER_OCCURRENCE) as u64;
     let open_chunk_bytes = threads * num_bins * (chunk_bytes as u64);
-    let phase1 = BASE_OVERHEAD_BYTES + store_bytes + open_chunk_bytes;
+    let phase1 = BINNED_BASE_OVERHEAD_BYTES + store_bytes + open_chunk_bytes;
 
     // Phase 2: `threads` bins in flight, each holding its expanded
     // occurrences and its compacted table, beside the output accumulated so
@@ -367,12 +409,20 @@ pub fn estimate_binned_peak_bytes(
     let per_bin_expanded_bytes = (occurrences / num_bins) * 8;
     let per_bin_table_bytes = ((distinct / num_bins as f64) as u64) * COUNT_TABLE_BYTES_PER_ENTRY;
     let phase2_transients = threads * (per_bin_expanded_bytes + per_bin_table_bytes);
-    let phase2 = BASE_OVERHEAD_BYTES + store_bytes / 2 + phase2_transients + final_table_bytes;
+    let phase2 = BINNED_BASE_OVERHEAD_BYTES + store_bytes / 2 + phase2_transients + final_table_bytes;
 
-    // The merge: every source table and the destination, all resident.
-    let merge = BASE_OVERHEAD_BYTES + 2 * final_table_bytes;
+    // The merge: every source table and the destination, all resident --
+    // and, measurement says, the store and the open chunks too. The store
+    // is what changed after this model met a real run: it was assumed
+    // released by merge time and is not, which is most of why the purely
+    // structural version under-predicted the 840M-occurrence runs by 26-29%
+    // while over-predicting the 144M ones by 11-19%. Both errors are gone
+    // once the store is counted here and the base is fit to the binned
+    // path's own floor rather than the in-memory path's.
+    let merge = BINNED_BASE_OVERHEAD_BYTES + store_bytes + 2 * final_table_bytes + open_chunk_bytes;
 
-    phase1.max(phase2).max(merge)
+    let structural = phase1.max(phase2).max(merge);
+    ((structural as f64) * BINNED_CALIBRATION_FACTOR) as u64
 }
 
 /// Reads how much physical memory is currently available on this machine,
@@ -532,19 +582,15 @@ mod tests {
         );
     }
 
-    /// `estimate_binned_peak_bytes` is documented as reproducing
-    /// `docs/design-minimizer-counting.md` 4.1's published memory table. Pin
-    /// each of that table's rows *and* each of its three phase totals, so
-    /// the code and the document cannot drift apart without a test failure.
-    ///
-    /// The tolerances are tight (0.5 MiB per term, 0.01 GiB per phase)
-    /// because this is not a check that the model is *right* -- nothing here
-    /// touches a real RSS -- but that the arithmetic is the arithmetic that
-    /// was written down and reviewed. Being wrong in a way the document is
-    /// also wrong in is a possibility this test cannot exclude, and does not
-    /// claim to.
+    /// The per-term arithmetic `docs/design-minimizer-counting.md` 4.1
+    /// published, pinned so the code and that document cannot drift apart
+    /// silently. Only the *terms* are pinned here: 4.1's three phase totals
+    /// used the in-memory strategy's 777 MiB base overhead, which the
+    /// calibration on 2026-09-05 replaced with this path's own measured
+    /// floor, so those totals are superseded and are checked against
+    /// measurements in the test below instead of against the document.
     #[test]
-    fn binned_estimate_reproduces_the_design_document_arithmetic() {
+    fn binned_estimate_reproduces_the_design_document_term_arithmetic() {
         let occurrences = BENCH_OCCURRENCES;
         let threads = BENCH_THREADS as u64;
         let num_bins = crate::minimizer::DEFAULT_NUM_BINS as u64;
@@ -558,9 +604,7 @@ mod tests {
         let per_bin_table = ((distinct / num_bins as f64) as u64) * COUNT_TABLE_BYTES_PER_ENTRY;
         let phase2_transients = threads * (per_bin_expanded + per_bin_table);
 
-        // 4.1's term table, row by row.
         for (label, actual_mib, published_mib) in [
-            ("base overhead", mib(BASE_OVERHEAD_BYTES), 777.0),
             ("super-k-mer store", mib(store), 829.0),
             ("open chunks", mib(open_chunks), 64.0),
             ("phase-2 per-bin transients", mib(phase2_transients), 113.0),
@@ -572,36 +616,59 @@ mod tests {
                  {published_mib:.1} MiB"
             );
         }
+    }
 
-        // ...and its three phase totals, in GiB as the document states them.
-        let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        let phase1 = BASE_OVERHEAD_BYTES + store + open_chunks;
-        let phase2 = BASE_OVERHEAD_BYTES + store / 2 + phase2_transients + table;
-        let merge = BASE_OVERHEAD_BYTES + 2 * table;
+    /// The eight runs `BINNED_CALIBRATION_FACTOR` and
+    /// `BINNED_BASE_OVERHEAD_BYTES` were fit to, with the residual against
+    /// each one reported in the failure message.
+    ///
+    /// Two properties, and the first is the one that matters: **no point may
+    /// be under-predicted.** A memory model that tells the automatic chooser
+    /// a run fits when it does not is how a 19 GB machine gets an OOM twenty
+    /// minutes into a count. Over-prediction only costs a run the disk
+    /// strategy it did not strictly need, so the ceiling is loose (25%)
+    /// while the floor is absolute.
+    ///
+    /// Measured on macOS arm64 (Apple M3 Pro, 19 GB), release build, peak
+    /// RSS from `/usr/bin/time -l`. The inputs are the `mid` and `large`
+    /// files `scripts/bench/generate_reads_large.py` produces at seeds 4242
+    /// and 9001 -- 144,000,000 and 840,000,000 k-mer occurrences at k=31.
+    #[test]
+    fn binned_estimate_matches_the_measured_runs_it_was_fit_to() {
+        let num_bins = crate::minimizer::DEFAULT_NUM_BINS;
+        let chunk_bytes = crate::binned::DEFAULT_CHUNK_BYTES;
 
-        for (label, actual_gib, published_gib) in [
-            ("phase 1", gib(phase1), 1.63),
-            ("phase 2", gib(phase2), 2.08),
-            ("cross-bin merge", gib(merge), 2.36),
-        ] {
+        // (occurrences, threads, measured peak RSS in MiB)
+        let measured = [
+            (144_000_000u64, 1usize, 891.0),
+            (144_000_000, 4, 915.0),
+            (144_000_000, 8, 923.0),
+            (144_000_000, 11, 951.0),
+            (840_000_000, 1, 3009.0),
+            (840_000_000, 4, 3372.0),
+            (840_000_000, 8, 3407.0),
+            (840_000_000, 11, 3287.0),
+        ];
+
+        for (occurrences, threads, measured_mib) in measured {
+            let predicted_mib =
+                mib(estimate_binned_peak_bytes(occurrences, threads, num_bins, chunk_bytes));
+            let residual = (predicted_mib - measured_mib) / measured_mib;
             assert!(
-                (actual_gib - published_gib).abs() < 0.01,
-                "{label}: model says {actual_gib:.3} GiB, design doc 4.1 published \
-                 {published_gib:.2} GiB"
+                residual >= 0.0,
+                "{occurrences} occurrences at {threads} threads: predicted {predicted_mib:.0} MiB \
+                 UNDER a measured {measured_mib:.0} MiB ({:.1}%). A binned estimate that \
+                 under-predicts lets the automatic chooser pick a run that will not fit.",
+                residual * 100.0
+            );
+            assert!(
+                residual <= 0.25,
+                "{occurrences} occurrences at {threads} threads: predicted {predicted_mib:.0} MiB \
+                 against a measured {measured_mib:.0} MiB (+{:.1}%), beyond the 25% ceiling this \
+                 model is allowed to be conservative by",
+                residual * 100.0
             );
         }
-
-        // The merge is the peak, which is what the function must return.
-        assert_eq!(
-            estimate_binned_peak_bytes(
-                occurrences,
-                BENCH_THREADS,
-                crate::minimizer::DEFAULT_NUM_BINS,
-                crate::binned::DEFAULT_CHUNK_BYTES,
-            ),
-            merge,
-            "the cross-bin merge is the largest of the three phases on this input"
-        );
     }
 
     /// The design's own falsifiable structural claim
@@ -637,14 +704,24 @@ mod tests {
         );
     }
 
-    /// The headline reason `binned` exists: on the benchmark input at 8
-    /// threads it should predict several times less memory than the
-    /// in-memory strategy. 4.1 predicts 2.36 GiB against the measured
-    /// 8.34 GB baseline.
+    /// The headline reason `binned` exists: it must predict materially less
+    /// memory than the in-memory strategy on the benchmark input.
     ///
-    /// Stated as a ratio against `estimate_peak_bytes`'s own prediction (not
-    /// against the measured 8.34 GB) so this compares two models on equal
-    /// terms rather than a model against a measurement it was never fit to.
+    /// **The design's "~3x cut" (4.1) did not survive measurement.** Runs on
+    /// 2026-09-05 over 840,000,000 occurrences put the real ratio at
+    /// **1.78x at 8 threads** (3,407 MiB against 6,073 MiB) and **1.98x at
+    /// 11** (3,287 against 6,513) -- a large win, and not the one the
+    /// document predicted. The threshold here is 2x rather than 3x for that
+    /// reason, and it is stated model-against-model (both predictions, not
+    /// one prediction against a measurement it was never fit to) so the two
+    /// models are compared on equal terms.
+    ///
+    /// Worth knowing when reading the ratio: `estimate_peak_bytes`, the
+    /// in-memory model, was calibrated on a different machine and OS and
+    /// **over-predicts on this one** -- 8.49 GiB against 6.07 GiB measured
+    /// at 8 threads. So the model-to-model ratio here (2.55x) sits above the
+    /// measured one, and the honest reading of the memory advantage is the
+    /// measured 1.8-2.0x, not this number.
     #[test]
     fn binned_predicts_substantially_less_memory_than_the_in_memory_strategy() {
         let binned = estimate_binned_peak_bytes(
@@ -656,9 +733,9 @@ mod tests {
         let in_memory = estimate_peak_bytes(BENCH_OCCURRENCES, BENCH_THREADS);
         let ratio = in_memory as f64 / binned as f64;
         assert!(
-            ratio > 3.0,
+            ratio > 2.0,
             "binned predicted {:.2} GiB against in-memory's {:.2} GiB (only {ratio:.2}x); the \
-             design claims a ~3x cut",
+             measured advantage is 1.8-2.0x and the models should not fall below it",
             binned as f64 / (1024.0 * 1024.0 * 1024.0),
             in_memory as f64 / (1024.0 * 1024.0 * 1024.0),
         );
@@ -673,13 +750,16 @@ mod tests {
         let zeroed = estimate_binned_peak_bytes(BENCH_OCCURRENCES, 0, 0, 0);
         let ones = estimate_binned_peak_bytes(BENCH_OCCURRENCES, 1, 1, 0);
         assert_eq!(zeroed, ones, "zero threads/bins must floor to one, not wrap or panic");
-        assert!(zeroed >= BASE_OVERHEAD_BYTES);
+        assert!(zeroed >= BINNED_BASE_OVERHEAD_BYTES);
 
-        // An empty input still costs the fixed base overhead and nothing that
-        // scales, at any thread count.
+        // An empty input still costs the fixed base overhead and nothing
+        // that scales, at any thread count -- scaled by the calibration
+        // factor, which applies to every prediction this function makes.
+        let empty_input_bytes =
+            ((BINNED_BASE_OVERHEAD_BYTES as f64) * BINNED_CALIBRATION_FACTOR) as u64;
         assert_eq!(
             estimate_binned_peak_bytes(0, 8, crate::minimizer::DEFAULT_NUM_BINS, 0),
-            BASE_OVERHEAD_BYTES
+            empty_input_bytes
         );
     }
 
