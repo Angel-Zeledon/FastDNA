@@ -1,0 +1,58 @@
+91 candidate cohorts with >= 25 in the smaller class
+
+[1] Streptococcus pneumoniae / penicillin
+    random 0.7875 -> blocked 0.6485   gap +0.1390   confounding 0.451   (127s, cached counts)
+
+[2] Escherichia coli / ceftriaxone
+    cache unreadable, recounting ([Errno 1] Failed to open local file 'cache/cohort_counts/escherichia_coli_ceftriaxone.n80.k31.parquet'. Detail: [errno 1] Operation not permitted)
+    ERROR: [Errno 1] Operation not permitted: 'cache/cohort_counts/escherichia_coli_ceftriaxone.n80.k31.parquet.partial' 
+
+[3] Escherichia coli / ampicillin_sulbactam
+    ERROR: failed to download https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,562.29139)&limit(100000)&http_acce
+
+[4] Klebsiella pneumoniae / ceftriaxone_cefpodoxime
+    ERROR: load_amr(): n_samples=80 exceeds the 59 samples available after filtering (30 positive, 29 negative class). Pa
+
+[5] Escherichia coli / trimethoprim
+    ERROR: failed to download https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,562.22470)&limit(100000)&http_acce
+
+[6] Klebsiella pneumoniae / tetracycline
+    ERROR: failed to download https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,573.24340)&limit(100000)&http_acce
+
+[7] Escherichia coli / cefalothin
+    ERROR: failed to download https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,562.57261)&limit(100000)&http_acce
+
+[8] Salmonella enterica / tetracycline
+    ERROR: failed to download https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,399587.66)&limit(100000)&http_acce
+
+[9] Klebsiella pneumoniae / gentamicin
+    ERROR: failed to download https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,573.12960)&limit(100000)&http_acce
+
+[10] Klebsiella pneumoniae / ticarcillin_clavulanic_acid
+    random 0.9432 -> blocked 0.7612   gap +0.1820   confounding 0.620   (750s)
+
+[11] Klebsiella pneumoniae / trimethoprim
+    ERROR: failed to download https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,573.5677)&limit(100000)&http_accep
+
+[12] Salmonella enterica / streptomycin
+    ERROR: failed to download https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,85569.41)&limit(100000)&http_accep
+
+[13] Klebsiella pneumoniae / cefoxitin
+    ERROR: failed to download https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,573.12878)&limit(100000)&http_acce
+
+[14] Salmonella enterica / spectinomycin
+    ERROR: failed to download https://www.bv-brc.org/api/genome_sequence/?eq(genome_id,85569.47)&limit(100000)&http_accep
+
+[15] Escherichia coli / amoxicillin
+    random 0.6867 -> blocked 0.7386   gap -0.0519   confounding 0.364   (712s)
+
+[16] Klebsiella pneumoniae / imipenem
+    random 0.7474 -> blocked 0.5590   gap +0.1884   confounding 0.422   (690s)
+
+[17] Escherichia coli / streptomycin
+    ERROR: IncompleteRead(222348 bytes read)
+
+[18] Streptococcus pneumoniae / trimethoprim_sulphamethoxazole
+    random 0.7617 -> blocked 0.6921   gap +0.0697   confounding 0.464   (307s)
+
+[19] Salmonella enterica / ampicillin

@@ -32,6 +32,7 @@ from sklearn.pipeline import Pipeline  # noqa: E402
 
 from fastdna.audit import (  # noqa: E402
     AuditReport,
+    ConstantPredictionWarning,
     Confounding,
     CovariateAudit,
     DegenerateLineagesWarning,
@@ -1343,3 +1344,95 @@ def test_explain_composes_with_audit_for_the_feature_attribution_question(tmp_pa
         "negative control: a marker present across every lineage must not be flagged "
         f"lineage_restricted; got {phenotype_feature.n_lineages_present}/{phenotype_feature.n_lineages_total}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The gap is withheld when the model ranked nothing.
+#
+# The second way a gap can be arithmetically fine and mean nothing (the
+# first being a degenerate grouping, above). A constant prediction scores
+# exactly 0.5 under roc_auc in every fold, so both splitters read 0.5 and
+# their difference is 0.0 by construction. That is not a hypothetical: it
+# is what audit() reported for a real cohort until 2026-09-03 -- see
+# python/tests/test_review_findings_2026_09_02.py.
+#
+# The condition can no longer be produced through KmerVectorizer, which is
+# the point of the fix, so these tests build it directly with a transformer
+# that returns a constant column.
+# ---------------------------------------------------------------------------
+
+
+def _constant_matrix_pipeline():
+    from sklearn.preprocessing import FunctionTransformer
+
+    return Pipeline(
+        [
+            ("constant", FunctionTransformer(lambda X: np.ones((len(X), 3)), validate=False)),
+            ("clf", LogisticRegression(max_iter=2000)),
+        ]
+    )
+
+
+def _tiny_cohort(tmp_path, n=12):
+    """`n` FASTQ files whose content is irrelevant: the pipeline under test
+    ignores it. They are real files so audit() handles them exactly as it
+    would any cohort."""
+    return [_write(tmp_path, f"s{i}.fastq", ["ACGTACGTACGTACGTACGT"] * 3) for i in range(n)]
+
+
+def test_audit_withholds_the_gap_when_every_fold_scores_exactly_half(tmp_path):
+    paths = _tiny_cohort(tmp_path)
+    phenotype = np.array([1, 0] * 6)
+    groups = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3])
+
+    with pytest.warns(ConstantPredictionWarning, match="ranked nothing"):
+        report = audit(
+            _constant_matrix_pipeline(), paths, phenotype,
+            groups=groups, n_splits=3, scoring="roc_auc", random_state=0,
+        )
+
+    assert report.score_random == 0.5
+    assert report.score_lineage == 0.5
+    assert report.gap != report.gap, "gap must be withheld as NaN, not reported as 0.0"
+    assert report.gap_undefined_reason is not None
+    assert "0.5" in report.gap_undefined_reason
+
+
+def test_audit_still_reports_the_scores_it_actually_measured(tmp_path):
+    """Withholding the gap must not withhold the measurements behind it:
+    `score_random`/`score_lineage` were really measured and stay populated,
+    the same split `DegenerateLineagesWarning`'s own path already makes.
+    """
+    paths = _tiny_cohort(tmp_path)
+    phenotype = np.array([1, 0] * 6)
+    groups = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConstantPredictionWarning)
+        report = audit(
+            _constant_matrix_pipeline(), paths, phenotype,
+            groups=groups, n_splits=3, scoring="roc_auc", random_state=0,
+        )
+
+    assert report.per_fold.column("score").to_pylist() == [0.5] * 6
+    assert "0.5" in report.to_markdown()
+
+
+def test_audit_does_not_withhold_the_gap_under_accuracy(tmp_path):
+    """Restricted to roc_auc on purpose: 0.5 is the constant-prediction
+    value only for a ranking metric. Under `accuracy` it is an ordinary
+    result on a balanced cohort, and withholding the gap there would be a
+    false positive on exactly the cohorts this library is built for.
+    """
+    paths = _tiny_cohort(tmp_path)
+    phenotype = np.array([1, 0] * 6)
+    groups = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ConstantPredictionWarning)
+        report = audit(
+            _constant_matrix_pipeline(), paths, phenotype,
+            groups=groups, n_splits=3, scoring="accuracy", random_state=0,
+        )
+
+    assert report.gap == report.gap, "accuracy=0.5 is an ordinary result, not a degenerate one"

@@ -43,10 +43,19 @@ than an overnight commitment each time.
 ## Resumability
 
 Results are appended to the output JSON after every cohort, and cohorts
-already present are skipped on a re-run. A four-hour job must survive a
+already *measured* are skipped on a re-run. A four-hour job must survive a
 closed laptop lid, an OOM kill, or a Ctrl-C. The count cache extends that to
 the case the results file cannot cover: a re-run that deliberately discards
 the old rows because the analysis changed.
+
+A row carrying `error` is **not** treated as measured: it is dropped on
+resume and the cohort is retried. The failures this job actually hits are
+transient and external -- DNS disappearing with the lid closed, a truncated
+HTTP read -- and the run on 2026-09-03 lost 11 of 18 cohorts to a single
+overnight network drop. Treating those as done would have capped the study
+at 7 usable cohorts while reporting that it had considered 18. A cohort
+that fails for a permanent reason simply fails again, at the cost of one
+metadata request.
 
 ## Before it runs anything
 
@@ -139,8 +148,17 @@ def counts_for(paths, cache_dir: Optional[Path], species: str, antibiotic: str,
                   flush=True)
 
     counts = fastdna.count_cohort(paths, k=k)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    counts.save(path)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        counts.save(path)
+    except OSError as exc:
+        # The counts are already in memory and the audit can run on them.
+        # Losing an hour of counting because a *cache* write failed would
+        # invert the point of the cache -- and it is not hypothetical: on
+        # 2026-09-05 `save()`'s atomic rename over an existing cache file
+        # returned EPERM (macOS, `com.apple.provenance` on the destination)
+        # and took a fully counted cohort down with it.
+        print(f"    cache write failed, continuing uncached ({exc})", flush=True)
     return counts, False
 
 
@@ -316,15 +334,39 @@ def main() -> int:
     # Resume: anything already recorded is not re-run.
     rows: List[Dict] = []
     if args.json.is_file():
-        rows = json.loads(args.json.read_text())
-        print(f"resuming: {len(rows)} cohorts already in {args.json}")
+        recorded = json.loads(args.json.read_text())
+        rows = [r for r in recorded if "error" not in r]
+        retrying = len(recorded) - len(rows)
+        print(f"resuming: {len(rows)} cohorts already measured in {args.json}"
+              + (f"; retrying {retrying} that errored" if retrying else ""))
     done = {(r["species"], r["antibiotic"]) for r in rows}
 
     for candidate in candidates:
-        if len([r for r in rows if "skipped" not in r]) >= args.max_cohorts:
+        # `max_cohorts` is a target for the *study*, so it counts cohorts
+        # that produced a number. Counting attempts instead would let a bad
+        # night of networking end the run early with a third of the
+        # statistical power the design asked for, and nothing in the output
+        # would say so.
+        if sum(1 for r in rows if "skipped" not in r and "error" not in r) >= args.max_cohorts:
             break
         key = (candidate["species"], candidate["antibiotic"])
         if key in done:
+            continue
+
+        # Checkable from metadata alone, before anything is downloaded:
+        # `load_amr` needs `n_samples` genomes to survive its own filtering,
+        # and a candidate qualifies on minority size alone (MIN_MINORITY),
+        # which says nothing about the total. Skipping here rather than
+        # letting load_amr raise keeps a permanent shortfall out of the
+        # error rows that get retried every run.
+        available = candidate["n_resistant"] + candidate["n_susceptible"]
+        if available < args.n_samples:
+            print(f"\n[{len(rows) + 1}] {candidate['species']} / {candidate['antibiotic']}"
+                  f"\n    skipped: only {available} labelled genomes, need {args.n_samples}",
+                  flush=True)
+            rows.append({"species": key[0], "antibiotic": key[1],
+                         "skipped": ["too_few_labelled_genomes"], "n_available": available})
+            args.json.write_text(json.dumps(rows, indent=2))
             continue
 
         print(f"\n[{len(rows) + 1}] {candidate['species']} / {candidate['antibiotic']}",

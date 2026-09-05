@@ -447,6 +447,7 @@ __all__ = [
     "CovariateAudit",
     "LeakageCurvePoint",
     "DegenerateLineagesWarning",
+    "ConstantPredictionWarning",
 ]
 
 # Below this fraction of samples-that-are-their-own-lineage, `LineageKFold`
@@ -472,6 +473,28 @@ _DEGENERATE_LINEAGE_FRACTION = 0.9
 #: not as a recommendation -- on a real E. coli cohort it produced 198
 #: lineages out of 200 samples.
 _FALLBACK_LINEAGE_THRESHOLD = 0.01
+
+
+class ConstantPredictionWarning(UserWarning):
+    """Every fold of both splitters scored exactly 0.5 under `roc_auc`,
+    which for a ranking metric means the model gave every held-out sample
+    the same score: it ranked nothing, so there was nothing to measure.
+
+    The usual cause is upstream of the estimator -- a feature matrix with
+    no variance. That is not hypothetical: until 2026-09-03,
+    `KmerVectorizer`'s presence encoding selected exactly the k-mers
+    present in every sample, and `audit()` reported the result as
+    `score_random = 0.5000, score_lineage = 0.5000, gap = 0.0000` -- a
+    report whose every field was in range and whose reading ("no leakage")
+    was exactly wrong. See
+    `python/tests/test_review_findings_2026_09_02.py`.
+
+    `gap` is withheld (`float("nan")`, with `gap_undefined_reason` set)
+    rather than reported as the 0.0 it arithmetically is, on the same
+    reasoning `DegenerateLineagesWarning` already withholds it: a warning
+    can be filtered, swallowed by a notebook, or simply not read, while
+    `report.gap` is the number that ends up in a paper.
+    """
 
 
 class DegenerateLineagesWarning(UserWarning):
@@ -1754,6 +1777,33 @@ def audit(
         cross_val_score(clone(estimator), paths, phenotype, cv=lineage_cv, scoring=resolved_scoring),
         dtype=np.float64,
     )
+
+    # A second way the gap can be arithmetically fine and mean nothing --
+    # the first being the degenerate grouping checked before any fitting.
+    # Here the splitters are fine and the *model* ranked nothing: under a
+    # ranking metric, a constant prediction scores exactly 0.5 in every
+    # fold, so both means are 0.5 and their difference is 0.0 by
+    # construction rather than by evidence. Restricted to `roc_auc` because
+    # 0.5 is only the constant-prediction value there: for `accuracy` it is
+    # an ordinary result on a balanced cohort, and for `average_precision`
+    # the constant value is the positive rate.
+    if gap_undefined_reason is None and resolved_scoring == "roc_auc" \
+            and bool((scores_random == 0.5).all()) and bool((scores_lineage == 0.5).all()):
+        warnings.warn(
+            "every fold of both splitters scored exactly 0.5 (roc_auc), which means the "
+            "model gave every held-out sample the same score -- it ranked nothing. The "
+            "usual cause is a feature matrix with no variance, upstream of the estimator. "
+            "gap is withheld rather than reported as the 0.0 it arithmetically is; see "
+            "ConstantPredictionWarning.",
+            ConstantPredictionWarning,
+            stacklevel=2,
+        )
+        gap_undefined_reason = (
+            "every fold of both splitters scored exactly 0.5 (roc_auc): the model gave "
+            "every held-out sample the same score, so it ranked nothing and the difference "
+            "between the two splitters measures nothing. Check the feature matrix for "
+            "constant columns. The score_* fields are still the scores actually measured."
+        )
 
     per_fold_cv_kind, per_fold_index, per_fold_score = [], [], []
 
