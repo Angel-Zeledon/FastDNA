@@ -1624,7 +1624,36 @@ fn process_stream_parallel_binned<S: RecordSource>(
     // 3. Phase 2 plus the cross-bin merge. A bin's chunks are freed as soon
     // as they have been expanded, and the merge is streaming, so the only
     // thing that grows here is the final table.
-    let merged = store.finish();
+    //
+    // Run inside a pool sized to `config.num_threads`, not on rayon's
+    // global one. Both halves of `finish` parallelise -- over bins, then
+    // over key ranges -- and the global pool is sized by core count, so
+    // until this existed `--threads 1` still counted bins on every core.
+    // That was not only a flag that did not mean what it said: it made
+    // `mem_estimate::estimate_binned_peak_bytes` **under-predict**, because
+    // its phase-2 term is `threads * per-bin transients` and the real
+    // number of bins in flight ignored `threads` entirely. A memory model
+    // that says a run fits when it does not is the one failure that model
+    // is calibrated never to commit.
+    //
+    // Only when the two differ. Building a pool spawns that many threads,
+    // and on the default run -- where `num_threads` already *is* the core
+    // count -- that is a set of threads created to do exactly what the
+    // existing ones would have done. No timing is quoted for the saving:
+    // the runs that would have measured it shared the machine with
+    // unrelated load, and `docs/BENCHMARKS.md` already records one
+    // retracted table taken that way. Falls back to the global pool if a
+    // pool cannot be built (thread limits, a sandbox): the run is then no
+    // worse than it was before this paragraph existed, which is better than
+    // failing a count over it.
+    let merged = if config.num_threads == rayon::current_num_threads() {
+        store.finish()
+    } else {
+        match rayon::ThreadPoolBuilder::new().num_threads(config.num_threads).build() {
+            Ok(pool) => pool.install(|| store.finish()),
+            Err(_) => store.finish(),
+        }
+    };
     let counter = KmerCounter::from_sorted_entries(merged, total_occurrences.load(Ordering::Relaxed));
 
     if let Some(emit) = progress {

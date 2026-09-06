@@ -443,13 +443,36 @@ Three findings, two of them things this document previously got wrong:
   writing 456 bytes (`-m 100`) is the same wall clock. The 17% figure this
   document reports for the in-memory strategy on the older machine does not
   carry over.
-- **Per-bin counting does not respond to `--threads` at all** (2.94 s at
-  one thread, 2.81 s at eleven). `BinStore::finish` parallelises over the
-  *global* rayon pool, which is sized by core count, while `--threads`
-  sizes only phase 1's worker pool. So `-t 1` does not give a
-  single-threaded run, and does not bound phase 2's memory the way it
-  bounds phase 1's. Recorded here as a known discrepancy between what the
-  flag says and what it does.
+- **Per-bin counting did not respond to `--threads` at all** (2.94 s at
+  one thread, 2.81 s at eleven). `BinStore::finish` parallelised over the
+  *global* rayon pool, sized by core count, while `--threads` sized only
+  phase 1's worker pool. **Fixed 2026-09-06**, and it was worse than a flag
+  that under-delivers: `mem_estimate::estimate_binned_peak_bytes`'s phase-2
+  term is `threads * per-bin transients`, so with `-t 1` the model counted
+  one bin in flight while eleven ran -- an **under-prediction**, the one
+  failure that model is calibrated never to commit. Phase 2 now runs in a
+  pool sized to `--threads`, built only when that differs from the global
+  pool so the default run pays nothing for it.
+
+  Peak RSS fell everywhere as a result (with the parallel merge landing in
+  the same window), which left the model conservative rather than tight:
+
+  | occurrences | threads | 2026-09-05 | 2026-09-06 |
+  |---:|---:|---:|---:|
+  | 144M | 1 | 891 MiB | 602 MiB |
+  | 144M | 11 | 951 MiB | 858 MiB |
+  | 840M | 1 | 3,009 MiB | 2,772 MiB |
+  | 840M | 11 | 3,287 MiB | 1,769 MiB |
+
+  The constants were **not** re-fit, deliberately. Peak memory no longer
+  rises with thread count at scale -- 840M occurrences costs 2,772 MiB at
+  one thread and 1,769 MiB at eleven -- so the model's `threads` term no
+  longer describes the shape of the data, and re-fitting a structure that
+  does not match would produce a number that interpolates rather than a
+  model. That is precisely what the earlier structural-but-unmeasured
+  version produced. It over-predicts by up to 94% and under-predicts
+  nowhere, and its own test says so until someone works out why more
+  threads now costs less memory.
 
 ### The cross-bin merge, parallelised
 

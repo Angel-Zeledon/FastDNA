@@ -895,6 +895,28 @@ La superficie con compatibilidad garantizada es:
 
 ### Fixed
 
+- **`--threads` no acotaba la fase 2 del conteo binned**, y eso hacía que
+  el modelo de memoria **sub-predijera**. `BinStore::finish` paralelizaba
+  sobre el pool global de rayon (dimensionado por número de cores) mientras
+  `--threads` solo dimensionaba los workers de la fase 1, así que `-t 1`
+  contaba bins en los once cores. No era solo una bandera que prometía de
+  más: el término de fase 2 de `estimate_binned_peak_bytes` es
+  `threads × transitorios_por_bin`, de modo que con `-t 1` el modelo contaba
+  un bin en vuelo mientras corrían once — sub-predicción, que es el único
+  fallo que ese modelo está calibrado para no cometer nunca.
+
+  La fase 2 corre ahora en un pool del tamaño de `--threads`, construido
+  solo cuando difiere del global para que la corrida por defecto no pague
+  nada. El pico de memoria bajó en todos los puntos medidos (840M
+  ocurrencias con 11 hilos: 3.287 → 1.769 MiB), lo que deja el modelo
+  conservador en vez de ajustado. **No se re-ajustaron las constantes, a
+  propósito**: la memoria ya no crece con el número de hilos, así que la
+  forma del modelo no describe los datos, y re-ajustar una estructura que
+  no encaja daría un número que interpola en vez de un modelo — que es
+  exactamente lo que produjo la versión estructural sin medir. Sobre-predice
+  hasta un 94%, no sub-predice en ningún punto, y su propio test lo dice.
+
+
 - **Python: `KmerVectorizer` con `representation="presence"` (el default)
   seleccionaba exactamente las k-mers constantes.** Dos decisiones bien
   razonadas por separado y degeneradas juntas. `_select_vocabulary` rankeaba
