@@ -117,6 +117,18 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **Python: `fastdna.similarity(tables)`.** La misma similitud exacta que
+  `fastdna similarity` en el CLI, devolviendo un `pyarrow.Table` en formato
+  largo con `sample_a`, `sample_b`, `shared`, `only_a`, `only_b`,
+  `jaccard`, `containment_ab`, `containment_ba` y `bray_curtis`. Las filas
+  se etiquetan con las rutas tal como las pasó quien llama, no con índices.
+
+  Cierra una brecha entre lo que `CLAUDE.md` afirmaba ("la API de Python
+  refleja el CLI") y lo que existía: `compare_all` compara *sketches*
+  MinHash y es aproximado por construcción, y no puede dar Bray-Curtis ni
+  en principio porque un sketch descarta los conteos.
+
+
 - **`k > 32`: un segundo motor, no una generalización del que ya había.**
   `--engine auto|narrow|wide`. `auto` (el default) enruta por `k`: hasta 32
   el motor estrecho (`kmer.rs`/`counter.rs`, dos bits por base en un `u64`),

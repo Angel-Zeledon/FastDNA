@@ -51,6 +51,14 @@ cargo test --test cli_args         # a single integration test file (tests/cli_a
 cargo test some_test_name          # a single test by name, any target
 cargo clippy --all-targets         # lint (see "Clippy" below before treating warnings as blocking)
 ```
+**`cargo build/test --all-targets` does not compile `src/ffi.rs`** -- it is
+behind the `python` feature. A change to a shared type (an error variant, a
+signature) can therefore leave the FFI broken with the whole Rust suite
+green, and the Python tests will keep passing against the previously built
+`.so`. Run `cargo check --features python --lib` after touching anything
+`ffi.rs` uses; it links nothing, so it is safe and fast. This has already
+happened once.
+
 **Never build with `--features python` or `--all-features` via plain
 `cargo build`/`test`.** PyO3's `extension-module` feature doesn't link
 libpython, which is correct for the cdylib maturin produces and fails to
@@ -205,6 +213,10 @@ Deliberately small — four modules, and three of them are thin:
   logic; see its module docstring for the exact rule before changing it.
 - `_progress.py` — the `progress=True` callback plumbing (`tqdm` is a soft
   dependency).
+
+`similarity()` is the one name here backed by a Rust function with no
+pure-Python part at all (`ffi::pairwise_similarity`); it is listed in
+`__all__` like the rest.
 
 `numpy` is the only optional package anything reaches for, and it is
 imported lazily inside the functions that need it, so `import fastdna`

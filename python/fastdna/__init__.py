@@ -42,6 +42,7 @@ __all__ = [
     "KmerTable",
     "compare",
     "compare_all",
+    "similarity",
     "estimate_cardinality",
     "estimate_spectrum",
     # Re-exported at the bottom of this module (see the comment there).
@@ -1062,6 +1063,47 @@ def compare(path_a: _PathLike, path_b: _PathLike, *, k: int = 21, sketch_size: i
     more than once.
     """
     return sketch(path_a, k=k, sketch_size=sketch_size).jaccard(sketch(path_b, k=k, sketch_size=sketch_size))
+
+
+def similarity(tables: Sequence[_PathLike]) -> pa.Table:
+    """Exact pairwise similarity between counted k-mer tables, as a
+    `pyarrow.Table` in long format -- one row per unordered pair, with
+    columns `sample_a`, `sample_b`, `shared`, `only_a`, `only_b`,
+    `jaccard`, `containment_ab`, `containment_ba` and `bray_curtis`.
+
+    `tables` are `.parquet` k-mer tables (what `fastdna.count()` writes,
+    or `union`/`intersect`/`diff`), not FASTQ files: this compares counts
+    that already exist rather than counting anything.
+
+    **Exact, where `compare_all` is approximate.** `compare_all` builds a
+    MinHash sketch per sample and compares those, which is what makes it
+    O(sketch_size) per pair instead of O(genome). This reads the real
+    tables, so it costs a pass over them and answers with no sampling
+    error at all -- and it can report `bray_curtis`, which needs the counts
+    a sketch throws away and is therefore not computable there even in
+    principle.
+
+    Containment is reported in both directions because it is asymmetric:
+    `containment_ab` is the fraction of A's k-mers also in B, which equals
+    `containment_ba` only when the two tables hold the same number of
+    distinct k-mers.
+
+    One pass total, not one per pair: every pair's statistics accumulate
+    over a single k-way merge of all the tables (Rust-side
+    `similarity::pairwise_similarity`), so comparing N tables reads each of
+    them once rather than N-1 times.
+
+    Degenerate cases return numbers rather than NaN, and the choices are
+    documented in that Rust module: two empty tables are vacuously
+    identical (jaccard 1.0, bray_curtis 0.0), and containment measured
+    from an empty table is 1.0.
+
+    Raises `ValueError` for fewer than two tables, or for tables built with
+    different `k`.
+    """
+    str_paths = [str(path) for path in tables]
+    batch = _core.pairwise_similarity(str_paths)
+    return pa.Table.from_batches([batch])
 
 
 def compare_all(

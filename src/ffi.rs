@@ -43,7 +43,9 @@ use std::time::Duration;
 // The counts table builds Arrow's layout directly (see `build_record_batch`),
 // which is why the raw buffer types appear alongside the builders: a table
 // whose row count is known up front does not need a builder's growth.
-use arrow::array::{ArrayRef, StringArray, StringBuilder, UInt32Array, UInt64Array};
+use arrow::array::{
+    ArrayRef, Float64Array, StringArray, StringBuilder, UInt32Array, UInt64Array,
+};
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::pyarrow::ToPyArrow;
@@ -65,6 +67,7 @@ use crate::pipeline::{process_stream_parallel_with_policy, MemoryPolicy, Pipelin
 use crate::preview;
 use crate::progress::Progress;
 use crate::qc::QcSummary;
+use crate::similarity;
 use crate::read_filter;
 use crate::read_profile;
 use crate::setops;
@@ -1116,7 +1119,9 @@ fn load_sketch(path: String) -> PyResult<PySketch> {
 #[pyo3(signature = (kmers, k=21, sketch_size=1000))]
 fn sketch_from_kmers(py: Python<'_>, kmers: Vec<u64>, k: usize, sketch_size: usize) -> PyResult<PySketch> {
     if k == 0 || k > 32 {
-        return Err(FastDnaError::InvalidK { k }.into());
+        // 32, not the wide engine's 64: sketching is `u64`-keyed
+        // throughout (`sketch.rs`), so this really is the limit here.
+        return Err(FastDnaError::InvalidK { k, max: 32 }.into());
     }
     if sketch_size == 0 {
         return Err(FastDnaError::InvalidConfig {
@@ -1670,6 +1675,90 @@ fn in_memory_batch(schema: Arc<Schema>, columns: Vec<ArrayRef>) -> Result<Record
     })
 }
 
+/// The schema `pairwise_similarity` hands back: one row per unordered pair,
+/// in the same column order and with the same names the `fastdna
+/// similarity` CSV uses, so a table read here and a file written there are
+/// the same thing in two containers rather than two shapes to reconcile.
+///
+/// `sample_a`/`sample_b` are the paths as the caller gave them, not
+/// indices: a Python caller has the list and would have to join against it
+/// otherwise, and the CLI already labels rows by the path a table was
+/// opened from.
+fn similarity_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("sample_a", DataType::Utf8, false),
+        Field::new("sample_b", DataType::Utf8, false),
+        Field::new("shared", DataType::UInt64, false),
+        Field::new("only_a", DataType::UInt64, false),
+        Field::new("only_b", DataType::UInt64, false),
+        Field::new("jaccard", DataType::Float64, false),
+        Field::new("containment_ab", DataType::Float64, false),
+        Field::new("containment_ba", DataType::Float64, false),
+        Field::new("bray_curtis", DataType::Float64, false),
+    ]))
+}
+
+/// Exact pairwise similarity between counted k-mer tables, as a
+/// `pyarrow.RecordBatch`.
+///
+/// The Python-visible counterpart of `similarity::pairwise_similarity`; see
+/// that function for the metrics, the one-merge-for-all-pairs design and
+/// what the degenerate cases return. This wrapper adds nothing but the path
+/// labels and the Arrow container.
+///
+/// Released under `py.allow_threads` like every other bulk operation here:
+/// merging several real k-mer tables is I/O- and CPU-bound work with
+/// nothing Python-specific in it.
+#[pyfunction]
+fn pairwise_similarity(py: Python<'_>, table_paths: Vec<String>) -> PyResult<PyObject> {
+    let paths: Vec<PathBuf> = table_paths.iter().map(PathBuf::from).collect();
+    let pairs = py.allow_threads(|| {
+        let tables = paths.iter().map(KmerTable::open).collect::<Result<Vec<_>, _>>()?;
+        similarity::pairwise_similarity(&tables)
+    })?;
+
+    let mut sample_a: Vec<&str> = Vec::with_capacity(pairs.len());
+    let mut sample_b: Vec<&str> = Vec::with_capacity(pairs.len());
+    let mut shared: Vec<u64> = Vec::with_capacity(pairs.len());
+    let mut only_a: Vec<u64> = Vec::with_capacity(pairs.len());
+    let mut only_b: Vec<u64> = Vec::with_capacity(pairs.len());
+    let mut jaccard: Vec<f64> = Vec::with_capacity(pairs.len());
+    let mut containment_ab: Vec<f64> = Vec::with_capacity(pairs.len());
+    let mut containment_ba: Vec<f64> = Vec::with_capacity(pairs.len());
+    let mut bray_curtis: Vec<f64> = Vec::with_capacity(pairs.len());
+
+    for pair in &pairs {
+        // `get` rather than indexing: the indices come from the same slice
+        // that was just counted, so this cannot miss, but an empty label is
+        // a better failure than a panic crossing the FFI boundary.
+        sample_a.push(table_paths.get(pair.index_a).map_or("", String::as_str));
+        sample_b.push(table_paths.get(pair.index_b).map_or("", String::as_str));
+        shared.push(pair.shared);
+        only_a.push(pair.only_a);
+        only_b.push(pair.only_b);
+        jaccard.push(pair.jaccard);
+        containment_ab.push(pair.containment_ab);
+        containment_ba.push(pair.containment_ba);
+        bray_curtis.push(pair.bray_curtis);
+    }
+
+    let batch = in_memory_batch(
+        similarity_schema(),
+        vec![
+            Arc::new(StringArray::from(sample_a)) as ArrayRef,
+            Arc::new(StringArray::from(sample_b)) as ArrayRef,
+            Arc::new(UInt64Array::from(shared)) as ArrayRef,
+            Arc::new(UInt64Array::from(only_a)) as ArrayRef,
+            Arc::new(UInt64Array::from(only_b)) as ArrayRef,
+            Arc::new(Float64Array::from(jaccard)) as ArrayRef,
+            Arc::new(Float64Array::from(containment_ab)) as ArrayRef,
+            Arc::new(Float64Array::from(containment_ba)) as ArrayRef,
+            Arc::new(Float64Array::from(bray_curtis)) as ArrayRef,
+        ],
+    )?;
+    batch.to_pyarrow(py)
+}
+
 /// The schema of `cohort_presence_matrix`'s `"triples"` batch: one row per
 /// nonzero `(sample, k-mer)` entry, in COO form -- `scipy.sparse.csr_matrix`
 /// accepts `(data, (row, col))` triples in any order, so no particular
@@ -1850,5 +1939,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(filter_reads, m)?)?;
     m.add_function(wrap_pyfunction!(filter_reads_paired, m)?)?;
     m.add_function(wrap_pyfunction!(profile_reads, m)?)?;
+    m.add_function(wrap_pyfunction!(pairwise_similarity, m)?)?;
     Ok(())
 }
