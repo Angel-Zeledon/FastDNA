@@ -21,10 +21,12 @@
 # same trap under a different name and is likewise never used here.
 #
 # One tempting piece of counter-evidence, disposed of up front:
-# `docs/audit/00-inventario.md` records `cargo check --all-features` as
-# passing. It does -- `check` never links -- so it says nothing whatsoever
-# about whether *building* with that feature works, and must not be cited
-# as a reason to relax the rule above.
+# `cargo check --all-features` passes. It does -- `check` never links -- so
+# it says nothing whatsoever about whether *building* with that feature
+# works, and must not be cited as a reason to relax the rule above. (That
+# same property is why `cargo check --features python --lib` is the right
+# way to catch an FFI break the rest of the suite cannot see; see
+# CLAUDE.md, which records the three commits it cost to learn that.)
 #
 # The Python job therefore reaches the `python` feature the only safe way:
 # through maturin (`maturin develop --features python`), which builds
@@ -124,12 +126,14 @@ jobs:
       # THE 6 PREEXISTING CLIPPY WARNINGS -- what this step does and why.
       #
       # `cargo clippy --all-targets` on this tree warns at exactly 6
-      # locations, all preexisting: src/binned.rs:553, src/counter.rs:1112,
-      # src/minimizer.rs:682, src/superkmer.rs:388, src/superkmer.rs:480,
-      # tests/dual_strategy.rs:75. It was 8 until 2026-09-05, when the ML
-      # layer was removed and took src/metagenomics.rs and src/translate.rs
-      # (one site each) with it -- the baseline moved because the code did,
-      # not because anything was fixed or silenced.
+      # locations, all preexisting: src/binned.rs, src/counter.rs,
+      # src/minimizer.rs, src/superkmer.rs (two), tests/dual_strategy.rs.
+      # It was 8 until 2026-09-05, when the ML layer was removed and took
+      # two of those sites with it -- the baseline moved because the code
+      # did, not because anything was fixed or silenced. Line numbers are
+      # deliberately not listed: they drift with every edit above them, and
+      # a comment that goes stale on an unrelated change is worse than one
+      # that names the files.
       # None is `deny`-level; the four lints `Cargo.toml` actually denies
       # (`unwrap_used`, `expect_used`, `print_stdout`, `print_stderr`) are
       # already clean and already fail the build on their own, without help
