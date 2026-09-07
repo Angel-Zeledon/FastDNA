@@ -356,8 +356,11 @@ at the end). Companion documents: `ml-genomics-roadmap.md` (ML side),
     rejections). (Same underlying evidence as
     `ml-differentiation-roadmap.md`'s B2, now also closed.)
 - **S7. ntCard-style streaming spectrum estimate; k up to 64 via u128.**
-  **The streaming-spectrum half is shipped. The u128/k>32 half remains
-  open, deliberately deferred.** "Wire or delete `cms.rs`" was resolved by
+  **Both halves shipped** -- the spectrum estimator on 2026-08-27, the
+  `u128` engine on 2026-09-05 (see the entry below, which was written while
+  the second half was still open and is left in place because it records
+  why the cascade it feared was avoided rather than paid).
+  "Wire or delete `cms.rs`" was resolved by
   deletion: `src/cms.rs` no longer exists (absent from `src/lib.rs`'s
   module list; `CHANGELOG.md`'s `[Unreleased] Removed` section records it).
   - **Shipped**: an ntCard-style streaming k-mer frequency-spectrum
@@ -426,6 +429,19 @@ at the end). Companion documents: `ml-genomics-roadmap.md` (ML side),
 - KMC-style memory knob forest (auto strategy + `--max-ram` is a better UX; keep it).
 
 ## Suggested execution order
+
+> **Spent, 2026-09-07.** Every item below has shipped except Q5 (Bioconda),
+> and Q5's stated justification -- "per
+> `docs/goal-most-complete-genomics-ml-library.md` publishability is now a
+> completeness blocker" -- cites a goal document that was superseded and
+> deleted on 2026-09-05. Publishing is no longer a completeness question
+> (`docs/goal-fast-kmer-counter.md`).
+>
+> The list is kept rather than rewritten because it records the order
+> things were actually done in, and because a plan that turned out to be
+> right is worth more as evidence than as instructions. Read it as history.
+> References below to `still open` items describe the state on the date
+> each line was written.
 
 Re-derived 2026-08-27 against what is actually still open (see status column
 above); the original document's foundation-first logic ("database before set
