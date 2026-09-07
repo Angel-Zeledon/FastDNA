@@ -117,6 +117,38 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **`fastdna query` lee tablas anchas (`src/wide_ktab.rs`).** Contar con
+  `k > 32` dejaba un Parquet que nada en este crate podía volver a leer:
+  `KmerTable::open` la rechazaba por nombre y ahí se acababa. Ahora
+  `query` la abre.
+
+  **Un segundo lector, no un `KmerTable` genérico**, por la misma razón
+  por la que `export_wide_counts_parquet` no es un escritor genérico: cada
+  consumidor de `KmerTable` -- `setops`, `read_filter`, `similarity` --
+  está construido sobre una clave `u64` concreta, y generalizar eso para
+  añadir un segundo ancho pondría en duda otra vez el camino medido igual
+  a KMC3, a cambio de ahorrar trescientas líneas.
+
+  Y no son tan paralelos como parecen. La clave es una cadena de bytes,
+  así que las estadísticas por row group llegan como `FixedLenByteArray`
+  y se comparan **byte a byte** -- que es exactamente para lo que
+  `to_key_bytes` escribe big-endian: el orden de bytes de esos 16 es el
+  orden numérico del `u128`, de modo que la poda por min/max de Parquet es
+  correcta sin decodificar nada. Un mínimo de 15 o 17 bytes es un fichero
+  corrupto y se rechaza en vez de rellenarse con ceros hasta parecer una
+  clave plausible.
+
+  **El ruteo se hace de una sola lectura de footer**, `ktab::table_key`
+  (nuevo, público, junto con `ktab::TableKey`), en vez de intentar un
+  lector y caer al otro: cuando fallan los dos, un fallback reporta
+  necesariamente el error equivocado de los dos.
+
+  **Lo que sigue sin forma ancha, dicho en vez de descubierto**:
+  `union`/`intersect`/`diff`, `filter` y `similarity` -- el heap de
+  `setops::MultiTableMerge` y la búsqueda binaria de
+  `read_filter::ReferenceIndex` sobre un `Vec<u64>` -- y el `KmerTable` de
+  Python. Todos la siguen rechazando por nombre.
+
 - **Python: `fastdna.count(..., engine="auto"|"narrow"|"wide")`.** El motor
   ancho (`k` hasta 64) deja de ser exclusivo del CLI. `auto` es el default
   y enruta por `k` igual que `--engine`, así que quien nunca nombre un
@@ -204,12 +236,11 @@ La superficie con compatibilidad garantizada es:
   La tabla ancha es Parquet con `kmer_bits` (16 bytes big-endian, de modo
   que el orden de bytes *es* el orden numérico y el fichero sigue estando
   ordenado para quien no lo decodifique) y `fastdna.sorted_by=kmer_bits`.
-  Las operaciones con clave `u64` -- `query`, `union`/`intersect`/`diff`,
-  `filter`, `similarity`, sketching -- la **rechazan por nombre** en vez de
-  malinterpretarla, y el error explica cuál es. Contar por encima de k=32
-  es por tanto una exportación, no un punto de partida: eso sigue siendo
-  cierto aunque `fastdna.count(engine="wide")` ya produzca tablas anchas
-  desde Python.
+  `fastdna query` la lee (ver `src/wide_ktab.rs`, más arriba en este
+  mismo Unreleased). Las demás operaciones con clave `u64` --
+  `union`/`intersect`/`diff`, `filter`, `similarity`, sketching -- la
+  **rechazan por nombre** en vez de malinterpretarla, y el error explica
+  cuál es.
 
 ### Changed
 

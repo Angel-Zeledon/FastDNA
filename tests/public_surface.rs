@@ -49,4 +49,22 @@ fn the_documented_public_modules_are_reachable() {
         Err(FastDnaError::Io { .. }) => {}
         other => panic!("expected an Io error opening a missing table, got {other:?}"),
     }
+
+    // El lector de tablas anchas es API publica por la misma razon que
+    // `ktab`: `query` lo alcanza a traves de `ktab::table_key`, y quien
+    // consuma el crate necesita poder nombrar el tipo que le devuelve esa
+    // decision.
+    use fastdna_core::ktab::{table_key, TableKey};
+    use fastdna_core::wide_ktab::{encode_query_wide_kmer, WideKmerTable};
+
+    match WideKmerTable::open("does-not-exist-anywhere.parquet") {
+        Err(FastDnaError::Io { .. }) => {}
+        other => panic!("expected an Io error opening a missing wide table, got {other:?}"),
+    }
+    match table_key("does-not-exist-anywhere.parquet") {
+        Err(FastDnaError::Io { .. }) => {}
+        other => panic!("expected an Io error routing a missing table, got {other:?}"),
+    }
+    let _: fn(&str, usize) -> Result<u128, FastDnaError> = encode_query_wide_kmer;
+    assert_ne!(TableKey::Narrow, TableKey::Wide);
 }

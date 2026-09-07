@@ -103,9 +103,11 @@ pub const SORTED_BY_VALUE: &str = "kmer_u64";
 /// keeps "sorted by the key column" meaning the same thing for both.
 ///
 /// `KmerTable::open` accepts only `SORTED_BY_VALUE`, so a wide table is
-/// rejected by name rather than misread as a narrow one -- the operations
-/// built on `KmerTable` (`query`, `union`/`intersect`/`diff`, `filter`,
-/// `similarity`) are all `u64`-keyed and do not yet have wide forms.
+/// rejected by name rather than misread as a narrow one. A wide table is
+/// read by [`crate::wide_ktab::WideKmerTable`] instead, which `fastdna
+/// query` selects via [`table_key`]; the remaining operations built on
+/// `KmerTable` (`union`/`intersect`/`diff`, `filter`, `similarity`) are
+/// `u64`-keyed end to end and have no wide forms.
 pub const SORTED_BY_WIDE_VALUE: &str = "kmer_bits";
 /// Parquet key-value metadata key recording the `k` every row's `kmer_u64`
 /// was packed with. Needed because a raw `u64` cannot be decoded (or a
@@ -160,6 +162,63 @@ fn load_reason(path: &Path, reason: String) -> FastDnaError {
     FastDnaError::Load { path: path.to_path_buf(), reason, source: None }
 }
 
+/// Which key column a `.parquet` k-mer table is sorted by, and therefore
+/// which reader can open it: [`KmerTable`] for `Narrow`,
+/// [`crate::wide_ktab::WideKmerTable`] for `Wide`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKey {
+    /// `kmer_u64` -- written at `k <= 32`.
+    Narrow,
+    /// `kmer_bits` -- written at `33 <= k <= 64`.
+    Wide,
+}
+
+/// Reads only `path`'s Parquet footer and reports which key column it
+/// declares.
+///
+/// Exists so a caller that can handle either width (`fastdna query`) picks
+/// the right reader in one step, instead of opening with one and falling
+/// back to the other on failure -- a fallback whose error message, when
+/// *both* fail, is necessarily the wrong one of the two.
+///
+/// `FastDnaError::Load` if the file is not Parquet, or carries no
+/// `fastdna.sorted_by` metadata naming a key column this crate writes. It
+/// deliberately validates nothing else: the reader it selects does the
+/// full check, and duplicating that here would be two places to keep in
+/// agreement.
+pub fn table_key<P: AsRef<Path>>(path: P) -> Result<TableKey> {
+    let path = path.as_ref();
+    let file = File::open(path).map_err(|e| FastDnaError::Io { path: path.to_path_buf(), source: e })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| load_err(path, e))?;
+    let metadata = builder.metadata().file_metadata().clone();
+
+    let sorted_by = metadata
+        .key_value_metadata()
+        .and_then(|pairs| pairs.iter().find(|p| p.key == SORTED_BY_KEY))
+        .and_then(|p| p.value.as_deref());
+
+    match sorted_by {
+        Some(SORTED_BY_VALUE) => Ok(TableKey::Narrow),
+        Some(SORTED_BY_WIDE_VALUE) => Ok(TableKey::Wide),
+        Some(other) => Err(load_reason(
+            path,
+            format!(
+                "'{SORTED_BY_KEY}' says this file is sorted by '{other}', which is not a k-mer \
+                 key column this crate writes ('{SORTED_BY_VALUE}' for k<=32, \
+                 '{SORTED_BY_WIDE_VALUE}' above it)"
+            ),
+        )),
+        None => Err(load_reason(
+            path,
+            format!(
+                "missing '{SORTED_BY_KEY}' Parquet metadata -- this file was not written as a \
+                 FastDNA k-mer table (run `fastdna count` with a .parquet output, which writes it \
+                 automatically)"
+            ),
+        )),
+    }
+}
+
 impl KmerTable {
     /// Opens `path` and validates it as a queryable k-mer table: the
     /// Parquet footer is read (schema, key-value metadata, one row group's
@@ -207,11 +266,12 @@ impl KmerTable {
                 load_reason(
                     &path,
                     "missing a non-nullable kmer_u64: uint64 column. A table written at k>32 \
-                     keys on a 16-byte kmer_bits column instead (see SORTED_BY_WIDE_VALUE): the \
-                     operations built on KmerTable -- query, union/intersect/diff, filter, \
-                     similarity -- are all u64-keyed and have no wide form yet, so a wide table \
-                     is refused here rather than misread. Anything else is not a FastDNA k-mer \
-                     table at all"
+                     keys on a 16-byte kmer_bits column instead (see SORTED_BY_WIDE_VALUE), and \
+                     is read by wide_ktab::WideKmerTable, which `fastdna query` selects on its \
+                     own via `table_key`. The other operations built on KmerTable -- \
+                     union/intersect/diff, filter, similarity -- are u64-keyed end to end and \
+                     have no wide form, so a wide table is refused here rather than misread. \
+                     Anything else is not a FastDNA k-mer table at all"
                         .to_string(),
                 )
             })?;

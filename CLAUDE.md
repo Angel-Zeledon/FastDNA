@@ -20,11 +20,11 @@ the CLI surface (`count`, `sketch`, `dist`, `card`, `peek`, `query`,
 `union`, `intersect`, `diff`, `similarity`, `filter`, `matrix`, `profile`,
 `spectrum`) and the Python API mirroring it -- including
 `count(engine="auto"|"narrow"|"wide")`, which reaches `k = 64` the same
-way the CLI's `--engine` does. One gap remains, and it is on both sides:
-**nothing reads a wide (`kmer_bits`) table back.** `query`, the set
-operations, `filter` and `similarity` are `u64`-keyed end to end and
-reject one by name, so counting above `k = 32` is an export rather than a
-starting point.
+way the CLI's `--engine` does. One gap remains: `query` reads a wide
+(`kmer_bits`) table, but **the set operations, `filter` and `similarity`
+do not** -- they are `u64`-keyed end to end (`setops::MultiTableMerge`'s
+heap, `read_filter::ReferenceIndex`'s binary search over a `Vec<u64>`) and
+reject one by name rather than misreading it.
 
 **The machine-learning layer was removed on 2026-09-05** — 31 Python
 modules and 4 Rust modules (`sklearn`, `audit`, `cv`, `explain`, `gwas`,
@@ -192,10 +192,16 @@ territory even pre-1.0.
   reuse `discover_samples` but escalate an unpaired file to a hard error
   (vs. cohort listing's warn-and-continue), since `--paired-dir` runs
   unattended across many samples.
-- `wide_kmer.rs`, `wide_counter.rs` -- the `k > 32` engine (`u128`,
-  `33 <= k <= 64`). In-memory only: `disk_spill.rs` and `binned.rs` are
+- `wide_kmer.rs`, `wide_counter.rs`, `wide_ktab.rs` -- the `k > 32` engine
+  (`u128`, `33 <= k <= 64`) and the reader for the tables it writes.
+  Counting is in-memory only: `disk_spill.rs` and `binned.rs` are
   8-byte-key machinery throughout, so `--strategy` does not apply above
   k=32 and the CLI says so rather than ignoring the flag silently.
+  `wide_ktab.rs` sits beside `ktab.rs` rather than making it generic, for
+  the reason its module comment gives: every consumer of `KmerTable` is
+  built on a concrete `u64` key, and generifying that to add a second
+  width would put the KMC3-validated path back in question. `query` picks
+  between them with `ktab::table_key`, one footer read.
 - `read_profile.rs` (backs `profile`),
   `qc.rs`, `preview.rs` (backs `peek`), `export.rs` (Parquet/CSV writers),
   `atomic.rs` (write-then-rename; deliberately left `pub` because an

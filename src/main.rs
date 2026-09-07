@@ -787,13 +787,28 @@ fn run_query(args: QueryArgs) -> Result<()> {
     println!("==================================================");
     println!("Table: {}", args.table.display());
 
-    let table = KmerTable::open(&args.table)?;
-    println!("k:     {}", table.k());
-    println!("Rows:  {}", table.len());
+    // Which reader can open this file is read off its footer first, in one
+    // step, rather than opening with one reader and falling back to the
+    // other -- when both fail, a fallback necessarily reports the wrong
+    // one of the two errors.
+    let (k, rows, found) = match ktab::table_key(&args.table)? {
+        ktab::TableKey::Narrow => {
+            let table = KmerTable::open(&args.table)?;
+            let encoded = ktab::encode_query_kmer(&args.kmer, table.k())?;
+            (table.k(), table.len(), table.get(encoded)?)
+        }
+        ktab::TableKey::Wide => {
+            let table = fastdna_core::wide_ktab::WideKmerTable::open(&args.table)?;
+            let encoded = fastdna_core::wide_ktab::encode_query_wide_kmer(&args.kmer, table.k())?;
+            (table.k(), table.len(), table.get(encoded)?)
+        }
+    };
+
+    println!("k:     {k}");
+    println!("Rows:  {rows}");
     println!("--------------------------------------------------");
 
-    let encoded = ktab::encode_query_kmer(&args.kmer, table.k())?;
-    match table.get(encoded)? {
+    match found {
         Some(count) => println!("{}: found, count = {count}", args.kmer),
         None => println!("{}: not found in table", args.kmer),
     }

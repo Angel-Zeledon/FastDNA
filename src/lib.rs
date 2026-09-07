@@ -25,6 +25,7 @@ pub mod similarity;
 pub mod sketch;
 pub mod wide_counter;
 pub mod wide_kmer;
+pub mod wide_ktab;
 
 // Implementation. Reachable from anywhere inside the crate, from nowhere
 // outside it.
