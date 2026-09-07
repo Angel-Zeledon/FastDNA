@@ -18,9 +18,13 @@ k-mer tables with set operations, read filtering against a reference table,
 cohort counting, exact similarity between tables, QC, preview. That is exactly
 the CLI surface (`count`, `sketch`, `dist`, `card`, `peek`, `query`,
 `union`, `intersect`, `diff`, `similarity`, `filter`, `matrix`, `profile`,
-`spectrum`) and the Python API mirroring it -- with two gaps the Python
-side still has: `count()` is narrow-only (no `k > 32`), and nothing there
-reads a wide table back.
+`spectrum`) and the Python API mirroring it -- including
+`count(engine="auto"|"narrow"|"wide")`, which reaches `k = 64` the same
+way the CLI's `--engine` does. One gap remains, and it is on both sides:
+**nothing reads a wide (`kmer_bits`) table back.** `query`, the set
+operations, `filter` and `similarity` are `u64`-keyed end to end and
+reject one by name, so counting above `k = 32` is an export rather than a
+starting point.
 
 **The machine-learning layer was removed on 2026-09-05** — 31 Python
 modules and 4 Rust modules (`sklearn`, `audit`, `cv`, `explain`, `gwas`,

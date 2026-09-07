@@ -669,11 +669,15 @@ tuned, and not yet benchmarked against them at that scale.
 
 ### Other limits
 
-- `max_k` is 32 **for this Python binding**, imposed by the 2-bit-per-base
-  `u64` packing. The CLI reaches 64 via `--engine wide`; `fastdna.count()`
-  has no equivalent yet, so this reports what it can actually deliver
-  rather than what the tool can. Analyses that
-  need longer k-mers are out of scope.
+- `max_k` is 64, and only for counting. `fastdna.count(..., engine="wide")`
+  reaches the `u128` engine the CLI's `--engine wide` uses, but everything
+  keyed on a `u64` -- `sketch`, `estimate_cardinality`, `estimate_spectrum`,
+  `KmerTable` and every set operation -- still stops at 32, which
+  `build_info()['max_k_sketch']` reports. A wide count is something to
+  export or read in Python, not something to feed back into those. Beyond
+  64 (KMC3 reaches 256) is out of scope: two bits per base in 128 of them
+  is 64 bases, and going further needs a byte-string key that changes the
+  sort order, the Parquet schema and every comparison in the counter.
 - Each worker's raw buffer is bounded at 2,000,000 buffered instances
   before an eager compaction; the measured effect of that bound -- helpful
   on low-diversity input, a wash-to-loss on high-diversity input -- is
@@ -687,13 +691,23 @@ exact disk-partitioned mode rather than failing when it does not.
 
 ## Python API reference
 
-### `fastdna.count(path, *, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=100_000) -> KmerCounts`
+### `fastdna.count(path, *, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=100_000, hpc=False, with_sequence=False, engine="auto") -> KmerCounts`
 
 Counts canonical k-mers in a single FASTQ or FASTQ.gz file.
 
 - `path` -- a `.fastq` or `.fastq.gz` file.
-- `k` -- k-mer length, `1..=32` (default 31; use `fastdna.peek()` first if
-  your reads are short -- see below).
+- `k` -- k-mer length, `1..=64` (default 31; use `fastdna.peek()` first if
+  your reads are short -- see below). Above 32 the wide engine counts it;
+  see `engine` below for what that changes.
+- `engine` -- `"auto"` (default), `"narrow"` or `"wide"`, mirroring the
+  CLI's `--engine`. `auto` picks the `u64` engine at `k <= 32` and the
+  `u128` one above, so a caller who never names an engine keeps exactly
+  the behaviour they had. `narrow` refuses `k > 32` rather than silently
+  upgrading, which is what you want when something downstream needs a
+  `kmer_u64` column. `wide` runs the `u128` engine even below 32 -- slower,
+  and how you check the two agree on your own data. A wide count's
+  `.table` keys on `kmer_bits` (16 big-endian bytes; Arrow has no 128-bit
+  integer) instead of `kmer_u64`, and `.engine` reports which you have.
 - `min_count` / `max_count` -- drop k-mers below/above these frequencies
   after counting (inclusive bounds; `total_kmers` is unaffected).
 - `min_quality` -- Phred quality cutoff for 3'-end trimming (see "Quality
@@ -817,8 +831,13 @@ r = fastdna.count("sample.fastq.gz", k=p.suggest_k())
 
 ```python
 >>> fastdna.build_info()
-{'version': '0.1.0', 'max_k': 32, 'avx2': True}
+{'version': '0.1.0', 'max_k': 64, 'max_k_sketch': 32, 'avx2': True}
 ```
+
+`max_k` is what `count()` reaches; `max_k_sketch` is the `u64` ceiling
+`sketch`, `estimate_cardinality`, `estimate_spectrum` and `KmerTable`
+still have. Two numbers because the ceiling is not uniform, and one number
+would mislead whoever read it and then called `sketch(k=41)`.
 
 `avx2` is a **runtime** check on the machine actually running the code, not
 a compile-time flag -- the same wheel ships everywhere, so a build-time-only
@@ -971,6 +990,11 @@ who needs that code can take it from the git history at `60b5f82`.
 
 Still ahead:
 
+- A wide form for the k-mer-table operations. `count` reaches k=64 in both
+  the CLI and Python, but nothing reads a `kmer_bits` table back:
+  `query`, `union`/`intersect`/`diff`, `filter` and `similarity` are
+  `u64`-keyed end to end and reject one by name. Counting above k=32 is
+  therefore an export, not a starting point.
 - A `strategy=`/`max_ram=` parameter on `fastdna.count()`, so the Python
   binding can use the disk strategy and automatic chooser without the
   `FASTDNA_STRATEGY` environment variable.

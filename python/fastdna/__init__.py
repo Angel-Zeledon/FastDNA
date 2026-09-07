@@ -89,13 +89,10 @@ def _decode_kmers(bits, k):
     `ChunkedArray` (via its own `to_numpy`), a plain Python sequence of
     ints, or an existing numpy array.
 
-    Shared by `KmerCounts.with_sequence()` (decodes every row of a table)
-    and `fastdna.sklearn.KmerVectorizer` (decodes only the k-mers that
-    survive vocabulary selection -- typically `top_features`, several
-    orders of magnitude fewer than a cohort's row count): both need the
-    same bit layout, and `kmer::decode_kmer` is the only other place that
-    layout is implemented, Rust-side, so this is the one Python copy of it
-    rather than a second one drifting from the first.
+    Used by `KmerCounts.with_sequence()`, which decodes every row of a
+    table. `kmer::decode_kmer` is the only other place this bit layout is
+    implemented, Rust-side, so this is the one Python copy of it rather
+    than a second one drifting from the first.
 
     Position `k-1-i` (from the right) comes from bits `2*i`/`2*i+1` of the
     packed k-mer -- the same layout `kmer::decode_kmer_into` unpacks in
@@ -115,6 +112,40 @@ def _decode_kmers(bits, k):
     codes = np.empty((len(bits), k), dtype=np.uint8)
     for i in range(k):
         codes[:, k - 1 - i] = alphabet[(bits >> np.uint64(2 * i)) & np.uint64(0b11)]
+    return [row.tobytes().decode("ascii") for row in codes]
+
+
+def _decode_wide_kmers(keys, k):
+    """`_decode_kmers` for the wide engine: decodes a `kmer_bits` column
+    (16 big-endian bytes per row, `33 <= k <= 64`) into ASCII sequences.
+
+    A separate function rather than a branch inside `_decode_kmers`
+    because the input is a different Arrow type with a different layout,
+    not a wider integer -- numpy has no 128-bit integer to widen into, so
+    the bit fields are read out of the raw bytes instead. The Rust side
+    that has to agree with this is `wide_kmer::decode_kmer_into`.
+
+    Position `p` (counted from the low end of the packed value, so the
+    *last* base is `p = 0`) lives in bits `2p`..`2p+1`. Big-endian storage
+    puts the least significant byte last, so those bits are in byte
+    `15 - p // 4` of the row, at shift `2 * (p % 4)`.
+    """
+    import numpy as np
+
+    if isinstance(keys, pa.ChunkedArray):
+        keys = keys.combine_chunks()
+    # Zero-copy: a FixedSizeBinary array's values are one flat buffer of
+    # `width * len` bytes, and `offset` is in elements, not bytes -- a
+    # sliced array (`.top()`, `.filter()`) has a non-zero one.
+    raw = np.frombuffer(
+        keys.buffers()[1], dtype=np.uint8, count=len(keys) * 16, offset=keys.offset * 16
+    ).reshape(-1, 16)
+
+    alphabet = np.frombuffer(b"ACGT", dtype=np.uint8)
+    codes = np.empty((len(keys), k), dtype=np.uint8)
+    for position in range(k):
+        byte = raw[:, 15 - position // 4]
+        codes[:, k - 1 - position] = alphabet[(byte >> (2 * (position % 4))) & 0b11]
     return [row.tobytes().decode("ascii") for row in codes]
 
 
@@ -226,6 +257,15 @@ class KmerCounts:
     def k(self) -> int:
         return self._raw.k
 
+    @property
+    def engine(self) -> str:
+        """`"narrow"` or `"wide"` -- which engine counted this table, and
+        so whether `.table`'s key column is `kmer_u64` (a `uint64`) or
+        `kmer_bits` (16 big-endian bytes). Not inferable from `k` alone:
+        `count(engine="wide")` is legal at `k <= 32`.
+        """
+        return self._raw.engine
+
     def filter(
         self, min_count: Optional[int] = None, max_count: Optional[int] = None
     ) -> "KmerCounts":
@@ -326,7 +366,8 @@ class KmerCounts:
 
     def with_sequence(self) -> "KmerCounts":
         """The current view with a `kmer_sequence` column added, decoded
-        from `kmer_u64`.
+        from the table's key column (`kmer_u64`, or `kmer_bits` when the
+        wide engine counted it).
 
         `count(with_sequence=False)` (the default) skips building this
         column: it is entirely derivable from `kmer_u64` plus `k`, and
@@ -344,15 +385,19 @@ class KmerCounts:
         if "kmer_sequence" in self.table.column_names:
             return self
 
-        bits = self.table.column("kmer_u64")
-        decoded = _decode_kmers(bits, self.k)
+        # Which key column is present is the engine's signature, and it is
+        # read off the table rather than off `self.engine` so a view built
+        # by `filter`/`top`/`sort_by` decodes correctly no matter which.
+        key = "kmer_bits" if "kmer_bits" in self.table.column_names else "kmer_u64"
+        decode = _decode_wide_kmers if key == "kmer_bits" else _decode_kmers
+        decoded = decode(self.table.column(key), self.k)
         sequences = pa.array(decoded, type=pa.string())
 
         table = self.table.append_column("kmer_sequence", sequences)
-        # `kmer_u64, kmer_sequence, frequency` -- the same column order
+        # `<key>, kmer_sequence, frequency` -- the same column order
         # `count(with_sequence=True)` produces, so a caller cannot tell
         # which path built a given table from its shape alone.
-        table = table.select(["kmer_u64", "kmer_sequence", "frequency"])
+        table = table.select([key, "kmer_sequence", "frequency"])
         return KmerCounts(self._raw, table)
 
     def to_pandas(self) -> "pandas.DataFrame":
@@ -437,6 +482,7 @@ def count(
     progress_interval: int = 100_000,
     hpc: bool = False,
     with_sequence: bool = False,
+    engine: str = "auto",
 ) -> KmerCounts:
     """Count canonical k-mers in a single FASTQ(.gz) file.
 
@@ -490,11 +536,28 @@ def count(
     against 430 MB for `kmer_u64` and 215 MB for `frequency`, 2.6x the
     other two columns combined; decoding it is also the majority of the
     ~17% of a run's wall time the export/table-build step costs. Every
-    ML-facing module this package ships (`fastdna.sklearn`, `.cv`, `.gwas`)
-    works in `u64` space and never reads it. Pass `with_sequence=True` to
-    get it back from the count itself, or call `.with_sequence()` on an
-    already-built `KmerCounts` to reconstruct it locally without rereading
-    the FASTQ.
+    Pass `with_sequence=True` to get it back from the count itself, or
+    call `.with_sequence()` on an already-built `KmerCounts` to
+    reconstruct it locally without rereading the FASTQ.
+
+    `engine` picks which of the two k-mer engines counts:
+
+    - `"auto"` (the default) uses the narrow u64 engine at `k <= 32` and
+      the wide u128 one from `k = 33` to `k = 64`. Every caller who never
+      names an engine keeps exactly the behaviour they had.
+    - `"narrow"` pins the run to the u64 engine and raises rather than
+      silently upgrading, which is what you want when a downstream step
+      needs a `kmer_u64` column.
+    - `"wide"` runs the u128 engine even at `k <= 32`. Slower, and it is
+      how the two engines get checked against each other.
+
+    A wide count's `.table` keys on `kmer_bits` -- 16 big-endian bytes,
+    since Arrow has no 128-bit integer -- instead of `kmer_u64`, and
+    `.engine` reports which you have. **The rest of this package is u64-
+    keyed**: `sketch`, `estimate_cardinality`, `estimate_spectrum`,
+    `KmerTable` and every set operation stop at `k = 32`, so a wide count
+    is something to export or read in Python, not something to feed back
+    into them. `build_info()["max_k_sketch"]` reports that second ceiling.
     """
     adapter = make_progress_adapter(progress)
     raw = _core.count(
@@ -508,6 +571,7 @@ def count(
         progress_interval=progress_interval,
         hpc=hpc,
         with_sequence=with_sequence,
+        engine=engine,
     )
     return KmerCounts(raw)
 
@@ -526,9 +590,14 @@ def peek(path: _PathLike, *, n_reads: int = 10_000) -> "_core.Preview":
 
 
 def build_info() -> Dict[str, Any]:
-    """Reports the installed version, the maximum supported k, and whether
-    AVX2 is live on *this* CPU -- without which "it's slow on my Mac" is
-    undiagnosable remotely.
+    """Reports the installed version, the two maximum-k ceilings, and
+    whether AVX2 is live on *this* CPU -- without which "it's slow on my
+    Mac" is undiagnosable remotely.
+
+    `max_k` is what `count()` reaches (64, via `engine="wide"`);
+    `max_k_sketch` is the u64 ceiling of 32 that `sketch`,
+    `estimate_cardinality`, `estimate_spectrum` and `KmerTable` still
+    have. Two numbers because the ceiling is not uniform.
     """
     return _core.build_info()
 

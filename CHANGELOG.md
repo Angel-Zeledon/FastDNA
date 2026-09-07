@@ -117,6 +117,44 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **Python: `fastdna.count(..., engine="auto"|"narrow"|"wide")`.** El motor
+  ancho (`k` hasta 64) deja de ser exclusivo del CLI. `auto` es el default
+  y enruta por `k` igual que `--engine`, así que quien nunca nombre un
+  motor conserva exactamente el comportamiento que tenía.
+
+  **Un solo tipo `KmerCounts`, no una clase aparte.** Los cinco accesores
+  que expone (`table`, `qc`, `total_kmers`, `distinct_kmers`, `spectrum`)
+  están bien definidos para los dos motores, y lo único que quien llama
+  ve distinto es el nombre de una columna. Una segunda clase habría
+  empujado esa rama a todo el código de usuario -- `isinstance` en sitios
+  cuya pregunta real es "cuántos k-mers distintos hay", que ambos motores
+  contestan igual. En su lugar hay `KmerCounts.engine`, `"narrow"` o
+  `"wide"`, que se reporta en vez de deducirse de `k`: `engine="wide"` es
+  legal con `k <= 32` y es como se comprueba un motor contra el otro.
+
+  La tabla ancha lleva `kmer_bits` (16 bytes big-endian) donde la estrecha
+  lleva `kmer_u64`, porque Arrow no tiene entero de 128 bits.
+  `with_sequence()` decodifica las dos: `_decode_wide_kmers` lee los
+  campos de 2 bits de los bytes crudos, respetando el `offset` del array
+  -- una vista de `top()`/`filter()` es un slice cuyo buffer sigue
+  conteniendo todas las filas, y un decodificador que ignorara el offset
+  devolvería en silencio las secuencias de las *primeras* n filas.
+
+  **Lo que lo sostiene**: `test_the_two_engines_agree_kmer_for_kmer_at_k32`
+  cuenta el mismo FASTQ con los dos motores y compara k-mer a k-mer, total,
+  distintos y espectro. Es la misma comprobación que hace
+  `tests/wide_engine.rs` en el core, pero a través del binding, que es
+  donde viven el ruteo, el tipo de columna Arrow y la decodificación.
+
+- **`build_info()` reporta dos techos: `max_k` (64) y `max_k_sketch` (32).**
+  `max_k` decía 32 porque era verdad de este binding; ahora `count()`
+  llega a 64 y decir 32 sería mentir. Pero el techo **no es uniforme**:
+  `sketch`, `estimate_cardinality`, `estimate_spectrum`, `KmerTable` y las
+  operaciones de conjuntos siguen teniendo clave `u64` y paran en 32. Un
+  solo número engañaría a quien lo leyera y llamara a `sketch(k=41)`, así
+  que se reportan los dos. Cambio rompedor del dict que devuelve
+  `build_info()`, que el 0.x permite y esta línea declara.
+
 - **Python: `fastdna.similarity(tables)`.** La misma similitud exacta que
   `fastdna similarity` en el CLI, devolviendo un `pyarrow.Table` en formato
   largo con `sample_a`, `sample_b`, `shared`, `only_a`, `only_b`,
@@ -167,8 +205,11 @@ La superficie con compatibilidad garantizada es:
   que el orden de bytes *es* el orden numérico y el fichero sigue estando
   ordenado para quien no lo decodifique) y `fastdna.sorted_by=kmer_bits`.
   Las operaciones con clave `u64` -- `query`, `union`/`intersect`/`diff`,
-  `filter`, `similarity`, sketching, la API de Python -- la **rechazan por
-  nombre** en vez de malinterpretarla, y el error explica cuál es.
+  `filter`, `similarity`, sketching -- la **rechazan por nombre** en vez de
+  malinterpretarla, y el error explica cuál es. Contar por encima de k=32
+  es por tanto una exportación, no un punto de partida: eso sigue siendo
+  cierto aunque `fastdna.count(engine="wide")` ya produzca tablas anchas
+  desde Python.
 
 ### Changed
 

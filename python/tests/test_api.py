@@ -193,4 +193,9 @@ def test_build_info_reports_avx2(tmp_path):
     assert "version" in info and "avx2" in info
     assert isinstance(info["avx2"], bool)
     assert info["version"] == fastdna.__version__
-    assert info["max_k"] == 32
+    # 64, not 32: `count(engine="wide")` reaches the u128 engine from
+    # Python, so `max_k` reports 64 and `max_k_sketch` carries the u64
+    # ceiling the rest of the module still has. See
+    # `test_wide_engine.py::test_build_info_reports_both_ceilings`.
+    assert info["max_k"] == 64
+    assert info["max_k_sketch"] == 32

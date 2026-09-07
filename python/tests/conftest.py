@@ -5,12 +5,11 @@ compiled Rust extension) at import time, so `import fastdna` -- and
 therefore `import fastdna.<anything>` -- normally requires `maturin
 develop` to have been run first.
 
-`python/fastdna/active_learning.py` (see docs/ml-genomics-roadmap.md item
-8) is pure Python over generic label/score data and deliberately has no
-dependency on the Rust extension at all -- it should be importable and
-testable without ever building it. The only thing standing in the way is
-`fastdna/__init__.py`'s own unconditional import, which this project's
-task constraints explicitly forbid editing.
+`python/fastdna/spectrum.py` is pure Python over a plain
+`{depth: count}` mapping and has no dependency on the Rust extension at
+all -- it should be importable and testable without ever building it. The
+only thing standing in the way is `fastdna/__init__.py`'s own
+unconditional import.
 
 If the real `fastdna._core` extension is already built and importable,
 this is a complete no-op (the `try` succeeds and nothing is stubbed) --

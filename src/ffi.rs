@@ -44,7 +44,8 @@ use std::time::Duration;
 // which is why the raw buffer types appear alongside the builders: a table
 // whose row count is known up front does not need a builder's growth.
 use arrow::array::{
-    ArrayRef, Float64Array, StringArray, StringBuilder, UInt32Array, UInt64Array,
+    ArrayRef, FixedSizeBinaryBuilder, Float64Array, StringArray, StringBuilder, UInt32Array,
+    UInt64Array,
 };
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -63,11 +64,16 @@ use crate::export;
 use crate::fastq::FastqReader;
 use crate::kmer;
 use crate::ktab::{self, KmerTable};
-use crate::pipeline::{process_stream_parallel_with_policy, MemoryPolicy, PipelineConfig};
+use crate::pipeline::{
+    process_stream_parallel_wide, process_stream_parallel_with_policy, resolve_engine, CountEngine,
+    EngineChoice, MemoryPolicy, PipelineConfig,
+};
 use crate::preview;
 use crate::progress::Progress;
 use crate::qc::QcSummary;
 use crate::similarity;
+use crate::wide_counter::WideCounts;
+use crate::wide_kmer;
 use crate::read_filter;
 use crate::read_profile;
 use crate::setops;
@@ -301,9 +307,72 @@ impl From<FastDnaError> for PyErr {
     }
 }
 
-/// `count()`'s own polling loop result: the pipeline's outcome (counter,
+/// The counted table behind a `KmerCounts`, in whichever of the two
+/// engines produced it.
+///
+/// A single Python type over both engines, rather than a second
+/// `WideKmerCounts` class, because every method `KmerCounts` exposes is
+/// well defined for both and the difference a caller actually sees is one
+/// column name in `.table` (`kmer_u64` vs `kmer_bits`). Making that a
+/// separate class would push the branch onto every user of the API --
+/// `isinstance` checks in code whose real question is "how many distinct
+/// k-mers", which both answer identically.
+enum CountsRepr {
+    /// `k <= 32`: the u64 engine, the default, and what every caller that
+    /// never names an engine gets.
+    Narrow(KmerCounter),
+    /// `33 <= k <= 64`: the u128 engine (`--engine wide` on the CLI).
+    Wide(WideCounts),
+}
+
+impl CountsRepr {
+    fn total_kmers(&self) -> u64 {
+        match self {
+            CountsRepr::Narrow(c) => c.total_kmers(),
+            CountsRepr::Wide(c) => c.total_kmers(),
+        }
+    }
+
+    fn distinct_kmers(&self) -> usize {
+        match self {
+            CountsRepr::Narrow(c) => c.distinct_kmers(),
+            CountsRepr::Wide(c) => c.distinct_kmers(),
+        }
+    }
+
+    /// `(depth, number of distinct k-mers at that depth)` pairs.
+    ///
+    /// A `Vec`, not either engine's own map type: the narrow counter
+    /// returns an `FxHashMap` and the wide one a `BTreeMap`, and the only
+    /// caller (`KmerCounts.spectrum`) drops both into a Python `dict`,
+    /// where neither the hashing nor the ordering survives. Converting
+    /// here keeps that difference from leaking into a signature.
+    fn histogram(&self) -> Vec<(u32, u64)> {
+        match self {
+            CountsRepr::Narrow(c) => c.generate_histogram().into_iter().collect(),
+            CountsRepr::Wide(c) => c.histogram().into_iter().collect(),
+        }
+    }
+
+    fn prune(&mut self, min_count: u32, max_count: Option<u32>) {
+        match self {
+            CountsRepr::Narrow(c) => {
+                c.prune(min_count, max_count);
+            }
+            CountsRepr::Wide(c) => {
+                // `WideCounts::prune` reports what it dropped; the narrow
+                // one does not, and `count()` has never surfaced those
+                // numbers to Python. Discarded here rather than exposed on
+                // one engine only.
+                let _ = c.prune(min_count, max_count);
+            }
+        }
+    }
+}
+
+/// `count()`'s own polling loop result: the pipeline's outcome (counts,
 /// QC summary, total reads read) or the error that ended it.
-type CountOutcome = Result<(KmerCounter, QcSummary, u64), FastDnaError>;
+type CountOutcome = Result<(CountsRepr, QcSummary, u64), FastDnaError>;
 
 /// Wraps an Arrow failure from `build_record_batch`. Mirrors
 /// `export.rs::export_err`, but the "path" is a placeholder: nothing here
@@ -434,13 +503,64 @@ fn build_record_batch(
     RecordBatch::try_new(schema, columns).map_err(in_memory_export_err)
 }
 
+/// `build_record_batch`'s wide sibling: the same in-memory Arrow batch for
+/// a `33 <= k <= 64` count.
+///
+/// Kept separate from the narrow builder rather than generic over the key
+/// type, for the same reason `export::export_wide_counts_parquet` is:
+/// the narrow one hand-assembles Arrow's buffers to avoid copying decoded
+/// bases twice, an optimisation with measurements behind it on the narrow
+/// path and none on this one. This uses Arrow's own `FixedSizeBinaryBuilder`
+/// and says so; the key column is `kmer_bits`, 16 big-endian bytes per row
+/// (`export::wide_counts_schema` explains why that, and not a `(hi, lo)`
+/// pair).
+fn build_wide_record_batch(
+    counts: &WideCounts,
+    k: usize,
+    with_sequence: bool,
+) -> Result<RecordBatch, FastDnaError> {
+    let schema = export::wide_counts_schema(with_sequence);
+    let n = counts.distinct_kmers();
+
+    let mut keys = FixedSizeBinaryBuilder::with_capacity(n, 16);
+    let mut freqs: Vec<u32> = Vec::with_capacity(n);
+    let mut sequences: Vec<String> = if with_sequence {
+        Vec::with_capacity(n)
+    } else {
+        Vec::new()
+    };
+
+    for (kmer, count) in counts.iter() {
+        // The builder's only failure mode is a value whose length is not
+        // the 16 the column was declared with, and `to_key_bytes` returns
+        // exactly 16 by its return type -- so this cannot fail, and the
+        // error is mapped rather than unwrapped only because `append_value`
+        // is fallible in the abstract.
+        keys.append_value(wide_kmer::to_key_bytes(kmer))
+            .map_err(in_memory_export_err)?;
+        if with_sequence {
+            sequences.push(wide_kmer::decode_kmer(kmer, k));
+        }
+        freqs.push(count);
+    }
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(3);
+    columns.push(Arc::new(keys.finish()));
+    if with_sequence {
+        columns.push(Arc::new(StringArray::from(sequences)));
+    }
+    columns.push(Arc::new(UInt32Array::from(freqs)));
+
+    RecordBatch::try_new(schema, columns).map_err(in_memory_export_err)
+}
+
 /// The Python-visible result of `count()`. Holds the counter and QC summary
 /// so `.qc`, `.total_kmers` and `.distinct_kmers` can be computed lazily
 /// rather than all up front. `table_cache` holds the one Arrow batch
 /// `.table` may need to build -- see that getter for why.
 #[pyclass(name = "KmerCounts", module = "fastdna._core")]
 struct PyKmerCounts {
-    counter: KmerCounter,
+    counts: CountsRepr,
     qc: QcSummary,
     k: usize,
     // Whether `.table` includes `kmer_sequence`. Fixed at construction time
@@ -474,8 +594,9 @@ impl PyKmerCounts {
         let batch = match self.table_cache.get() {
             Some(cached) => cached.clone(),
             None => {
-                let built = py.allow_threads(|| {
-                    build_record_batch(&self.counter, self.k, self.with_sequence)
+                let built = py.allow_threads(|| match &self.counts {
+                    CountsRepr::Narrow(c) => build_record_batch(c, self.k, self.with_sequence),
+                    CountsRepr::Wide(c) => build_wide_record_batch(c, self.k, self.with_sequence),
                 })?;
                 // `OnceLock::set` can in general lose a race to a
                 // concurrent initializer, and that race is real here, not
@@ -512,12 +633,26 @@ impl PyKmerCounts {
 
     #[getter]
     fn total_kmers(&self) -> u64 {
-        self.counter.total_kmers()
+        self.counts.total_kmers()
     }
 
     #[getter]
     fn distinct_kmers(&self) -> usize {
-        self.counter.distinct_kmers()
+        self.counts.distinct_kmers()
+    }
+
+    /// `"narrow"` or `"wide"` -- which of the two engines produced this
+    /// table, and therefore whether `.table`'s key column is `kmer_u64`
+    /// or the 16-byte `kmer_bits`. Reported rather than left to be
+    /// inferred from `k`, because `engine="wide"` is a legal thing to ask
+    /// for at `k <= 32` (it is how the two engines get checked against
+    /// each other), so `k` alone does not answer it.
+    #[getter]
+    fn engine(&self) -> &'static str {
+        match self.counts {
+            CountsRepr::Narrow(_) => "narrow",
+            CountsRepr::Wide(_) => "wide",
+        }
     }
 
     #[getter]
@@ -539,7 +674,7 @@ impl PyKmerCounts {
     /// peak, and differs per sample -- there is no universal default.
     fn spectrum(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = PyDict::new_bound(py);
-        for (depth, count) in self.counter.generate_histogram() {
+        for (depth, count) in self.counts.histogram() {
             dict.set_item(depth, count)?;
         }
         Ok(dict.into())
@@ -638,7 +773,7 @@ fn open_fastq_reader(path: &PathBuf) -> Result<FastqReader<Box<dyn BufRead + Sen
 /// returns `FastDnaError::Cancelled`, which `impl From<..> for PyErr`
 /// above maps to `KeyboardInterrupt`.
 #[pyfunction]
-#[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=None, hpc=false, with_sequence=false))]
+#[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=None, hpc=false, with_sequence=false, engine="auto"))]
 #[allow(clippy::too_many_arguments)]
 fn count(
     py: Python<'_>,
@@ -662,7 +797,36 @@ fn count(
     // wall time on the benchmark file). `KmerCounts.with_sequence()`
     // reconstructs it locally when this was left off.
     with_sequence: bool,
+    // Which k-mer engine to count with: `"auto"` (the default, and what
+    // every pre-existing caller gets) picks the narrow u64 engine at
+    // `k <= 32` and the wide u128 one above it; `"narrow"` pins a run to
+    // the u64 engine and fails rather than silently upgrading; `"wide"`
+    // runs the u128 engine even at `k <= 32`, which is slower and is how
+    // the two engines get checked against each other. Mirrors the CLI's
+    // `--engine`, string-valued rather than an enum class because it is a
+    // three-way flag and a Python caller writing `engine="wide"` needs no
+    // import to do it.
+    engine: &str,
 ) -> PyResult<PyKmerCounts> {
+    let choice = match engine {
+        "auto" => EngineChoice::Auto,
+        "narrow" => EngineChoice::Narrow,
+        "wide" => EngineChoice::Wide,
+        other => {
+            return Err(FastDnaError::InvalidConfig {
+                parameter: "engine",
+                reason: format!(
+                    "{other:?} is not an engine: expected \"auto\", \"narrow\" or \"wide\""
+                ),
+            }
+            .into())
+        }
+    };
+    // Resolved before the file is opened so a bad `k`/`engine` pair costs
+    // nothing: `resolve_engine` is also where `k` gets its range check
+    // (1..=64), which the narrow path used to leave to the pipeline.
+    let engine = resolve_engine(choice, k)?;
+
     let path_buf = PathBuf::from(path);
     let reader = open_fastq_reader(&path_buf)?;
 
@@ -705,7 +869,7 @@ fn count(
     // only requires `T: Send`, which `PyErr` is.
     let callback_error: Arc<Mutex<Option<PyErr>>> = Arc::new(Mutex::new(None));
     let callback_error_for_progress = callback_error.clone();
-    let (result_tx, result_rx) = mpsc::channel::<Result<(KmerCounter, QcSummary, u64), FastDnaError>>();
+    let (result_tx, result_rx) = mpsc::channel::<CountOutcome>();
 
     // The actual counting runs on its own OS thread, not on the thread that
     // entered this function. This inversion exists entirely because of a
@@ -772,15 +936,29 @@ fn count(
         // `scripts/bench/crosscheck.py` and similar tooling exercise both
         // counting strategies through the same public `fastdna.count()`
         // Python API without needing one.
-        let outcome = process_stream_parallel_with_policy(
-            reader,
-            config,
-            &path_buf,
-            progress_ref,
-            Some(cancel_for_worker),
-            MemoryPolicy::default(),
-        )
-        .map(|(counter, qc, reads, _decision)| (counter, qc, reads));
+        //
+        // The wide engine has no `MemoryPolicy` equivalent: it counts in
+        // memory only (the disk and binned strategies are u64-keyed), which
+        // is the same restriction the CLI documents for `--engine wide`.
+        let outcome = match engine {
+            CountEngine::Narrow => process_stream_parallel_with_policy(
+                reader,
+                config,
+                &path_buf,
+                progress_ref,
+                Some(cancel_for_worker),
+                MemoryPolicy::default(),
+            )
+            .map(|(counter, qc, reads, _decision)| (CountsRepr::Narrow(counter), qc, reads)),
+            CountEngine::Wide => process_stream_parallel_wide(
+                reader,
+                config,
+                &path_buf,
+                progress_ref,
+                Some(cancel_for_worker),
+            )
+            .map(|(counts, qc, reads)| (CountsRepr::Wide(counts), qc, reads)),
+        };
         // The receiving end only ever stops listening after it has already
         // gotten a result (see the loop below), so a failed send here is
         // unreachable; there is nothing useful to do with that error even
@@ -869,15 +1047,15 @@ fn count(
     // applied in RAM, after the pipeline and before the result is handed
     // back.
     let outcome = py.allow_threads(|| {
-        outcome.map(|(mut counter, qc, total_reads)| {
-            counter.prune(min_count, max_count);
-            (counter, qc, total_reads)
+        outcome.map(|(mut counts, qc, total_reads)| {
+            counts.prune(min_count, max_count);
+            (counts, qc, total_reads)
         })
     });
 
-    let (counter, qc, _total_reads) = outcome?;
+    let (counts, qc, _total_reads) = outcome?;
 
-    Ok(PyKmerCounts { counter, qc, k, with_sequence, table_cache: OnceLock::new() })
+    Ok(PyKmerCounts { counts, qc, k, with_sequence, table_cache: OnceLock::new() })
 }
 
 /// The Python-visible result of `peek()`. Wraps `preview::PreviewStats`
@@ -957,11 +1135,15 @@ fn peek(py: Python<'_>, path: String, n_reads: usize) -> PyResult<PyPreview> {
 fn build_info(py: Python<'_>) -> PyResult<PyObject> {
     let dict = PyDict::new_bound(py);
     dict.set_item("version", env!("CARGO_PKG_VERSION"))?;
-    // 32, not `wide_kmer::MAX_WIDE_K`: this reports what *this binding*
-    // can count, and `count()` here is the narrow engine only. The CLI
-    // reaches 64 through `--engine wide`; Python has no equivalent yet, so
-    // reporting 64 would be advertising a range this module cannot deliver.
-    dict.set_item("max_k", 32usize)?;
+    // What `count()` can reach, which since `engine="wide"` exists here is
+    // the wide engine's own ceiling rather than the narrow 32 this used to
+    // report. `max_k_sketch` is reported alongside it because the ceiling
+    // is not uniform across the module: sketching, cardinality estimation
+    // and every k-mer-table operation are u64-keyed and still stop at 32,
+    // so a caller that reads `max_k` and hands 41 to `sketch()` would
+    // otherwise be misled by a number that is true only of counting.
+    dict.set_item("max_k", wide_kmer::MAX_WIDE_K)?;
+    dict.set_item("max_k_sketch", 32usize)?;
     dict.set_item("avx2", avx2_is_live())?;
     Ok(dict.into())
 }
