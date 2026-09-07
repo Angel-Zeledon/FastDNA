@@ -454,25 +454,38 @@ Three findings, two of them things this document previously got wrong:
   pool sized to `--threads`, built only when that differs from the global
   pool so the default run pays nothing for it.
 
-  Peak RSS fell everywhere as a result (with the parallel merge landing in
-  the same window), which left the model conservative rather than tight:
+  Peak RSS moved as a result, and **the first attempt to record how much
+  was wrong.** Those figures were one run per configuration. Repeating each
+  three times on 2026-09-07 showed every one of them had been 20-55% low:
 
-  | occurrences | threads | 2026-09-05 | 2026-09-06 |
+  | occurrences | threads | single run (2026-09-06) | worst of three (2026-09-07) |
   |---:|---:|---:|---:|
-  | 144M | 1 | 891 MiB | 602 MiB |
-  | 144M | 11 | 951 MiB | 858 MiB |
-  | 840M | 1 | 3,009 MiB | 2,772 MiB |
-  | 840M | 11 | 3,287 MiB | 1,769 MiB |
+  | 144M | 1 | 602 MiB | 785 MiB |
+  | 144M | 8 | 827 MiB | 985 MiB |
+  | 144M | 11 | 858 MiB | 1,008 MiB |
+  | 840M | 1 | 2,772 MiB | 3,271 MiB |
+  | 840M | 4 | 2,222 MiB | 2,707 MiB |
+  | 840M | 11 | 1,769 MiB | 3,239 MiB |
 
-  The constants were **not** re-fit, deliberately. Peak memory no longer
-  rises with thread count at scale -- 840M occurrences costs 2,772 MiB at
-  one thread and 1,769 MiB at eleven -- so the model's `threads` term no
-  longer describes the shape of the data, and re-fitting a structure that
-  does not match would produce a number that interpolates rather than a
-  model. That is precisely what the earlier structural-but-unmeasured
-  version produced. It over-predicts by up to 94% and under-predicts
-  nowhere, and its own test says so until someone works out why more
-  threads now costs less memory.
+  That mattered, and not only for tidiness: against the honest numbers the
+  calibration factor of 1.195 **under-predicted at 144M occurrences on 8
+  and 11 threads** (by 1.6% and 1.3%) -- the one failure that model exists
+  to make impossible. It is now 1.24, the smallest factor that leaves no
+  measured *run* above the prediction, fit against the worst of three at
+  every point rather than the median. A bound fit to a median is exceeded
+  by half the runs it bounds.
+
+  Two claims made here on 2026-09-06 are withdrawn with it. "Peak memory no
+  longer rises with thread count" was drawn from single runs: at 144M
+  occurrences it plainly does (785 -> 1,008 MiB from 1 to 11 threads), and
+  at 840M it falls by ~15% rather than the 36% one pair of outliers
+  suggested. And "over-predicts by up to 94%" was arithmetic on the low
+  figure; the real ceiling is 33%.
+
+  Run-to-run spread, for whoever re-measures: six of the eight points vary
+  by under 2% between runs, and two vary by 12% and 23%. Repeats are not
+  ceremony here -- they are the difference between the two points that move
+  and the six that do not.
 
 ### The cross-bin merge, parallelised
 

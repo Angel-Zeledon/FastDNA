@@ -294,12 +294,17 @@ const BINNED_BASE_OVERHEAD_BYTES: u64 = 320 * 1024 * 1024;
 /// `large` benchmark files) x four thread counts (1, 4, 8, 11), peak RSS
 /// read from `/usr/bin/time -l`'s `maximum resident set size`.
 ///
-/// It was chosen as the smallest factor that leaves **no** measured point
+/// It is the smallest factor that leaves **no** measured run
 /// under-predicted, because the one thing this number must never do is tell
-/// the automatic chooser a run fits when it does not. The residuals it
-/// leaves are reported by
-/// `binned_estimate_matches_the_measured_runs_it_was_fit_to` and range from
-/// 0.0% to +11.1% -- conservative everywhere, never optimistic anywhere.
+/// the automatic chooser a run fits when it does not.
+///
+/// "No measured run", not "no measured median". It was 1.195 until
+/// 2026-09-07, fit against one run per configuration -- and repeating those
+/// runs showed every one of those figures had been 20-55% low, which hid
+/// the model **under-predicting by 1.6% at 144M occurrences on 8 threads**.
+/// A bound fit to a median is exceeded by half the runs it bounds; this one
+/// is fit to the worst of three at every point. The residuals it leaves are
+/// reported by `binned_estimate_matches_the_measured_runs_it_was_fit_to`.
 ///
 /// What it absorbs, and why a bare structural sum could not: allocator
 /// retention (macOS does not return freed pages promptly, so peak RSS
@@ -310,7 +315,7 @@ const BINNED_BASE_OVERHEAD_BYTES: u64 = 320 * 1024 * 1024;
 /// factor is honest about that, where quietly inflating
 /// `SUPERKMER_BYTES_PER_OCCURRENCE` (which has its own derivation and its
 /// own test) to 3.6 would not be.
-const BINNED_CALIBRATION_FACTOR: f64 = 1.195;
+const BINNED_CALIBRATION_FACTOR: f64 = 1.24;
 
 /// Predicts peak RSS in bytes for a **binned** counting run (`binned.rs` /
 /// `CountStrategy::Binned`) over `occurrences` total k-mer instances,
@@ -692,46 +697,40 @@ mod tests {
     /// strategy it did not strictly need, so the ceiling is loose while the
     /// floor is absolute.
     ///
-    /// **The model is now conservative rather than tight, and the ceiling
-    /// says so.** These constants were fit on 2026-09-05 to that day's
-    /// measurements; on 2026-09-06 two changes moved the thing being
-    /// measured -- the cross-bin merge became parallel, and phase 2 started
-    /// honouring `--threads` instead of always using every core -- and both
-    /// lowered peak RSS. The numbers below are re-measured against the code
-    /// as it stands. The fit was not redone, for a reason: peak memory no
-    /// longer *rises* with thread count at scale (840M occurrences costs
-    /// 2,772 MiB at one thread and 1,769 MiB at eleven), so the model's
-    /// `threads * per-bin transients` term no longer describes the shape of
-    /// the data at all. Re-fitting a structure that does not match would
-    /// produce a number that happens to interpolate rather than a model,
-    /// and the previous structural-but-unmeasured version is exactly what
-    /// that produced. It stays conservative, and stays honest about being
-    /// conservative, until someone works out *why* more threads now costs
-    /// less memory.
+    /// **Each figure is the worst of three runs, not one run.** The
+    /// 2026-09-06 version of this test recorded one run per configuration.
+    /// Repeating them on 2026-09-07 showed every figure had been 20-55%
+    /// low -- and with the honest numbers the model was found to
+    /// **under-predict at two of the eight points**, which is the failure
+    /// this test exists to make impossible. One measurement of a peak is a
+    /// sample of a distribution, and a bound has to hold for the tail of it.
+    ///
+    /// Run-to-run spread, for whoever re-measures: six of the eight points
+    /// vary by under 2%, and two vary by 12% and 23%. So repeats are not
+    /// ceremony here; they are the difference between the two points that
+    /// move and the six that do not.
     ///
     /// Measured on macOS arm64 (Apple M3 Pro, 19 GB), release build, peak
     /// RSS from `/usr/bin/time -l`. The inputs are the `mid` and `large`
     /// files `scripts/bench/generate_reads_large.py` produces at seeds 4242
     /// and 9001 -- 144,000,000 and 840,000,000 k-mer occurrences at k=31.
-    /// Peak RSS, unlike wall clock, is not meaningfully perturbed by the
-    /// unrelated load that was on this machine at the time.
     #[test]
     fn binned_estimate_matches_the_measured_runs_it_was_fit_to() {
         let num_bins = crate::minimizer::DEFAULT_NUM_BINS;
         let chunk_bytes = crate::binned::DEFAULT_CHUNK_BYTES;
 
-        // (occurrences, threads, measured peak RSS in MiB), 2026-09-06.
-        // The 2026-09-05 figures these replace were 891/915/923/951 and
-        // 3009/3372/3407/3287; every one of them fell.
+        // (occurrences, threads, worst of three runs' peak RSS in MiB),
+        // 2026-09-07. The single-run figures these replace were
+        // 602/685/827/858 and 2772/2222/2230/1769 -- every one of them low.
         let measured = [
-            (144_000_000u64, 1usize, 602.0),
-            (144_000_000, 4, 685.0),
-            (144_000_000, 8, 827.0),
-            (144_000_000, 11, 858.0),
-            (840_000_000, 1, 2772.0),
-            (840_000_000, 4, 2222.0),
-            (840_000_000, 8, 2230.0),
-            (840_000_000, 11, 1769.0),
+            (144_000_000u64, 1usize, 785.0),
+            (144_000_000, 4, 926.0),
+            (144_000_000, 8, 985.0),
+            (144_000_000, 11, 1008.0),
+            (840_000_000, 1, 3271.0),
+            (840_000_000, 4, 2707.0),
+            (840_000_000, 8, 2659.0),
+            (840_000_000, 11, 3239.0),
         ];
 
         for (occurrences, threads, measured_mib) in measured {
@@ -746,12 +745,12 @@ mod tests {
                 residual * 100.0
             );
             assert!(
-                residual <= 1.0,
+                residual <= 0.4,
                 "{occurrences} occurrences at {threads} threads: predicted {predicted_mib:.0} MiB \
-                 against a measured {measured_mib:.0} MiB (+{:.1}%), beyond even the loose \
-                 ceiling a deliberately conservative model is allowed. Past this the estimate \
-                 stops being conservative and starts being wrong: it would route runs to the \
-                 disk strategy that fit in memory twice over.",
+                 against a measured {measured_mib:.0} MiB (+{:.1}%), beyond the ceiling a \
+                 conservative model is allowed. Past this the estimate stops being \
+                 conservative and starts being wrong: it would route runs to the disk \
+                 strategy that fit in memory with room to spare.",
                 residual * 100.0
             );
         }

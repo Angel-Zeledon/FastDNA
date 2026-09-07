@@ -907,6 +907,25 @@ La superficie con compatibilidad garantizada es:
 
 ### Fixed
 
+- **El modelo de memoria de `binned` sub-predecía, y mis propias mediciones
+  lo ocultaban.** Los ocho puntos de calibración registrados el 2026-09-06
+  eran de **una sola corrida cada uno**. Repitiéndolos tres veces, todos
+  resultaron entre un 20% y un 55% bajos — y con las cifras honestas el
+  factor de 1,195 **sub-predice** en 144M ocurrencias con 8 y 11 hilos
+  (1,6% y 1,3%). Sub-predecir es el único fallo que ese modelo existe para
+  hacer imposible.
+
+  El factor pasa a 1,24: el mínimo que no deja ninguna *corrida* por encima
+  de la predicción, ajustado contra la **peor de tres** en cada punto, no
+  contra la mediana. Una cota ajustada a la mediana la supera la mitad de
+  las corridas que acota.
+
+  Se retiran dos afirmaciones que hice el 2026-09-06 a partir de aquellas
+  corridas únicas: "la memoria ya no crece con el número de hilos" (con
+  144M ocurrencias crece claramente, 785 → 1.008 MiB de 1 a 11 hilos) y
+  "sobre-predice hasta un 94%" (el techo real es 33%).
+
+
 - **`--threads` no acotaba la fase 2 del conteo binned**, y eso hacía que
   el modelo de memoria **sub-predijera**. `BinStore::finish` paralelizaba
   sobre el pool global de rayon (dimensionado por número de cores) mientras
