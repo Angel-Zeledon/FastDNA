@@ -12,10 +12,18 @@ operative document again, and its evidence is why.
 FastDNA is **a fast, exact k-mer counter with a small set of capabilities
 that are counting**: sketching and distance, cardinality and spectrum
 estimation, k-mer tables with set operations, read filtering against a
-reference table, cohort counting, QC, and preview. That is the CLI surface
-(`count`, `sketch`, `dist`, `card`, `peek`, `query`, `union`, `intersect`,
-`diff`, `filter`, `matrix`, `profile`, `spectrum`) and the Python API that
-mirrors it.
+reference table, exact similarity between tables, cohort counting, QC,
+and preview. That is the CLI surface (`count`, `sketch`, `dist`, `card`,
+`peek`, `query`, `union`, `intersect`, `diff`, `similarity`, `filter`,
+`matrix`, `profile`, `spectrum`) and the Python API that mirrors it.
+
+Two things were added under this goal rather than inherited from before it,
+and both had to earn it the same way: `similarity` (exact Jaccard,
+containment and abundance-weighted Bray-Curtis between counted tables --
+checkable against `kmc_tools`' own set operations, and it agrees exactly)
+and the `k > 32` engine (`--engine`, up to k=64 -- checkable against the
+narrow engine, which they agree with k-mer for k-mer wherever both are
+defined).
 
 The machine-learning layer is **removed**, not frozen: the scikit-learn
 vectorizer, lineage-aware cross-validation, the leakage audit, feature

@@ -15,9 +15,12 @@ zero-copy Arrow table.
 **fast, exact k-mer counter and the small set of capabilities that are
 counting** — sketching and distance, cardinality and spectrum estimation,
 k-mer tables with set operations, read filtering against a reference table,
-cohort counting, QC, preview. That is exactly the CLI surface (`count`,
-`sketch`, `dist`, `card`, `peek`, `query`, `union`, `intersect`, `diff`,
-`filter`, `matrix`, `profile`, `spectrum`) and the Python API mirroring it.
+cohort counting, exact similarity between tables, QC, preview. That is exactly
+the CLI surface (`count`, `sketch`, `dist`, `card`, `peek`, `query`,
+`union`, `intersect`, `diff`, `similarity`, `filter`, `matrix`, `profile`,
+`spectrum`) and the Python API mirroring it -- with two gaps the Python
+side still has: `count()` is narrow-only (no `k > 32`), and nothing there
+reads a wide table back.
 
 **The machine-learning layer was removed on 2026-09-05** — 31 Python
 modules and 4 Rust modules (`sklearn`, `audit`, `cv`, `explain`, `gwas`,
