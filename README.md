@@ -206,8 +206,12 @@ detail that the numbers above are explained rather than just asserted.
 A/a = 00   C/c = 01   G/g = 10   T/t/U/u = 11
 ```
 
-A k-mer of length k (FastDNA supports `1 <= k <= 32`) therefore fits
-*exactly* into a `u64`: 32 bases x 2 bits = 64 bits. That one design
+A k-mer of length k therefore fits *exactly* into a `u64` at `k <= 32`:
+32 bases x 2 bits = 64 bits. Above that, a second engine
+(`--engine wide`, selected automatically) packs the same two bits per base
+into a `u128` and reaches `k = 64`; everything in this section describes
+the `u64` engine, which is the one every benchmark and the KMC3 equality
+result below were measured on. That one design
 decision is why almost everything downstream is cheap:
 
 - No heap allocation per k-mer. A Python string, or a Rust `String`, is a
@@ -455,7 +459,7 @@ Counting is also reachable as an explicit `fastdna count ...` subcommand,
 identical in every way to giving no subcommand at all -- both forms are
 covered by this project's compatibility contract (see `CHANGELOG.md`'s "Qué
 cubre este contrato"), so existing scripts that call `fastdna --input ...`
-with no subcommand word keep working unchanged. Four more subcommands expose
+with no subcommand word keep working unchanged. Four subcommands expose
 Rust-core functionality that, before this section, was reachable only from
 the Python binding (`fastdna.sketch()`, `.compare_all()`,
 `.estimate_cardinality()`, `.peek()`) -- pipeline users who never leave the
@@ -469,6 +473,21 @@ without writing Python:
 | `fastdna dist --input FILE... [--metric jaccard\|containment\|mash]` | Pairwise comparison across two or more sketches and/or files | `fastdna.compare_all(...)` |
 | `fastdna card --input FILE -k 31 [--precision 14]` | HyperLogLog estimate of the number of distinct k-mers | `fastdna.estimate_cardinality(...)` |
 | `fastdna peek --input FILE [--n-reads 10000]` | Quick preview: read length stats, GC content, a suggested k | `fastdna.peek(...)` |
+
+Nine more expose the operations built on counted k-mer tables -- the
+Parquet files `count` itself writes:
+
+| Subcommand | What it does | Equivalent Python call |
+|---|---|---|
+| `fastdna query --table FILE --kmer SEQ` | Point-lookup of one k-mer's count, pruning row groups by their key statistics | `fastdna.KmerTable.open(...).get(...)` |
+| `fastdna union --input A B ... -o OUT` | Every k-mer in any input table, counts combined | -- |
+| `fastdna intersect --input A B ... -o OUT` | Only k-mers present in every input | -- |
+| `fastdna diff --input A B ... -o OUT` | K-mers in the first table and absent from the rest (host/contaminant subtraction) | -- |
+| `fastdna filter --input READS --table REF -o OUT` | Streams reads and keeps those matching a reference table | -- |
+| `fastdna similarity --input A B ...` | Exact Jaccard, containment (both directions) and abundance-weighted Bray-Curtis between tables | `fastdna.similarity(...)` |
+| `fastdna matrix --input DIR -o OUT` | Cohort-wide presence/count matrix across many samples | -- |
+| `fastdna profile --input READS --table REF -o OUT` | Per-read k-mer coverage profile against a reference table | -- |
+| `fastdna spectrum --input FILE -o OUT` | ntCard-style streaming frequency-spectrum estimate, in bounded memory | `fastdna.estimate_spectrum(...)` |
 
 `fastdna <subcommand> --help` prints each one's full flag list.
 
@@ -500,7 +519,8 @@ explicitly -- see [Subcommands](#subcommands) above). `sketch`/`dist`/
 |---|---|---|
 | `-i, --input <FILE>` | (required unless `--paired-dir` is given) | Input FASTQ file (`.fastq` or `.fastq.gz`); several may be given (R1/R2, extra lanes) and are aggregated into one run |
 | `-o, --output <FILE>` | `kmer_counts.parquet` | Output path for k-mer frequencies (`.csv` or `.parquet`). Ignored with `--paired-dir` (see `--paired-output`) |
-| `-k, --kmer-size <N>` | `31` | Length of k-mers (`1 <= k <= 32`) |
+| `-k, --kmer-size <N>` | `31` | Length of k-mers. `1..=32` on the default engine, up to `64` with the wide one |
+| `--engine <auto\|narrow\|wide>` | `auto` | Which k-mer encoding to count with. `auto` picks by `k`: the `u64` engine at or below 32, the `u128` one above. `narrow` refuses `k > 32` rather than silently upgrading; `wide` runs the `u128` engine even below 32, which is how you check the two agree on your own data. The wide engine counts in memory only, so `--strategy` does not apply above `k = 32` |
 | `-q, --min-quality <Q>` | `20` | Minimum Phred quality score cutoff (0-40) for 3'-end trimming |
 | `-m, --min-count <COUNT>` | `1` | Filter out k-mers with frequency below this cutoff |
 | `-M, --max-count <COUNT>` | unset | Filter out k-mers with frequency above this cutoff (repetitive regions) |
@@ -649,7 +669,10 @@ tuned, and not yet benchmarked against them at that scale.
 
 ### Other limits
 
-- `max_k` is 32, imposed by the 2-bit-per-base `u64` packing. Analyses that
+- `max_k` is 32 **for this Python binding**, imposed by the 2-bit-per-base
+  `u64` packing. The CLI reaches 64 via `--engine wide`; `fastdna.count()`
+  has no equivalent yet, so this reports what it can actually deliver
+  rather than what the tool can. Analyses that
   need longer k-mers are out of scope.
 - Each worker's raw buffer is bounded at 2,000,000 buffered instances
   before an eager compaction; the measured effect of that bound -- helpful
@@ -844,6 +867,38 @@ cheap sketch comparisons, not `O(N^2)` FASTQ reads -- the exact cost
 sketching exists to avoid), returning a plain `pyarrow.Table` in long
 format (`sample_a`, `sample_b`, the metric column) that composes directly
 with `.sort_by()`/DuckDB/Polars.
+
+### `fastdna.similarity(tables) -> pyarrow.Table`
+
+Exact pairwise similarity between counted k-mer tables -- the `.parquet`
+files `count` writes, not FASTQ. One row per unordered pair:
+
+```python
+fastdna.similarity(["a.parquet", "b.parquet", "c.parquet"]).to_pandas()
+#    sample_a    sample_b   shared  only_a  only_b  jaccard  containment_ab  containment_ba  bray_curtis
+```
+
+**Exact, where `compare_all` is approximate.** `compare_all` sketches each
+sample and compares the sketches, which is what makes it `O(sketch_size)`
+per pair instead of `O(genome)`. This reads the real tables: it costs a
+pass over them and answers with no sampling error, and it can report
+`bray_curtis` -- which is computed from the counts a sketch discards, and
+so is not available there even in principle.
+
+Containment is reported in both directions because it is asymmetric:
+`containment_ab` is the fraction of A's k-mers also present in B, and equals
+`containment_ba` only when both tables hold the same number of distinct
+k-mers.
+
+Comparing N tables costs **one** k-way merge, not one per pair: every pair's
+statistics accumulate over a single streaming pass, so each table is read
+once rather than N-1 times.
+
+Degenerate cases return numbers rather than `NaN`, and the choices are
+documented rather than incidental: two empty tables are vacuously identical
+(`jaccard` 1.0, `bray_curtis` 0.0), and containment measured *from* an empty
+table is 1.0. Fewer than two tables, or tables built with different `k`,
+raise `ValueError`.
 
 ### `fastdna.estimate_cardinality(path, *, k=31, precision=14) -> float`
 

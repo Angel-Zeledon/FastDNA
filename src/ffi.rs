@@ -957,6 +957,10 @@ fn peek(py: Python<'_>, path: String, n_reads: usize) -> PyResult<PyPreview> {
 fn build_info(py: Python<'_>) -> PyResult<PyObject> {
     let dict = PyDict::new_bound(py);
     dict.set_item("version", env!("CARGO_PKG_VERSION"))?;
+    // 32, not `wide_kmer::MAX_WIDE_K`: this reports what *this binding*
+    // can count, and `count()` here is the narrow engine only. The CLI
+    // reaches 64 through `--engine wide`; Python has no equivalent yet, so
+    // reporting 64 would be advertising a range this module cannot deliver.
     dict.set_item("max_k", 32usize)?;
     dict.set_item("avx2", avx2_is_live())?;
     Ok(dict.into())
