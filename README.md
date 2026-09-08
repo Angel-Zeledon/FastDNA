@@ -181,7 +181,7 @@ sequencing data rather than generated input**, by scripts committed under
 |---|---|---|
 | k-mer counting, `u64` engine | KMC3 3.2.4 | **exact match** at k=31, 21 and 15 |
 | k-mer counting, `u128` engine | KMC3 3.2.4 | **exact match** at k=33, 41 and 64, and at k=31 forced into the overlap |
-| non-canonical counting | KMC3 3.2.4 `-b` | **exact match**: 23,570,343 distinct, 163,051,083 total |
+| non-canonical counting | KMC3 3.2.4 `-b` | **exact match** at k=31 (23,570,343 distinct) and k=41 (23,250,550), i.e. in both engines |
 | exact similarity, `u128` tables | `kmc_tools` set operations | **exact match** at k=41: every set size and every derived ratio |
 | MinHash distances | Mash 2.3 | r = 0.997, no systematic bias |
 | HyperLogLog cardinality | the exact count | −0.26% (bound: ~0.8%) |

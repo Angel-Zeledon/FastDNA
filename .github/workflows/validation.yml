@@ -104,6 +104,10 @@ jobs:
         run: |
           python scripts/validation/kmc3_equivalence.py \
             --no-canonical --json "${RUNNER_TEMP}/kmc3_nocanonical.json"
+          # And the combination: the u128 engine's own forward extractor,
+          # which shares no code with the u64 one.
+          python scripts/validation/kmc3_equivalence.py \
+            --k 41 --no-canonical --json "${RUNNER_TEMP}/kmc3_nocanonical_k41.json"
 
       - name: Counting above k=32 is exactly KMC3's too
         run: |
