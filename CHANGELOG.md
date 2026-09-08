@@ -25,6 +25,36 @@ La superficie con compatibilidad garantizada es:
 
 ### Changed
 
+- **El sort por bin usa la partición MSD que ya estaba medida** y que el
+  camino por defecto no aprovechaba. `counter.rs` particiona su buffer en
+  1024 cubetas ascendentes y ordena cada una desde que eso midió 1,23-1,37x
+  más rápido; `binned.rs` seguía con un `sort_unstable` pelado.
+
+  **Había un argumento en contra, escrito en el propio repo**: el
+  comentario de `DEFAULT_NUM_BINS` dice que el buffer de un bin (~12,5 MiB)
+  es "L3-resident ... which makes the per-bin sort cache-local", y
+  particionar algo que ya cabe en caché no compra nada y cuesta una pasada
+  de dispersión. Pero ese argumento es de un solo hilo: la fase 2 corre un
+  worker por hilo, y a 11 hilos son ~137 MiB de buffers vivos contra una
+  caché compartida.
+
+  Medido en vez de discutido (`binned::tests::per_bin_sort_ab`, misma
+  metodología que la que justificó el cambio en `counter.rs`): **1,32-1,37x
+  a un hilo y 1,31-1,41x a once**. La ventaja *aguanta* al escalar hilos,
+  que es justo donde el argumento de la caché decía que desaparecería.
+
+  **De punta a punta vale mucho menos: 1,050x** sobre el fichero de 2,14 GB
+  (9 corridas intercaladas de cada binario, mediana 9,23 → 8,79 s), con el
+  pico de RSS igual (1,016x, dentro de la dispersión). Un 1,35x sobre un
+  paso que un perfil anterior situaba en el 39,5% debería haber dado ~1,11x.
+  **Ese hueco no queda explicado**, y `docs/BENCHMARKS.md` lo dice así en
+  vez de elegir una de las dos hipótesis sin medirla.
+
+  Se envía igual porque la operación no tiene lado perdedor: estrictamente
+  más rápida, salida byte-idéntica (comprobada contra la estrategia
+  in-memory sobre lecturas reales, y `tests/dual_strategy.rs` lo exige en
+  cada corrida), memoria sin cambio, y reutiliza una rutina ya probada.
+
 - **Retractada: "la única de las tres cuyo pico de memoria es configurable
   contra un presupuesto".** Aparecía en `README.md` y en
   `docs/BENCHMARKS.md`, sobre FastDNA frente a KMC3 y FASTK, y es **falsa**.

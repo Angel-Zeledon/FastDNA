@@ -286,13 +286,13 @@ impl BinStore {
     /// sorted, deduplicated table.
     ///
     /// Bins are processed in parallel; the merge is sequential and streaming.
-    /// The expansion buffer is created per rayon worker, not per bin, so a
+    /// The scratch buffers are created per rayon worker, not per bin, so a
     /// 512-bin run does not pay 512 allocations of ~12.5 MiB.
     pub fn finish(&self) -> Vec<(u64, u32)> {
         let k = self.config.k;
         let tables: Vec<Vec<(u64, u32)>> = (0..self.config.num_bins)
             .into_par_iter()
-            .map_init(Vec::<u64>::new, |expanded, bin| self.count_bin(bin, k, expanded))
+            .map_init(BinScratch::default, |scratch, bin| self.count_bin(bin, k, scratch))
             .collect();
 
         // Parallel, because this merge was measured at **1.9 s
@@ -312,25 +312,25 @@ impl BinStore {
     /// cannot reach the result.
     pub fn finish_sequential(&self) -> Vec<(u64, u32)> {
         let k = self.config.k;
-        let mut expanded: Vec<u64> = Vec::new();
+        let mut scratch = BinScratch::default();
         let tables: Vec<Vec<(u64, u32)>> =
-            (0..self.config.num_bins).map(|bin| self.count_bin(bin, k, &mut expanded)).collect();
+            (0..self.config.num_bins).map(|bin| self.count_bin(bin, k, &mut scratch)).collect();
 
         k_way_merge_sorted_counts(tables)
     }
 
     /// Expands, sorts and compacts one bin, freeing its chunks before the
     /// sort so the two never coexist.
-    fn count_bin(&self, bin: usize, k: usize, expanded: &mut Vec<u64>) -> Vec<(u64, u32)> {
+    fn count_bin(&self, bin: usize, k: usize, scratch: &mut BinScratch) -> Vec<(u64, u32)> {
         let chunks = self.take_bin(bin);
         if chunks.is_empty() {
             return Vec::new();
         }
 
-        expanded.clear();
+        scratch.expanded.clear();
         for chunk in &chunks {
             for record in records(chunk.filled()) {
-                record.expand_canonical_into(k, expanded);
+                record.expand_canonical_into(k, &mut scratch.expanded);
             }
         }
         // The chunks are dead the moment they have been expanded, and a
@@ -338,9 +338,45 @@ impl BinStore {
         // sort would be the single largest avoidable transient in phase 2.
         drop(chunks);
 
-        expanded.sort_unstable();
-        compact_sorted(expanded)
+        // `counter::sort_keys_msd`, not `sort_unstable`: an MSD partition
+        // into 1024 ascending buckets and a `sort_unstable` per bucket.
+        // Identical output -- bucket order *is* key order -- and measured
+        // faster here, which was not obvious enough to assume.
+        //
+        // `DEFAULT_NUM_BINS`'s own doc argues the opposite: a bin's buffer
+        // is ~12.5 MiB and "L3-resident ... which makes the per-bin sort
+        // cache-local", and an MSD pass over data already in cache buys
+        // nothing and costs a scatter. That reasoning is single-threaded.
+        // Phase 2 runs one worker per thread, each holding its own bin: at
+        // 11 threads that is ~137 MiB of live buffers against one shared
+        // cache.
+        //
+        // Measured rather than argued (`per_bin_sort_ab` in this module's
+        // tests, three coverage shapes, 15 interleaved repeats, three runs
+        // on an M3 Pro): 1.32-1.37x at one thread and **1.31-1.41x at 11**,
+        // so the advantage holds where the single-threaded argument said it
+        // should disappear. The same routine, and the same result shape, as
+        // `counter::msd_partition`'s own numbers.
+        crate::counter::sort_keys_msd(&mut scratch.expanded, &mut scratch.keys, &mut scratch.bounds);
+        compact_sorted(&scratch.expanded)
     }
+}
+
+/// The three buffers one phase-2 worker reuses across every bin it counts.
+///
+/// A struct rather than three parameters because `finish`'s `map_init`
+/// creates them per rayon worker: reusing the MSD scratch across bins is
+/// what makes the partition pay at all (`counter::compact_raw`'s own
+/// measurements were taken with it reused, and reallocating per call was
+/// "far worse").
+#[derive(Default)]
+struct BinScratch {
+    /// Every k-mer of one bin, expanded from its super-k-mers.
+    expanded: Vec<u64>,
+    /// `sort_keys_msd`'s partition destination.
+    keys: Vec<u64>,
+    /// `sort_keys_msd`'s bucket bounds.
+    bounds: Vec<usize>,
 }
 
 /// Compacts a sorted `Vec<u64>` of occurrences into a sorted, deduplicated
@@ -537,6 +573,187 @@ mod tests {
     use crate::fastq::FastqReader;
     use crate::kmer::extract_canonical_kmers;
     use std::io::Cursor;
+
+    /// A/B measurement, not an assertion: `#[ignore]`d so it never runs in
+    /// CI, and run by hand with
+    /// `cargo test --release per_bin_sort_ab -- --ignored --nocapture`.
+    ///
+    /// # The question
+    ///
+    /// `run_count` sorts each bin with a plain `sort_unstable`, while
+    /// `counter.rs`'s own buffer goes through `sort_keys_msd` -- an MSD
+    /// partition into 1024 ascending buckets, then a `sort_unstable` per
+    /// bucket -- because that measured 1.23-1.37x faster there (see
+    /// `counter::msd_partition`'s doc comment for the numbers and the
+    /// method this one copies).
+    ///
+    /// It was never applied here, and `DEFAULT_NUM_BINS`'s own doc gives
+    /// the reason to expect it would not help: a bin's expansion buffer is
+    /// ~12.5 MiB, "L3-resident on the machines FastDNA runs on, which makes
+    /// the per-bin sort cache-local". If the bin already fits in cache,
+    /// the MSD pass buys nothing and costs a scatter.
+    ///
+    /// That reasoning is single-threaded. Phase 2 runs one worker per
+    /// thread, each holding its own bin: at 11 threads that is ~137 MiB of
+    /// live expansion buffers against a shared cache, which is exactly the
+    /// regime where `counter.rs`'s thread-scaling table showed the MSD
+    /// advantage *holding* rather than eroding. So the two arguments point
+    /// opposite ways and only a measurement decides.
+    ///
+    /// # The answer (M3 Pro, 2026-09-07, three runs)
+    ///
+    /// ```text
+    ///                        sort_unstable    MSD
+    ///  1 thread  high cov.      0.0169 s    0.0124 s   1.37x
+    ///  1 thread  medium         0.0175 s    0.0129 s   1.35x
+    ///  1 thread  low            0.0174 s    0.0131 s   1.32x
+    /// 11 threads high cov.      0.0440 s    0.0312 s   1.41x
+    /// 11 threads medium         0.0478 s    0.0353 s   1.35x
+    /// 11 threads low            0.0448 s    0.0341 s   1.31x
+    /// ```
+    ///
+    /// The MSD partition wins in every shape, and the advantage **holds at
+    /// 11 threads** rather than disappearing -- so the cache-locality
+    /// argument against it was the single-threaded one, and it does not
+    /// survive the way phase 2 actually runs.
+    ///
+    /// **End to end this is worth far less**: 1.050x on the 2.14 GB
+    /// benchmark file (9 interleaved runs of each binary, median 9.23 s ->
+    /// 8.79 s; min-to-min 1.042x), with peak RSS unchanged at 1.016x, which
+    /// is inside the run-to-run spread. A 1.35x speedup on a step an older
+    /// profile put at 39.5% of the run should have been worth ~1.11x, and
+    /// it is not. **That gap is not explained here.** Two candidates --
+    /// sorting being a smaller share now that the cross-bin merge is
+    /// parallel, and the isolated bench overstating the win because it does
+    /// not compete with phase 2's other memory traffic -- are both
+    /// plausible and neither is measured, so neither is asserted.
+    ///
+    /// Shipped anyway because the trade has no losing side: strictly
+    /// faster, byte-identical output, memory unchanged, and it reuses a
+    /// routine that was already tested and measured for `counter.rs`.
+    #[test]
+    #[ignore]
+    fn per_bin_sort_ab() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Instant;
+
+        const KEYS_PER_BIN: usize = 1_600_000; // ~12.5 MiB, one bin's buffer
+        const REPEATS: usize = 15;
+
+        /// Canonical k-mers drawn from a genome of `distinct_bases`, which
+        /// sets how much the pool repeats. Real k-mers, not uniform-random
+        /// `u64`: `min(forward, revcomp)` skews the distribution toward the
+        /// low end of exactly the high bits an MSD partition buckets on,
+        /// and uniform keys would hide that.
+        fn realistic_keys(distinct_bases: usize, want: usize, seed: u64) -> Vec<u64> {
+            let mut state = seed | 1;
+            let mut next = || {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                state
+            };
+            let genome: Vec<u8> =
+                (0..distinct_bases).map(|_| b"ACGT"[(next() >> 33) as usize % 4]).collect();
+
+            let mut out = Vec::with_capacity(want);
+            let mut buf = Vec::new();
+            while out.len() < want {
+                let start = (next() >> 33) as usize % (genome.len() - 200);
+                crate::kmer::extract_canonical_kmers_into(&genome[start..start + 150], 31, &mut buf);
+                out.extend_from_slice(&buf);
+            }
+            out.truncate(want);
+            out
+        }
+
+        fn median(mut v: Vec<f64>) -> f64 {
+            v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a timing"));
+            v[v.len() / 2]
+        }
+
+        println!("\nper-bin sort A/B -- {KEYS_PER_BIN} keys/bin, {REPEATS} repeats, interleaved");
+        // The host's load, printed with the numbers: interleaving makes the
+        // *ratio* usable under load, but the wall times are not comparable
+        // across runs without it.
+        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_else(|_| {
+            let out = std::process::Command::new("uptime").output().map(|o| o.stdout).unwrap_or_default();
+            String::from_utf8_lossy(&out).into_owned()
+        });
+        println!("host load: {}", load.trim());
+
+        let shapes: [(&str, usize); 3] =
+            [("high coverage", 200_000), ("medium", 2_000_000), ("low (near-unique)", 20_000_000)];
+
+        for (label, distinct_bases) in shapes {
+            let pool = realistic_keys(distinct_bases, KEYS_PER_BIN, 0x5EED_1234);
+
+            let mut plain = Vec::new();
+            let mut msd = Vec::new();
+            let mut scratch = Vec::new();
+            let mut bounds = Vec::new();
+
+            for _ in 0..REPEATS {
+                // Interleaved so any drift in machine load hits both arms.
+                let mut a = pool.clone();
+                let t = Instant::now();
+                a.sort_unstable();
+                plain.push(t.elapsed().as_secs_f64());
+                std::hint::black_box(&a);
+
+                let mut b = pool.clone();
+                let t = Instant::now();
+                crate::counter::sort_keys_msd(&mut b, &mut scratch, &mut bounds);
+                msd.push(t.elapsed().as_secs_f64());
+                std::hint::black_box(&b);
+
+                assert_eq!(a, b, "the two sorts must agree exactly");
+            }
+
+            let (p, m) = (median(plain), median(msd));
+            println!("  1 thread  {label:<18} sort_unstable {p:.4} s   msd {m:.4} s   {:.2}x", p / m);
+        }
+
+        // The regime the single-threaded number cannot see: every worker
+        // sorting its own bin at once, against one shared cache.
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+        for (label, distinct_bases) in shapes {
+            let pool = Arc::new(realistic_keys(distinct_bases, KEYS_PER_BIN, 0xA11CE));
+            let mut timings = [Vec::new(), Vec::new()];
+
+            for repeat in 0..REPEATS {
+                for (arm, slot) in timings.iter_mut().enumerate() {
+                    let barrier = Arc::new(Barrier::new(threads));
+                    let start = Instant::now();
+                    let handles: Vec<_> = (0..threads)
+                        .map(|_| {
+                            let pool = Arc::clone(&pool);
+                            let barrier = Arc::clone(&barrier);
+                            std::thread::spawn(move || {
+                                let mut buf = pool.as_ref().clone();
+                                let mut scratch = Vec::new();
+                                let mut bounds = Vec::new();
+                                barrier.wait();
+                                if arm == 0 {
+                                    buf.sort_unstable();
+                                } else {
+                                    crate::counter::sort_keys_msd(&mut buf, &mut scratch, &mut bounds);
+                                }
+                                std::hint::black_box(&buf);
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        h.join().expect("worker panicked");
+                    }
+                    slot.push(start.elapsed().as_secs_f64());
+                }
+                let _ = repeat;
+            }
+
+            let (p, m) = (median(timings[0].clone()), median(timings[1].clone()));
+            println!("  {threads} threads {label:<18} sort_unstable {p:.4} s   msd {m:.4} s   {:.2}x", p / m);
+        }
+        println!();
+    }
 
     /// The same deterministic FASTQ generator `tests/dual_strategy.rs`
     /// uses -- a fixed-seed xorshift64, no RNG crate -- so a failure here is
@@ -751,9 +968,9 @@ mod tests {
 
         let mut owner: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
         let mut nonempty = 0usize;
-        let mut expanded = Vec::new();
+        let mut scratch = BinScratch::default();
         for bin in 0..store.num_bins() {
-            let table = store.count_bin(bin, k, &mut expanded);
+            let table = store.count_bin(bin, k, &mut scratch);
             if table.is_empty() {
                 continue;
             }

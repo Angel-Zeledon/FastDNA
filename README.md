@@ -223,7 +223,7 @@ Often not. The honest comparison, with every row checked against
 | `k` | 1-256 | 1-64. Two bits per base in 128 of them is 64 bases; past that needs a byte-string key that changes the sort order, the Parquet schema and every comparison in the counter |
 | Out-of-core at scale | 729 gigabases of human reads in 33-34 GB (Kokot et al., *Bioinformatics*, 2017) | a disk strategy that is newer, less tuned, and **never benchmarked at that scale** |
 | Non-canonical counting | `-b` | no equivalent; canonicalization is unconditional |
-| Input formats | FASTA, FASTQ, multi-FASTA, **BAM**, and a KMC database | FASTQ/FASTA, gzipped or not, or stdin |
+| Input formats | adds **BAM** (`-fbam`) and a KMC database as input (`-fkmc`) | FASTQ, FASTA and multi-FASTA (every record is a read), gzipped or not, or stdin -- no BAM |
 | Counter cap | `-cs` caps the stored counter (default 255) to shrink the database | counts are `u32`, uncapped -- better for accuracy, worse for output size |
 | Interchange format | `-o kff` writes [KFF](https://github.com/Kmer-File-Format/kff-reference), a community standard | Parquet only |
 | Maturity | a decade old, thousands of citations, in every distribution | one author, pre-1.0, no release yet |

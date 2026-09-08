@@ -302,6 +302,77 @@ counting happens as a one-time sort-and-compact pass on first read (see
 not new hardware, not a smaller test file -- is the entire difference
 between 920.7 s / 6.96 GB and ~101 s / 8.02 GB.
 
+## The per-bin sort: MSD partition instead of `sort_unstable` (2026-09-07)
+
+`binned.rs` sorted each bin with a plain `sort_unstable`, while
+`counter.rs`'s own buffer had gone through an MSD partition (1024 ascending
+buckets, then `sort_unstable` per bucket) since it measured 1.23-1.37x
+faster there. The default path never got it.
+
+`DEFAULT_NUM_BINS`'s own doc comment gives the reason to expect it would
+not help: a bin's expansion buffer is ~12.5 MiB, "L3-resident ... which
+makes the per-bin sort cache-local". A partition over data already in cache
+buys nothing and costs a scatter pass.
+
+**That argument is single-threaded.** Phase 2 runs one worker per thread,
+each holding its own bin: at 11 threads that is ~137 MiB of live buffers
+against one shared cache -- the regime where `counter.rs`'s own thread
+scaling showed the advantage holding. The two arguments point opposite
+ways, so it was measured (`binned::tests::per_bin_sort_ab`, run with
+`cargo test --release per_bin_sort_ab -- --ignored --nocapture`).
+
+Method copied from `counter::msd_partition`'s: 1,600,000 keys (one bin's
+buffer), real canonical k-mers rather than uniform-random `u64` (canonical
+form skews the high bits an MSD partition buckets on), three coverage
+shapes, 15 interleaved repeats, scratch reused. Three runs, medians:
+
+| | `sort_unstable` | MSD | |
+|---|---:|---:|---:|
+| 1 thread, high coverage | 0.0169 s | 0.0124 s | **1.37x** |
+| 1 thread, medium | 0.0175 s | 0.0129 s | **1.35x** |
+| 1 thread, low (near-unique) | 0.0174 s | 0.0131 s | **1.32x** |
+| 11 threads, high coverage | 0.0440 s | 0.0312 s | **1.41x** |
+| 11 threads, medium | 0.0478 s | 0.0353 s | **1.35x** |
+| 11 threads, low | 0.0448 s | 0.0341 s | **1.31x** |
+
+The advantage holds at 11 threads rather than eroding, which is what
+settled it.
+
+### End to end it is worth much less, and that is not fully explained
+
+Two release binaries differing only in that one line, run interleaved on
+the same 2.14 GB file (`-k 31 -m 1 -q 0`, default strategy), 9 repeats
+each:
+
+| | median time | min | median peak RSS |
+|---|---:|---:|---:|
+| `sort_unstable` | 9.23 s | 8.84 s | 2.99 GB |
+| MSD | 8.79 s | 8.48 s | 3.04 GB |
+| | **1.050x** | 1.042x | 1.016x |
+
+Output is byte-identical (SHA-256 checked against the in-memory strategy on
+real reads, and `tests/dual_strategy.rs` asserts it on every run).
+
+A 1.35x speedup on a step an earlier profile put at **39.5%** of the run
+should have been worth about 1.11x overall. It is worth 1.05x. **That gap
+is not explained.** Two candidates -- sorting being a smaller share now
+that the cross-bin merge is parallel, and the isolated benchmark
+overstating the win because it does not compete with phase 2's other
+memory traffic -- are both plausible, neither is measured, and so neither
+is claimed here. A profile taken to settle it was discarded as unusable:
+`/usr/bin/sample` emits a call tree with cumulative counts, and the first
+attempt summed frames that share those counts, which attributed 95% of the
+run to "sort" and is meaningless.
+
+The change shipped anyway because the trade has no losing side: strictly
+faster, identical output, memory unchanged within the spread, and it reuses
+a routine already tested and measured for `counter.rs`.
+
+**Caveat on the absolute numbers**: the host was not idle (load average
+5.7-10.3 from unrelated processes) and both arms are inflated by it. The
+interleaving is what makes the *ratio* usable; the wall times are not
+comparable to the 9.88 s recorded below, which was taken separately.
+
 ## Strategy comparison on Apple silicon (2026-09-05)
 
 A second machine, and the first measurement of all three strategies against

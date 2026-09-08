@@ -441,6 +441,38 @@ fn msd_partition(raw: &mut Vec<u64>, scratch: &mut Vec<u64>, counts: &mut Vec<us
     std::mem::swap(raw, scratch);
 }
 
+/// Sorts `raw` ascending via [`msd_partition`] plus a `sort_unstable` per
+/// bucket -- the concatenation is already in ascending key order, so the
+/// result is exactly what `raw.sort_unstable()` would have produced.
+///
+/// `scratch` and `bounds` are caller-owned and reused across calls; see
+/// [`msd_partition`] for why the extra buffer is what buys the locality.
+///
+/// `pub(crate)` so `binned.rs`'s per-bin sort can use the same routine
+/// rather than a second copy of it. Whether it is *faster* there is a
+/// separate question from whether it is the same code, and is answered by
+/// `examples/bin_sort_ab.rs` -- see this module's `msd_partition` doc for
+/// the measurements that justified it here.
+pub(crate) fn sort_keys_msd(raw: &mut Vec<u64>, scratch: &mut Vec<u64>, bounds: &mut Vec<usize>) {
+    if raw.is_empty() {
+        return;
+    }
+    msd_partition(raw, scratch, bounds);
+
+    let mut rest: &mut [u64] = raw.as_mut_slice();
+    for bucket in 0..(1usize << MSD_BUCKET_BITS) {
+        let len = bounds[bucket + 1] - bounds[bucket];
+        let (head, tail) = rest.split_at_mut(len);
+        head.sort_unstable();
+        rest = tail;
+    }
+    debug_assert!(rest.is_empty(), "bucket lengths must cover the whole buffer");
+    debug_assert!(
+        raw.windows(2).all(|w| w[0] <= w[1]),
+        "MSD partition + per-bucket sort must leave the buffer fully sorted"
+    );
+}
+
 fn compact_raw(inner: &mut Inner) {
     if inner.raw.is_empty() {
         return;
@@ -451,20 +483,8 @@ fn compact_raw(inner: &mut Inner) {
     // already fully sorted -- exactly what `raw.sort_unstable()` produced
     // before, so everything downstream is untouched.
     let mut bounds: Vec<usize> = Vec::new();
-    msd_partition(&mut inner.raw, &mut inner.scratch, &mut bounds);
-
-    let mut rest: &mut [u64] = inner.raw.as_mut_slice();
-    for bucket in 0..(1usize << MSD_BUCKET_BITS) {
-        let len = bounds[bucket + 1] - bounds[bucket];
-        let (head, tail) = rest.split_at_mut(len);
-        head.sort_unstable();
-        rest = tail;
-    }
-    debug_assert!(rest.is_empty(), "bucket lengths must cover the whole buffer");
-    debug_assert!(
-        inner.raw.windows(2).all(|w| w[0] <= w[1]),
-        "MSD partition + per-bucket sort must leave the buffer fully sorted"
-    );
+    let raw = &mut inner.raw;
+    sort_keys_msd(raw, &mut inner.scratch, &mut bounds);
 
     let sorted: &[u64] = inner.raw.as_slice();
     let len = sorted.len();
