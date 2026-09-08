@@ -146,6 +146,18 @@ jobs:
             --reads-per-half 100000 \
             --json "${RUNNER_TEMP}/similarity.json"
 
+      # The same oracle, above k=32. `setops` and `similarity` take either
+      # table width now, and the wide path shares no key-handling code with
+      # the narrow one: a different reader, a different exporter, and a
+      # 16-byte big-endian key whose byte order has to *be* its numeric
+      # order for the merge to pair rows correctly. `kmc_tools` is what says
+      # it does, rather than the narrow engine saying so about itself.
+      - name: Exact similarity agrees with KMC3 above k=32 too
+        run: |
+          python scripts/validation/similarity_vs_kmc_tools.py \
+            --k 41 --reads-per-half 100000 \
+            --json "${RUNNER_TEMP}/similarity_k41.json"
+
       # Uploaded even on failure: the JSON is what a human compares against
       # the previous run to see whether a number moved a little or a lot.
       - name: Upload validation results

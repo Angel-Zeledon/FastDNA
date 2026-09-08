@@ -175,6 +175,7 @@ sequencing data rather than generated input**, by scripts committed under
 |---|---|---|
 | k-mer counting, `u64` engine | KMC3 3.2.4 | **exact match** at k=31, 21 and 15 |
 | k-mer counting, `u128` engine | KMC3 3.2.4 | **exact match** at k=33, 41 and 64, and at k=31 forced into the overlap |
+| exact similarity, `u128` tables | `kmc_tools` set operations | **exact match** at k=41: every set size and every derived ratio |
 | MinHash distances | Mash 2.3 | r = 0.997, no systematic bias |
 | HyperLogLog cardinality | the exact count | −0.26% (bound: ~0.8%) |
 | ntCard spectrum | the exact histogram | −0.6% / +2.0% / −1.5% at f1/f2/f3 |
