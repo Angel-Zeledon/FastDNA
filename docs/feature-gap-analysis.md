@@ -404,14 +404,16 @@ at the end). Companion documents: `ml-genomics-roadmap.md` (ML side),
     (`src/wide_ktab.rs`) -- both picking their reader from the file's own
     footer via `ktab::table_key`.
 
-    The set operations followed on the same day: `setops` is generic over
-    `MergeSource`, so `union`/`intersect`/`diff` take either width, and
-    `tests/wide_setops.rs` requires the two to agree k-mer for k-mer on the
-    same reads counted by both engines.
+    The set operations and `similarity` followed on the same day: `setops`
+    is generic over `MergeSource`, so `union`/`intersect`/`diff` take
+    either width, and `similarity` -- built on the same merge, and never
+    looking at a key -- came with them. `tests/wide_setops.rs` requires the
+    two widths to agree k-mer for k-mer on the same reads counted by both
+    engines.
 
     Still narrow-only, and refused by name rather than misread
-    (`ktab::SORTED_BY_WIDE_VALUE`): `filter`, `profile`, `similarity` and
-    sketching. A wide table is a
+    (`ktab::SORTED_BY_WIDE_VALUE`): `filter`, `profile` and sketching. A
+    wide table is a
     Parquet file keyed on 16 big-endian bytes; those operations are all
     `u64`-keyed end to end -- `setops::MultiTableMerge`'s heap and
     `read_filter::ReferenceIndex`'s binary search over a `Vec<u64>` are

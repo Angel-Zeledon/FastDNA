@@ -284,3 +284,80 @@ fn mixing_a_narrow_and_a_wide_table_is_rejected_by_name() {
     assert!(stderr.contains("narrow"), "the error should name both widths:\n{stderr}");
     assert!(stderr.contains("wide"), "the error should name both widths:\n{stderr}");
 }
+
+/// The similarity table, computed over both widths of the same k-mers.
+///
+/// `pairwise_similarity` never looks at a key -- every number it reports
+/// comes from `MergedRow`'s per-table counts -- so the two widths must
+/// agree to the digit, including the three floating-point ratios. Anything
+/// else would mean the merge itself paired rows differently, which is the
+/// failure this is here to catch.
+#[test]
+fn similarity_agrees_across_both_widths() {
+    let dir = ScratchDir::new("similarity");
+    let (a_reads, b_reads) = write_samples(&dir);
+
+    let mut tables = Vec::new();
+    for engine in ["narrow", "wide"] {
+        let a = count(&dir, &a_reads, 31, engine, &format!("sa_{engine}.parquet"));
+        let b = count(&dir, &b_reads, 31, engine, &format!("sb_{engine}.parquet"));
+        let out = dir.path(&format!("sim_{engine}.csv"));
+        run_fastdna(&[
+            "similarity",
+            "--input", a.to_str().unwrap(), b.to_str().unwrap(),
+            "--output", out.to_str().unwrap(),
+        ]);
+
+        // Every column but the two path labels, which necessarily differ:
+        // the two runs read different files.
+        let text = std::fs::read_to_string(&out).expect("read similarity output");
+        let numbers: Vec<String> = text
+            .lines()
+            .skip(1)
+            .map(|line| line.splitn(3, ',').nth(2).unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(numbers.len(), 1, "two inputs make exactly one pair:\n{text}");
+        tables.push(numbers);
+    }
+
+    assert_eq!(tables[0], tables[1], "the two widths report different similarity");
+
+    // And the numbers have to be a real comparison, not two empty tables
+    // agreeing that they share nothing.
+    let fields: Vec<&str> = tables[0][0].split(',').collect();
+    let shared: u64 = fields[0].parse().expect("shared is a number");
+    let jaccard: f64 = fields[3].parse().expect("jaccard is a number");
+    assert!(shared > 0, "the fixture must share k-mers: {:?}", tables[0]);
+    assert!(jaccard > 0.0 && jaccard < 1.0, "partial overlap expected, got {jaccard}");
+}
+
+/// A wide table reaches `similarity` at all -- the k>32 path, not just the
+/// forced-wide one the differential test above uses.
+#[test]
+fn similarity_takes_a_genuinely_wide_table() {
+    let dir = ScratchDir::new("similarity_wide");
+    let (a_reads, b_reads) = write_samples(&dir);
+    let a = count(&dir, &a_reads, 41, "auto", "a.parquet");
+    let b = count(&dir, &b_reads, 41, "auto", "b.parquet");
+
+    let out = dir.path("sim.csv");
+    run_fastdna(&[
+        "similarity",
+        "--input", a.to_str().unwrap(), b.to_str().unwrap(),
+        "--output", out.to_str().unwrap(),
+    ]);
+
+    let text = std::fs::read_to_string(&out).expect("read similarity output");
+    let row = text.lines().nth(1).expect("one data row");
+    let fields: Vec<&str> = row.split(',').collect();
+
+    // shared + only_a is |A|, and shared + only_b is |B| -- checked against
+    // the tables' own row counts, which came from a different code path
+    // (the Parquet footer) than the merge that produced these.
+    let shared: usize = fields[2].parse().unwrap();
+    let only_a: usize = fields[3].parse().unwrap();
+    let only_b: usize = fields[4].parse().unwrap();
+    assert_eq!(shared + only_a, decoded(&a).len(), "shared + only_a != |A|");
+    assert_eq!(shared + only_b, decoded(&b).len(), "shared + only_b != |B|");
+    assert!(shared > 0, "the fixture must share k-mers at k=41");
+}

@@ -113,8 +113,7 @@
 //! denominator).
 
 use crate::error::{FastDnaError, Result};
-use crate::ktab::KmerTable;
-use crate::setops::{check_same_k, MergedRow, MultiTableMerge};
+use crate::setops::{check_same_k, MergeSource, MergedRow, MultiTableMerge};
 
 /// One unordered pair's similarity, as returned by `pairwise_similarity`.
 /// `index_a`/`index_b` index into the same `&[KmerTable]` slice
@@ -193,8 +192,14 @@ fn triangular_index(i: usize, j: usize, n: usize) -> usize {
 /// containment is reported in both directions, and how the degenerate
 /// (empty-table) cases are defined.
 ///
+/// Takes either table width, since it is built on `setops::MultiTableMerge`
+/// and never looks at a key: every number below comes from `MergedRow`'s
+/// per-table counts, and which integer type carried the k-mer that produced
+/// them changes nothing. `tests/wide_setops.rs` requires the two widths
+/// to agree.
+///
 /// Rejects `tables` built at different `k` (`setops::check_same_k` --
-/// their `kmer_u64` encodings would not even mean the same thing) and
+/// their packed encodings would not even mean the same thing) and
 /// fewer than two tables (a similarity between one table and nothing is
 /// not a comparison).
 ///
@@ -211,7 +216,7 @@ fn triangular_index(i: usize, j: usize, n: usize) -> usize {
 /// negligible next to the I/O it shares with a plain union; it would only
 /// dominate at an `n` this crate's cohort tooling (`cohort/`) already
 /// handles with sketches, not exact tables, for exactly that reason.
-pub fn pairwise_similarity(tables: &[KmerTable]) -> Result<Vec<PairSimilarity>> {
+pub fn pairwise_similarity<S: MergeSource>(tables: &[S]) -> Result<Vec<PairSimilarity>> {
     check_same_k(tables)?;
     if tables.len() < 2 {
         return Err(FastDnaError::InvalidConfig {
@@ -319,6 +324,7 @@ pub fn pairwise_similarity(tables: &[KmerTable]) -> Result<Vec<PairSimilarity>> 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::ktab::KmerTable;
     use crate::counter::KmerCounter;
     use crate::export;
     use std::path::PathBuf;

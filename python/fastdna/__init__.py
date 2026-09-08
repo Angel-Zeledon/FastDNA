@@ -1165,9 +1165,15 @@ def similarity(tables: Sequence[_PathLike]) -> pa.Table:
     columns `sample_a`, `sample_b`, `shared`, `only_a`, `only_b`,
     `jaccard`, `containment_ab`, `containment_ba` and `bray_curtis`.
 
-    `tables` are `.parquet` k-mer tables (what `fastdna.count()` writes,
-    or `union`/`intersect`/`diff`), not FASTQ files: this compares counts
-    that already exist rather than counting anything.
+    `tables` are `.parquet` k-mer tables (what the CLI's `count` writes, or
+    `union`/`intersect`/`diff`), not FASTQ files: this compares counts that
+    already exist rather than counting anything.
+
+    Either width. A table counted at `k > 32` is keyed on `kmer_bits`
+    rather than `kmer_u64`, and this reads both -- the width is taken from
+    each file's own footer. Every input must share one, which is not a
+    restriction in practice: two widths never share a `k`, and comparing
+    tables built at different `k` is already refused.
 
     **Exact, where `compare_all` is approximate.** `compare_all` builds a
     MinHash sketch per sample and compares those, which is what makes it

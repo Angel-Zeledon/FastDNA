@@ -185,6 +185,8 @@ def test_the_u64_keyed_surface_still_stops_at_32(reads):
 
 
 def _count_to_parquet(reads, tmp_path, k):
+    tmp_path = pathlib.Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
     """Writes a table through the CLI, because `fastdna.count()` returns an
     in-memory `KmerCounts` and cannot write a file carrying the footer
     metadata `KmerTable.open` requires -- the same limitation
@@ -307,3 +309,35 @@ def test_read_filtering_still_requires_a_narrow_table(reads, tmp_path):
         )
     message = str(excinfo.value)
     assert "kmer_bits" in message, message
+
+
+def test_similarity_takes_wide_tables(reads, tmp_path):
+    """`similarity` reads both widths now. Checked against the tables' own
+    row counts, which come from the Parquet footer rather than from the
+    merge that produced these numbers: `shared + only_a` must be `|A|`.
+    """
+    a = _count_to_parquet(reads, tmp_path, 41)
+    # A second sample from the *same* genome but with fewer reads: its
+    # k-mers are a proper subset of A's, so the pair overlaps partially.
+    # A different seed would give an unrelated genome and a jaccard of 0,
+    # which would satisfy nothing.
+    other = tmp_path / "other.fastq"
+    _write_reads(other, n_reads=12, seed=11)
+    b = _count_to_parquet(other, tmp_path / "b", 41)
+
+    table = fastdna.similarity([a, b])
+    assert table.num_rows == 1
+    row = {name: table.column(name)[0].as_py() for name in table.column_names}
+
+    assert row["shared"] + row["only_a"] == len(fastdna.KmerTable.open(a))
+    assert row["shared"] + row["only_b"] == len(fastdna.KmerTable.open(b))
+    assert 0.0 < row["jaccard"] < 1.0, row
+
+
+def test_similarity_refuses_a_mix_of_widths(reads, tmp_path):
+    narrow = _count_to_parquet(reads, tmp_path, 21)
+    wide = _count_to_parquet(reads, tmp_path, 41)
+
+    with pytest.raises(ValueError) as excinfo:
+        fastdna.similarity([narrow, wide])
+    assert "width" in str(excinfo.value), excinfo.value

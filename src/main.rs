@@ -1017,10 +1017,14 @@ fn run_similarity(args: SimilarityArgs) -> Result<()> {
     eprintln!("Inputs: {}", args.input.len());
     eprintln!("--------------------------------------------------");
 
-    let tables = open_tables(&args.input)?;
     let labels: Vec<String> = args.input.iter().map(|p| p.display().to_string()).collect();
 
-    let pairs = similarity::pairwise_similarity(&tables)?;
+    // Same routing as the set operations: one footer read decides the
+    // width, and every input must agree on it.
+    let pairs = match shared_table_key(&args.input)? {
+        ktab::TableKey::Narrow => similarity::pairwise_similarity(&open_tables(&args.input)?)?,
+        ktab::TableKey::Wide => similarity::pairwise_similarity(&open_wide_tables(&args.input)?)?,
+    };
 
     match &args.output {
         Some(path) => {

@@ -157,9 +157,17 @@ La superficie con compatibilidad garantizada es:
   fichero que `WideKmerTable::open` acepta mientras miente sobre su propio
   orden.
 
+  **`similarity` viene con ellas**, y casi gratis: está construida sobre el
+  mismo `MultiTableMerge` y **no mira nunca una clave** -- cada número que
+  reporta sale de los conteos por tabla de `MergedRow`, así que qué entero
+  llevó el k-mer que los produjo no cambia nada. Cambia la firma y ya. Que
+  las dos anchuras coincidan hasta el dígito, incluidos los tres cocientes
+  en coma flotante, es lo que comprueba
+  `similarity_agrees_across_both_widths`.
+
   **Lo que sigue siendo estrecho**, y ahora se dice en un solo sitio:
-  `filter`, `profile` y `similarity`. Esos guardan la referencia como un
-  `Vec<u64>` y contestan cada lectura con una búsqueda binaria sobre él
+  `filter` y `profile`. Esos guardan la referencia como un `Vec<u64>` y
+  contestan cada lectura con una búsqueda binaria sobre él
   (`read_filter::ReferenceIndex`, `read_profile::ProfileIndex`), así que
   ahí el tipo de la clave **es** la estructura de datos, no una anotación.
 

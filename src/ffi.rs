@@ -2117,9 +2117,41 @@ fn similarity_schema() -> Arc<Schema> {
 #[pyfunction]
 fn pairwise_similarity(py: Python<'_>, table_paths: Vec<String>) -> PyResult<PyObject> {
     let paths: Vec<PathBuf> = table_paths.iter().map(PathBuf::from).collect();
-    let pairs = py.allow_threads(|| {
-        let tables = paths.iter().map(KmerTable::open).collect::<Result<Vec<_>, _>>()?;
-        similarity::pairwise_similarity(&tables)
+    let pairs = py.allow_threads(|| -> Result<Vec<similarity::PairSimilarity>, FastDnaError> {
+        // Takes paths rather than open handles (unlike the set operations),
+        // so the width is decided here from the first file's footer and
+        // then required of the rest -- `ktab::table_key`, the same one
+        // `fastdna query` and `fastdna similarity` use.
+        let width = match paths.first() {
+            Some(first) => ktab::table_key(first)?,
+            None => ktab::TableKey::Narrow,
+        };
+        for path in paths.iter().skip(1) {
+            if ktab::table_key(path)? != width {
+                return Err(FastDnaError::InvalidConfig {
+                    parameter: "tables",
+                    reason: format!(
+                        "{} is not the same width as {} -- similarity needs every input table \
+                         at one width, and two widths never share a k in the first place",
+                        path.display(),
+                        paths[0].display()
+                    ),
+                });
+            }
+        }
+        match width {
+            ktab::TableKey::Narrow => {
+                let tables = paths.iter().map(KmerTable::open).collect::<Result<Vec<_>, _>>()?;
+                similarity::pairwise_similarity(&tables)
+            }
+            ktab::TableKey::Wide => {
+                let tables = paths
+                    .iter()
+                    .map(crate::wide_ktab::WideKmerTable::open)
+                    .collect::<Result<Vec<_>, _>>()?;
+                similarity::pairwise_similarity(&tables)
+            }
+        }
     })?;
 
     let mut sample_a: Vec<&str> = Vec::with_capacity(pairs.len());
