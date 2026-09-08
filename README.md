@@ -220,7 +220,7 @@ Often not. The honest comparison, with every row checked against
 
 | | KMC3 | FastDNA |
 |---|---|---|
-| Speed | 110.4 s on the 2.14 GB file | 388.2 s on the same file, same machine. That measures a default path FastDNA no longer has (see above) and the gap has narrowed by an unmeasured amount -- but it has not been re-measured, so KMC3 is the one with a number |
+| Speed | 110.4 s on the 2.14 GB file | 388.2 s on the same file, same machine -- a default path FastDNA no longer has. A native-vs-native rerun on 2026-09-08 put the two in the same range once FastDNA was given a comparable memory budget, but the host's run-to-run spread reached 7x for *both* tools, so it settled nothing. KMC3 is still the one with a trustworthy number |
 | `k` | 1-256 | 1-64. Two bits per base in 128 of them is 64 bases; past that needs a byte-string key that changes the sort order, the Parquet schema and every comparison in the counter |
 | Out-of-core at scale | 729 gigabases of human reads in 33-34 GB (Kokot et al., *Bioinformatics*, 2017) | a disk strategy that is newer, less tuned, and **never benchmarked at that scale** |
 | Counter cap and DB size | `-cs` caps the stored counter; `--opt-out-size` shrinks the database | neither |
@@ -242,9 +242,17 @@ Often not. The honest comparison, with every row checked against
 **What is not settled either way**: the speed comparison. The table above
 predates the default becoming super-k-mer partitioned, which took the same
 file from 24.10 s to 9.88 s on an M3 Pro. Whether that closes a 3.5x gap,
-halves it, or overturns it is not something this repository knows yet --
-`.github/workflows/validation.yml`'s `benchmark` job re-runs the head to
-head natively on x86-64, and its first result is the answer.
+halves it, or overturns it is not something this repository knows yet.
+
+An attempt on 2026-09-08 got closer without arriving: KMC 3.2.4 builds for
+`aarch64` from its own Makefile, so `scripts/bench/head_to_head.py` now
+compiles it there instead of refusing, and both tools run native on one
+machine. On that footing they land in the same range once FastDNA is given
+a comparable memory budget -- but consecutive runs of the *same* tool
+varied by up to 7x on the machine available, so no median from it is
+usable. `docs/BENCHMARKS.md` has the numbers and why they do not count.
+`.github/workflows/validation.yml`'s `benchmark` job, on a quiet x86-64
+runner, is still what answers this.
 
 Counting itself is not in question on either side: FastDNA is **exactly
 equal to KMC3** on real reads at every `k` tested, in both engines (see the

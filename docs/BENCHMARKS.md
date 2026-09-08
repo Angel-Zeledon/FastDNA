@@ -302,6 +302,60 @@ counting happens as a one-time sort-and-compact pass on first read (see
 not new hardware, not a smaller test file -- is the entire difference
 between 920.7 s / 6.96 GB and ~101 s / 8.02 GB.
 
+## The head-to-head against KMC3, attempted natively (2026-09-08)
+
+`README.md` has carried "the speed comparison is not settled" since the
+default became super-k-mer partitioned. This is the attempt to settle it,
+and it did not -- but it removed one of the two blockers permanently and
+identified the other precisely.
+
+**The architecture blocker is gone.** KMC3 ships x86-64 Linux binaries, so
+on the Apple silicon this project is developed on it could only run
+emulated, and `scripts/bench/head_to_head.py` refused to report timings for
+that reason. But **KMC 3.2.4's own Makefile handles `aarch64`**
+(`D_ARCH=ARM64`, `-march=armv8.4-a`). Built from source in a Linux arm64
+container it runs native, alongside a native FastDNA, on one machine. The
+script now does that automatically off x86-64 instead of refusing.
+
+**Correctness, on a second dataset and both tools native.** On the 2.14 GB
+synthetic file (840,000,000 occurrences, k=31, singletons kept):
+
+| | distinct | total |
+|---|---:|---:|
+| KMC3 3.2.4 (native arm64) | 53,776,394 | 840,000,000 |
+| FastDNA | 53,776,394 | 840,000,000 |
+
+**Speed: still unresolved, and now for a reason that is measured.** The
+Docker VM available here has 11 cores and 7.7 GB, and the host carries
+unrelated load. Consecutive runs of the *same* tool on the *same* file
+varied by up to 7x:
+
+| | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| KMC3 `-m5` | 19.95 s | **150.92 s** | 30.06 s |
+| FastDNA `--max-ram 5G` | 22.49 s | 27.52 s | 19.17 s |
+| FastDNA `--strategy binned` | 28.76 s | 18.01 s | **105.91 s** |
+
+No median over a handful of runs survives that spread, and quoting one
+would repeat the mistake the 2026-08-25 retraction was about. What the
+numbers *do* show is that the two are in the same range once FastDNA is
+given a comparable memory budget -- which is more than the old table said,
+and less than a result.
+
+**One thing the run did settle**, and it is about the chooser rather than
+the speed: with the VM's default budget (1,009 MB, derived from what was
+actually free) `auto` estimated an 11.40 GB peak for the in-memory path and
+selected `disk`, FastDNA's slowest strategy, while KMC3 was explicitly
+given `-m5`. Handed the same 5 GB with `--max-ram 5G`, `auto` estimated
+3.49 GB and selected `binned`. The chooser is behaving correctly; a
+benchmark that gives one tool a budget and lets the other discover a
+starved one is not a fair comparison, and the earlier WSL table has the
+same shape of problem.
+
+**What is still owed**: a quiet x86-64 host with room for the working set.
+`.github/workflows/validation.yml`'s `benchmark` job is exactly that, and
+has never run.
+
 ## The per-bin sort: MSD partition instead of `sort_unstable` (2026-09-07)
 
 `binned.rs` sorted each bin with a plain `sort_unstable`, while

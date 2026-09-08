@@ -22,8 +22,23 @@ arm64 host they run under emulation, and emulation does not cost every
 program the same -- a SIMD-heavy inner loop pays far more than a
 memory-bound one. Timing an emulated KMC3 against a native FastDNA would
 produce a flattering number that means nothing, which is worse than no
-number. This script therefore refuses to report timings on a non-x86-64
-host unless `--allow-emulation` is passed, and labels them when it is.
+number.
+
+This script used to refuse outright off x86-64. It no longer has to for
+KMC3: **KMC 3.2.4's own Makefile handles `aarch64`** (`D_ARCH=ARM64`,
+`-march=armv8.4-a`), so on an ARM host `fetch_kmc` clones and builds it
+instead of downloading the wrong architecture. Both tools then run native
+on the same machine, which is the condition that made the refusal
+necessary in the first place. FASTK ships x86-64 binaries only and has no
+such escape, so `--with-fastk` keeps the guard.
+
+What that does *not* fix is a busy or small machine. Measured on an M3 Pro
+with an 11-core, 7.7 GB Docker VM and unrelated host load, consecutive runs
+of the **same** tool on the same file varied by up to 7x (KMC3: 19.95 s
+then 150.92 s; FastDNA binned: 18.01 s then 105.91 s). No median over a
+handful of runs survives that. Architecture was one blocker; a quiet host
+with room for the working set is the other, and this script cannot supply
+it.
 
 ## What is compared, and on what terms
 
@@ -53,8 +68,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -66,7 +83,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: KMC3's own published Linux x86-64 release, pinned. Not a container: this
 #: script's whole point is measuring native speed, and the biocontainer used
-#: by `scripts/validation/` is amd64-only and would be emulated here.
+#: by `scripts/validation/` is amd64-only and would be emulated here. Off
+#: x86-64 this URL is skipped and `build_kmc_from_source` compiles the same
+#: pinned version instead.
+KMC_VERSION = "3.2.4"
 KMC_RELEASE_URL = (
     "https://github.com/refresh-bio/KMC/releases/download/v3.2.4/KMC3.2.4.linux.x64.tar.gz"
 )
@@ -120,10 +140,49 @@ def timed(command: list[str], cwd: Path | None = None) -> tuple[float, int, str]
     return elapsed, peak, proc.stdout
 
 
+def build_kmc_from_source(tools: Path) -> Path:
+    """Compiles KMC3 for *this* machine, for hosts its release archive does
+    not cover.
+
+    KMC ships x86-64 Linux binaries only, which is why this script used to
+    refuse to report timings anywhere else: an emulated competitor against a
+    native FastDNA measures the emulator. But KMC 3.2.4's own Makefile
+    handles `aarch64` (it sets `D_ARCH=ARM64` and `-march=armv8.4-a`), so on
+    an ARM host the honest move is to build it rather than emulate it --
+    both tools native, same machine, same compiler family.
+
+    Requires `git`, `make` and a C++ toolchain. Returns the built binary.
+    """
+    binary = tools / "bin" / "kmc"
+    if binary.is_file():
+        return binary
+    tools.mkdir(parents=True, exist_ok=True)
+    src = tools / "KMC"
+    if not src.is_dir():
+        print(f"  building KMC3 {KMC_VERSION} from source for {platform.machine()}")
+        clone = run(["git", "clone", "--depth", "1", "--branch", f"v{KMC_VERSION}",
+                     "https://github.com/refresh-bio/KMC.git", str(src)])
+        if clone.returncode != 0:
+            die(f"git clone of KMC failed:\n{clone.stderr[-2000:]}")
+    made = run(["make", "-j", str(os.cpu_count() or 4), "kmc"], cwd=src)
+    if made.returncode != 0:
+        made = run(["make", "-j", str(os.cpu_count() or 4)], cwd=src)
+    built = next((p for p in src.rglob("kmc") if p.is_file() and os.access(p, os.X_OK)), None)
+    if built is None:
+        die(f"KMC did not build here:\n{made.stderr[-3000:]}")
+    (tools / "bin").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(built, binary)
+    binary.chmod(0o755)
+    return binary
+
+
 def fetch_kmc(tools: Path) -> Path:
     binary = tools / "bin" / "kmc"
     if binary.is_file():
         return binary
+    # Off x86-64 the release archive is the wrong architecture; build instead.
+    if platform.machine() not in ("x86_64", "AMD64"):
+        return build_kmc_from_source(tools)
     tools.mkdir(parents=True, exist_ok=True)
     archive = tools / "kmc.tar.gz"
     print(f"  downloading {KMC_RELEASE_URL}")
@@ -229,19 +288,24 @@ def main() -> int:
     parser.add_argument("--with-fastk", action="store_true",
                         help="also build and run FASTK (adds minutes to a cold run)")
     parser.add_argument("--allow-emulation", action="store_true",
-                        help="report timings on a non-x86-64 host anyway; see the module docstring")
+                        help="time FASTK on a non-x86-64 host anyway, under emulation; "
+                             "see the module docstring. KMC3 no longer needs this -- it is "
+                             "built from source there instead")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
 
     machine = platform.machine()
-    emulated = machine not in ("x86_64", "AMD64")
-    if emulated and not args.allow_emulation:
-        die(
-            f"this host is {machine}; KMC3 and FASTK are x86-64 Linux binaries and would run "
-            "under emulation, which penalises them unevenly against a native FastDNA. Run this "
-            "on an x86-64 Linux host (the validation workflow does), or pass --allow-emulation "
-            "to get numbers that are labelled as meaningless for comparison."
-        )
+    if machine not in ("x86_64", "AMD64"):
+        # No longer a refusal: `fetch_kmc` builds KMC3 from source here, so
+        # both tools are native and the emulation objection is gone. FASTK
+        # is still x86-64-only, which is why `--with-fastk` keeps the guard.
+        print(f"note: {machine} host -- KMC3 will be built from source so both tools run native")
+        if args.with_fastk and not args.allow_emulation:
+            die(
+                f"this host is {machine} and FASTK ships x86-64 binaries only, so --with-fastk "
+                "would time an emulated competitor against a native FastDNA. Drop --with-fastk, "
+                "run on x86-64, or pass --allow-emulation for numbers labelled as meaningless."
+            )
 
     binary = REPO_ROOT / "target" / "release" / "fastdna"
     if not binary.is_file():
