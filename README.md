@@ -1000,11 +1000,10 @@ who needs that code can take it from the git history at `60b5f82`.
 
 Still ahead:
 
-- A wide form for the remaining k-mer-table operations. `fastdna query`
-  and `fastdna.KmerTable` read a `kmer_bits` table, but
-  `union`/`intersect`/`diff`, `filter` and `similarity` are still
-  `u64`-keyed end to end and reject one by name. Set operations above k=32
-  therefore still have to happen outside FastDNA.
+- A wide form for `filter`, `profile` and `similarity`. `query`,
+  `fastdna.KmerTable` and the set operations read a `kmer_bits` table;
+  these three still hold the reference as a `Vec<u64>` and binary-search it
+  per read, so they reject one by name.
 - A `strategy=`/`max_ram=` parameter on `fastdna.count()`, so the Python
   binding can use the disk strategy and automatic chooser without the
   `FASTDNA_STRATEGY` environment variable.

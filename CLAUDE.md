@@ -20,12 +20,14 @@ the CLI surface (`count`, `sketch`, `dist`, `card`, `peek`, `query`,
 `union`, `intersect`, `diff`, `similarity`, `filter`, `matrix`, `profile`,
 `spectrum`) and the Python API mirroring it -- including
 `count(engine="auto"|"narrow"|"wide")`, which reaches `k = 64` the same
-way the CLI's `--engine` does. One gap remains: `query` and
-`fastdna.KmerTable` read a wide (`kmer_bits`) table, but **the set
-operations, `filter` and `similarity` do not** -- they are `u64`-keyed end
-to end (`setops::MultiTableMerge`'s heap, `read_filter::ReferenceIndex`'s
-binary search over a `Vec<u64>`) and reject one by name rather than
-misreading it. On the Python side that refusal lives in one place,
+way the CLI's `--engine` does. Wide (`kmer_bits`) tables are read by
+`query`, `fastdna.KmerTable`, and the set operations
+(`union`/`intersect`/`diff`, generic over `setops::MergeSource`). What is
+**still narrow-only**: `filter`, `profile` and `similarity`. Those hold the
+reference as a `Vec<u64>` and answer each read by binary search over it
+(`read_filter::ReferenceIndex`, `read_profile::ProfileIndex`), so the key
+type is the data structure rather than an annotation; they reject a wide
+table by name. On the Python side that refusal lives in one place,
 `PyKmerTable::narrow`.
 
 **The machine-learning layer was removed on 2026-09-05** — 31 Python

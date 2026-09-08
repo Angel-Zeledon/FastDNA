@@ -117,6 +117,52 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **Las operaciones de conjuntos aceptan las dos anchuras.**
+  `union`/`intersect`/`diff` eran de clave `u64` de punta a punta; ahora son
+  genéricas sobre un trait nuevo, `setops::MergeSource`, implementado por
+  `KmerTable` (`u64`) y `WideKmerTable` (`u128`).
+
+  **Por qué aquí sí se generaliza y en el motor de conteo no.** La
+  distinción importa y está escrita en el propio módulo: el `u64` del motor
+  de conteo es una elección **medida** -- exactamente igual a KMC3, y cada
+  número de `docs/BENCHMARKS.md` tomado sobre él --, así que generalizarlo
+  volvería a poner esos resultados en duda. La clave de un merge-join es
+  una clave de ordenación y nada más; nada de `setops.rs` se midió nunca
+  sobre el tipo concreto. Una segunda copia del fichero que solo se
+  diferenciara en el ancho de un entero habría sido peor por las dos
+  puntas.
+
+  `MergeSource` es **público**, y no por gusto: las tres operaciones son
+  públicas y genéricas sobre él, así que su tipo de retorno lo nombra y
+  nadie puede usarlas sin poder nombrarlo. Entra en el contrato de
+  compatibilidad y `tests/public_surface.rs` lo cita.
+
+  **Lo que lo sostiene**: `tests/wide_setops.rs`. Contar el mismo FASTQ al
+  mismo `k ≤ 32` con `--engine narrow` y con `--engine wide` da dos tablas
+  de anchura distinta que contienen **los mismos k-mers**; cada operación
+  tiene que devolver el mismo resultado sobre las dos, k-mer a k-mer, ya
+  decodificado a bases. Además se comprueba la identidad
+  `|A ∪ B| = |A| + |B| − |A ∩ B|` y `|A \ B| = |A| − |A ∩ B|`, que no son
+  algo que calcule este crate: son lo que significan las palabras.
+
+  Mezclar anchuras se rechaza por adelantado y con nombre, en el CLI y en
+  Python. Dos anchuras nunca comparten `k`, así que una mezcla siempre es
+  un error; dejarlo al lector daría "falta la columna kmer_bits", que es
+  cierto y no dice nada de lo que quien llama hizo mal.
+
+  Sale también `export::export_wide_pairs_parquet`, con la misma
+  comprobación de orden ascendente que su hermano estrecho y por la misma
+  razón: el footer afirma `sorted_by=kmer_bits` incondicionalmente, y
+  escribir esa afirmación sobre un flujo que no la cumple produciría un
+  fichero que `WideKmerTable::open` acepta mientras miente sobre su propio
+  orden.
+
+  **Lo que sigue siendo estrecho**, y ahora se dice en un solo sitio:
+  `filter`, `profile` y `similarity`. Esos guardan la referencia como un
+  `Vec<u64>` y contestan cada lectura con una búsqueda binaria sobre él
+  (`read_filter::ReferenceIndex`, `read_profile::ProfileIndex`), así que
+  ahí el tipo de la clave **es** la estructura de datos, no una anotación.
+
 - **El motor ancho, validado contra KMC3 y no solo contra el estrecho.**
   Hasta ahora `k > 32` se comprobaba contra el motor `u64` -- que sí está
   medido exactamente igual a KMC3, pero eso hace la garantía indirecta y,

@@ -207,6 +207,103 @@ fn flush_wide_chunk(
     Ok(rows)
 }
 
+/// `export_pairs_parquet`'s wide sibling: writes a stream of already-merged
+/// `(u128, u32)` pairs as a `kmer_bits`-keyed table.
+///
+/// What `setops::union`/`intersect`/`diff` produce when their inputs are
+/// wide tables. Separate from `export_wide_counts_parquet` for the same
+/// reason `export_pairs_parquet` is separate from `export_counts_parquet`:
+/// the input here is a bare iterator that has already been filtered and
+/// combined by its caller, not a counter with a `min_count` still to apply.
+///
+/// The ascending check is not optional. The footer this writes claims
+/// `fastdna.sorted_by=kmer_bits` unconditionally -- true for every in-crate
+/// caller, since the merge is provably ascending -- but `pairs` is a bare
+/// iterator. Writing that claim over a stream that does not hold it would
+/// produce a file `WideKmerTable::open` accepts while silently lying about
+/// its own order. Returning early leaves the destination untouched:
+/// `AtomicFile`'s `Drop` removes the temp file, and `pending.commit()` is
+/// never reached.
+pub fn export_wide_pairs_parquet<P, I>(pairs: I, output_path: P, k: usize) -> Result<usize>
+where
+    P: AsRef<Path>,
+    I: IntoIterator<Item = Result<(u128, u32)>>,
+{
+    let path = output_path.as_ref();
+    let (file, pending) = AtomicFile::create(path)?;
+    let schema = wide_counts_schema(false);
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![
+            KeyValue::new(
+                ktab::SORTED_BY_KEY.to_string(),
+                Some(ktab::SORTED_BY_WIDE_VALUE.to_string()),
+            ),
+            KeyValue::new(ktab::K_KEY.to_string(), Some(k.to_string())),
+        ]))
+        .build();
+
+    let mut writer =
+        ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| export_err(path, e))?;
+    let chunk_size = 131_072;
+    let mut total_written = 0;
+
+    let mut keys = FixedSizeBinaryBuilder::with_capacity(chunk_size, 16);
+    let mut frequencies: Vec<u32> = Vec::with_capacity(chunk_size);
+    let mut sequences: Vec<String> = Vec::new();
+    let mut last_kmer: Option<u128> = None;
+
+    for pair in pairs {
+        let (kmer, count) = pair?;
+        if let Some(prev) = last_kmer {
+            if kmer < prev {
+                return Err(FastDnaError::InvalidConfig {
+                    parameter: "pairs",
+                    reason: format!(
+                        "k-mer {kmer} was written after k-mer {prev}: pairs must be ascending \
+                         by kmer_bits, since this function always records \
+                         fastdna.sorted_by=kmer_bits"
+                    ),
+                });
+            }
+        }
+        last_kmer = Some(kmer);
+
+        keys.append_value(crate::wide_kmer::to_key_bytes(kmer))
+            .map_err(|e| export_err(path, e))?;
+        frequencies.push(count);
+
+        if frequencies.len() >= chunk_size {
+            total_written += flush_wide_chunk(
+                &mut writer,
+                &schema,
+                &mut keys,
+                &mut frequencies,
+                &mut sequences,
+                false,
+                path,
+            )?;
+        }
+    }
+
+    if !frequencies.is_empty() {
+        total_written += flush_wide_chunk(
+            &mut writer,
+            &schema,
+            &mut keys,
+            &mut frequencies,
+            &mut sequences,
+            false,
+            path,
+        )?;
+    }
+
+    writer.close().map_err(|e| export_err(path, e))?;
+    pending.commit()?;
+    Ok(total_written)
+}
+
 /// Writes a wide count table as CSV.
 ///
 /// Columns: `kmer_sequence,frequency`. The 16-byte binary key the Parquet
@@ -214,8 +311,10 @@ fn flush_wide_chunk(
 /// file a packed `u128` is a number nobody can act on, while the decoded
 /// bases are the thing a CSV reader actually wants. The narrow CSV writer
 /// includes `kmer_u64` because a 64-bit integer is what its whole API is
-/// keyed by (`KmerTable`, `query`, the Python surface); no wide equivalent
-/// of those exists yet, so the integer would be a column with no consumer.
+/// keyed by (`KmerTable`, `query`, the Python surface). The wide
+/// equivalents of those now exist (`wide_ktab.rs`) and read the Parquet
+/// form, so a CSV column holding a 39-digit integer would still be one no
+/// reader here consumes.
 pub fn export_wide_counts_csv<P: AsRef<Path>>(
     counts: &crate::wide_counter::WideCounts,
     output_path: P,

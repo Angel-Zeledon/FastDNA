@@ -256,16 +256,54 @@ def test_a_narrow_table_still_opens_as_narrow(reads, tmp_path):
     assert len(table) > 0
 
 
-def test_set_operations_refuse_a_wide_table_by_name(reads, tmp_path):
-    """`union`/`intersect`/`difference` are u64-keyed end to end. Refusing
-    is the honest answer; what this pins is that the refusal names the
-    file and says lookups still work, rather than failing obscurely.
+def test_set_operations_work_on_a_wide_table(reads, tmp_path):
+    """`setops` is generic over the key now, so `union`/`intersect`/
+    `difference` take a wide table and hand back a wide one.
+
+    The assertions are set-algebra identities over a table combined with
+    itself -- answers that hold by definition, not ones this package
+    computed: a self-union and a self-intersection are the table, and a
+    self-difference is empty.
+    """
+    wide = fastdna.KmerTable.open(_count_to_parquet(reads, tmp_path, 41))
+    assert wide.engine == "wide"
+
+    unioned = wide.union(wide, output=str(tmp_path / "u.parquet"))
+    assert unioned.engine == "wide", "a wide input must produce a wide output"
+    assert unioned.k == 41
+    assert len(unioned) == len(wide)
+
+    intersected = wide.intersect(wide, output=str(tmp_path / "i.parquet"))
+    assert len(intersected) == len(wide)
+
+    differenced = wide.difference(wide, output=str(tmp_path / "d.parquet"))
+    assert len(differenced) == 0, "a table minus itself is empty"
+
+
+def test_mixing_widths_in_a_set_operation_is_refused_by_name(reads, tmp_path):
+    """Two widths never share a `k`, so a mixed set is always a mistake."""
+    narrow = fastdna.KmerTable.open(_count_to_parquet(reads, tmp_path, 21))
+    wide = fastdna.KmerTable.open(_count_to_parquet(reads, tmp_path, 41))
+
+    with pytest.raises(ValueError) as excinfo:
+        narrow.union(wide, output=str(tmp_path / "mixed.parquet"))
+    message = str(excinfo.value)
+    assert "narrow" in message and "wide" in message, message
+
+
+def test_read_filtering_still_requires_a_narrow_table(reads, tmp_path):
+    """The honest remaining limit: `filter_reads` indexes the reference as
+    a `Vec[u64]`, so it has no wide form. Pinned so the day it grows one,
+    this test is what has to change.
     """
     wide = fastdna.KmerTable.open(_count_to_parquet(reads, tmp_path, 41))
 
-    for operation in ("union", "intersect", "difference"):
-        with pytest.raises(ValueError) as excinfo:
-            getattr(wide, operation)(wide, output=str(tmp_path / "out.parquet"))
-        message = str(excinfo.value)
-        assert "wide" in message, message
-        assert "kmer_bits" in message, message
+    with pytest.raises(ValueError) as excinfo:
+        fastdna._core.filter_reads(
+            table=wide._raw,
+            inputs=[str(reads)],
+            mode="keep",
+            output=str(tmp_path / "kept.fastq"),
+        )
+    message = str(excinfo.value)
+    assert "kmer_bits" in message, message

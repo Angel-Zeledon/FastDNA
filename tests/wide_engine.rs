@@ -136,10 +136,60 @@ fn k_above_both_engines_reports_the_real_limit() {
     );
 }
 
-/// A wide table is a FastDNA table, and the `u64`-keyed operations must say
-/// so while refusing it -- not report it as an unrecognised file.
+/// The set operations take a wide table now (`setops::MergeSource`), so
+/// what this pins is that they do -- and that the result is a table the
+/// wide reader accepts, not merely that the command exited 0.
+///
+/// This test used to assert the opposite (that `union` refused a wide
+/// table by name). That refusal was real and correct while `setops` was
+/// `u64`-keyed; it is not the behaviour any more, so the assertion is
+/// inverted rather than deleted, which keeps the same code path covered.
 #[test]
-fn u64_operations_refuse_a_wide_table_by_name() {
+fn the_set_operations_take_a_wide_table() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reads: Vec<String> = (0..20).map(|i| sequence(150, i + 41)).collect();
+    let refs: Vec<&str> = reads.iter().map(String::as_str).collect();
+    let input = fastq(dir.path(), "in.fastq", &refs);
+    let table = dir.path().join("wide.parquet");
+
+    let (ok, text) = run(&[
+        "--input", input.to_str().expect("utf8"),
+        "--output", table.to_str().expect("utf8"),
+        "-k", "41", "-q", "0",
+        "--qc", dir.path().join("qc.json").to_str().expect("utf8"),
+    ]);
+    assert!(ok, "wide count failed:\n{text}");
+
+    let unioned = dir.path().join("u.parquet");
+    let (ok, text) = run(&[
+        "union",
+        "--input", table.to_str().expect("utf8"), table.to_str().expect("utf8"),
+        "--output", unioned.to_str().expect("utf8"),
+    ]);
+    assert!(ok, "union on a wide table must succeed now:\n{text}");
+
+    // A table unioned with itself is itself -- every k-mer present in
+    // exactly the same set, so the row count must be unchanged. That is an
+    // answer this test knows without trusting the merge's own arithmetic.
+    let (ok, before) = run(&["query", "--table", table.to_str().expect("utf8"), "--kmer", "0"]);
+    assert!(ok, "query on the input failed:\n{before}");
+    let (ok, after) = run(&["query", "--table", unioned.to_str().expect("utf8"), "--kmer", "0"]);
+    assert!(ok, "the union's output must be a readable wide table:\n{after}");
+
+    let rows = |text: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix("Rows:").map(|n| n.trim().to_string()))
+            .unwrap_or_else(|| panic!("no Rows: line in:\n{text}"))
+    };
+    assert_eq!(rows(&before), rows(&after), "self-union changed the row count");
+    assert!(after.contains("k:     41"), "the output must keep k=41:\n{after}");
+}
+
+/// The operations still keyed on a `u64` must keep saying so by name, not
+/// report a wide table as an unrecognised file. `filter` is the one left;
+/// when it grows a wide form this assertion is what has to change.
+#[test]
+fn the_still_narrow_operations_refuse_a_wide_table_by_name() {
     let dir = tempfile::tempdir().expect("tempdir");
     let reads: Vec<String> = (0..20).map(|i| sequence(150, i + 41)).collect();
     let refs: Vec<&str> = reads.iter().map(String::as_str).collect();
@@ -155,10 +205,12 @@ fn u64_operations_refuse_a_wide_table_by_name() {
     assert!(ok, "wide count failed:\n{text}");
 
     let (ok, text) = run(&[
-        "union",
-        "--input", table.to_str().expect("utf8"), table.to_str().expect("utf8"),
-        "--output", dir.path().join("u.parquet").to_str().expect("utf8"),
+        "filter",
+        "--table", table.to_str().expect("utf8"),
+        "--input", input.to_str().expect("utf8"),
+        "--mode", "keep",
+        "--output", dir.path().join("kept.fastq").to_str().expect("utf8"),
     ]);
-    assert!(!ok, "union on a wide table must fail:\n{text}");
+    assert!(!ok, "filter on a wide table must fail:\n{text}");
     assert!(text.contains("kmer_bits"), "the error must name the wide key column:\n{text}");
 }

@@ -67,4 +67,12 @@ fn the_documented_public_modules_are_reachable() {
     }
     let _: fn(&str, usize) -> Result<u128, FastDnaError> = encode_query_wide_kmer;
     assert_ne!(TableKey::Narrow, TableKey::Wide);
+
+    // `setops::MergeSource` es publico por necesidad, no por gusto:
+    // `union`/`intersect`/`diff` son genericas sobre el, asi que su tipo de
+    // retorno lo nombra y nadie puede usarlas sin poder nombrarlo. Que este
+    // archivo lo pueda citar es la prueba.
+    use fastdna_core::setops::MergeSource;
+    fn assert_key_types<N: MergeSource<Key = u64>, W: MergeSource<Key = u128>>() {}
+    assert_key_types::<KmerTable, WideKmerTable>();
 }

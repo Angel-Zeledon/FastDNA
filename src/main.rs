@@ -34,6 +34,7 @@ use fastdna_core::progress::Progress;
 use fastdna_core::read_filter;
 use fastdna_core::read_profile;
 use fastdna_core::setops;
+use fastdna_core::wide_ktab::WideKmerTable;
 use fastdna_core::similarity::{self, PairSimilarity};
 use fastdna_core::sketch::GenomeSketch;
 
@@ -843,6 +844,47 @@ fn open_tables(paths: &[PathBuf]) -> Result<Vec<KmerTable>> {
     paths.iter().map(KmerTable::open).collect()
 }
 
+fn open_wide_tables(paths: &[PathBuf]) -> Result<Vec<WideKmerTable>> {
+    paths.iter().map(WideKmerTable::open).collect()
+}
+
+/// The one width every input to a set operation must share, decided by the
+/// first file's own footer and then required of the rest.
+///
+/// Checked up front, by name, rather than left to the readers: opening a
+/// `kmer_u64` file with the wide reader fails with "missing a non-nullable
+/// kmer_bits column", which is true but tells a user who mixed a k=21 and
+/// a k=41 table nothing about what they actually did wrong. A mixed set is
+/// always a mistake -- `setops::check_same_k` would reject it a moment
+/// later anyway, since the two widths never share a `k`.
+fn shared_table_key(paths: &[PathBuf]) -> Result<ktab::TableKey> {
+    let Some(first) = paths.first() else {
+        return Ok(ktab::TableKey::Narrow);
+    };
+    let expected = ktab::table_key(first)?;
+    for path in &paths[1..] {
+        let found = ktab::table_key(path)?;
+        if found != expected {
+            let name = |key: ktab::TableKey| match key {
+                ktab::TableKey::Narrow => "narrow (kmer_u64, k<=32)",
+                ktab::TableKey::Wide => "wide (kmer_bits, k>32)",
+            };
+            return Err(FastDnaError::InvalidConfig {
+                parameter: "input tables",
+                reason: format!(
+                    "{} is a {} table, but {} is a {} one -- a set operation needs every input \
+                     at the same width, and two widths never share a k in the first place",
+                    path.display(),
+                    name(found),
+                    first.display(),
+                    name(expected)
+                ),
+            });
+        }
+    }
+    Ok(expected)
+}
+
 /// `fastdna union`: thin console-output wrapper around `setops::union`
 /// (see `cli::UnionArgs`'s doc comment).
 fn run_union(args: UnionArgs) -> Result<()> {
@@ -855,14 +897,25 @@ fn run_union(args: UnionArgs) -> Result<()> {
     println!("Combine: {:?}", args.combine);
     println!("--------------------------------------------------");
 
-    let tables = open_tables(&args.input)?;
-    // Guaranteed non-empty by `--input`'s `num_args = 2..`, so `tables[0]`
-    // cannot panic here.
-    let k = tables[0].k();
-
     let start = Instant::now();
-    let rows = setops::union(&tables, args.combine.into())?;
-    let written = export::export_pairs_parquet(rows, &args.output, k)?;
+    // Both arms are spelled out rather than hidden behind a macro: the two
+    // widths use different readers and different writers, and the pairing
+    // of the two is the thing worth being able to read at a glance.
+    // `tables[0]` cannot panic -- `--input` has `num_args = 2..`.
+    let written = match shared_table_key(&args.input)? {
+        ktab::TableKey::Narrow => {
+            let tables = open_tables(&args.input)?;
+            let k = tables[0].k();
+            let rows = setops::union(&tables, args.combine.into())?;
+            export::export_pairs_parquet(rows, &args.output, k)?
+        }
+        ktab::TableKey::Wide => {
+            let tables = open_wide_tables(&args.input)?;
+            let k = tables[0].k();
+            let rows = setops::union(&tables, args.combine.into())?;
+            export::export_wide_pairs_parquet(rows, &args.output, k)?
+        }
+    };
     let elapsed = start.elapsed().as_secs_f64();
 
     println!("Distinct k-mers written: {written} ({elapsed:.2}s)");
@@ -883,12 +936,21 @@ fn run_intersect(args: IntersectArgs) -> Result<()> {
     println!("Combine: {:?}", args.combine);
     println!("--------------------------------------------------");
 
-    let tables = open_tables(&args.input)?;
-    let k = tables[0].k();
-
     let start = Instant::now();
-    let rows = setops::intersect(&tables, args.combine.into())?;
-    let written = export::export_pairs_parquet(rows, &args.output, k)?;
+    let written = match shared_table_key(&args.input)? {
+        ktab::TableKey::Narrow => {
+            let tables = open_tables(&args.input)?;
+            let k = tables[0].k();
+            let rows = setops::intersect(&tables, args.combine.into())?;
+            export::export_pairs_parquet(rows, &args.output, k)?
+        }
+        ktab::TableKey::Wide => {
+            let tables = open_wide_tables(&args.input)?;
+            let k = tables[0].k();
+            let rows = setops::intersect(&tables, args.combine.into())?;
+            export::export_wide_pairs_parquet(rows, &args.output, k)?
+        }
+    };
     let elapsed = start.elapsed().as_secs_f64();
 
     println!("Distinct k-mers written: {written} ({elapsed:.2}s)");
@@ -912,13 +974,23 @@ fn run_diff(args: DiffArgs) -> Result<()> {
     println!("Max subtract count:  {}", args.max_subtract_count);
     println!("--------------------------------------------------");
 
-    let a = KmerTable::open(&args.input)?;
-    let subtract = open_tables(&args.subtract)?;
-    let k = a.k();
-
     let start = Instant::now();
-    let rows = setops::diff(&a, &subtract, args.max_subtract_count)?;
-    let written = export::export_pairs_parquet(rows, &args.output, k)?;
+    let written = match shared_table_key(&all_inputs)? {
+        ktab::TableKey::Narrow => {
+            let a = KmerTable::open(&args.input)?;
+            let subtract = open_tables(&args.subtract)?;
+            let k = a.k();
+            let rows = setops::diff(&a, &subtract, args.max_subtract_count)?;
+            export::export_pairs_parquet(rows, &args.output, k)?
+        }
+        ktab::TableKey::Wide => {
+            let a = WideKmerTable::open(&args.input)?;
+            let subtract = open_wide_tables(&args.subtract)?;
+            let k = a.k();
+            let rows = setops::diff(&a, &subtract, args.max_subtract_count)?;
+            export::export_wide_pairs_parquet(rows, &args.output, k)?
+        }
+    };
     let elapsed = start.elapsed().as_secs_f64();
 
     println!("Distinct k-mers written: {written} ({elapsed:.2}s)");

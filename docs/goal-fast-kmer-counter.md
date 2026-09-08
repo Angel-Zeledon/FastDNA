@@ -25,9 +25,9 @@ and the `k > 32` engine (`--engine`, up to k=64 -- checkable against KMC3,
 which counts to k=256, and exactly equal to it on real reads at k=33, 41
 and 64, as well as at k=31 with the wide engine forced into the overlap).
 The wide engine is reachable from Python as well
-(`count(engine=...)`), and `query` reads the tables it writes; the set
-operations, `filter` and `similarity` still do not, and say so rather
-than misreading one.
+(`count(engine=...)`), `query` and `KmerTable` read the tables it writes,
+and the set operations take either width. `filter`, `profile` and
+`similarity` still do not, and say so rather than misreading one.
 
 The machine-learning layer is **removed**, not frozen: the scikit-learn
 vectorizer, lineage-aware cross-validation, the leakage audit, feature

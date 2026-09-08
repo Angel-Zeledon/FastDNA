@@ -22,9 +22,8 @@
 //! # Why this is a linear merge-join, not a hash-join
 //!
 //! `docs/feature-gap-analysis.md`'s own framing for S2: "every op is a linear
-//! merge-join -- machinery `disk_spill.rs` already has." Every `KmerTable`'s
-//! rows are already globally sorted, deduplicated `(kmer_u64, frequency)`
-//! pairs (`ktab.rs`'s `open` verifies the sort at row-group boundaries;
+//! merge-join -- machinery `disk_spill.rs` already has." Every table's rows
+//! are already globally sorted, deduplicated `(key, frequency)` pairs (`ktab.rs`'s `open` verifies the sort at row-group boundaries;
 //! `counter.rs`'s `CountTable` invariant guarantees the dedup before a table
 //! is ever written). Given that, combining two or more tables is exactly
 //! what `disk_spill.rs::merge_sources_into` already does for its own
@@ -48,7 +47,7 @@
 //!
 //! `MultiTableMerge` streams `MergedRow`s -- one per distinct k-mer across
 //! every input table, carrying *each* table's own frequency for that k-mer
-//! (or `None` if that table lacks it) -- in ascending `kmer_u64` order.
+//! (or `None` if that table lacks it) -- in ascending key order.
 //! `union`, `intersect` and `diff` are each a thin, different decision over
 //! that same slice: whether to keep the row, and how to fold whichever
 //! per-table frequencies are present down into the single `frequency` column
@@ -56,18 +55,34 @@
 //! "intersect must expose each input's count, not just a boolean" -- the
 //! merge itself always computes every table's individual count for a shared
 //! k-mer; `intersect`'s `combine` argument is only how that Rust-level detail
-//! gets folded into the one column a `(kmer_u64, frequency)` Parquet table
-//! has room for.
+//! gets folded into the one `frequency` column a k-mer table has room for.
+//!
+//! # Both table widths
+//!
+//! Everything here is generic over [`MergeSource`], implemented by
+//! `ktab::KmerTable` (`u64` keys, `k <= 32`) and
+//! `wide_ktab::WideKmerTable` (`u128` keys, `33 <= k <= 64`). That is
+//! deliberately a *different* decision from the one `wide_kmer.rs` and
+//! `wide_ktab.rs` make when they refuse to generify: the counting engine's
+//! `u64` is a measured choice -- exactly equal to KMC3, every benchmark
+//! taken on it -- so making *that* generic would put those results back in
+//! question. A merge-join's key is a sort key and nothing else, and nothing
+//! in this module was ever measured on the concrete type.
+//!
+//! `tests/wide_setops.rs` is what holds the two together: the same reads
+//! counted at the same `k` by each engine give two tables of different
+//! width holding the same k-mers, and every operation here must return the
+//! same result over both, k-mer for k-mer.
 //!
 //! # Output shape
 //!
-//! Every operation here returns a plain `impl Iterator<Item = Result<(u64,
-//! u32)>>` in ascending, deduplicated `kmer_u64` order -- exactly the shape
-//! `export::export_pairs_parquet` writes to Parquet with `ktab.rs`'s
-//! `fastdna.sorted_by`/`fastdna.k` footer metadata attached, so a set
-//! operation's result is immediately reopenable as its own `KmerTable`, with
-//! no conversion step: set operations compose (`union(a, b)`'s output can be
-//! `diff`'d against `c` directly).
+//! Every operation here returns a plain `impl Iterator<Item = Result<(S::Key,
+//! u32)>>` in ascending, deduplicated key order -- exactly the shape
+//! `export::export_pairs_parquet` (or `export_wide_pairs_parquet`) writes to
+//! Parquet with `ktab.rs`'s `fastdna.sorted_by`/`fastdna.k` footer metadata
+//! attached, so a set operation's result is immediately reopenable as its own
+//! table, with no conversion step: set operations compose (`union(a, b)`'s
+//! output can be `diff`'d against `c` directly).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -75,6 +90,7 @@ use std::path::Path;
 
 use crate::error::{FastDnaError, Result};
 use crate::ktab::{KmerTable, RangeIter};
+use crate::wide_ktab::{WideKmerTable, WideRangeIter};
 
 /// Rejects a set operation whose `--output` would overwrite one of its own
 /// input tables. Shared by the CLI (`main.rs::guard_against_setops_output_
@@ -151,9 +167,77 @@ impl CombineOp {
 /// second, subtly different way. Still crate-private: nothing outside this
 /// crate has a `KmerTable` to build a `MultiTableMerge` from in the first
 /// place.
-pub(crate) struct MergedRow {
-    pub(crate) kmer: u64,
+pub(crate) struct MergedRow<K> {
+    pub(crate) kmer: K,
     pub(crate) per_table: Vec<Option<u32>>,
+}
+
+/// A k-mer table this module can merge: something that knows its own `k`
+/// and can hand out its rows, ascending and deduplicated.
+///
+/// This is the one place `setops` is generic, and it is deliberately the
+/// *narrowest* possible abstraction: a sort key and a stream of
+/// `(key, count)`. Everything below -- the heap, the fold, the three
+/// operations -- is already key-agnostic in its logic, so a trait with two
+/// implementations replaces what would otherwise be a second copy of this
+/// file differing only in an integer width.
+///
+/// This is not the "generify the counting engine" that `wide_kmer.rs` and
+/// `wide_ktab.rs` argue against, and the difference is worth stating: the
+/// counting engine's `u64` is a *measured* choice (exactly equal to KMC3,
+/// every benchmark taken on it), so making it generic would put those
+/// results in question. A merge-join's key is a sort key and nothing else.
+/// Nothing here was ever measured on the concrete type.
+///
+/// `pub`, and therefore part of the compatibility contract, because it has
+/// to be: `union`, `intersect` and `diff` are public and generic over it,
+/// so their return type (`impl Iterator<Item = Result<(S::Key, u32)>>`)
+/// names it. A caller cannot use those functions without being able to
+/// name the trait that decides what comes out. Implemented for exactly the
+/// two table types this crate has and not meant to be implemented outside
+/// it, but sealing it would only trade a documented intent for a harder-to-
+/// read one.
+pub trait MergeSource {
+    /// The packed k-mer type: `u64` for a narrow table, `u128` for a wide
+    /// one. `Ord` is what the merge needs; `Display` is for the error
+    /// messages that name an offending k-mer.
+    type Key: Ord + Copy + std::fmt::Display;
+    type Rows: Iterator<Item = Result<(Self::Key, u32)>>;
+
+    /// The `k` this table's rows were packed with, from its own footer
+    /// metadata -- never re-derived from row contents.
+    fn k(&self) -> usize;
+
+    /// A fresh, owned iterator over every row, ascending. Owned rather
+    /// than borrowed so a merge carries no lifetime back to the tables it
+    /// was built from -- see `MultiTableMerge`'s own doc comment.
+    fn rows(&self) -> Result<Self::Rows>;
+}
+
+impl MergeSource for KmerTable {
+    type Key = u64;
+    type Rows = RangeIter;
+
+    fn k(&self) -> usize {
+        KmerTable::k(self)
+    }
+
+    fn rows(&self) -> Result<RangeIter> {
+        self.iter()
+    }
+}
+
+impl MergeSource for WideKmerTable {
+    type Key = u128;
+    type Rows = WideRangeIter;
+
+    fn k(&self) -> usize {
+        WideKmerTable::k(self)
+    }
+
+    fn rows(&self) -> Result<WideRangeIter> {
+        self.iter()
+    }
 }
 
 /// Streams `MergedRow`s across several `KmerTable`s in ascending `kmer_u64`
@@ -173,9 +257,9 @@ pub(crate) struct MergedRow {
 /// an owned iterator with its own file handle, not one borrowed from the
 /// table), so this -- and everything built on it -- carries no lifetime
 /// tied back to the `&[KmerTable]` it was built from.
-pub(crate) struct MultiTableMerge {
-    sources: Vec<RangeIter>,
-    heap: BinaryHeap<Reverse<(u64, usize)>>,
+pub(crate) struct MultiTableMerge<S: MergeSource> {
+    sources: Vec<S::Rows>,
+    heap: BinaryHeap<Reverse<(S::Key, usize)>>,
     /// The count belonging to whichever entry each source currently has *in
     /// the heap* -- mirrors `disk_spill.rs::merge_sources_into`'s own
     /// `pending` buffer and the same reasoning: a source's absence from the
@@ -183,11 +267,14 @@ pub(crate) struct MultiTableMerge {
     pending: Vec<u32>,
 }
 
-impl MultiTableMerge {
-    pub(crate) fn new<'t>(tables: impl IntoIterator<Item = &'t KmerTable>) -> Result<Self> {
-        let mut sources: Vec<RangeIter> = Vec::new();
+impl<S: MergeSource> MultiTableMerge<S> {
+    pub(crate) fn new<'t>(tables: impl IntoIterator<Item = &'t S>) -> Result<Self>
+    where
+        S: 't,
+    {
+        let mut sources: Vec<S::Rows> = Vec::new();
         for table in tables {
-            sources.push(table.iter()?);
+            sources.push(table.rows()?);
         }
 
         let mut pending = vec![0u32; sources.len()];
@@ -220,8 +307,8 @@ impl MultiTableMerge {
     }
 }
 
-impl Iterator for MultiTableMerge {
-    type Item = Result<MergedRow>;
+impl<S: MergeSource> Iterator for MultiTableMerge<S> {
+    type Item = Result<MergedRow<S::Key>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let Reverse((kmer, idx)) = self.heap.pop()?;
@@ -259,11 +346,12 @@ impl Iterator for MultiTableMerge {
 /// merging them by raw integer comparison would silently produce a
 /// nonsensical result rather than fail loudly.
 ///
-/// `pub(crate)`: `cohort_vocab.rs` needs the exact same guard for
-/// `rank_vocabulary`'s own multi-table merge, which is built on this
-/// module's `MultiTableMerge` for the same reason `union`/`intersect`/
-/// `diff` are -- one merge primitive, one k-mismatch check, not two.
-pub(crate) fn check_same_k<'t>(tables: impl IntoIterator<Item = &'t KmerTable>) -> Result<()> {
+/// `pub(crate)` rather than private: `similarity.rs` builds on the same
+/// merge primitive and needs the identical guard -- one merge primitive,
+/// one k-mismatch check, not two.
+pub(crate) fn check_same_k<'t, S: MergeSource + 't>(
+    tables: impl IntoIterator<Item = &'t S>,
+) -> Result<()> {
     let mut tables = tables.into_iter();
     let Some(first) = tables.next() else { return Ok(()) };
     let k = first.k();
@@ -275,7 +363,7 @@ pub(crate) fn check_same_k<'t>(tables: impl IntoIterator<Item = &'t KmerTable>) 
                 parameter: "input tables",
                 reason: format!(
                     "table {} has k={}, but table 0 has k={k} -- a set operation requires every \
-                     input table to share the same k (their kmer_u64 encodings are only \
+                     input table to share the same k (their packed encodings are only \
                      comparable when they do)",
                     idx + 1,
                     table.k()
@@ -286,7 +374,7 @@ pub(crate) fn check_same_k<'t>(tables: impl IntoIterator<Item = &'t KmerTable>) 
     Ok(())
 }
 
-fn require_min_tables(tables: &[KmerTable], op: &'static str) -> Result<()> {
+fn require_min_tables<S>(tables: &[S], op: &'static str) -> Result<()> {
     if tables.len() < 2 {
         return Err(FastDnaError::InvalidConfig {
             parameter: "input tables",
@@ -313,7 +401,10 @@ fn require_min_tables(tables: &[KmerTable], op: &'static str) -> Result<()> {
 /// Streaming: nothing beyond one Arrow batch per input table (`RangeIter`'s
 /// own bound) is held in memory at a time, however many distinct k-mers the
 /// union produces.
-pub fn union(tables: &[KmerTable], combine: CombineOp) -> Result<impl Iterator<Item = Result<(u64, u32)>>> {
+pub fn union<S: MergeSource>(
+    tables: &[S],
+    combine: CombineOp,
+) -> Result<impl Iterator<Item = Result<(S::Key, u32)>>> {
     check_same_k(tables)?;
     require_min_tables(tables, "union")?;
     let merge = MultiTableMerge::new(tables)?;
@@ -334,10 +425,10 @@ pub fn union(tables: &[KmerTable], combine: CombineOp) -> Result<impl Iterator<I
 /// this, and here is how confidently". `Sum`/`Max` remain available for a
 /// caller who wants a different summary of the same per-table counts this
 /// merge already computes.
-pub fn intersect(
-    tables: &[KmerTable],
+pub fn intersect<S: MergeSource>(
+    tables: &[S],
     combine: CombineOp,
-) -> Result<impl Iterator<Item = Result<(u64, u32)>>> {
+) -> Result<impl Iterator<Item = Result<(S::Key, u32)>>> {
     check_same_k(tables)?;
     require_min_tables(tables, "intersect")?;
     let merge = MultiTableMerge::new(tables)?;
@@ -380,18 +471,18 @@ pub fn intersect(
 /// the threshold in *any* of them, not only if it does in all of them --
 /// the natural reading for "remove everything that looks like any of these
 /// references."
-pub fn diff<'a>(
-    a: &'a KmerTable,
-    subtract: &'a [KmerTable],
+pub fn diff<'a, S: MergeSource>(
+    a: &'a S,
+    subtract: &'a [S],
     max_subtract_count: u32,
-) -> Result<impl Iterator<Item = Result<(u64, u32)>>> {
+) -> Result<impl Iterator<Item = Result<(S::Key, u32)>>> {
     if subtract.is_empty() {
         return Err(FastDnaError::InvalidConfig {
             parameter: "subtract",
             reason: "diff needs at least one table to subtract from the input".to_string(),
         });
     }
-    let all: Vec<&KmerTable> = std::iter::once(a).chain(subtract.iter()).collect();
+    let all: Vec<&S> = std::iter::once(a).chain(subtract.iter()).collect();
     check_same_k(all.iter().copied())?;
 
     let merge = MultiTableMerge::new(all)?;
