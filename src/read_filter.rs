@@ -24,13 +24,19 @@
 //! operation into memory (there, either side could be arbitrarily large and
 //! the whole point is to support tables bigger than RAM). Here, one specific
 //! side is expected to be the bounded one, and it is read into memory
-//! exactly once via [`KmerTable::iter`] (already a tested, streaming code
-//! path) into a flat `Vec<u64>`. Because a `KmerTable`'s rows are already
-//! sorted and deduplicated by construction (`ktab.rs`'s own invariant), that
-//! `Vec` needs no re-sorting and no hash table: [`ReferenceIndex::contains`]
-//! is a plain `binary_search`, and the resident structure is exactly 8 bytes
+//! exactly once via the table's own streaming iterator (already a tested
+//! code path) into a flat, sorted `Vec` of keys. Because a table's rows are
+//! already sorted and deduplicated by construction (`ktab.rs`'s own
+//! invariant), that `Vec` needs no re-sorting and no hash table: membership
+//! is a plain `binary_search`, and the resident structure is exactly one key
 //! per distinct reference k-mer -- no frequency column, no per-entry hash
 //! overhead, since filtering only ever asks "is this k-mer present at all".
+//!
+//! Both table widths are supported ([`ReferenceIndex::from_table`] and
+//! [`ReferenceIndex::from_wide_table`]), which costs 8 bytes per k-mer for
+//! a `k <= 32` reference and 16 for one above it. The width belongs to the
+//! reference file, so it is an enum inside the index rather than a type
+//! parameter: no caller of this module ever chooses it.
 //!
 //! This does mean a filtering run's memory scales with the reference
 //! table's own size, not with the input read stream's (which is streamed
@@ -145,6 +151,8 @@ use crate::fastq::{
 };
 use crate::kmer;
 use crate::ktab::KmerTable;
+use crate::wide_kmer;
+use crate::wide_ktab::WideKmerTable;
 
 /// A resident, sorted array of every k-mer in a reference `KmerTable`,
 /// built once per filtering run. See the module doc comment for why this
@@ -152,15 +160,58 @@ use crate::ktab::KmerTable;
 #[derive(Debug, Clone)]
 pub struct ReferenceIndex {
     k: usize,
-    /// Ascending, deduplicated -- inherited directly from `KmerTable::iter`'s
-    /// own guarantee, never re-sorted here.
-    kmers: Vec<u64>,
+    /// Ascending, deduplicated -- inherited directly from the table
+    /// iterator's own guarantee, never re-sorted here.
+    keys: IndexKeys,
     /// The reference table's own file, kept so `run_filter` can reject an
     /// `--output` that points back at it (the table is fully consumed into
     /// `kmers` up front, so nothing would notice a truncated reference file
     /// mid-run -- the damage would only surface the next time anyone tried
     /// to reopen it). See `run_filter`'s own doc comment for the full guard.
     table_path: PathBuf,
+}
+
+/// The resident key array, at whichever width the reference table was
+/// written in.
+///
+/// An enum rather than a generic `ReferenceIndex<K>`: the width is a
+/// property of the *file*, decided at `from_table` time, and every caller
+/// (`filter_records`, `run_filter`, the CLI, the Python binding) works with
+/// one already-built index whose width it never chose. Making the type
+/// generic would push that parameter through all of them to express
+/// something none of them decides.
+///
+/// A wide index costs twice the resident memory per k-mer -- 16 bytes
+/// against 8 -- which is the real price of filtering above k=32 and is
+/// stated rather than discovered.
+#[derive(Debug, Clone)]
+enum IndexKeys {
+    Narrow(Vec<u64>),
+    Wide(Vec<u128>),
+}
+
+/// Reusable per-read scratch for [`matching_fraction`] and
+/// [`read_is_match`].
+///
+/// Holds one buffer per width and uses whichever the index needs, so a
+/// filtering run over millions of reads allocates nothing per read -- the
+/// same "buffers the caller already owns" shape `FastqReader::
+/// next_record_into` uses. The unused buffer stays empty and costs three
+/// words.
+///
+/// This replaced a bare `&mut Vec<u64>` when filtering learned to read wide
+/// tables: the caller cannot know which width the index behind it holds, so
+/// it cannot be asked to bring the right buffer.
+#[derive(Debug, Default, Clone)]
+pub struct KmerScratch {
+    narrow: Vec<u64>,
+    wide: Vec<u128>,
+}
+
+impl KmerScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl ReferenceIndex {
@@ -174,7 +225,29 @@ impl ReferenceIndex {
             let (kmer, _count) = row?;
             kmers.push(kmer);
         }
-        Ok(Self { k: table.k(), kmers, table_path: table.path().to_path_buf() })
+        Ok(Self {
+            k: table.k(),
+            keys: IndexKeys::Narrow(kmers),
+            table_path: table.path().to_path_buf(),
+        })
+    }
+
+    /// `from_table` for a wide (`kmer_bits`, `33 <= k <= 64`) reference.
+    ///
+    /// A separate constructor rather than a widened `from_table`: the two
+    /// take different, unrelated table types, and which one a caller has is
+    /// already decided by `ktab::table_key` before it gets here.
+    pub fn from_wide_table(table: &WideKmerTable) -> Result<Self> {
+        let mut kmers = Vec::with_capacity(table.len() as usize);
+        for row in table.iter()? {
+            let (kmer, _count) = row?;
+            kmers.push(kmer);
+        }
+        Ok(Self {
+            k: table.k(),
+            keys: IndexKeys::Wide(kmers),
+            table_path: table.path().to_path_buf(),
+        })
     }
 
     /// The `k` every resident k-mer was packed with (the reference table's
@@ -192,17 +265,55 @@ impl ReferenceIndex {
 
     /// Number of distinct k-mers held in memory.
     pub fn len(&self) -> usize {
-        self.kmers.len()
+        match &self.keys {
+            IndexKeys::Narrow(k) => k.len(),
+            IndexKeys::Wide(k) => k.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.kmers.is_empty()
+        self.len() == 0
     }
 
-    /// Whether `kmer` (already canonical, `k`-bit-packed) is present in the
-    /// reference. `O(log n)` over the resident array.
-    pub fn contains(&self, kmer: u64) -> bool {
-        self.kmers.binary_search(&kmer).is_ok()
+    /// `"narrow"` or `"wide"` -- which key width this reference was built
+    /// at. Reported for the same reason `KmerCounts::engine` is: it is not
+    /// inferable from `k`, since a table counted with `--engine wide` at
+    /// `k <= 32` is wide too.
+    pub fn width(&self) -> &'static str {
+        match &self.keys {
+            IndexKeys::Narrow(_) => "narrow",
+            IndexKeys::Wide(_) => "wide",
+        }
+    }
+
+    /// Whether `kmer` (already canonical and packed) is in a **narrow**
+    /// reference. `O(log n)` over the resident array; always `false` on a
+    /// wide one, which holds no `u64` keys.
+    ///
+    /// Test-only, where this used to be `pub fn contains(u64)`. With two
+    /// widths there is no correct answer for a public `contains(u64)`
+    /// against a wide index -- `false` would be a silent wrong answer for
+    /// every input -- and which width to ask with is decided by the
+    /// reference file, never by the caller. Real callers use
+    /// [`matching_fraction`], which takes a plain sequence and needs no
+    /// width from them at all; it binary-searches its own arm's `keys`
+    /// directly rather than coming through here, so this has no non-test
+    /// user left and is gated accordingly.
+    #[cfg(test)]
+    pub(crate) fn contains_narrow(&self, kmer: u64) -> bool {
+        match &self.keys {
+            IndexKeys::Narrow(keys) => keys.binary_search(&kmer).is_ok(),
+            IndexKeys::Wide(_) => false,
+        }
+    }
+
+    /// [`Self::contains_narrow`] for a wide reference.
+    #[cfg(test)]
+    pub(crate) fn contains_wide(&self, kmer: u128) -> bool {
+        match &self.keys {
+            IndexKeys::Wide(keys) => keys.binary_search(&kmer).is_ok(),
+            IndexKeys::Narrow(_) => false,
+        }
     }
 }
 
@@ -241,25 +352,52 @@ pub fn validate_min_fraction(min_fraction: f64) -> Result<()> {
 /// read is a distinct case from a genuine zero-fraction read rather than
 /// being silently folded into one.
 ///
-/// `kmer_buf` is a caller-owned scratch buffer, reused across calls (the
-/// same "buffers the caller already owns" shape `FastqReader::
-/// next_record_into` uses) so a filtering run over millions of reads does
-/// not allocate a fresh `Vec` per read.
-pub fn matching_fraction(seq: &[u8], index: &ReferenceIndex, kmer_buf: &mut Vec<u64>) -> Option<f64> {
-    kmer::extract_canonical_kmers_into(seq, index.k(), kmer_buf);
-    if kmer_buf.is_empty() {
+/// `scratch` is a caller-owned buffer, reused across calls (the same
+/// "buffers the caller already owns" shape `FastqReader::next_record_into`
+/// uses) so a filtering run over millions of reads does not allocate a
+/// fresh `Vec` per read. It carries one buffer per key width because the
+/// caller cannot know which width the index holds -- see [`KmerScratch`].
+///
+/// The read is extracted at whichever width the *reference* was built at,
+/// which is the only choice that can be right: a read has no width of its
+/// own, and the comparison is against the reference's keys.
+pub fn matching_fraction(
+    seq: &[u8],
+    index: &ReferenceIndex,
+    scratch: &mut KmerScratch,
+) -> Option<f64> {
+    let (matched, total) = match &index.keys {
+        IndexKeys::Narrow(keys) => {
+            kmer::extract_canonical_kmers_into(seq, index.k(), &mut scratch.narrow);
+            let found = scratch.narrow.iter().filter(|km| keys.binary_search(km).is_ok()).count();
+            (found, scratch.narrow.len())
+        }
+        IndexKeys::Wide(keys) => {
+            wide_kmer::extract_canonical_kmers_into(seq, index.k(), &mut scratch.wide);
+            let found = scratch.wide.iter().filter(|km| keys.binary_search(km).is_ok()).count();
+            (found, scratch.wide.len())
+        }
+        // The two arms binary-search their own `keys` directly rather than
+        // going through `contains_narrow`/`contains_wide`: those re-match
+        // on the width once per k-mer, and this is the per-read hot loop.
+    };
+    if total == 0 {
         return None;
     }
-    let matched = kmer_buf.iter().filter(|&&km| index.contains(km)).count();
-    Some(matched as f64 / kmer_buf.len() as f64)
+    Some(matched as f64 / total as f64)
 }
 
 /// Whether `seq` matches the reference at `min_fraction` (`>=`, inclusive --
 /// see the module doc comment). A read with no k-mers of its own
 /// (`matching_fraction` returning `None`) never matches, regardless of
 /// `min_fraction`.
-pub fn read_is_match(seq: &[u8], index: &ReferenceIndex, min_fraction: f64, kmer_buf: &mut Vec<u64>) -> bool {
-    matches!(matching_fraction(seq, index, kmer_buf), Some(fraction) if fraction >= min_fraction)
+pub fn read_is_match(
+    seq: &[u8],
+    index: &ReferenceIndex,
+    min_fraction: f64,
+    scratch: &mut KmerScratch,
+) -> bool {
+    matches!(matching_fraction(seq, index, scratch), Some(fraction) if fraction >= min_fraction)
 }
 
 /// Outcome of a filtering run: how many reads were read in total, and how
@@ -385,7 +523,7 @@ pub fn filter_records<S: RecordSource, W: Write>(
     fallback_path: &Path,
 ) -> Result<FilterStats> {
     let mut record = FastqRecord::default();
-    let mut kmer_buf: Vec<u64> = Vec::new();
+    let mut kmer_buf = KmerScratch::new();
     let mut stats = FilterStats::default();
 
     loop {
@@ -550,7 +688,7 @@ pub fn filter_records_paired<W: Write>(
 ) -> Result<PairedFilterStats> {
     let mut rec1 = FastqRecord::default();
     let mut rec2 = FastqRecord::default();
-    let mut kmer_buf: Vec<u64> = Vec::new();
+    let mut kmer_buf = KmerScratch::new();
     let mut stats = PairedFilterStats::default();
 
     loop {
@@ -735,6 +873,22 @@ mod tests {
         (ReferenceIndex::from_table(&table).unwrap(), path)
     }
 
+    /// `build_index` for a wide reference: counts `seqs` at `k > 32` with
+    /// the u128 engine, exports the `kmer_bits` table, and indexes it.
+    fn build_wide_index(name: &str, k: usize, seqs: &[&str]) -> (ReferenceIndex, PathBuf) {
+        let path = temp_path(name);
+        let mut counter = crate::wide_counter::WideKmerCounter::new();
+        let mut kmers = Vec::new();
+        for seq in seqs {
+            wide_kmer::extract_canonical_kmers_into(seq.as_bytes(), k, &mut kmers);
+            counter.insert_batch(&kmers);
+        }
+        let counts = counter.finish();
+        crate::export::export_wide_counts_parquet(&counts, &path, k, false).unwrap();
+        let table = WideKmerTable::open(&path).unwrap();
+        (ReferenceIndex::from_wide_table(&table).unwrap(), path)
+    }
+
     fn cleanup(paths: &[PathBuf]) {
         for p in paths {
             let _ = std::fs::remove_file(p);
@@ -743,14 +897,67 @@ mod tests {
 
     // -- ReferenceIndex --------------------------------------------------
 
+    /// The wide half of `reference_index_reports_membership_correctly`.
+    /// The keys are not written by hand -- there is no readable literal for
+    /// a 41-base k-mer -- so they are re-derived from the same sequence the
+    /// index was built from, and a k-mer from a *different* sequence stands
+    /// in for the absent case.
+    #[test]
+    fn a_wide_reference_index_reports_membership_correctly() {
+        const PRESENT: &str = "ACGTTGCAAGGCTTACCGATCGATTACAGCATCGGATCCATTGCA";
+        const ABSENT: &str = "TTTTTTTTTTGGGGGGGGGGCCCCCCCCCCAAAAAAAAAATTTTT";
+        let (index, p) = build_wide_index("wide_membership", 41, &[PRESENT]);
+
+        assert_eq!(index.width(), "wide");
+        assert_eq!(index.k(), 41);
+        assert!(!index.is_empty());
+
+        for km in wide_kmer::extract_canonical_kmers(PRESENT.as_bytes(), 41) {
+            assert!(index.contains_wide(km), "a k-mer of the reference must be present");
+        }
+        for km in wide_kmer::extract_canonical_kmers(ABSENT.as_bytes(), 41) {
+            assert!(!index.contains_wide(km), "a k-mer of another sequence must be absent");
+        }
+
+        // And a narrow lookup against a wide index answers `false` rather
+        // than pretending: the index holds no u64 keys at all.
+        assert!(!index.contains_narrow(0));
+
+        cleanup(&[p]);
+    }
+
+    /// The read-level entry point over a wide reference: a read drawn from
+    /// the reference matches completely, one from elsewhere not at all, and
+    /// a read too short for `k` is `None` rather than a zero fraction.
+    #[test]
+    fn matching_fraction_works_against_a_wide_reference() {
+        const PRESENT: &str = "ACGTTGCAAGGCTTACCGATCGATTACAGCATCGGATCCATTGCA";
+        const ABSENT: &str = "TTTTTTTTTTGGGGGGGGGGCCCCCCCCCCAAAAAAAAAATTTTT";
+        let (index, p) = build_wide_index("wide_fraction", 41, &[PRESENT]);
+        let mut buf = KmerScratch::new();
+
+        assert_eq!(matching_fraction(PRESENT.as_bytes(), &index, &mut buf), Some(1.0));
+        assert_eq!(matching_fraction(ABSENT.as_bytes(), &index, &mut buf), Some(0.0));
+        assert_eq!(
+            matching_fraction(b"ACGT", &index, &mut buf),
+            None,
+            "4 bases < k=41 yields no k-mers, which is not a zero fraction"
+        );
+        assert!(read_is_match(PRESENT.as_bytes(), &index, 1.0, &mut buf));
+        assert!(!read_is_match(ABSENT.as_bytes(), &index, 0.01, &mut buf));
+
+        cleanup(&[p]);
+    }
+
     #[test]
     fn reference_index_reports_membership_correctly() {
         let (index, p) = build_index("membership", 4, &[6, 6, 0]);
         assert_eq!(index.len(), 2);
-        assert!(index.contains(6));
-        assert!(index.contains(0));
-        assert!(!index.contains(3), "3 lies between the two keys but is not itself present");
-        assert!(!index.contains(u64::MAX));
+        assert!(index.contains_narrow(6));
+        assert!(index.contains_narrow(0));
+        assert!(!index.contains_narrow(3), "3 lies between the two keys but is not itself present");
+        assert!(!index.contains_narrow(u64::MAX));
+        assert_eq!(index.width(), "narrow");
         cleanup(&[p]);
     }
 
@@ -758,7 +965,7 @@ mod tests {
     fn reference_index_from_an_empty_table_contains_nothing() {
         let (index, p) = build_index("empty_ref", 4, &[]);
         assert!(index.is_empty());
-        assert!(!index.contains(0));
+        assert!(!index.contains_narrow(0));
         cleanup(&[p]);
     }
 
@@ -767,7 +974,7 @@ mod tests {
     #[test]
     fn matching_fraction_is_none_for_a_read_shorter_than_k() {
         let (index, p) = build_index("short_read", 8, &[1, 2, 3]);
-        let mut buf = Vec::new();
+        let mut buf = KmerScratch::new();
         assert_eq!(matching_fraction(b"ACG", &index, &mut buf), None, "3 bases < k=8 yields no k-mers");
         cleanup(&[p]);
     }
@@ -775,7 +982,7 @@ mod tests {
     #[test]
     fn a_read_with_no_kmers_never_matches_in_either_mode_even_at_zero_threshold() {
         let (index, p) = build_index("short_read_modes", 8, &[]);
-        let mut buf = Vec::new();
+        let mut buf = KmerScratch::new();
         // min_fraction = 0.0 would make a genuine 0/n fraction match; a read
         // with *no* k-mers at all must still not match, by design.
         assert!(!read_is_match(b"AC", &index, 0.0, &mut buf));
@@ -791,7 +998,7 @@ mod tests {
         let kmers = kmer::extract_canonical_kmers(seq, 4);
         let (index, p) = build_index("full_match", 4, &kmers);
 
-        let mut buf = Vec::new();
+        let mut buf = KmerScratch::new();
         let fraction = matching_fraction(seq, &index, &mut buf).unwrap();
         assert!((fraction - 1.0).abs() < 1e-9, "every k-mer of this read is in the reference: {fraction}");
         assert!(read_is_match(seq, &index, 1.0, &mut buf));
@@ -810,7 +1017,7 @@ mod tests {
         let unrelated = kmer::extract_canonical_kmers(b"TTTTTTTT", 4);
         let (index, p) = build_index("no_overlap", 4, &unrelated);
 
-        let mut buf = Vec::new();
+        let mut buf = KmerScratch::new();
         let fraction = matching_fraction(seq, &index, &mut buf).unwrap();
         assert_eq!(fraction, 0.0);
         assert!(
@@ -835,7 +1042,7 @@ mod tests {
         assert_eq!(kmers.len(), 3, "sanity: this fixture must yield exactly 3 k-mers");
         let (index, p) = build_index("boundary", 4, &kmers[..2]);
 
-        let mut buf = Vec::new();
+        let mut buf = KmerScratch::new();
         let fraction = matching_fraction(seq, &index, &mut buf).unwrap();
         assert!((fraction - (2.0 / 3.0)).abs() < 1e-9, "fraction: {fraction}");
         assert!(read_is_match(seq, &index, fraction, &mut buf), "a fraction exactly at the threshold must match (>=)");

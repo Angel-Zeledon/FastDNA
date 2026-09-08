@@ -78,7 +78,7 @@
 //! since the whole point of a profile is the count itself.
 //!
 //! `ReferenceIndex` was not widened to optionally carry counts (e.g. a
-//! `Vec<Option<u32>>` alongside its `Vec<u64>`). That type is directly
+//! `Vec<Option<u32>>` alongside its keys). That type is directly
 //! covered by `read_filter.rs`'s own tests and is reachable from a stable
 //! public method (`ReferenceIndex::from_table`) used by both the CLI and
 //! `ffi.rs::filter_reads`; changing its shape to serve a second, unrelated
@@ -89,8 +89,15 @@
 //! type instead: same construction shape (stream `KmerTable::iter` once
 //! into a resident, sorted structure), same complexity characteristics
 //! (`O(n)` build, `O(log n)` point lookup, no hash overhead), but an
-//! explicit `Vec<u32>` of counts parallel to the sorted `Vec<u64>` of keys,
-//! since a profile is never asked "present or not" -- only "what count".
+//! explicit `Vec<u32>` of counts parallel to the sorted keys, since a
+//! profile is never asked "present or not" -- only "what count".
+//!
+//! Both widths, like `ReferenceIndex`: `ProfileIndex::from_wide_table`
+//! builds the same structure over `u128` keys. The run-length encoder in
+//! `build_read_profile` sees neither -- extraction and reference lookup
+//! happen first and hand it `(position, count)` pairs -- which is why the
+//! part carrying the gap rules and run boundaries exists once rather than
+//! once per width.
 //!
 //! Memory: resident on the reference table's size, exactly as
 //! `ReferenceIndex` documents for filtering -- the same deliberate tradeoff,
@@ -178,6 +185,7 @@ use crate::atomic::AtomicFile;
 use crate::error::{FastDnaError, Result};
 use crate::fastq::{FastqReadError, FastqRecord, InputSpec, MultiSourceReader, RecordSource};
 use crate::kmer;
+use crate::wide_kmer;
 use crate::ktab::KmerTable;
 
 /// A resident, sorted `(k-mer, count)` index built once per profiling run --
@@ -187,11 +195,43 @@ use crate::ktab::KmerTable;
 #[derive(Debug, Clone)]
 pub struct ProfileIndex {
     k: usize,
-    /// Ascending, deduplicated -- inherited directly from `KmerTable::
-    /// iter`'s own guarantee, never re-sorted here.
-    kmers: Vec<u64>,
-    /// `counts[i]` is the reference table's frequency for `kmers[i]`.
+    /// Ascending, deduplicated -- inherited directly from the table
+    /// iterator's own guarantee, never re-sorted here.
+    kmers: ProfileKeys,
+    /// `counts[i]` is the reference table's frequency for key `i`.
     counts: Vec<u32>,
+}
+
+/// The resident key array, at whichever width the reference was written in
+/// -- the same shape, and the same reasoning, as
+/// `read_filter::IndexKeys`: the width belongs to the file, so it is an
+/// enum here rather than a type parameter threaded through every caller.
+#[derive(Debug, Clone)]
+enum ProfileKeys {
+    Narrow(Vec<u64>),
+    Wide(Vec<u128>),
+}
+
+/// Per-read scratch for [`build_read_profile`], reused across reads.
+///
+/// Holds one extraction buffer per key width plus the resolved
+/// `(position, reference count)` pairs the run-length encoder actually
+/// works over. Splitting the extraction from the encoding is what lets the
+/// RLE loop -- the part with the gap handling and the run-boundary rules --
+/// exist once rather than once per width: by the time it runs, the key is
+/// already gone.
+#[derive(Debug, Default, Clone)]
+pub struct ProfileScratch {
+    narrow: Vec<(u32, u64)>,
+    wide: Vec<(u32, u128)>,
+    /// `(read position, the reference's count for the k-mer there)`.
+    resolved: Vec<(u32, u32)>,
+}
+
+impl ProfileScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl ProfileIndex {
@@ -206,7 +246,21 @@ impl ProfileIndex {
             kmers.push(kmer);
             counts.push(count);
         }
-        Ok(Self { k: table.k(), kmers, counts })
+        Ok(Self { k: table.k(), kmers: ProfileKeys::Narrow(kmers), counts })
+    }
+
+    /// `from_table` for a wide (`kmer_bits`, `33 <= k <= 64`) reference.
+    /// Twice the resident bytes per k-mer, which is the price of profiling
+    /// above k=32 and is stated rather than discovered.
+    pub fn from_wide_table(table: &crate::wide_ktab::WideKmerTable) -> Result<Self> {
+        let mut kmers = Vec::with_capacity(table.len() as usize);
+        let mut counts = Vec::with_capacity(table.len() as usize);
+        for row in table.iter()? {
+            let (kmer, count) = row?;
+            kmers.push(kmer);
+            counts.push(count);
+        }
+        Ok(Self { k: table.k(), kmers: ProfileKeys::Wide(kmers), counts })
     }
 
     /// The `k` every resident k-mer was packed with (the reference table's
@@ -218,20 +272,48 @@ impl ProfileIndex {
 
     /// Number of distinct k-mers held in memory.
     pub fn len(&self) -> usize {
-        self.kmers.len()
+        self.counts.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.kmers.is_empty()
+        self.counts.is_empty()
     }
 
-    /// The reference table's frequency for `kmer` (already canonical,
-    /// `k`-bit-packed), or `None` if it is absent from the reference --
+    /// `"narrow"` or `"wide"` -- which key width this reference was built
+    /// at, which `k` alone does not answer (a table counted with
+    /// `--engine wide` below k=32 is wide too).
+    pub fn width(&self) -> &'static str {
+        match &self.kmers {
+            ProfileKeys::Narrow(_) => "narrow",
+            ProfileKeys::Wide(_) => "wide",
+        }
+    }
+
+    /// The reference table's frequency for `kmer` (already canonical and
+    /// packed) in a **narrow** reference, or `None` if it is absent --
     /// callers building a profile treat an absent k-mer as count `0`, not as
     /// missing data (see the module doc comment's summary-statistics
     /// section for why that distinction matters and where it is drawn).
-    pub fn get(&self, kmer: u64) -> Option<u32> {
-        self.kmers.binary_search(&kmer).ok().map(|i| self.counts[i])
+    ///
+    /// Always `None` on a wide reference, which holds no `u64` keys. This
+    /// was `pub fn get(u64)` before profiling learned both widths; it is
+    /// crate-private now for the reason
+    /// `read_filter::ReferenceIndex::contains_narrow` gives -- there is no
+    /// correct public answer for a `u64` lookup against a `u128` index, and
+    /// no caller chooses the width anyway.
+    pub(crate) fn get_narrow(&self, kmer: u64) -> Option<u32> {
+        match &self.kmers {
+            ProfileKeys::Narrow(keys) => keys.binary_search(&kmer).ok().map(|i| self.counts[i]),
+            ProfileKeys::Wide(_) => None,
+        }
+    }
+
+    /// [`Self::get_narrow`] for a wide reference.
+    pub(crate) fn get_wide(&self, kmer: u128) -> Option<u32> {
+        match &self.kmers {
+            ProfileKeys::Wide(keys) => keys.binary_search(&kmer).ok().map(|i| self.counts[i]),
+            ProfileKeys::Narrow(_) => None,
+        }
     }
 }
 
@@ -314,7 +396,7 @@ fn median_of_sorted(sorted: &[u32]) -> Option<f64> {
 pub fn build_read_profile(
     seq: &[u8],
     index: &ProfileIndex,
-    positions_buf: &mut Vec<(u32, u64)>,
+    scratch: &mut ProfileScratch,
 ) -> Result<(Vec<RleRun>, ProfileSummaryStats)> {
     if seq.len() > u32::MAX as usize {
         return Err(FastDnaError::InvalidConfig {
@@ -327,20 +409,41 @@ pub fn build_read_profile(
         });
     }
 
-    kmer::extract_canonical_kmers_with_positions_into(seq, index.k(), positions_buf);
+    // Extraction and reference lookup happen here, at the index's own
+    // width; everything below works over `(position, count)` pairs and has
+    // no key in it at all. That split is why the run-length encoder -- the
+    // part carrying the gap rules and the run boundaries -- exists once
+    // instead of once per width.
+    let resolved = &mut scratch.resolved;
+    resolved.clear();
+    match index.width() {
+        "wide" => {
+            wide_kmer::extract_canonical_kmers_with_positions_into(seq, index.k(), &mut scratch.wide);
+            resolved.reserve(scratch.wide.len());
+            for &(pos, km) in scratch.wide.iter() {
+                resolved.push((pos, index.get_wide(km).unwrap_or(0)));
+            }
+        }
+        _ => {
+            kmer::extract_canonical_kmers_with_positions_into(seq, index.k(), &mut scratch.narrow);
+            resolved.reserve(scratch.narrow.len());
+            for &(pos, km) in scratch.narrow.iter() {
+                resolved.push((pos, index.get_narrow(km).unwrap_or(0)));
+            }
+        }
+    }
 
-    if positions_buf.is_empty() {
+    if resolved.is_empty() {
         return Ok((Vec::new(), ProfileSummaryStats::empty()));
     }
 
     let mut runs: Vec<RleRun> = Vec::new();
-    let mut counts_for_stats: Vec<u32> = Vec::with_capacity(positions_buf.len());
+    let mut counts_for_stats: Vec<u32> = Vec::with_capacity(resolved.len());
     let mut n_present: u32 = 0;
 
     let mut idx = 0usize;
-    while idx < positions_buf.len() {
-        let (start, kmer_bits) = positions_buf[idx];
-        let count = index.get(kmer_bits).unwrap_or(0);
+    while idx < resolved.len() {
+        let (start, count) = resolved[idx];
         counts_for_stats.push(count);
         if count > 0 {
             n_present += 1;
@@ -349,8 +452,8 @@ pub fn build_read_profile(
         let mut run_length: u32 = 1;
         let mut cur_pos = start;
         let mut next_idx = idx + 1;
-        while next_idx < positions_buf.len() {
-            let (next_pos, next_kmer) = positions_buf[next_idx];
+        while next_idx < resolved.len() {
+            let (next_pos, next_count) = resolved[next_idx];
             // A run never crosses a gap: two positions are only part of the
             // same run when they are numerically consecutive (`next_pos ==
             // cur_pos + 1`), not merely adjacent in `positions_buf` -- an
@@ -359,7 +462,6 @@ pub fn build_read_profile(
             if next_pos != cur_pos + 1 {
                 break;
             }
-            let next_count = index.get(next_kmer).unwrap_or(0);
             if next_count != count {
                 break;
             }
@@ -378,7 +480,7 @@ pub fn build_read_profile(
 
     counts_for_stats.sort_unstable();
     let stats = ProfileSummaryStats {
-        n_kmers: positions_buf.len() as u32,
+        n_kmers: resolved.len() as u32,
         n_present_kmers: n_present,
         min_count: counts_for_stats.first().copied(),
         median_count: median_of_sorted(&counts_for_stats),
@@ -636,7 +738,7 @@ pub fn run_profile(inputs: Vec<InputSpec>, index: &ProfileIndex, profile_output:
     let mut summary_chunk = SummaryChunkBuffers::with_capacity(CHUNK_SIZE);
 
     let mut record = FastqRecord::default();
-    let mut positions_buf: Vec<(u32, u64)> = Vec::new();
+    let mut positions_buf = ProfileScratch::new();
     let mut stats = ProfileStats::default();
     let mut record_no: u64 = 0;
     let fallback_path = PathBuf::from("<inputs>");
@@ -745,9 +847,9 @@ mod tests {
     #[test]
     fn profile_index_reports_the_exact_recorded_count() {
         let (index, p) = build_index("index_hit", 4, &[6, 6, 6, 0]);
-        assert_eq!(index.get(6), Some(3));
-        assert_eq!(index.get(0), Some(1));
-        assert_eq!(index.get(3), None, "3 lies between the two keys but is not itself present");
+        assert_eq!(index.get_narrow(6), Some(3));
+        assert_eq!(index.get_narrow(0), Some(1));
+        assert_eq!(index.get_narrow(3), None, "3 lies between the two keys but is not itself present");
         cleanup(&[p]);
     }
 
@@ -755,7 +857,7 @@ mod tests {
     fn profile_index_from_an_empty_table_has_nothing() {
         let (index, p) = build_index("index_empty", 4, &[]);
         assert!(index.is_empty());
-        assert_eq!(index.get(0), None);
+        assert_eq!(index.get_narrow(0), None);
         cleanup(&[p]);
     }
 
@@ -789,7 +891,7 @@ mod tests {
         }
         let (index, p) = build_index("one_run", 4, &entries);
 
-        let mut buf = Vec::new();
+        let mut buf = ProfileScratch::new();
         let (runs, stats) = build_read_profile(seq, &index, &mut buf).unwrap();
 
         assert_eq!(runs, vec![RleRun { start: 0, run_length: 5, count: 7 }]);
@@ -812,7 +914,7 @@ mod tests {
         let unrelated = kmer::extract_canonical_kmers(b"GGGGGGGG", 4);
         let (index, p) = build_index("all_absent", 4, &unrelated);
 
-        let mut buf = Vec::new();
+        let mut buf = ProfileScratch::new();
         let (runs, stats) = build_read_profile(seq, &index, &mut buf).unwrap();
 
         assert_eq!(runs, vec![RleRun { start: 0, run_length: 5, count: 0 }]);
@@ -831,7 +933,7 @@ mod tests {
     fn a_read_shorter_than_k_yields_an_empty_profile_and_a_null_summary() {
         let (index, p) = build_index("too_short", 8, &[1, 2, 3]);
 
-        let mut buf = Vec::new();
+        let mut buf = ProfileScratch::new();
         let (runs, stats) = build_read_profile(b"ACG", &index, &mut buf).unwrap();
 
         assert!(runs.is_empty());
@@ -857,7 +959,7 @@ mod tests {
         // would wrongly collapse into a single run.
         let (index, p) = build_index("gap_same_count", 4, &[acgt_kmer, acgt_kmer]);
 
-        let mut buf = Vec::new();
+        let mut buf = ProfileScratch::new();
         let (runs, stats) = build_read_profile(seq, &index, &mut buf).unwrap();
 
         assert_eq!(
@@ -896,7 +998,7 @@ mod tests {
         }
         let (index, p) = build_index("count_change", 4, &entries);
 
-        let mut buf = Vec::new();
+        let mut buf = ProfileScratch::new();
         let (runs, stats) = build_read_profile(seq, &index, &mut buf).unwrap();
 
         assert_eq!(
@@ -928,7 +1030,7 @@ mod tests {
         let seq = b"ACGTNNNNACGTACGT";
         let (index, p) = build_index("ambiguous", 4, &[]);
 
-        let mut buf = Vec::new();
+        let mut buf = ProfileScratch::new();
         let (runs, stats) = build_read_profile(seq, &index, &mut buf).unwrap();
 
         let mut expected_positions = Vec::new();
@@ -993,16 +1095,16 @@ mod tests {
         }
         let (index, p) = build_index("round_trip_real", 4, &entries);
 
-        let mut buf = Vec::new();
+        let mut buf = ProfileScratch::new();
         let (runs, _stats) = build_read_profile(seq, &index, &mut buf).unwrap();
         let expanded = expand_rle(&runs);
 
         // Independently recompute the expected per-position counts by
         // looking each position's k-mer up directly, with no RLE involved.
-        let mut positions_buf = Vec::new();
-        kmer::extract_canonical_kmers_with_positions_into(seq, 4, &mut positions_buf);
+        let mut positions: Vec<(u32, u64)> = Vec::new();
+        kmer::extract_canonical_kmers_with_positions_into(seq, 4, &mut positions);
         let direct: Vec<(u32, u32)> =
-            positions_buf.iter().map(|&(pos, km)| (pos, index.get(km).unwrap_or(0))).collect();
+            positions.iter().map(|&(pos, km)| (pos, index.get_narrow(km).unwrap_or(0))).collect();
 
         assert_eq!(expanded, direct);
         cleanup(&[p]);

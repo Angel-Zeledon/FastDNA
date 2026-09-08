@@ -26,8 +26,9 @@ which counts to k=256, and exactly equal to it on real reads at k=33, 41
 and 64, as well as at k=31 with the wide engine forced into the overlap).
 The wide engine is reachable from Python as well
 (`count(engine=...)`), `query` and `KmerTable` read the tables it writes,
-and the set operations and `similarity` take either width. `filter` and
-`profile` still do not, and say so rather than misreading one.
+and every operation that reads a k-mer table takes either width -- the set
+operations, `similarity`, `filter`, `profile`. Sketching and the estimators
+still stop at k=32; they hash from FASTQ, never from a table.
 
 The machine-learning layer is **removed**, not frozen: the scikit-learn
 vectorizer, lineage-aware cross-validation, the leakage audit, feature

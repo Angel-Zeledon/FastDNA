@@ -411,13 +411,14 @@ at the end). Companion documents: `ml-genomics-roadmap.md` (ML side),
     two widths to agree k-mer for k-mer on the same reads counted by both
     engines.
 
-    Still narrow-only, and refused by name rather than misread
-    (`ktab::SORTED_BY_WIDE_VALUE`): `filter`, `profile` and sketching. A
-    wide table is a
-    Parquet file keyed on 16 big-endian bytes; those operations are all
-    `u64`-keyed end to end -- `setops::MultiTableMerge`'s heap and
-    `read_filter::ReferenceIndex`'s binary search over a `Vec<u64>` are
-    where that is load-bearing, not incidental.
+    `filter` and `profile` followed the same day: `ReferenceIndex` and
+    `ProfileIndex` hold their keys in an enum rather than a `Vec<u64>`, at
+    16 bytes per k-mer instead of 8. That closes the gap entirely --
+    **every operation that reads a k-mer table now takes both widths.**
+
+    What still stops at k=32 is sketching and the estimators (`sketch`,
+    `dist`, `card`, `spectrum`), which hash straight from FASTQ and never
+    open a table at all.
 
   - **The original deferral, for the record**: k > 32 support via `u128`
     k-mers. This would require changing the 2-bit-per-base `u64` k-mer

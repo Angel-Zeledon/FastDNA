@@ -160,6 +160,68 @@ pub fn extract_canonical_kmers_into(seq: &[u8], k: usize, out: &mut Vec<u128>) {
     }
 }
 
+/// [`extract_canonical_kmers_into`] with each k-mer's start position in
+/// `seq` alongside it -- the wide form of
+/// [`crate::kmer::extract_canonical_kmers_with_positions_into`], and what
+/// `read_profile` needs to map a read's bases back to reference counts.
+///
+/// Emits exactly the same k-mers, in the same order, as
+/// [`extract_canonical_kmers_into`] on the same input; a divergence would
+/// be a bug rather than a design choice, and
+/// `positions_emit_the_same_kmers_as_the_plain_extractor` pins the two
+/// against each other.
+///
+/// A read position with no valid k-mer of its own -- inside the first
+/// `k - 1` bases, or too close to an ambiguous base for a full window to
+/// have rolled through -- simply has no entry in `out`. That is "no data
+/// here", never "a count of zero".
+///
+/// Positions are `u32` for the same reason the narrow form's are: no real
+/// sequencing read approaches `u32::MAX` bases, and the cap keeps
+/// `read_profile::RleRun` small. A caller holding a `usize` length rejects
+/// an oversized read before calling, rather than being silently truncated
+/// here.
+pub fn extract_canonical_kmers_with_positions_into(seq: &[u8], k: usize, out: &mut Vec<(u32, u128)>) {
+    out.clear();
+    if seq.len() < k || k == 0 || k > MAX_WIDE_K {
+        return;
+    }
+    debug_assert!(
+        seq.len() <= u32::MAX as usize,
+        "read of {} bases exceeds the u32 position cap",
+        seq.len()
+    );
+    out.reserve(seq.len() - k + 1);
+
+    let mask = if k == MAX_WIDE_K { u128::MAX } else { (1u128 << (2 * k)) - 1 };
+    let top_shift = 2 * (k - 1);
+
+    let mut fwd: u128 = 0;
+    let mut rev: u128 = 0;
+    let mut valid_len: usize = 0;
+
+    for (i, &base) in seq.iter().enumerate() {
+        if let Some(bits) = base_to_bits(base) {
+            let bits = u128::from(bits);
+            fwd = ((fwd << 2) | bits) & mask;
+            rev = (rev >> 2) | (complement_bits(bits) << top_shift);
+            valid_len += 1;
+
+            if valid_len >= k {
+                // `i` is the last base rolled into this k-mer; the first is
+                // `k - 1` earlier. `valid_len <= i + 1` guarantees
+                // `i + 1 >= k`, so this cannot underflow.
+                let start = (i + 1 - k) as u32;
+                out.push((start, fwd.min(rev)));
+            }
+        } else {
+            fwd = 0;
+            rev = 0;
+            valid_len = 0;
+        }
+    }
+}
+
 /// Allocating convenience over [`extract_canonical_kmers_into`], for tests
 /// and one-off callers. The hot path uses the buffer-reusing form.
 pub fn extract_canonical_kmers(seq: &[u8], k: usize) -> Vec<u128> {
@@ -219,6 +281,53 @@ pub fn from_key_bytes(bytes: [u8; 16]) -> u128 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// The positions form must emit exactly the k-mers the plain form
+    /// does, in the same order -- including around ambiguous bases, where
+    /// both must reset. Anything else is a bug, not a choice.
+    #[test]
+    fn positions_emit_the_same_kmers_as_the_plain_extractor() {
+        let cases: [&[u8]; 5] = [
+            b"ACGTTGCAAGGCTTACCGATCGATTACAGCATCGGATCCATGGTACCAATTGCA",
+            b"ACGTTGCAAGGCTTACCGNTCGATTACAGCATCGGATCCATGGTACCAATTGCA",
+            b"NNNNACGTTGCAAGGCTTACCGATCGATTACAGCATCGGATCCATGGTACCAAT",
+            b"ACGT",
+            b"",
+        ];
+        for k in [33usize, 41, 64] {
+            for seq in cases {
+                let plain = extract_canonical_kmers(seq, k);
+                let mut with_positions = Vec::new();
+                extract_canonical_kmers_with_positions_into(seq, k, &mut with_positions);
+
+                let kmers: Vec<u128> = with_positions.iter().map(|&(_, km)| km).collect();
+                assert_eq!(plain, kmers, "k={k}, seq={:?}", String::from_utf8_lossy(seq));
+
+                // Every reported start must actually be the start of a
+                // `k`-base window of unambiguous bases -- re-derived from
+                // the input here rather than trusted from the extractor.
+                for &(start, _) in &with_positions {
+                    let window = &seq[start as usize..start as usize + k];
+                    assert!(
+                        window.iter().all(|b| base_to_bits(*b).is_some()),
+                        "k={k}: window at {start} spans an ambiguous base"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The positions themselves, on a case small enough to write out by
+    /// hand: k=33 over 35 unambiguous bases gives starts 0, 1 and 2.
+    #[test]
+    fn positions_are_the_kmers_own_start_offsets() {
+        let seq = b"ACGTTGCAAGGCTTACCGATCGATTACAGCATCGG";
+        assert_eq!(seq.len(), 35);
+        let mut out = Vec::new();
+        extract_canonical_kmers_with_positions_into(seq, 33, &mut out);
+        let starts: Vec<u32> = out.iter().map(|&(s, _)| s).collect();
+        assert_eq!(starts, vec![0, 1, 2]);
+    }
+
     use super::*;
 
     fn random_sequence(len: usize, seed: u64) -> Vec<u8> {

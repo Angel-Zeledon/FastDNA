@@ -1418,6 +1418,7 @@ struct PyKmerTable {
 /// k-mer's count". What a caller *does* need to distinguish is the set
 /// operations, which have no wide form -- and those say so by name
 /// (`narrow` below) rather than by the caller having to check first.
+#[derive(Clone)]
 enum TableRepr {
     Narrow(KmerTable),
     Wide(crate::wide_ktab::WideKmerTable),
@@ -1557,34 +1558,18 @@ impl PyKmerTable {
 }
 
 impl PyKmerTable {
-    /// The underlying narrow table, or a `ValueError` naming the problem.
+    /// A read-filtering reference index over this table, at whichever
+    /// width it holds. Built by the caller inside `py.allow_threads`, since
+    /// it streams the whole key column into memory.
     ///
-    /// What is left behind this gate is the read-scanning family --
-    /// `filter_reads`, `filter_reads_paired`, `profile_reads`. Those go
-    /// through `read_filter::ReferenceIndex`/`read_profile::ProfileIndex`,
-    /// which hold the reference as a `Vec<u64>` and answer each read's
-    /// k-mers by binary search over it: the key type is the data structure
-    /// there, not an incidental annotation. The set operations used to be
-    /// here too and are not any more -- `setops` is generic over
-    /// `MergeSource` and takes either width.
-    ///
-    /// Refusing in one place is what keeps the three remaining call sites
-    /// from each inventing their own wording, or forgetting to refuse.
-    ///
-    /// Clones rather than borrows because every caller hands the table to
-    /// `py.allow_threads`, which cannot hold a `PyRef` across the GIL
-    /// release. `KmerTable` is a path plus a row-group index, so the clone
-    /// is cheap and reopens nothing.
-    fn narrow(&self) -> PyResult<KmerTable> {
-        match &self.inner {
-            TableRepr::Narrow(table) => Ok(table.clone()),
-            TableRepr::Wide(table) => Err(PyValueError::new_err(format!(
-                "{} is a wide (k>32) k-mer table, keyed on kmer_bits. Read filtering and \
-                 profiling index the reference as a Vec<u64> and have no wide form, so they \
-                 accept only tables counted at k<=32. Lookups and the set operations \
-                 (get/__getitem__/in, union/intersect/difference) do work on this table",
-                table.path().display()
-            ))),
+    /// This replaced a `narrow()` gate that used to sit here and refuse a
+    /// wide table on behalf of every operation that could not take one.
+    /// Nothing needs it now: `filter_reads`, `filter_reads_paired` and
+    /// `profile_reads` were the last three, and they read both widths.
+    fn reference_index(repr: &TableRepr) -> Result<read_filter::ReferenceIndex, FastDnaError> {
+        match repr {
+            TableRepr::Narrow(t) => read_filter::ReferenceIndex::from_table(t),
+            TableRepr::Wide(t) => read_filter::ReferenceIndex::from_wide_table(t),
         }
     }
 }
@@ -1650,13 +1635,13 @@ fn filter_reads(
     min_fraction: f64,
 ) -> PyResult<PyFilterStats> {
     let mode = parse_filter_mode(mode)?;
-    let table_inner = table.narrow()?;
+    let table_inner = table.inner.clone();
     let input_specs: Vec<crate::fastq::InputSpec> =
         inputs.iter().map(|p| crate::fastq::InputSpec::from_arg(std::path::Path::new(p))).collect();
     let output_path = PathBuf::from(output);
 
     let stats = py.allow_threads(|| -> Result<read_filter::FilterStats, FastDnaError> {
-        let index = read_filter::ReferenceIndex::from_table(&table_inner)?;
+        let index = PyKmerTable::reference_index(&table_inner)?;
         read_filter::run_filter(input_specs, &index, mode, min_fraction, &output_path)
     })?;
 
@@ -1721,7 +1706,7 @@ fn filter_reads_paired(
     min_fraction: f64,
 ) -> PyResult<PyPairedFilterStats> {
     let mode = parse_filter_mode(mode)?;
-    let table_inner = table.narrow()?;
+    let table_inner = table.inner.clone();
     let inputs_r1: Vec<crate::fastq::InputSpec> =
         inputs.iter().map(|p| crate::fastq::InputSpec::from_arg(std::path::Path::new(p))).collect();
     let inputs_r2: Vec<crate::fastq::InputSpec> =
@@ -1730,7 +1715,7 @@ fn filter_reads_paired(
     let output2_path = PathBuf::from(output2);
 
     let stats = py.allow_threads(|| -> Result<read_filter::PairedFilterStats, FastDnaError> {
-        let index = read_filter::ReferenceIndex::from_table(&table_inner)?;
+        let index = PyKmerTable::reference_index(&table_inner)?;
         read_filter::run_filter_paired(
             inputs_r1, inputs_r2, &index, mode, min_fraction, &output_path, &output2_path,
         )
@@ -1785,14 +1770,17 @@ fn profile_reads(
     output: String,
     summary: String,
 ) -> PyResult<PyProfileStats> {
-    let table_inner = table.narrow()?;
+    let table_inner = table.inner.clone();
     let input_specs: Vec<crate::fastq::InputSpec> =
         inputs.iter().map(|p| crate::fastq::InputSpec::from_arg(std::path::Path::new(p))).collect();
     let output_path = PathBuf::from(output);
     let summary_path = PathBuf::from(summary);
 
     let stats = py.allow_threads(|| -> Result<read_profile::ProfileStats, FastDnaError> {
-        let index = read_profile::ProfileIndex::from_table(&table_inner)?;
+        let index = match &table_inner {
+            TableRepr::Narrow(t) => read_profile::ProfileIndex::from_table(t)?,
+            TableRepr::Wide(t) => read_profile::ProfileIndex::from_wide_table(t)?,
+        };
         read_profile::run_profile(input_specs, &index, &output_path, &summary_path)
     })?;
 

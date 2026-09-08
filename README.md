@@ -1001,11 +1001,9 @@ who needs that code can take it from the git history at `60b5f82`.
 
 Still ahead:
 
-- A wide form for `filter` and `profile`. Everything else that reads a
-  k-mer table -- `query`, `fastdna.KmerTable`, the set operations,
-  `similarity` -- takes a `kmer_bits` table; these two still hold the
-  reference as a `Vec<u64>` and binary-search it once per read, so they
-  reject one by name.
+- A wide form for sketching and the estimators (`sketch`, `dist`, `card`,
+  `spectrum`). Every operation that reads a k-mer *table* takes both widths
+  now; these four hash straight from FASTQ and still stop at k=32.
 - A `strategy=`/`max_ram=` parameter on `fastdna.count()`, so the Python
   binding can use the disk strategy and automatic chooser without the
   `FASTDNA_STRATEGY` environment variable.

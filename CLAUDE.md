@@ -20,16 +20,16 @@ the CLI surface (`count`, `sketch`, `dist`, `card`, `peek`, `query`,
 `union`, `intersect`, `diff`, `similarity`, `filter`, `matrix`, `profile`,
 `spectrum`) and the Python API mirroring it -- including
 `count(engine="auto"|"narrow"|"wide")`, which reaches `k = 64` the same
-way the CLI's `--engine` does. Wide (`kmer_bits`) tables are read by
-`query`, `fastdna.KmerTable`, and the set operations
-(`union`/`intersect`/`diff`, generic over `setops::MergeSource`). `similarity` takes either width too --
-it is built on the same merge and never looks at a key. What is **still
-narrow-only**: `filter` and `profile`. Those hold the reference as a
-`Vec<u64>` and answer each read by binary search over it
-(`read_filter::ReferenceIndex`, `read_profile::ProfileIndex`), so there the
-key type is the data structure rather than an annotation; they reject a
-wide table by name. On the Python side that refusal lives in one place,
-`PyKmerTable::narrow`.
+way the CLI's `--engine` does. **Every operation that reads a k-mer table
+takes both widths** as of 2026-09-07: `query`, `fastdna.KmerTable`, the set
+operations (generic over `setops::MergeSource`), `similarity`, `filter` and
+`profile`. `read_filter::ReferenceIndex` and `read_profile::ProfileIndex`
+hold their keys in an enum rather than a type parameter, because the width
+belongs to the reference *file* and no caller chooses it. Routing is always
+one footer read, `ktab::table_key`.
+
+What still stops at `k = 32` is sketching and the estimators (`sketch`,
+`dist`, `card`, `spectrum`) -- they hash from FASTQ, never from a table.
 
 **The machine-learning layer was removed on 2026-09-05** — 31 Python
 modules and 4 Rust modules (`sklearn`, `audit`, `cv`, `explain`, `gwas`,

@@ -293,22 +293,35 @@ def test_mixing_widths_in_a_set_operation_is_refused_by_name(reads, tmp_path):
     assert "narrow" in message and "wide" in message, message
 
 
-def test_read_filtering_still_requires_a_narrow_table(reads, tmp_path):
-    """The honest remaining limit: `filter_reads` indexes the reference as
-    a `Vec[u64]`, so it has no wide form. Pinned so the day it grows one,
-    this test is what has to change.
+def test_read_filtering_takes_a_wide_table(reads, tmp_path):
+    """`filter_reads` indexes a wide reference now. The expectation is
+    definitional rather than a number this package produced: every read
+    comes from the very file the reference was counted from, so at
+    `min_fraction=1.0` keep-mode keeps all of them and discard-mode none.
     """
     wide = fastdna.KmerTable.open(_count_to_parquet(reads, tmp_path, 41))
+    assert wide.engine == "wide"
 
-    with pytest.raises(ValueError) as excinfo:
-        fastdna._core.filter_reads(
-            table=wide._raw,
-            inputs=[str(reads)],
-            mode="keep",
-            output=str(tmp_path / "kept.fastq"),
-        )
-    message = str(excinfo.value)
-    assert "kmer_bits" in message, message
+    kept = tmp_path / "kept.fastq"
+    stats = fastdna._core.filter_reads(
+        table=wide._raw,
+        inputs=[str(reads)],
+        mode="keep",
+        output=str(kept),
+        min_fraction=1.0,
+    )
+    assert stats.reads_written == stats.reads_total
+    assert stats.reads_total > 0
+
+    dropped = tmp_path / "dropped.fastq"
+    stats = fastdna._core.filter_reads(
+        table=wide._raw,
+        inputs=[str(reads)],
+        mode="discard",
+        output=str(dropped),
+        min_fraction=1.0,
+    )
+    assert stats.reads_written == 0, "no read can be absent from its own reference"
 
 
 def test_similarity_takes_wide_tables(reads, tmp_path):

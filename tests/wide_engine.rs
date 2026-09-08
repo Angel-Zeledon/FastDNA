@@ -185,11 +185,21 @@ fn the_set_operations_take_a_wide_table() {
     assert!(after.contains("k:     41"), "the output must keep k=41:\n{after}");
 }
 
-/// The operations still keyed on a `u64` must keep saying so by name, not
-/// report a wide table as an unrecognised file. `filter` is the one left;
-/// when it grows a wide form this assertion is what has to change.
+/// `filter` reads a wide reference now, so what this pins is the behaviour
+/// rather than a refusal.
+///
+/// The assertions are definitional: every read is drawn from the very
+/// sequence the reference was counted from, so at `--min-fraction 1.0`
+/// `--mode keep` must keep all of them and `--mode discard` none. Neither
+/// number depends on the reference index being right about any particular
+/// k-mer -- only on it being right about all of them.
+///
+/// This test used to assert the opposite (that `filter` refused a wide
+/// table by name). That was correct while `ReferenceIndex` held a
+/// `Vec<u64>`; it is not the behaviour any more, so the assertion is
+/// inverted rather than deleted.
 #[test]
-fn the_still_narrow_operations_refuse_a_wide_table_by_name() {
+fn filter_reads_a_wide_reference() {
     let dir = tempfile::tempdir().expect("tempdir");
     let reads: Vec<String> = (0..20).map(|i| sequence(150, i + 41)).collect();
     let refs: Vec<&str> = reads.iter().map(String::as_str).collect();
@@ -204,13 +214,63 @@ fn the_still_narrow_operations_refuse_a_wide_table_by_name() {
     ]);
     assert!(ok, "wide count failed:\n{text}");
 
+    let count_reads = |path: &std::path::Path| -> usize {
+        std::fs::read_to_string(path).map(|t| t.lines().count() / 4).unwrap_or(0)
+    };
+
+    let kept = dir.path().join("kept.fastq");
     let (ok, text) = run(&[
         "filter",
         "--table", table.to_str().expect("utf8"),
         "--input", input.to_str().expect("utf8"),
         "--mode", "keep",
-        "--output", dir.path().join("kept.fastq").to_str().expect("utf8"),
+        "--min-fraction", "1.0",
+        "--output", kept.to_str().expect("utf8"),
     ]);
-    assert!(!ok, "filter on a wide table must fail:\n{text}");
-    assert!(text.contains("kmer_bits"), "the error must name the wide key column:\n{text}");
+    assert!(ok, "filter on a wide table must succeed now:\n{text}");
+    assert!(text.contains("(wide)"), "the banner should say which width it indexed:\n{text}");
+    assert_eq!(count_reads(&kept), 20, "every read came from the reference itself");
+
+    let dropped = dir.path().join("dropped.fastq");
+    let (ok, text) = run(&[
+        "filter",
+        "--table", table.to_str().expect("utf8"),
+        "--input", input.to_str().expect("utf8"),
+        "--mode", "discard",
+        "--min-fraction", "1.0",
+        "--output", dropped.to_str().expect("utf8"),
+    ]);
+    assert!(ok, "discard mode failed:\n{text}");
+    assert_eq!(count_reads(&dropped), 0, "no read can be absent from its own reference");
+}
+
+/// `profile` reads a wide reference too. Its summary table reports one row
+/// per read, and every read here is drawn from the reference, so every
+/// k-mer must be present -- `n_present_kmers == n_kmers` on every row.
+#[test]
+fn profile_reads_a_wide_reference() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reads: Vec<String> = (0..10).map(|i| sequence(150, i + 41)).collect();
+    let refs: Vec<&str> = reads.iter().map(String::as_str).collect();
+    let input = fastq(dir.path(), "in.fastq", &refs);
+    let table = dir.path().join("wide.parquet");
+
+    let (ok, text) = run(&[
+        "--input", input.to_str().expect("utf8"),
+        "--output", table.to_str().expect("utf8"),
+        "-k", "41", "-q", "0",
+        "--qc", dir.path().join("qc.json").to_str().expect("utf8"),
+    ]);
+    assert!(ok, "wide count failed:\n{text}");
+
+    let (ok, text) = run(&[
+        "profile",
+        "--table", table.to_str().expect("utf8"),
+        "--input", input.to_str().expect("utf8"),
+        "--output", dir.path().join("profile.parquet").to_str().expect("utf8"),
+        "--summary", dir.path().join("summary.parquet").to_str().expect("utf8"),
+    ]);
+    assert!(ok, "profile on a wide table must succeed:\n{text}");
+    assert!(text.contains("(wide)"), "the banner should say which width it indexed:\n{text}");
+    assert!(text.contains("Reads profiled: 10"), "every read should profile:\n{text}");
 }

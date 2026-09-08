@@ -165,11 +165,50 @@ La superficie con compatibilidad garantizada es:
   en coma flotante, es lo que comprueba
   `similarity_agrees_across_both_widths`.
 
-  **Lo que sigue siendo estrecho**, y ahora se dice en un solo sitio:
-  `filter` y `profile`. Esos guardan la referencia como un `Vec<u64>` y
-  contestan cada lectura con una búsqueda binaria sobre él
-  (`read_filter::ReferenceIndex`, `read_profile::ProfileIndex`), así que
-  ahí el tipo de la clave **es** la estructura de datos, no una anotación.
+- **`filter` y `profile` también, y con eso el hueco queda cerrado
+  entero.** `read_filter::ReferenceIndex` y `read_profile::ProfileIndex`
+  guardaban la referencia como un `Vec<u64>`; ahora la guardan en un enum
+  por anchura. **Toda operación que lee una tabla de k-mers acepta las dos.**
+
+  **Un enum y no un parámetro de tipo**, a diferencia de `setops`: ahí el
+  genérico se justifica porque la operación es la misma sobre cualquier
+  clave y quien llama trae las tablas. Aquí la anchura la fija el *fichero*
+  de referencia, decidida en `from_table`, y ningún llamante
+  (`filter_records`, `run_filter`, el CLI, el binding) la elige nunca --
+  parametrizar el tipo sería propagar por todos ellos algo que ninguno
+  decide.
+
+  **El coste, dicho y no descubierto**: una referencia ancha ocupa 16 bytes
+  por k-mer residente en vez de 8. Ese es el precio de filtrar por encima
+  de k=32.
+
+  **El codificador RLE de `profile` se quedó en una sola copia** porque la
+  extracción y la consulta a la referencia se separaron de él: para cuando
+  corre, ya solo ve pares `(posición, conteo)` y la clave ha desaparecido.
+  Era la parte con las reglas de huecos y los límites de racha, justo la
+  que no convenía duplicar.
+
+  Sale `wide_kmer::extract_canonical_kmers_with_positions_into`, con un
+  test que lo fija contra el extractor llano: mismos k-mers, mismo orden,
+  también alrededor de bases ambiguas.
+
+  **Cambios rompedores** en `read_filter` y `read_profile`, que el 0.x
+  permite y esta línea declara: `ReferenceIndex::contains(u64)` y
+  `ProfileIndex::get(u64)` dejan de ser públicos -- con dos anchuras no
+  tienen respuesta correcta sobre un índice ancho, y `false`/`None` sería
+  una respuesta silenciosamente equivocada para toda entrada. Y
+  `matching_fraction`/`read_is_match`/`build_read_profile` toman ahora
+  `KmerScratch`/`ProfileScratch` en vez de un `&mut Vec<...>`: quien llama
+  no puede saber qué anchura tiene el índice, así que no se le puede pedir
+  que traiga el buffer correcto.
+
+  Con esto desaparece también `PyKmerTable::narrow`, el portón que
+  rechazaba tablas anchas en nombre de quien no podía leerlas. Ya no queda
+  nadie a quien representar.
+
+  **Lo que sigue parando en k=32**: el sketching y los estimadores
+  (`sketch`, `dist`, `card`, `spectrum`). Hashean directamente desde FASTQ
+  y no abren una tabla nunca.
 
 - **El motor ancho, validado contra KMC3 y no solo contra el estrecho.**
   Hasta ahora `k > 32` se comprobaba contra el motor `u64` -- que sí está

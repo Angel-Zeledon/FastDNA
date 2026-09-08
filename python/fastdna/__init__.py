@@ -876,18 +876,19 @@ class KmerTable:
     Opens both widths. A table counted at `k <= 32` is keyed on `kmer_u64`
     and one counted above it on `kmer_bits` (16 big-endian bytes); which
     one you have is `table.engine`, and the reader is picked from the
-    file's own footer rather than from anything the caller passes. Lookups
-    and the set operations below (`union`, `intersect`, `difference`) work
-    on both, and return a table of the same width they were given. Every
-    input to one operation must share a width -- two widths never share a
-    `k` either, so a mixed set is always a mistake and is refused by name.
+    file's own footer rather than from anything the caller passes.
 
-    What still requires `k <= 32` is the read-scanning family --
-    `filter_reads`, `filter_reads_paired`, `profile_reads` -- and
-    `similarity`. Those index the reference as a `Vec[u64]` and answer each
-    read's k-mers by binary search over it, so the key type is the data
-    structure rather than an annotation. They raise `ValueError` naming the
-    file if handed a wide table.
+    Everything that reads a k-mer table takes either width: lookups, the
+    set operations below (`union`, `intersect`, `difference`, which return
+    a table of the same width they were given), `similarity`, and the
+    read-scanning family (`filter_reads`, `filter_reads_paired`,
+    `profile_reads`). A wide reference index costs twice the resident bytes
+    per k-mer -- 16 against 8 -- which is the price of working above k=32.
+
+    Every input to one operation must share a width. That is not a
+    restriction in practice: two widths never share a `k`, so a mixed set
+    is always a mistake, and it is refused by name rather than left to
+    surface as a confusing missing-column error.
 
     Point lookups (`get`/`__getitem__`) decode at most one Parquet row
     group per call, pruned via that row group's own min/max k-mer

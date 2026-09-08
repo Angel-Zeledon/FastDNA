@@ -848,6 +848,18 @@ fn open_wide_tables(paths: &[PathBuf]) -> Result<Vec<WideKmerTable>> {
     paths.iter().map(WideKmerTable::open).collect()
 }
 
+/// Builds a read-filtering reference index from a table of either width,
+/// routed by the file's own footer -- the same one-read decision `query`
+/// and the set operations make.
+fn open_reference_index(path: &Path) -> Result<read_filter::ReferenceIndex> {
+    match ktab::table_key(path)? {
+        ktab::TableKey::Narrow => read_filter::ReferenceIndex::from_table(&KmerTable::open(path)?),
+        ktab::TableKey::Wide => {
+            read_filter::ReferenceIndex::from_wide_table(&WideKmerTable::open(path)?)
+        }
+    }
+}
+
 /// The one width every input to a set operation must share, decided by the
 /// first file's own footer and then required of the rest.
 ///
@@ -1124,10 +1136,9 @@ fn run_filter(args: FilterArgs) -> Result<()> {
     println!("Min fraction: {}", args.min_fraction);
     println!("--------------------------------------------------");
 
-    let table = KmerTable::open(&args.table)?;
-    println!("Reference k:  {}", table.k());
-    println!("Reference kmers: {}", table.len());
-    let index = read_filter::ReferenceIndex::from_table(&table)?;
+    let index = open_reference_index(&args.table)?;
+    println!("Reference k:  {}", index.k());
+    println!("Reference kmers: {} ({})", index.len(), index.width());
 
     let pb = spinner("Filtering reads...");
     let start = Instant::now();
@@ -1217,10 +1228,9 @@ fn run_filter_paired(args: FilterArgs) -> Result<()> {
     println!("Min fraction: {}", args.min_fraction);
     println!("--------------------------------------------------");
 
-    let table = KmerTable::open(&args.table)?;
-    println!("Reference k:  {}", table.k());
-    println!("Reference kmers: {}", table.len());
-    let index = read_filter::ReferenceIndex::from_table(&table)?;
+    let index = open_reference_index(&args.table)?;
+    println!("Reference k:  {}", index.k());
+    println!("Reference kmers: {} ({})", index.len(), index.width());
 
     let pb = spinner("Filtering read pairs...");
     let start = Instant::now();
@@ -1438,10 +1448,16 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
     println!("Summary: {}", summary.display());
     println!("--------------------------------------------------");
 
-    let table = KmerTable::open(&args.table)?;
-    println!("Reference k:     {}", table.k());
-    println!("Reference kmers: {}", table.len());
-    let index = read_profile::ProfileIndex::from_table(&table)?;
+    let index = match ktab::table_key(&args.table)? {
+        ktab::TableKey::Narrow => {
+            read_profile::ProfileIndex::from_table(&KmerTable::open(&args.table)?)?
+        }
+        ktab::TableKey::Wide => {
+            read_profile::ProfileIndex::from_wide_table(&WideKmerTable::open(&args.table)?)?
+        }
+    };
+    println!("Reference k:     {}", index.k());
+    println!("Reference kmers: {} ({})", index.len(), index.width());
 
     let pb = spinner("Profiling reads...");
     let start = Instant::now();
