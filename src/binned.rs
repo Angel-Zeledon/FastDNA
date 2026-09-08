@@ -622,11 +622,10 @@ mod tests {
     /// 8.79 s; min-to-min 1.042x), with peak RSS unchanged at 1.016x, which
     /// is inside the run-to-run spread. A 1.35x speedup on a step an older
     /// profile put at 39.5% of the run should have been worth ~1.11x, and
-    /// it is not. **That gap is not explained here.** Two candidates --
-    /// sorting being a smaller share now that the cross-bin merge is
-    /// parallel, and the isolated bench overstating the win because it does
-    /// not compete with phase 2's other memory traffic -- are both
-    /// plausible and neither is measured, so neither is asserted.
+    /// it is not -- because **sorting is no longer 39.5% of this pipeline,
+    /// it is 22.6%** (leaf-attributed profile, `docs/BENCHMARKS.md`). Amdahl
+    /// on 22.6% with a local 1.35x predicts 1.062x against 1.050x measured,
+    /// which is the whole of the discrepancy.
     ///
     /// Shipped anyway because the trade has no losing side: strictly
     /// faster, byte-identical output, memory unchanged, and it reuses a

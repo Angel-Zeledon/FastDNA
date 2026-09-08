@@ -47,8 +47,31 @@ La superficie con compatibilidad garantizada es:
   (9 corridas intercaladas de cada binario, mediana 9,23 → 8,79 s), con el
   pico de RSS igual (1,016x, dentro de la dispersión). Un 1,35x sobre un
   paso que un perfil anterior situaba en el 39,5% debería haber dado ~1,11x.
-  **Ese hueco no queda explicado**, y `docs/BENCHMARKS.md` lo dice así en
-  vez de elegir una de las dos hipótesis sin medirla.
+  El hueco se persiguió en vez de dejarlo estar, y se cierra:
+  **ordenar ya no es el 39,5% de una corrida binned, es el 22,6%.** Amdahl
+  sobre esa fracción predice 1,062x contra 1,050x medido.
+
+  **Y de ahí sale lo que más importa de todo esto**, un perfil atribuido
+  por hoja del camino por defecto:
+
+  | | % del trabajo |
+  |---|---:|
+  | `minimizer::SignatureScanner::push` | **31,8%** |
+  | `binned::BinWriter::push_sequence` | 19,0% |
+  | `binned::BinStore::finish` | 18,5% |
+  | quicksort | 16,3% |
+  | partición MSD | 5,4% |
+
+  El mayor consumidor de una corrida binned ya no es ordenar sino el
+  escáner de firmas del minimizador: un mínimo en ventana deslizante sobre
+  un `VecDeque`, una vez por base. Ahí es donde va el siguiente trabajo de
+  velocidad, no en el sort.
+
+  El primer intento de ese perfil se descartó por inservible: `sample`
+  emite un árbol con conteos **acumulados** y sumar esas líneas cuenta cada
+  padre varias veces -- atribuía el 95% de la corrida a "sort". Los números
+  buenos salen de la sección "Sort by top of stack, same collapsed", que sí
+  es tiempo propio por hoja.
 
   Se envía igual porque la operación no tiene lado perdedor: estrictamente
   más rápida, salida byte-idéntica (comprobada contra la estrategia

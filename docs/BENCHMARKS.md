@@ -354,15 +354,40 @@ Output is byte-identical (SHA-256 checked against the in-memory strategy on
 real reads, and `tests/dual_strategy.rs` asserts it on every run).
 
 A 1.35x speedup on a step an earlier profile put at **39.5%** of the run
-should have been worth about 1.11x overall. It is worth 1.05x. **That gap
-is not explained.** Two candidates -- sorting being a smaller share now
-that the cross-bin merge is parallel, and the isolated benchmark
-overstating the win because it does not compete with phase 2's other
-memory traffic -- are both plausible, neither is measured, and so neither
-is claimed here. A profile taken to settle it was discarded as unusable:
-`/usr/bin/sample` emits a call tree with cumulative counts, and the first
-attempt summed frames that share those counts, which attributed 95% of the
-run to "sort" and is meaningless.
+should have been worth about 1.11x overall. It is worth 1.05x. The
+discrepancy was chased rather than left standing, and it resolves cleanly:
+**sorting is no longer 39.5% of a binned run. It is 22.6%.**
+
+The first attempt at that profile was discarded as unusable --
+`/usr/bin/sample` emits a call tree with *cumulative* counts, and summing
+those lines double-counts every parent, which attributed 95% of the run to
+"sort". The usable numbers come from the same output's "Sort by top of
+stack, same collapsed" section, which is leaf-attributed self time. Five
+seconds sampled from a ~9 s run, waiting frames (`__psynch_cvwait`,
+`semaphore_wait_trap`, ...) excluded so the shares are of work rather than
+of wall time:
+
+| | share of work |
+|---|---:|
+| `minimizer::SignatureScanner::push` | **31.8%** |
+| `binned::BinWriter::push_sequence` | 19.0% |
+| `binned::BinStore::finish` (expand + compact) | 18.5% |
+| `core::slice::sort` (quicksort) | 16.3% |
+| `counter::sort_keys_msd` (the partition itself) | 5.4% |
+| pipeline phase-1 driver | 2.6% |
+| `__bzero` / `memmove` / pivot selection | 4.1% |
+
+Sorting -- quicksort, pivot selection and the MSD partition together --
+is 22.6%. Amdahl on that fraction with a 1.35x local speedup predicts
+**1.062x**, against 1.050x measured, which closes the question: the
+isolated benchmark overstates the win slightly, and the older 39.5% figure
+simply no longer describes this pipeline (the cross-bin merge became
+parallel after it was taken).
+
+**The finding that matters more than the 5%**: the largest single consumer
+of a binned run is now the minimizer signature scanner, at 31.8% -- a
+sliding-window minimum over a `VecDeque`, run once per base. That, not
+sorting, is where the next speed work belongs.
 
 The change shipped anyway because the trade has no losing side: strictly
 faster, identical output, memory unchanged within the spread, and it reuses
