@@ -117,6 +117,34 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **El motor ancho, validado contra KMC3 y no solo contra el estrecho.**
+  Hasta ahora `k > 32` se comprobaba contra el motor `u64` -- que sí está
+  medido exactamente igual a KMC3, pero eso hace la garantía indirecta y,
+  en `k > 32`, inexistente: por encima de 32 no hay motor estrecho contra
+  el que comparar. KMC3 cuenta hasta k=256, así que es una respuesta de
+  fuera también ahí.
+
+  Sobre `DRR002015` (*E. coli*, 2.343.637 lecturas), sin recorte de calidad
+  y con singletons incluidos, **igualdad exacta**:
+
+  | motor | k | distintos | totales |
+  |---|---|---|---|
+  | `u128`, forzado (`--engine wide`) | 31 | 19.062.700 | 163.051.083 |
+  | `u128` (auto) | 33 | 19.088.450 | 158.322.947 |
+  | `u128` (auto) | 41 | 18.752.097 | 139.553.420 |
+  | `u128` (auto) | 64 | 15.963.026 | 85.649.847 |
+
+  k=33 y k=64 son los dos extremos del rango: donde aparecería primero un
+  error de máscara o de desplazamiento. Y `--engine wide` a k=31 -- una
+  bandera nueva de `kmc3_equivalence.py` -- mete el motor ancho **dentro
+  del solape**, donde KMC3 contesta directamente en vez de que la
+  comprobación termine en "los dos motores coinciden entre sí". Los
+  19.062.700 / 163.051.083 que devuelve ahí son exactamente los mismos
+  dígitos que ya devolvía el motor estrecho.
+
+  Los tres casos están en `validation.yml` y corren en el calendario, no
+  solo una vez.
+
 - **`fastdna query` lee tablas anchas (`src/wide_ktab.rs`).** Contar con
   `k > 32` dejaba un Parquet que nada en este crate podía volver a leer:
   `KmerTable::open` la rechazaba por nombre y ahí se acababa. Ahora

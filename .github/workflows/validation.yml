@@ -89,6 +89,22 @@ jobs:
           python scripts/validation/kmc3_equivalence.py \
             --json "${RUNNER_TEMP}/kmc3.json"
 
+      # The u128 engine, against the same outside answer. KMC3 counts to
+      # k=256, so it is a real source of truth here and not only for the
+      # u64 path. k=33 and k=64 are the ends of the wide engine's range --
+      # the two values a masking or shift bug would show up at first -- and
+      # `--engine wide` at k=31 runs the wide engine inside the OVERLAP,
+      # where KMC3 answers directly instead of the check bottoming out at
+      # "the two engines agree with each other".
+      - name: Counting above k=32 is exactly KMC3's too
+        run: |
+          for k in 33 64; do
+            python scripts/validation/kmc3_equivalence.py \
+              --k "$k" --json "${RUNNER_TEMP}/kmc3_k${k}.json"
+          done
+          python scripts/validation/kmc3_equivalence.py \
+            --k 31 --engine wide --json "${RUNNER_TEMP}/kmc3_k31_wide.json"
+
       # The two approximate answers, each against its own documented bound
       # and against the exact count of the same file.
       - name: Estimators are inside their documented bounds

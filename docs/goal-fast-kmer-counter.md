@@ -21,9 +21,10 @@ Two things were added under this goal rather than inherited from before it,
 and both had to earn it the same way: `similarity` (exact Jaccard,
 containment and abundance-weighted Bray-Curtis between counted tables --
 checkable against `kmc_tools`' own set operations, and it agrees exactly)
-and the `k > 32` engine (`--engine`, up to k=64 -- checkable against the
-narrow engine, which they agree with k-mer for k-mer wherever both are
-defined). The wide engine is reachable from Python as well
+and the `k > 32` engine (`--engine`, up to k=64 -- checkable against KMC3,
+which counts to k=256, and exactly equal to it on real reads at k=33, 41
+and 64, as well as at k=31 with the wide engine forced into the overlap).
+The wide engine is reachable from Python as well
 (`count(engine=...)`), and `query` reads the tables it writes; the set
 operations, `filter` and `similarity` still do not, and say so rather
 than misreading one.
@@ -53,7 +54,9 @@ nine retracted claims the repository had already written down.
 
 The counting engine, over the same period, was checked against KMC3 on real
 reads and came back **exactly equal** — 19,062,700 distinct k-mers,
-163,051,083 total, to the digit. HyperLogLog landed within −0.26% of the
+163,051,083 total, to the digit. (Since 2026-09-07 that holds for the
+`u128` engine too, at k=33/41/64 and at k=31 forced into the overlap, where
+it returns those same two numbers.) HyperLogLog landed within −0.26% of the
 exact count, ntCard within ±2%, MinHash distances at r = 0.997 against
 Mash 2.3 with no bias and error shrinking as 1/sqrt(sketch size).
 

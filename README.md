@@ -173,7 +173,8 @@ sequencing data rather than generated input**, by scripts committed under
 
 | what | against | result |
 |---|---|---|
-| k-mer counting | KMC3 3.2.4 | **exact match** at k=31, 21 and 15 |
+| k-mer counting, `u64` engine | KMC3 3.2.4 | **exact match** at k=31, 21 and 15 |
+| k-mer counting, `u128` engine | KMC3 3.2.4 | **exact match** at k=33, 41 and 64, and at k=31 forced into the overlap |
 | MinHash distances | Mash 2.3 | r = 0.997, no systematic bias |
 | HyperLogLog cardinality | the exact count | −0.26% (bound: ~0.8%) |
 | ntCard spectrum | the exact histogram | −0.6% / +2.0% / −1.5% at f1/f2/f3 |
@@ -183,6 +184,15 @@ reference assemblies; reference tools run from pinned biocontainers, so a
 rerun later compares against the same versions. The counting comparison
 allows **no tolerance at all** -- with trimming off and singletons kept,
 both tools solve the identical problem, so any difference would be a bug.
+
+KMC3 counts to k=256, which is what makes it an outside answer for the
+`u128` engine and not only the `u64` one. k=33 and k=64 are the ends of
+that engine's range, where a masking or shift error would surface first;
+`--engine wide` at k=31 runs it inside the *overlap*, so the check is
+against KMC3 directly rather than bottoming out at "the two engines agree
+with each other". At k=31 the wide engine returns 19,062,700 distinct and
+163,051,083 total -- the same digits the `u64` engine returns, and the same
+digits KMC3 does.
 What each comparison can and cannot establish is documented in
 [`scripts/validation/README.md`](scripts/validation/README.md).
 
@@ -210,9 +220,9 @@ A k-mer of length k therefore fits *exactly* into a `u64` at `k <= 32`:
 32 bases x 2 bits = 64 bits. Above that, a second engine
 (`--engine wide`, selected automatically) packs the same two bits per base
 into a `u128` and reaches `k = 64`; everything in this section describes
-the `u64` engine, which is the one every benchmark and the KMC3 equality
-result below were measured on. That one design
-decision is why almost everything downstream is cheap:
+the `u64` engine, which is the one every *benchmark* was measured on. (The
+KMC3 equality result covers both -- see the accuracy table above.) That one
+design decision is why almost everything downstream is cheap:
 
 - No heap allocation per k-mer. A Python string, or a Rust `String`, is a
   pointer to a heap buffer; a `u64` lives in a CPU register.

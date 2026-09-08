@@ -21,6 +21,12 @@ deliberate there and all three are weaknesses here:
     distinct canonical k-mers of length k -- and the only acceptable
     difference is zero. See "The fair-comparison flags" below.
 
+Both engines are in scope. KMC3 counts to k=256, so it is an outside answer
+for the `u128` engine (`33 <= k <= 64`) as well as the `u64` one -- and
+`--engine wide` at `k <= 32` checks the wide engine *directly* against KMC3
+rather than only against the narrow engine, which is the strongest form the
+overlap check can take.
+
 `docs/BENCHMARKS.md` already records an exact agreement with KMC3 at 2.14 GB,
 and `scripts/bench/kmc3_fastk_comparison.sh` records the steps that produced
 it -- but that script says of itself that it is "a record of what was
@@ -33,6 +39,8 @@ Usage:
 
     python scripts/validation/kmc3_equivalence.py              # downloads a real ENA run
     python scripts/validation/kmc3_equivalence.py --file r.fastq.gz --k 21
+    python scripts/validation/kmc3_equivalence.py --k 41            # the u128 engine
+    python scripts/validation/kmc3_equivalence.py --k 31 --engine wide   # u128 in the overlap
     python scripts/validation/kmc3_equivalence.py --keep       # keep the downloaded data
 
 Requirements: Docker (for KMC3) and a release build of FastDNA
@@ -155,7 +163,7 @@ def run_kmc3(reads: Path, k: int, threads: int) -> tuple[int, int, int]:
     return distinct, total, n_reads
 
 
-def run_fastdna(binary: Path, reads: Path, k: int) -> tuple[int, int, int]:
+def run_fastdna(binary: Path, reads: Path, k: int, engine: str) -> tuple[int, int, int]:
     out = reads.parent / "fastdna_out.parquet"
     qc = reads.parent / "fastdna_qc.json"
 
@@ -168,6 +176,7 @@ def run_fastdna(binary: Path, reads: Path, k: int) -> tuple[int, int, int]:
     command = [
         str(binary), "--input", str(reads), "--output", str(out),
         "--qc", str(qc), "-k", str(k), "-q", "0", "-m", "1",
+        "--engine", engine,
     ]
     started = time.monotonic()
     proc = subprocess.run(command, capture_output=True, text=True)
@@ -208,6 +217,19 @@ def main() -> int:
     parser.add_argument("--file", type=Path, help="use this FASTQ(.gz) instead of downloading")
     parser.add_argument("--url", default=DEFAULT_URL, help="ENA URL to download when --file is absent")
     parser.add_argument("--k", type=int, default=31, help="k-mer length (default: 31)")
+    parser.add_argument(
+        "--engine",
+        choices=("auto", "narrow", "wide"),
+        default="auto",
+        help=(
+            "which FastDNA engine to check. 'auto' (the default) is what a user gets: the "
+            "u64 engine at k<=32, the u128 one above. 'wide' forces the u128 engine into "
+            "the OVERLAP RANGE, which is the point of exposing this here -- at k<=32 both "
+            "engines answer the same question, so running the wide one against KMC3 checks "
+            "it directly rather than only against the narrow engine that KMC3 already "
+            "validated. 'narrow' pins the u64 engine and fails above k=32."
+        ),
+    )
     parser.add_argument("--threads", type=int, default=4, help="threads for KMC3 (default: 4)")
     parser.add_argument("--workdir", type=Path, default=Path.home() / ".fastdna" / "validation")
     parser.add_argument("--keep", action="store_true", help="keep intermediate KMC3/Parquet artefacts")
@@ -223,10 +245,14 @@ def main() -> int:
     else:
         reads = fetch_reads(args.url, args.workdir / f"{DEFAULT_ACCESSION}_1.fastq.gz")
 
-    print(f"\ncomparing at k={args.k}, singletons included, quality trimming disabled")
+    engine_note = "" if args.engine == "auto" else f", --engine {args.engine}"
+    print(
+        f"\ncomparing at k={args.k}{engine_note}, singletons included, "
+        "quality trimming disabled"
+    )
     print("-" * 78)
     kmc = run_kmc3(reads, args.k, args.threads)
-    fastdna = run_fastdna(binary, reads, args.k)
+    fastdna = run_fastdna(binary, reads, args.k, args.engine)
     print("-" * 78)
 
     labels = ("distinct k-mers", "total k-mers", "reads")
@@ -237,6 +263,7 @@ def main() -> int:
     if args.json is not None:
         args.json.write_text(json.dumps({
             "k": args.k,
+            "engine": args.engine,
             "input": str(reads),
             "kmc3": dict(zip(labels, kmc)),
             "fastdna": dict(zip(labels, fastdna)),
