@@ -84,6 +84,7 @@ print(df.nlargest(5, "frequency"))   # the five most frequent k-mers
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Benchmarks](#benchmarks)
+  - [Should you use this instead of KMC3?](#should-you-use-this-instead-of-kmc3)
 - [How the Rust core actually works](#how-the-rust-core-actually-works)
 - [Command-line interface](#command-line-interface)
 - [Memory use and limitations](#memory-use-and-limitations)
@@ -130,10 +131,15 @@ ext4, 8 threads) so no OS or filesystem difference is doing any of the work:
 | FastDNA (disk strategy) | 553.6 s | **1.21 GB** | 53,776,394 |
 
 **FastDNA is slower than both dedicated counters** -- 10x behind FASTK and
-3.5x behind KMC3 here -- and the only one of the three whose peak memory is
-configurable against a budget. All four runs agree exactly on 53,776,394
-distinct k-mers out of 840,000,000 total, so correctness is not what is in
-question.
+3.5x behind KMC3 here. All four runs agree exactly on 53,776,394 distinct
+k-mers out of 840,000,000 total, so correctness is not what is in question.
+
+*(An earlier version of this paragraph also claimed FastDNA was the only
+one of the three with a configurable memory budget. That was false and is
+retracted: `kmc --help` lists `-m<size>` for a RAM limit in GB and `-sm`
+for a strict mode that will not exceed it. FastDNA's `--max-ram` is not a
+differentiator; what it adds is an estimator that picks a strategy against
+the budget without being told to.)*
 
 Two things that qualify the numbers without rescuing them: that WSL2 VM had
 12 GB of RAM and FastDNA's in-memory peak was 10.34 GB, so that run was
@@ -203,6 +209,45 @@ and assembly QV against Merqury (18.4192 vs 18.4205) -- were measured on
 code they checked is gone.
 
 ---
+
+### Should you use this instead of KMC3?
+
+Often not. The honest comparison, with every row checked against
+`kmc --help` (3.2.4) rather than recalled:
+
+**Where KMC3 is ahead**
+
+| | KMC3 | FastDNA |
+|---|---|---|
+| Speed | 110.4 s on the 2.14 GB file | 388.2 s on the same file, same machine. That measures a default path FastDNA no longer has (see above) and the gap has narrowed by an unmeasured amount -- but it has not been re-measured, so KMC3 is the one with a number |
+| `k` | 1-256 | 1-64. Two bits per base in 128 of them is 64 bases; past that needs a byte-string key that changes the sort order, the Parquet schema and every comparison in the counter |
+| Out-of-core at scale | 729 gigabases of human reads in 33-34 GB (Kokot et al., *Bioinformatics*, 2017) | a disk strategy that is newer, less tuned, and **never benchmarked at that scale** |
+| Non-canonical counting | `-b` | no equivalent; canonicalization is unconditional |
+| Input formats | FASTA, FASTQ, multi-FASTA, **BAM**, and a KMC database | FASTQ/FASTA, gzipped or not, or stdin |
+| Counter cap | `-cs` caps the stored counter (default 255) to shrink the database | counts are `u32`, uncapped -- better for accuracy, worse for output size |
+| Interchange format | `-o kff` writes [KFF](https://github.com/Kmer-File-Format/kff-reference), a community standard | Parquet only |
+| Maturity | a decade old, thousands of citations, in every distribution | one author, pre-1.0, no release yet |
+
+**Where FastDNA is ahead**
+
+| | |
+|---|---|
+| Output you can already read | Parquet, sorted, with footer metadata. It opens in pandas, polars, DuckDB and Spark with zero code from this project. KMC writes its own binary database; getting a table out means `kmc_dump` and a text file |
+| Python | in-process, zero-copy Arrow, no subprocess and no serialization round trip. `fastdna.count(...)` hands back a `pyarrow.Table` |
+| Quality trimming | `-q` trims low-quality 3' ends before extraction. KMC3 has no quality-aware mode; it counts what the read says |
+| What ships in one tool | MinHash sketching and Mash distance, HyperLogLog cardinality, ntCard spectrum estimation, per-read coverage profiles, abundance-weighted Bray-Curtis, `peek`, a QC report. `kmc_tools` covers the set operations and a histogram; the rest has no KMC equivalent |
+| Choosing a strategy | `--max-ram` plus an estimator that predicts peak RSS and picks in-memory, binned or disk-partitioned on its own. KMC3's `-m`/`-sm` set a budget you must choose; this one is chosen for you and says which it picked |
+
+**What is not settled either way**: the speed comparison. The table above
+predates the default becoming super-k-mer partitioned, which took the same
+file from 24.10 s to 9.88 s on an M3 Pro. Whether that closes a 3.5x gap,
+halves it, or overturns it is not something this repository knows yet --
+`.github/workflows/validation.yml`'s `benchmark` job re-runs the head to
+head natively on x86-64, and its first result is the answer.
+
+Counting itself is not in question on either side: FastDNA is **exactly
+equal to KMC3** on real reads at every `k` tested, in both engines (see the
+table above).
 
 ## How the Rust core actually works
 

@@ -222,8 +222,18 @@ substantially more frugal than both with memory.** FASTK is 10x faster than
 FastDNA's in-memory strategy in the shared environment (3.5x faster than the
 Windows build); KMC3 is 3.5x faster (1.2x). Against that, FastDNA's disk
 strategy peaks at 1.21 GB -- less than half FASTK's 2.86 GB and a seventh of
-KMC3's 9.06 GB -- and is the only one of the three whose peak memory is
-configurable against a budget.
+KMC3's 9.06 GB.
+
+**Retracted 2026-09-07**: this paragraph also claimed FastDNA was the only
+one of the three whose peak memory is configurable against a budget. That
+is false, and was never checked before being written. `kmc --help` (3.2.4)
+lists `-m<size>` -- max RAM in GB, default 12 -- and `-sm`, a strict mode
+documented as "memory limit from `-m<n>` switch will not be exceeded". The
+run in the table above was given `-m8`. What FastDNA actually adds over
+that is not the budget but the estimator: `mem_estimate.rs` predicts peak
+RSS from input size and thread count and picks a strategy against the
+budget without being told which, and reports which it picked. That is a
+narrower claim, and it is the true one.
 
 One caveat that does not rescue the result but does explain part of it: the
 WSL2 VM has 12 GB of RAM and FastDNA's in-memory strategy peaked at

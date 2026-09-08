@@ -25,6 +25,26 @@ La superficie con compatibilidad garantizada es:
 
 ### Changed
 
+- **Retractada: "la única de las tres cuyo pico de memoria es configurable
+  contra un presupuesto".** Aparecía en `README.md` y en
+  `docs/BENCHMARKS.md`, sobre FastDNA frente a KMC3 y FASTK, y es **falsa**.
+  Nunca se comprobó antes de escribirla. `kmc --help` (3.2.4) lista
+  `-m<size>` -- RAM máxima en GB, por defecto 12 -- y `-sm`, un modo
+  estricto documentado como "memory limit from `-m<n>` switch will not be
+  exceeded". La propia corrida de la tabla usaba `-m8`.
+
+  Lo que FastDNA sí añade sobre eso no es el presupuesto sino el estimador:
+  `mem_estimate.rs` predice el pico de RSS y elige estrategia contra el
+  presupuesto sin que se lo digan, y dice cuál eligió. Es una afirmación
+  más estrecha y es la verdadera.
+
+  Sale de la misma revisión que añadió `README.md`'s "Should you use this
+  instead of KMC3?", una comparación honesta fila a fila comprobada contra
+  la salida real de `kmc --help` en vez de contra el recuerdo. Deja dicho
+  también lo que KMC3 tiene y nosotros no: k hasta 256 (nosotros 64),
+  conteo no canónico (`-b`), entrada BAM y multi-FASTA, salida KFF, y
+  out-of-core medido a 729 gigabases.
+
 - **El merge entre bins ahora es paralelo** (`counter::k_way_merge_sorted_
   counts_parallel`). Era la mayor porción secuencial que quedaba en una
   corrida binned: 1,88 s en un core contra 2,76 s de todo el conteo por bin
