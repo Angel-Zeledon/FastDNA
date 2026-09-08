@@ -56,6 +56,7 @@ fn config(k: usize) -> PipelineConfig {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     }
 }
@@ -194,6 +195,7 @@ fn zero_threads_is_rejected_instead_of_hanging() {
         batch_size: 8,
         num_threads: 0,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     };
 
@@ -219,6 +221,7 @@ fn zero_progress_interval_is_rejected_as_invalid_config() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 0,
+        canonical: true,
         hpc: false,
     };
 
@@ -251,6 +254,7 @@ fn zero_quality_window_is_rejected_as_invalid_config() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     };
 
@@ -283,6 +287,7 @@ fn zero_batch_size_is_rejected_as_invalid_config() {
         batch_size: 0,
         num_threads: 2,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     };
 
@@ -321,6 +326,7 @@ fn nan_min_quality_is_rejected_and_would_silently_zero_out_counts_if_not() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     };
 
@@ -349,6 +355,7 @@ fn nan_min_quality_is_rejected_and_would_silently_zero_out_counts_if_not() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     };
     let (counter, _qc, reads) = process_stream_parallel(
@@ -376,6 +383,7 @@ fn positive_infinity_min_quality_is_rejected_as_invalid_config() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     };
 
@@ -407,6 +415,7 @@ fn negative_infinity_min_quality_is_rejected_as_invalid_config() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     };
 
@@ -450,6 +459,7 @@ fn cancel_set_before_the_call_returns_promptly() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     };
 
@@ -532,6 +542,7 @@ fn cancellation_mid_run_returns_cancelled_not_partial_counts() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 10,
+        canonical: true,
         hpc: false,
     };
 
@@ -586,6 +597,7 @@ fn a_panic_in_a_worker_thread_progress_callback_becomes_internal_and_returns() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 10,
+        canonical: true,
         hpc: false,
     };
 

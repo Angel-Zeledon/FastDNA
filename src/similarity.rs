@@ -351,7 +351,7 @@ mod tests {
         let path = temp_path(name);
         let mut counter = KmerCounter::new();
         counter.insert_batch(entries);
-        export::export_counts_parquet(&counter, &path, k, 1, false).unwrap();
+        export::export_counts_parquet(&counter, &path, k, 1, false, true).unwrap();
         (KmerTable::open(&path).unwrap(), path)
     }
 

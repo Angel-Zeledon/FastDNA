@@ -65,7 +65,7 @@ fn the_documented_public_modules_are_reachable() {
         Err(FastDnaError::Io { .. }) => {}
         other => panic!("expected an Io error routing a missing table, got {other:?}"),
     }
-    let _: fn(&str, usize) -> Result<u128, FastDnaError> = encode_query_wide_kmer;
+    let _: fn(&str, usize, bool) -> Result<u128, FastDnaError> = encode_query_wide_kmer;
     assert_ne!(TableKey::Narrow, TableKey::Wide);
 
     // `setops::MergeSource` es publico por necesidad, no por gusto:

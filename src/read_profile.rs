@@ -200,6 +200,9 @@ pub struct ProfileIndex {
     kmers: ProfileKeys,
     /// `counts[i]` is the reference table's frequency for key `i`.
     counts: Vec<u32>,
+    /// The reference's own counting convention; reads are extracted the
+    /// same way. See `ktab::CANONICAL_KEY`.
+    canonical: bool,
 }
 
 /// The resident key array, at whichever width the reference was written in
@@ -246,7 +249,7 @@ impl ProfileIndex {
             kmers.push(kmer);
             counts.push(count);
         }
-        Ok(Self { k: table.k(), kmers: ProfileKeys::Narrow(kmers), counts })
+        Ok(Self { k: table.k(), kmers: ProfileKeys::Narrow(kmers), counts, canonical: table.canonical() })
     }
 
     /// `from_table` for a wide (`kmer_bits`, `33 <= k <= 64`) reference.
@@ -260,7 +263,7 @@ impl ProfileIndex {
             kmers.push(kmer);
             counts.push(count);
         }
-        Ok(Self { k: table.k(), kmers: ProfileKeys::Wide(kmers), counts })
+        Ok(Self { k: table.k(), kmers: ProfileKeys::Wide(kmers), counts, canonical: table.canonical() })
     }
 
     /// The `k` every resident k-mer was packed with (the reference table's
@@ -418,14 +421,22 @@ pub fn build_read_profile(
     resolved.clear();
     match index.width() {
         "wide" => {
-            wide_kmer::extract_canonical_kmers_with_positions_into(seq, index.k(), &mut scratch.wide);
+            if index.canonical {
+                wide_kmer::extract_canonical_kmers_with_positions_into(seq, index.k(), &mut scratch.wide);
+            } else {
+                wide_kmer::extract_forward_kmers_with_positions_into(seq, index.k(), &mut scratch.wide);
+            }
             resolved.reserve(scratch.wide.len());
             for &(pos, km) in scratch.wide.iter() {
                 resolved.push((pos, index.get_wide(km).unwrap_or(0)));
             }
         }
         _ => {
-            kmer::extract_canonical_kmers_with_positions_into(seq, index.k(), &mut scratch.narrow);
+            if index.canonical {
+                kmer::extract_canonical_kmers_with_positions_into(seq, index.k(), &mut scratch.narrow);
+            } else {
+                kmer::extract_forward_kmers_with_positions_into(seq, index.k(), &mut scratch.narrow);
+            }
             resolved.reserve(scratch.narrow.len());
             for &(pos, km) in scratch.narrow.iter() {
                 resolved.push((pos, index.get_narrow(km).unwrap_or(0)));
@@ -831,7 +842,7 @@ mod tests {
         let path = temp_path(name);
         let mut counter = KmerCounter::new();
         counter.insert_batch(entries);
-        export::export_counts_parquet(&counter, &path, k, 1, false).unwrap();
+        export::export_counts_parquet(&counter, &path, k, 1, false, true).unwrap();
         let table = KmerTable::open(&path).unwrap();
         (ProfileIndex::from_table(&table).unwrap(), path)
     }

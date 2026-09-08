@@ -190,6 +190,48 @@ La superficie con compatibilidad garantizada es:
 
 ### Added
 
+- **Conteo no canónico: `--no-canonical` / `count(canonical=False)`**, la
+  bandera `-b` de KMC3, que era un hueco real de capacidad. Cada k-mer se
+  cuenta tal como se lee hacia adelante, así que un k-mer y su complemento
+  inverso son claves distintas. Para datos específicos de hebra; el default
+  canónico sigue siendo el correcto para escopeta, donde un fragmento se
+  secuencia por un extremo arbitrario.
+
+  **Igualdad exacta con `kmc -b`** sobre `DRR002015`: 23.570.343 distintos
+  y 163.051.083 totales en ambas herramientas. Que las dos banderas
+  signifiquen lo mismo no lo comprueba nada más: un contador que
+  canonicalizara igualmente coincidiría con KMC3 en toda corrida canónica y
+  solo divergería aquí. Está en `validation.yml`.
+
+  **La tabla lo recuerda, y esa es la parte que importa.** El footer lleva
+  `fastdna.canonical`, y **ausente significa canónico** -- toda tabla
+  escrita antes de que existiera la clave se sigue leyendo bien. Sin eso,
+  `query` canonicalizaría la consulta contra una tabla que no lo es,
+  buscaría una clave que esa tabla no puede contener, y devolvería un fallo
+  **indistinguible de una ausencia real**. Ese es el modo de fallo que este
+  proyecto lleva persiguiendo todo el año: la respuesta bien formada y
+  equivocada.
+
+  Todo lo que convierte una *secuencia* en clave lee esa marca en vez de
+  suponerla: `query`, `read_filter::ReferenceIndex`,
+  `read_profile::ProfileIndex`. Y mezclar una tabla canónica con una que no
+  lo es en una operación de conjuntos o en `similarity` se **rechaza**:
+  ambas son `u64` con el mismo `k`, así que nada aguas abajo lo detectaría.
+
+  Salen también las variantes hacia adelante de los extractores
+  (`extract_forward_kmers_into` y su forma con posiciones, en los dos
+  motores) y `SuperKmerRecord::expand_forward_into`, que no mantienen
+  registro inverso y por tanto hacen estrictamente menos trabajo por base.
+
+  **Cambio rompedor** que el 0.x permite: los cuatro escritores de tablas
+  (`export_counts_parquet`, `export_wide_counts_parquet`,
+  `export_pairs_parquet`, `export_wide_pairs_parquet`) y
+  `encode_query_kmer`/`encode_query_wide_kmer` toman ahora la convención.
+  `matrix` deliberadamente **no** expone la bandera: una matriz de cohorte
+  existe para que una columna signifique el mismo k-mer en cada muestra, y
+  mezclar convenciones entre muestras compararía cosas incomparables con
+  aspecto perfectamente correcto.
+
 - **Las operaciones de conjuntos aceptan las dos anchuras.**
   `union`/`intersect`/`diff` eran de clave `u64` de punta a punta; ahora son
   genéricas sobre un trait nuevo, `setops::MergeSource`, implementado por

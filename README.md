@@ -181,6 +181,7 @@ sequencing data rather than generated input**, by scripts committed under
 |---|---|---|
 | k-mer counting, `u64` engine | KMC3 3.2.4 | **exact match** at k=31, 21 and 15 |
 | k-mer counting, `u128` engine | KMC3 3.2.4 | **exact match** at k=33, 41 and 64, and at k=31 forced into the overlap |
+| non-canonical counting | KMC3 3.2.4 `-b` | **exact match**: 23,570,343 distinct, 163,051,083 total |
 | exact similarity, `u128` tables | `kmc_tools` set operations | **exact match** at k=41: every set size and every derived ratio |
 | MinHash distances | Mash 2.3 | r = 0.997, no systematic bias |
 | HyperLogLog cardinality | the exact count | −0.26% (bound: ~0.8%) |
@@ -222,9 +223,8 @@ Often not. The honest comparison, with every row checked against
 | Speed | 110.4 s on the 2.14 GB file | 388.2 s on the same file, same machine. That measures a default path FastDNA no longer has (see above) and the gap has narrowed by an unmeasured amount -- but it has not been re-measured, so KMC3 is the one with a number |
 | `k` | 1-256 | 1-64. Two bits per base in 128 of them is 64 bases; past that needs a byte-string key that changes the sort order, the Parquet schema and every comparison in the counter |
 | Out-of-core at scale | 729 gigabases of human reads in 33-34 GB (Kokot et al., *Bioinformatics*, 2017) | a disk strategy that is newer, less tuned, and **never benchmarked at that scale** |
-| Non-canonical counting | `-b` | no equivalent; canonicalization is unconditional |
+| Counter cap and DB size | `-cs` caps the stored counter; `--opt-out-size` shrinks the database | neither |
 | Input formats | adds **BAM** (`-fbam`) and a KMC database as input (`-fkmc`) | FASTQ, FASTA and multi-FASTA (every record is a read), gzipped or not, or stdin -- no BAM |
-| Counter cap | `-cs` caps the stored counter (default 255) to shrink the database | counts are `u32`, uncapped -- better for accuracy, worse for output size |
 | Interchange format | `-o kff` writes [KFF](https://github.com/Kmer-File-Format/kff-reference), a community standard | Parquet only |
 | Maturity | a decade old, thousands of citations, in every distribution | one author, pre-1.0, no release yet |
 
@@ -235,6 +235,7 @@ Often not. The honest comparison, with every row checked against
 | Output you can already read | Parquet, sorted, with footer metadata. It opens in pandas, polars, DuckDB and Spark with zero code from this project. KMC writes its own binary database; getting a table out means `kmc_dump` and a text file |
 | Python | in-process, zero-copy Arrow, no subprocess and no serialization round trip. `fastdna.count(...)` hands back a `pyarrow.Table` |
 | Quality trimming | `-q` trims low-quality 3' ends before extraction. KMC3 has no quality-aware mode; it counts what the read says |
+| Non-canonical counting | `--no-canonical` matches KMC3's `-b` exactly (23,570,343 distinct against KMC3's 23,570,343 on `DRR002015` at k=31), and the table records the convention in its footer so `query`, `filter` and `profile` follow it instead of assuming. KMC3 has the flag but nothing that reads the database back knows which way it was written |
 | What ships in one tool | MinHash sketching and Mash distance, HyperLogLog cardinality, ntCard spectrum estimation, per-read coverage profiles, abundance-weighted Bray-Curtis, `peek`, a QC report. `kmc_tools` covers the set operations and a histogram; the rest has no KMC equivalent |
 | Choosing a strategy | `--max-ram` plus an estimator that predicts peak RSS and picks in-memory, binned or disk-partitioned on its own. KMC3's `-m`/`-sm` set a budget you must choose; this one is chosen for you and says which it picked |
 

@@ -82,6 +82,9 @@ struct RowGroupRange {
 pub struct WideKmerTable {
     path: PathBuf,
     k: usize,
+    /// From the table's own `fastdna.canonical` footer key; absent means
+    /// `true`. See `ktab::CANONICAL_KEY`.
+    canonical: bool,
     total_rows: u64,
     kmer_col: usize,
     freq_col: usize,
@@ -258,13 +261,33 @@ impl WideKmerTable {
             row_groups.push(RowGroupRange { index, min, max });
         }
 
-        Ok(Self { path, k, total_rows, kmer_col, freq_col, row_groups })
+        let canonical = match kv
+            .and_then(|pairs| pairs.iter().find(|p| p.key == crate::ktab::CANONICAL_KEY))
+            .and_then(|p| p.value.as_deref())
+        {
+            None | Some("true") => true,
+            Some("false") => false,
+            Some(other) => {
+                return Err(load_reason(
+                    &path,
+                    format!("'fastdna.canonical' is '{other}', which is neither 'true' nor 'false'"),
+                ))
+            }
+        };
+
+        Ok(Self { path, k, canonical, total_rows, kmer_col, freq_col, row_groups })
     }
 
     /// The `k` every row's `kmer_bits` was packed with, from the table's
     /// own `fastdna.k` metadata.
     pub fn k(&self) -> usize {
         self.k
+    }
+
+    /// Whether this table's k-mers were canonicalised -- see
+    /// [`crate::ktab::KmerTable::canonical`].
+    pub fn canonical(&self) -> bool {
+        self.canonical
     }
 
     /// The file this table was opened from.
@@ -428,7 +451,10 @@ impl Iterator for WideRangeIter {
 /// A malformed query is `FastDnaError::InvalidConfig`, never a silent
 /// `None` -- "you typed it wrong" and "it is not in the table" are
 /// different answers and must not look the same.
-pub fn encode_query_wide_kmer(input: &str, k: usize) -> Result<u128> {
+/// `canonical` must match the table being queried -- see
+/// [`crate::ktab::encode_query_kmer`] for why a mismatch is a silent wrong
+/// answer rather than an error.
+pub fn encode_query_wide_kmer(input: &str, k: usize, canonical: bool) -> Result<u128> {
     let trimmed = input.trim();
     if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
         return trimmed.parse::<u128>().map_err(|e| FastDnaError::InvalidConfig {
@@ -445,7 +471,13 @@ pub fn encode_query_wide_kmer(input: &str, k: usize) -> Result<u128> {
         });
     }
 
-    match wide_kmer::extract_canonical_kmers(bytes, k).as_slice() {
+    let mut extracted = Vec::new();
+    if canonical {
+        wide_kmer::extract_canonical_kmers_into(bytes, k, &mut extracted);
+    } else {
+        wide_kmer::extract_forward_kmers_into(bytes, k, &mut extracted);
+    }
+    match extracted.as_slice() {
         [only] => Ok(*only),
         _ => Err(FastDnaError::InvalidConfig {
             parameter: "kmer",
@@ -487,7 +519,7 @@ mod tests {
         let expected: Vec<(u128, u32)> = counts.iter().collect();
 
         let path = temp_path(name);
-        export::export_wide_counts_parquet(&counts, &path, k, false).expect("write wide table");
+        export::export_wide_counts_parquet(&counts, &path, k, false, true).expect("write wide table");
         (path, expected)
     }
 
@@ -556,7 +588,7 @@ mod tests {
         counter.insert_batch(&crate::kmer::extract_canonical_kmers(b"ACGTACGTACGTACGTACGTACGT", 21));
         let path = temp_path("narrow_input");
         let _cleanup = Cleanup(path.clone());
-        export::export_counts_parquet(&counter, &path, 21, 1, false).expect("write narrow table");
+        export::export_counts_parquet(&counter, &path, 21, 1, false, true).expect("write narrow table");
 
         let err = WideKmerTable::open(&path).unwrap_err().to_string();
         assert!(err.contains("kmer_bits"), "the error should name the column it wanted: {err}");
@@ -583,16 +615,16 @@ mod tests {
         assert_eq!(seq.len(), k);
         let packed = wide_kmer::extract_canonical_kmers(seq.as_bytes(), k)[0];
 
-        assert_eq!(encode_query_wide_kmer(seq, k).unwrap(), packed);
-        assert_eq!(encode_query_wide_kmer(&packed.to_string(), k).unwrap(), packed);
+        assert_eq!(encode_query_wide_kmer(seq, k, true).unwrap(), packed);
+        assert_eq!(encode_query_wide_kmer(&packed.to_string(), k, true).unwrap(), packed);
     }
 
     #[test]
     fn a_malformed_query_is_an_error_not_a_miss() {
         let k = 33;
-        assert!(encode_query_wide_kmer("ACGT", k).is_err(), "wrong length");
+        assert!(encode_query_wide_kmer("ACGT", k, true).is_err(), "wrong length");
         let with_n = format!("N{}", "ACGTTGCAAGGCTTACCGATCGATTACAGCAT");
         assert_eq!(with_n.len(), k);
-        assert!(encode_query_wide_kmer(&with_n, k).is_err(), "ambiguous base");
+        assert!(encode_query_wide_kmer(&with_n, k, true).is_err(), "ambiguous base");
     }
 }

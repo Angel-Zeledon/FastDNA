@@ -248,6 +248,48 @@ pub fn homopolymer_compress_into(seq: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// [`extract_canonical_kmers_into`] without the canonicalisation: emits each
+/// k-mer exactly as it reads in the forward direction, so a k-mer and its
+/// reverse complement are two different keys.
+///
+/// This is what `--no-canonical` counts, and what KMC3's `-b` counts. It is
+/// the right answer for strand-specific data, where "this k-mer on the
+/// sense strand" and "the same bases on the antisense strand" are different
+/// observations, and the wrong answer for ordinary shotgun data, where a
+/// fragment is sequenced from an arbitrary end and canonicalising is what
+/// makes the two orientations one count. Canonical stays the default for
+/// that reason.
+///
+/// Identical to the canonical form in every other respect: `out` is cleared
+/// first, an ambiguous base resets the window rather than corrupting the
+/// k-mers spanning it, and the roll is the same O(n) shift. There is no
+/// reverse register to maintain at all, which is why this is also strictly
+/// less work per base.
+pub fn extract_forward_kmers_into(seq: &[u8], k: usize, out: &mut Vec<u64>) {
+    out.clear();
+    if seq.len() < k || k == 0 || k > 32 {
+        return;
+    }
+    out.reserve(seq.len() - k + 1);
+
+    let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let mut fwd: u64 = 0;
+    let mut valid_len: usize = 0;
+
+    for &base in seq {
+        if let Some(bits) = base_to_bits(base) {
+            fwd = ((fwd << 2) | bits) & mask;
+            valid_len += 1;
+            if valid_len >= k {
+                out.push(fwd);
+            }
+        } else {
+            fwd = 0;
+            valid_len = 0;
+        }
+    }
+}
+
 /// Extracts every canonical k-mer from a DNA sequence into a fresh `Vec`.
 ///
 /// A thin wrapper over [`extract_canonical_kmers_into`]; identical results.
@@ -337,6 +379,50 @@ pub fn extract_canonical_kmers_with_positions_into(seq: &[u8], k: usize, out: &m
         } else {
             fwd = 0;
             rev = 0;
+            valid_len = 0;
+        }
+    }
+}
+
+/// [`extract_canonical_kmers_with_positions_into`] without the canonicalisation: each k-mer as it
+/// reads forward, paired with its start offset. What `profile` needs when
+/// its reference table was counted with `--no-canonical`.
+///
+/// No reverse register at all, so this is strictly less work per base than
+/// the canonical form.
+pub fn extract_forward_kmers_with_positions_into(seq: &[u8], k: usize, out: &mut Vec<(u32, u64)>) {
+    out.clear();
+    if seq.len() < k || k == 0 || k > 32 {
+        return;
+    }
+    // See this function's doc comment: a caller with a `usize`-length input
+    // is responsible for rejecting an oversized read before this call. This
+    // assert is a cheap, release-mode-free tripwire, not the enforcement
+    // point itself -- the same division of labor `reverse_complement_u64`'s
+    // own `debug_assert!` on `k` already uses in this file.
+    debug_assert!(seq.len() <= u32::MAX as usize, "read of {} bases exceeds the u32 position cap", seq.len());
+    out.reserve(seq.len() - k + 1);
+
+    let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+
+    let mut fwd: u64 = 0;
+    let mut valid_len: usize = 0;
+
+    for (i, &base) in seq.iter().enumerate() {
+        if let Some(bits) = base_to_bits(base) {
+            fwd = ((fwd << 2) | bits) & mask;
+            valid_len += 1;
+
+            if valid_len >= k {
+                // `i` is the position of the last base rolled into this
+                // k-mer; the first is `k - 1` positions earlier. `i + 1 >=
+                // k` is guaranteed here (valid_len <= i + 1), so this
+                // subtraction cannot underflow.
+                let start = (i + 1 - k) as u32;
+                out.push((start, fwd));
+            }
+        } else {
+            fwd = 0;
             valid_len = 0;
         }
     }

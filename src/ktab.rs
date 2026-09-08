@@ -117,6 +117,22 @@ pub const SORTED_BY_WIDE_VALUE: &str = "kmer_bits";
 /// value.
 pub const K_KEY: &str = "fastdna.k";
 
+/// Parquet key-value metadata key recording whether a table's k-mers were
+/// canonicalised (`"true"`) or counted as they read forward (`"false"`,
+/// what `--no-canonical` and KMC3's `-b` produce).
+///
+/// **Absent means canonical.** Every table written before this key existed
+/// is canonical, and a reader that defaulted the other way would silently
+/// stop canonicalising queries against them. [`table_is_canonical`] is the
+/// one place that default lives.
+///
+/// This has to be recorded rather than inferred, and `query` is why: a
+/// non-canonical table holds `ACGT...` and `...ACGT` as different rows, so
+/// canonicalising a user's query before looking it up would search for a
+/// key the table may never contain -- a miss that looks exactly like a
+/// genuine absence.
+pub const CANONICAL_KEY: &str = "fastdna.canonical";
+
 /// One row group's `kmer_u64` range, read once from `ParquetMetaData` at
 /// `open` time -- cheap (footer-only, no row decoded) and enough to prune
 /// every `get`/`range` call down to the row groups that can possibly
@@ -136,6 +152,9 @@ struct RowGroupRange {
 pub struct KmerTable {
     path: PathBuf,
     k: usize,
+    /// From the table's own `fastdna.canonical` footer key; absent means
+    /// `true`. See `ktab::CANONICAL_KEY`.
+    canonical: bool,
     total_rows: u64,
     kmer_col: usize,
     freq_col: usize,
@@ -187,6 +206,34 @@ pub enum TableKey {
 /// deliberately validates nothing else: the reader it selects does the
 /// full check, and duplicating that here would be two places to keep in
 /// agreement.
+/// Whether the table at `path` holds canonical k-mers, from its own
+/// [`CANONICAL_KEY`] footer metadata. Absent metadata means canonical --
+/// see that constant for why the default is not symmetric.
+///
+/// Footer-only, like [`table_key`], and separate from it because the two
+/// answer independent questions: a table can be wide or narrow, and
+/// canonical or not, in any combination.
+pub fn table_is_canonical<P: AsRef<Path>>(path: P) -> Result<bool> {
+    let path = path.as_ref();
+    let file = File::open(path).map_err(|e| FastDnaError::Io { path: path.to_path_buf(), source: e })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| load_err(path, e))?;
+    let metadata = builder.metadata().file_metadata().clone();
+
+    let value = metadata
+        .key_value_metadata()
+        .and_then(|pairs| pairs.iter().find(|p| p.key == CANONICAL_KEY))
+        .and_then(|p| p.value.as_deref());
+
+    match value {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(load_reason(
+            path,
+            format!("'{CANONICAL_KEY}' is '{other}', which is neither 'true' nor 'false'"),
+        )),
+    }
+}
+
 pub fn table_key<P: AsRef<Path>>(path: P) -> Result<TableKey> {
     let path = path.as_ref();
     let file = File::open(path).map_err(|e| FastDnaError::Io { path: path.to_path_buf(), source: e })?;
@@ -375,7 +422,22 @@ impl KmerTable {
             row_groups.push(RowGroupRange { index, min, max });
         }
 
-        Ok(Self { path, k, total_rows, kmer_col, freq_col, row_groups })
+        // Same footer, already in hand -- no second read of the file.
+        let canonical = match kv
+            .and_then(|pairs| pairs.iter().find(|p| p.key == CANONICAL_KEY))
+            .and_then(|p| p.value.as_deref())
+        {
+            None | Some("true") => true,
+            Some("false") => false,
+            Some(other) => {
+                return Err(load_reason(
+                    &path,
+                    format!("'{CANONICAL_KEY}' is '{other}', which is neither 'true' nor 'false'"),
+                ))
+            }
+        };
+
+        Ok(Self { path, k, canonical, total_rows, kmer_col, freq_col, row_groups })
     }
 
     /// The `k` every row's `kmer_u64` was packed with (from the table's own
@@ -383,6 +445,18 @@ impl KmerTable {
     /// empty table has no rows to derive it from).
     pub fn k(&self) -> usize {
         self.k
+    }
+
+    /// Whether this table's k-mers were canonicalised. Read from its own
+    /// footer at `open` time; absent metadata means `true` (see
+    /// [`CANONICAL_KEY`]).
+    ///
+    /// Every consumer that turns a *sequence* into a key has to agree with
+    /// this or it will look up keys the table cannot contain --
+    /// `encode_query_kmer`, `read_filter::ReferenceIndex`,
+    /// `read_profile::ProfileIndex`.
+    pub fn canonical(&self) -> bool {
+        self.canonical
     }
 
     /// The file this table was opened from. Needed by any caller that must
@@ -583,7 +657,13 @@ impl Iterator for RangeIter {
 /// `FastDnaError::InvalidConfig`, not a silent `None` result indistinguishable
 /// from "not in the table" -- those are different problems (a malformed
 /// query vs. a genuine miss) and must not be reported the same way.
-pub fn encode_query_kmer(input: &str, k: usize) -> Result<u64> {
+/// `canonical` must match the table being queried
+/// ([`table_is_canonical`]). Canonicalising a query against a
+/// non-canonical table searches for a key that table may never hold, and
+/// the miss is indistinguishable from a genuine absence -- which is the
+/// whole reason the convention is recorded in the footer rather than
+/// assumed.
+pub fn encode_query_kmer(input: &str, k: usize, canonical: bool) -> Result<u64> {
     let trimmed = input.trim();
     if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
         return trimmed.parse::<u64>().map_err(|e| FastDnaError::InvalidConfig {
@@ -600,7 +680,13 @@ pub fn encode_query_kmer(input: &str, k: usize) -> Result<u64> {
         });
     }
 
-    match kmer::extract_canonical_kmers(bytes, k).as_slice() {
+    let mut extracted = Vec::new();
+    if canonical {
+        kmer::extract_canonical_kmers_into(bytes, k, &mut extracted);
+    } else {
+        kmer::extract_forward_kmers_into(bytes, k, &mut extracted);
+    }
+    match extracted.as_slice() {
         [only] => Ok(*only),
         _ => Err(FastDnaError::InvalidConfig {
             parameter: "kmer",
@@ -632,7 +718,7 @@ mod tests {
     fn write_test_table(path: &Path, k: usize, entries: &[u64]) -> KmerCounter {
         let mut counter = KmerCounter::new();
         counter.insert_batch(entries);
-        export::export_counts_parquet(&counter, path, k, 1, false).unwrap();
+        export::export_counts_parquet(&counter, path, k, 1, false, true).unwrap();
         counter
     }
 
@@ -851,19 +937,19 @@ mod tests {
 
     #[test]
     fn encode_query_kmer_accepts_a_numeric_literal_as_the_raw_encoding() {
-        assert_eq!(encode_query_kmer("42", 4).unwrap(), 42);
+        assert_eq!(encode_query_kmer("42", 4, true).unwrap(), 42);
     }
 
     #[test]
     fn encode_query_kmer_encodes_a_sequence_of_the_right_length_canonically() {
         // "ACGT" at k=4, same fixture kmer.rs's own tests use.
-        let encoded = encode_query_kmer("ACGT", 4).unwrap();
+        let encoded = encode_query_kmer("ACGT", 4, true).unwrap();
         assert_eq!(encoded, kmer::extract_canonical_kmers(b"ACGT", 4)[0]);
     }
 
     #[test]
     fn encode_query_kmer_rejects_a_sequence_of_the_wrong_length() {
-        match encode_query_kmer("ACG", 4) {
+        match encode_query_kmer("ACG", 4, true) {
             Err(FastDnaError::InvalidConfig { .. }) => {}
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
@@ -871,7 +957,7 @@ mod tests {
 
     #[test]
     fn encode_query_kmer_rejects_an_ambiguous_base() {
-        match encode_query_kmer("ACGN", 4) {
+        match encode_query_kmer("ACGN", 4, true) {
             Err(FastDnaError::InvalidConfig { .. }) => {}
             other => panic!("expected InvalidConfig, got {other:?}"),
         }

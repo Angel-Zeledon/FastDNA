@@ -162,7 +162,7 @@ fn csv_export_leaves_no_temp_sibling_on_success() {
 fn parquet_export_leaves_no_temp_sibling_on_success() {
     let dir = TempDir::new().unwrap();
     let dest = dir.path().join("counts.parquet");
-    export::export_counts_parquet(&counter_with_data(), &dest, 4, 1, false).unwrap();
+    export::export_counts_parquet(&counter_with_data(), &dest, 4, 1, false, true).unwrap();
     assert!(dest.exists());
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 }

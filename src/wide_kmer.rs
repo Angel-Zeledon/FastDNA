@@ -222,6 +222,78 @@ pub fn extract_canonical_kmers_with_positions_into(seq: &[u8], k: usize, out: &m
     }
 }
 
+/// [`extract_canonical_kmers_with_positions_into`] without the canonicalisation: each k-mer as it
+/// reads forward, paired with its start offset. What `profile` needs when
+/// its reference table was counted with `--no-canonical`.
+///
+/// No reverse register at all, so this is strictly less work per base than
+/// the canonical form.
+pub fn extract_forward_kmers_with_positions_into(seq: &[u8], k: usize, out: &mut Vec<(u32, u128)>) {
+    out.clear();
+    if seq.len() < k || k == 0 || k > MAX_WIDE_K {
+        return;
+    }
+    debug_assert!(
+        seq.len() <= u32::MAX as usize,
+        "read of {} bases exceeds the u32 position cap",
+        seq.len()
+    );
+    out.reserve(seq.len() - k + 1);
+
+    let mask = if k == MAX_WIDE_K { u128::MAX } else { (1u128 << (2 * k)) - 1 };
+
+    let mut fwd: u128 = 0;
+    let mut valid_len: usize = 0;
+
+    for (i, &base) in seq.iter().enumerate() {
+        if let Some(bits) = base_to_bits(base) {
+            let bits = u128::from(bits);
+            fwd = ((fwd << 2) | bits) & mask;
+            valid_len += 1;
+
+            if valid_len >= k {
+                // `i` is the last base rolled into this k-mer; the first is
+                // `k - 1` earlier. `valid_len <= i + 1` guarantees
+                // `i + 1 >= k`, so this cannot underflow.
+                let start = (i + 1 - k) as u32;
+                out.push((start, fwd));
+            }
+        } else {
+            fwd = 0;
+            valid_len = 0;
+        }
+    }
+}
+
+/// [`extract_canonical_kmers_into`] without the canonicalisation -- the
+/// wide form of [`crate::kmer::extract_forward_kmers_into`]. See that
+/// function for what `--no-canonical` means and when it is the right
+/// answer.
+pub fn extract_forward_kmers_into(seq: &[u8], k: usize, out: &mut Vec<u128>) {
+    out.clear();
+    if seq.len() < k || k == 0 || k > MAX_WIDE_K {
+        return;
+    }
+    out.reserve(seq.len() - k + 1);
+
+    let mask = if k == MAX_WIDE_K { u128::MAX } else { (1u128 << (2 * k)) - 1 };
+    let mut fwd: u128 = 0;
+    let mut valid_len = 0;
+
+    for &base in seq {
+        if let Some(bits) = base_to_bits(base) {
+            fwd = ((fwd << 2) | u128::from(bits)) & mask;
+            valid_len += 1;
+            if valid_len >= k {
+                out.push(fwd);
+            }
+        } else {
+            fwd = 0;
+            valid_len = 0;
+        }
+    }
+}
+
 /// Allocating convenience over [`extract_canonical_kmers_into`], for tests
 /// and one-off callers. The hot path uses the buffer-reusing form.
 pub fn extract_canonical_kmers(seq: &[u8], k: usize) -> Vec<u128> {

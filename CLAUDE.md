@@ -31,6 +31,17 @@ one footer read, `ktab::table_key`.
 What still stops at `k = 32` is sketching and the estimators (`sketch`,
 `dist`, `card`, `spectrum`) -- they hash from FASTQ, never from a table.
 
+**Counting convention**: `--no-canonical` (`PipelineConfig::canonical`,
+`count(canonical=False)`) counts each k-mer as it reads forward instead of
+folding it with its reverse complement -- KMC3's `-b`, and exactly equal to
+it. A table records the convention in its footer
+(`ktab::CANONICAL_KEY`; **absent means canonical**, so every table written
+before this key stays readable), and every consumer that turns a sequence
+into a key reads it rather than assuming: `query`, `ReferenceIndex`,
+`ProfileIndex`. Combining a canonical and a non-canonical table in a set
+operation or in `similarity` is refused -- both are `u64` at the same `k`,
+so nothing downstream would catch it.
+
 **The machine-learning layer was removed on 2026-09-05** — 31 Python
 modules and 4 Rust modules (`sklearn`, `audit`, `cv`, `explain`, `gwas`,
 `mic`, `embed`, `datasets`, `metagenomics`, `taxonomy`, `translate`,

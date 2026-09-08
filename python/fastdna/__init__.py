@@ -483,6 +483,7 @@ def count(
     hpc: bool = False,
     with_sequence: bool = False,
     engine: str = "auto",
+    canonical: bool = True,
 ) -> KmerCounts:
     """Count canonical k-mers in a single FASTQ(.gz) file.
 
@@ -551,6 +552,16 @@ def count(
     - `"wide"` runs the u128 engine even at `k <= 32`. Slower, and it is
       how the two engines get checked against each other.
 
+    `canonical=False` counts each k-mer as it reads forward instead of
+    folding it together with its reverse complement -- the CLI's
+    `--no-canonical` and KMC3's `-b`. The default is right for ordinary
+    shotgun data, where a fragment is sequenced from an arbitrary end and
+    the two orientations are one observation; turn it off for
+    strand-specific input, where they are two. A table written this way
+    records the fact in its Parquet footer, and everything that reads one
+    back -- `query`, `KmerTable`, filtering, profiling -- follows it rather
+    than assuming.
+
     A wide count's `.table` keys on `kmer_bits` -- 16 big-endian bytes,
     since Arrow has no 128-bit integer -- instead of `kmer_u64`, and
     `.engine` reports which you have. **The rest of this package is u64-
@@ -572,6 +583,7 @@ def count(
         hpc=hpc,
         with_sequence=with_sequence,
         engine=engine,
+        canonical=canonical,
     )
     return KmerCounts(raw)
 
@@ -926,6 +938,20 @@ class KmerTable:
         afterwards.
         """
         return self._raw.engine
+
+    @property
+    def canonical(self) -> bool:
+        """Whether this table's k-mers were canonicalised. `False` is a
+        table counted with `--no-canonical` (KMC3's `-b`), where a k-mer and
+        its reverse complement are separate rows.
+
+        Every input to one set operation, or to `similarity`, must agree on
+        this: a canonical and a non-canonical table disagree about what a
+        key *means*, so combining them would pair rows that are not the same
+        k-mer. The mix is refused rather than allowed to produce a
+        well-formed wrong answer.
+        """
+        return self._raw.canonical
 
     def get(self, kmer: Union[str, int]) -> Optional[int]:
         """The frequency recorded for `kmer`, or `None` if it is absent."""

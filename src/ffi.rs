@@ -773,7 +773,7 @@ fn open_fastq_reader(path: &PathBuf) -> Result<FastqReader<Box<dyn BufRead + Sen
 /// returns `FastDnaError::Cancelled`, which `impl From<..> for PyErr`
 /// above maps to `KeyboardInterrupt`.
 #[pyfunction]
-#[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=None, hpc=false, with_sequence=false, engine="auto"))]
+#[pyo3(signature = (path, k=31, min_count=1, max_count=None, min_quality=20.0, threads=None, progress=None, progress_interval=None, hpc=false, with_sequence=false, engine="auto", canonical=true))]
 #[allow(clippy::too_many_arguments)]
 fn count(
     py: Python<'_>,
@@ -807,6 +807,11 @@ fn count(
     // three-way flag and a Python caller writing `engine="wide"` needs no
     // import to do it.
     engine: &str,
+    // Fold each k-mer with its reverse complement (the default), or count it
+    // as it reads forward. `False` is the CLI's `--no-canonical` and KMC3's
+    // `-b`, and is for strand-specific input; ordinary shotgun data wants
+    // the default, since a fragment is sequenced from an arbitrary end.
+    canonical: bool,
 ) -> PyResult<PyKmerCounts> {
     let choice = match engine {
         "auto" => EngineChoice::Auto,
@@ -847,7 +852,8 @@ fn count(
     // default batch size so the common case (no explicit interval) is
     // unaffected.
     let batch_size = (progress_interval as usize).clamp(1, defaults.batch_size);
-    let config = PipelineConfig { k, min_quality, num_threads, batch_size, progress_interval, hpc, ..defaults };
+    let config =
+        PipelineConfig { k, min_quality, num_threads, batch_size, progress_interval, hpc, canonical, ..defaults };
 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_worker = cancel.clone();
@@ -1458,7 +1464,7 @@ fn extract_kmer_arg(kmer: &Bound<'_, PyAny>, k: usize) -> PyResult<u64> {
             "kmer must be a DNA sequence (str) of length k, or the table's raw kmer_u64 encoding (a non-negative int)",
         )
     })?;
-    Ok(ktab::encode_query_kmer(&sequence, k)?)
+    Ok(ktab::encode_query_kmer(&sequence, k, true)?)
 }
 
 /// `extract_kmer_arg` for a wide table: the same contract, with the packed
@@ -1474,7 +1480,7 @@ fn extract_wide_kmer_arg(kmer: &Bound<'_, PyAny>, k: usize) -> PyResult<u128> {
             "kmer must be a DNA sequence (str) of length k, or the table's raw kmer_bits encoding (a non-negative int)",
         )
     })?;
-    Ok(crate::wide_ktab::encode_query_wide_kmer(&sequence, k)?)
+    Ok(crate::wide_ktab::encode_query_wide_kmer(&sequence, k, true)?)
 }
 
 #[pymethods]
@@ -1502,6 +1508,22 @@ impl PyKmerTable {
     #[getter]
     fn k(&self) -> usize {
         self.inner.k()
+    }
+
+    /// Whether this table's k-mers were canonicalised. `False` is a table
+    /// counted with `--no-canonical` (KMC3's `-b`), where a k-mer and its
+    /// reverse complement are separate rows.
+    ///
+    /// Worth checking before comparing two tables: a canonical and a
+    /// non-canonical table disagree about what a key *means*, so a set
+    /// operation over both would pair rows that are not the same k-mer.
+    /// The set operations refuse the mix rather than let that happen.
+    #[getter]
+    fn canonical(&self) -> bool {
+        match &self.inner {
+            TableRepr::Narrow(t) => t.canonical(),
+            TableRepr::Wide(t) => t.canonical(),
+        }
     }
 
     /// `"narrow"` or `"wide"` -- which key column this table is stored
@@ -1818,9 +1840,12 @@ fn parse_combine_op(combine: &str) -> PyResult<setops::CombineOp> {
 /// functions and nothing else.
 trait SetOpTable: setops::MergeSource + Sized {
     fn source_path(&self) -> &Path;
-    fn export_rows<I>(rows: I, output: &str, k: usize) -> Result<usize, FastDnaError>
+    fn export_rows<I>(rows: I, output: &str, k: usize, canonical: bool) -> Result<usize, FastDnaError>
     where
         I: Iterator<Item = Result<(Self::Key, u32), FastDnaError>>;
+
+    /// The table's own counting convention, so the output inherits it.
+    fn is_canonical(&self) -> bool;
     fn reopen(output: &str) -> Result<TableRepr, FastDnaError>;
 }
 
@@ -1829,11 +1854,15 @@ impl SetOpTable for KmerTable {
         self.path()
     }
 
-    fn export_rows<I>(rows: I, output: &str, k: usize) -> Result<usize, FastDnaError>
+    fn export_rows<I>(rows: I, output: &str, k: usize, canonical: bool) -> Result<usize, FastDnaError>
     where
         I: Iterator<Item = Result<(u64, u32), FastDnaError>>,
     {
-        export::export_pairs_parquet(rows, output, k)
+        export::export_pairs_parquet(rows, output, k, canonical)
+    }
+
+    fn is_canonical(&self) -> bool {
+        self.canonical()
     }
 
     fn reopen(output: &str) -> Result<TableRepr, FastDnaError> {
@@ -1846,11 +1875,15 @@ impl SetOpTable for crate::wide_ktab::WideKmerTable {
         self.path()
     }
 
-    fn export_rows<I>(rows: I, output: &str, k: usize) -> Result<usize, FastDnaError>
+    fn export_rows<I>(rows: I, output: &str, k: usize, canonical: bool) -> Result<usize, FastDnaError>
     where
         I: Iterator<Item = Result<(u128, u32), FastDnaError>>,
     {
-        export::export_wide_pairs_parquet(rows, output, k)
+        export::export_wide_pairs_parquet(rows, output, k, canonical)
+    }
+
+    fn is_canonical(&self) -> bool {
+        self.canonical()
     }
 
     fn reopen(output: &str) -> Result<TableRepr, FastDnaError> {
@@ -1874,6 +1907,26 @@ enum TableBatch {
 /// the operations themselves reject with their own "needs at least two
 /// tables" message -- not this function's question to answer.
 fn collect_tables(tables: &[PyRef<'_, PyKmerTable>]) -> PyResult<TableBatch> {
+    // A canonical and a non-canonical table disagree about what a key
+    // *means*, so merging them pairs rows that are not the same k-mer and
+    // returns a well-formed wrong answer. Unlike a width mismatch, nothing
+    // downstream catches it: both sides are the same key type and the same
+    // `k`.
+    if let Some(first) = tables.first() {
+        let expected = first.canonical();
+        if let Some(bad) = tables.iter().find(|t| t.canonical() != expected) {
+            let name = |c: bool| if c { "canonical" } else { "non-canonical" };
+            return Err(PyValueError::new_err(format!(
+                "every input table must be counted the same way: got {} and {} ones. \
+                 A {} table and a {} one disagree about what a k-mer key means",
+                name(expected),
+                name(bad.canonical()),
+                name(expected),
+                name(bad.canonical())
+            )));
+        }
+    }
+
     let mut narrow = Vec::new();
     let mut wide = Vec::new();
     for table in tables {
@@ -1909,8 +1962,11 @@ where
     let paths: Vec<&Path> = inner.iter().map(S::source_path).collect();
     setops::guard_against_output_overwrite(&paths, Path::new(output))?;
     let k = inner.first().map(setops::MergeSource::k).unwrap_or(0);
+    // `collect_tables` already required one convention across the inputs,
+    // so the first table's is the batch's.
+    let canonical = inner.first().is_none_or(S::is_canonical);
     let rows = make_rows(inner)?;
-    S::export_rows(rows, output, k)?;
+    S::export_rows(rows, output, k, canonical)?;
     S::reopen(output)
 }
 
@@ -2116,7 +2172,27 @@ fn pairwise_similarity(py: Python<'_>, table_paths: Vec<String>) -> PyResult<PyO
             Some(first) => ktab::table_key(first)?,
             None => ktab::TableKey::Narrow,
         };
+        // Same requirement as the set operations, and for the same reason:
+        // a canonical and a non-canonical table disagree about what a key
+        // means, so every shared/only_a/only_b count over the mix would be
+        // wrong while looking perfectly well formed.
+        let canonical = match paths.first() {
+            Some(first) => ktab::table_is_canonical(first)?,
+            None => true,
+        };
         for path in paths.iter().skip(1) {
+            if ktab::table_is_canonical(path)? != canonical {
+                return Err(FastDnaError::InvalidConfig {
+                    parameter: "tables",
+                    reason: format!(
+                        "{} is not counted the same way as {} -- similarity needs every input \
+                         canonical, or every input non-canonical, since the two disagree about \
+                         what a k-mer key means",
+                        path.display(),
+                        paths[0].display()
+                    ),
+                });
+            }
             if ktab::table_key(path)? != width {
                 return Err(FastDnaError::InvalidConfig {
                     parameter: "tables",
@@ -2281,7 +2357,8 @@ fn cohort_presence_matrix(
             batch_size,
             num_threads,
             progress_interval,
-            hpc: defaults.hpc,
+            canonical: true,
+        hpc: defaults.hpc,
         };
 
         let mut counter = py

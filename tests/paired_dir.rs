@@ -56,6 +56,7 @@ fn config(k: usize) -> PipelineConfig {
         batch_size: 4,
         num_threads: 2,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     }
 }

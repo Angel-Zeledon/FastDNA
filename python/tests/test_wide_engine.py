@@ -354,3 +354,69 @@ def test_similarity_refuses_a_mix_of_widths(reads, tmp_path):
     with pytest.raises(ValueError) as excinfo:
         fastdna.similarity([narrow, wide])
     assert "width" in str(excinfo.value), excinfo.value
+
+
+def test_non_canonical_counting_splits_reverse_complement_pairs(tmp_path):
+    """`canonical=False` counts each k-mer as it reads forward -- the CLI's
+    `--no-canonical`, KMC3's `-b`.
+
+    Checked by a property rather than a number: canonicalising *merges* a
+    k-mer with its reverse complement, so turning it off can only split
+    rows, never invent or lose an occurrence. The reads are written on both
+    strands, because with one strand there is nothing to merge and the two
+    counts come out equal.
+    """
+    genome_rng = random.Random(5)
+    genome = "".join(genome_rng.choice("ACGT") for _ in range(800))
+    complement = {"A": "T", "C": "G", "G": "C", "T": "A"}
+
+    reads = tmp_path / "both_strands.fastq"
+    with reads.open("w") as handle:
+        for i, start in enumerate(range(0, 600, 23)):
+            read = genome[start : start + 150]
+            if i % 2:
+                read = "".join(complement[b] for b in reversed(read))
+            handle.write(f"@r{i}\n{read}\n+\n{'I' * len(read)}\n")
+
+    canonical = fastdna.count(reads, k=21)
+    forward = fastdna.count(reads, k=21, canonical=False)
+
+    assert forward.total_kmers == canonical.total_kmers, "occurrences cannot change"
+    assert forward.distinct_kmers > canonical.distinct_kmers, "pairs must split"
+    assert forward.distinct_kmers <= canonical.distinct_kmers * 2, "at most one split per row"
+
+
+def test_a_table_records_its_counting_convention(reads, tmp_path):
+    """The convention lives in the Parquet footer, so a reader never has to
+    assume it. `KmerTable.canonical` is what a caller checks before
+    combining two tables.
+    """
+    import subprocess
+
+    binary = shutil.which("fastdna")
+    if binary is None:
+        for candidate in ("target/release/fastdna", "target/debug/fastdna"):
+            if pathlib.Path(candidate).exists():
+                binary = candidate
+                break
+    if binary is None:
+        pytest.skip("the fastdna binary is not built; run `cargo build --release`")
+
+    tables = {}
+    for label, extra in (("canonical", []), ("forward", ["--no-canonical"])):
+        out = tmp_path / f"{label}.parquet"
+        subprocess.run(
+            [binary, "count", "--input", str(reads), "-k", "21", "-o", str(out),
+             "--qc", str(tmp_path / f"{label}.qc.json"), *extra],
+            check=True, capture_output=True,
+        )
+        tables[label] = fastdna.KmerTable.open(out)
+
+    assert tables["canonical"].canonical is True
+    assert tables["forward"].canonical is False
+
+    # Combining the two is refused: they disagree about what a key means,
+    # and nothing downstream would catch it -- same width, same k.
+    with pytest.raises(ValueError) as excinfo:
+        tables["canonical"].union(tables["forward"], output=str(tmp_path / "mixed.parquet"))
+    assert "canonical" in str(excinfo.value)

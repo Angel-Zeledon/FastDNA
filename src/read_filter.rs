@@ -169,6 +169,9 @@ pub struct ReferenceIndex {
     /// mid-run -- the damage would only surface the next time anyone tried
     /// to reopen it). See `run_filter`'s own doc comment for the full guard.
     table_path: PathBuf,
+    /// The reference's own counting convention. Reads are extracted the
+    /// same way or every lookup asks for keys the reference cannot hold.
+    canonical: bool,
 }
 
 /// The resident key array, at whichever width the reference table was
@@ -229,6 +232,7 @@ impl ReferenceIndex {
             k: table.k(),
             keys: IndexKeys::Narrow(kmers),
             table_path: table.path().to_path_buf(),
+            canonical: table.canonical(),
         })
     }
 
@@ -247,6 +251,7 @@ impl ReferenceIndex {
             k: table.k(),
             keys: IndexKeys::Wide(kmers),
             table_path: table.path().to_path_buf(),
+            canonical: table.canonical(),
         })
     }
 
@@ -371,12 +376,20 @@ pub fn matching_fraction(
     // width once per k-mer, and this is the per-read hot loop.
     let (matched, total) = match &index.keys {
         IndexKeys::Narrow(keys) => {
-            kmer::extract_canonical_kmers_into(seq, index.k(), &mut scratch.narrow);
+            if index.canonical {
+                kmer::extract_canonical_kmers_into(seq, index.k(), &mut scratch.narrow);
+            } else {
+                kmer::extract_forward_kmers_into(seq, index.k(), &mut scratch.narrow);
+            }
             let found = scratch.narrow.iter().filter(|km| keys.binary_search(km).is_ok()).count();
             (found, scratch.narrow.len())
         }
         IndexKeys::Wide(keys) => {
-            wide_kmer::extract_canonical_kmers_into(seq, index.k(), &mut scratch.wide);
+            if index.canonical {
+                wide_kmer::extract_canonical_kmers_into(seq, index.k(), &mut scratch.wide);
+            } else {
+                wide_kmer::extract_forward_kmers_into(seq, index.k(), &mut scratch.wide);
+            }
             let found = scratch.wide.iter().filter(|km| keys.binary_search(km).is_ok()).count();
             (found, scratch.wide.len())
         }
@@ -868,7 +881,7 @@ mod tests {
         let path = temp_path(name);
         let mut counter = KmerCounter::new();
         counter.insert_batch(entries);
-        export::export_counts_parquet(&counter, &path, k, 1, false).unwrap();
+        export::export_counts_parquet(&counter, &path, k, 1, false, true).unwrap();
         let table = KmerTable::open(&path).unwrap();
         (ReferenceIndex::from_table(&table).unwrap(), path)
     }
@@ -884,7 +897,7 @@ mod tests {
             counter.insert_batch(&kmers);
         }
         let counts = counter.finish();
-        crate::export::export_wide_counts_parquet(&counts, &path, k, false).unwrap();
+        crate::export::export_wide_counts_parquet(&counts, &path, k, false, true).unwrap();
         let table = WideKmerTable::open(&path).unwrap();
         (ReferenceIndex::from_wide_table(&table).unwrap(), path)
     }

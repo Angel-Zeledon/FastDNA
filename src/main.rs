@@ -233,6 +233,7 @@ fn run_paired_dir(args: &CountArgs, dir: &Path) -> Result<()> {
         num_threads: threads,
         progress_interval: default_config.progress_interval,
         hpc: args.hpc,
+        canonical: !args.no_canonical,
     };
 
     let format = match args.paired_format {
@@ -311,6 +312,7 @@ fn run(args: CountArgs) -> Result<()> {
         num_threads: threads,
         progress_interval: default_config.progress_interval,
         hpc: args.hpc,
+        canonical: !args.no_canonical,
     };
 
     // Resolved before anything is read, so a request that cannot work
@@ -425,12 +427,13 @@ fn run(args: CountArgs) -> Result<()> {
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"));
     let records_written = if wants_parquet {
-        export::export_parquet(
+        export::export_counts_parquet(
             &counter,
             &args.output,
             args.kmer_size,
             args.min_count,
             args.with_sequence,
+            !args.no_canonical,
         )
         .inspect_err(|_| pb_export.abandon())?
     } else {
@@ -531,7 +534,13 @@ fn run_count_wide(args: CountArgs, inputs: Vec<InputSpec>, config: PipelineConfi
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"));
     let records_written = if wants_parquet {
-        export::export_wide_counts_parquet(&counts, &args.output, args.kmer_size, args.with_sequence)
+        export::export_wide_counts_parquet(
+            &counts,
+            &args.output,
+            args.kmer_size,
+            args.with_sequence,
+            !args.no_canonical,
+        )
             .inspect_err(|_| pb_export.abandon())?
     } else {
         export::export_wide_counts_csv(&counts, &args.output, args.kmer_size)
@@ -792,21 +801,28 @@ fn run_query(args: QueryArgs) -> Result<()> {
     // step, rather than opening with one reader and falling back to the
     // other -- when both fail, a fallback necessarily reports the wrong
     // one of the two errors.
+    // Read from the file, never assumed: a query canonicalised against a
+    // non-canonical table misses silently.
+    let canonical = ktab::table_is_canonical(&args.table)?;
     let (k, rows, found) = match ktab::table_key(&args.table)? {
         ktab::TableKey::Narrow => {
             let table = KmerTable::open(&args.table)?;
-            let encoded = ktab::encode_query_kmer(&args.kmer, table.k())?;
+            let encoded = ktab::encode_query_kmer(&args.kmer, table.k(), canonical)?;
             (table.k(), table.len(), table.get(encoded)?)
         }
         ktab::TableKey::Wide => {
             let table = fastdna_core::wide_ktab::WideKmerTable::open(&args.table)?;
-            let encoded = fastdna_core::wide_ktab::encode_query_wide_kmer(&args.kmer, table.k())?;
+            let encoded =
+                fastdna_core::wide_ktab::encode_query_wide_kmer(&args.kmer, table.k(), canonical)?;
             (table.k(), table.len(), table.get(encoded)?)
         }
     };
 
     println!("k:     {k}");
     println!("Rows:  {rows}");
+    if !canonical {
+        println!("Note:  this table is non-canonical (--no-canonical)");
+    }
     println!("--------------------------------------------------");
 
     match found {
@@ -869,6 +885,36 @@ fn open_reference_index(path: &Path) -> Result<read_filter::ReferenceIndex> {
 /// a k=41 table nothing about what they actually did wrong. A mixed set is
 /// always a mistake -- `setops::check_same_k` would reject it a moment
 /// later anyway, since the two widths never share a `k`.
+/// The one counting convention every input to a set operation must share,
+/// read from each file's own footer.
+///
+/// Mixing them is refused for the same reason mixing widths is: a canonical
+/// table and a non-canonical one disagree about what a key *means*, so a
+/// merge-join over both would pair rows that are not the same k-mer and
+/// return a well-formed wrong answer. Unlike widths, nothing else catches
+/// it -- both sides are `u64` and the same `k`.
+fn shared_canonical(paths: &[PathBuf]) -> Result<bool> {
+    let Some(first) = paths.first() else { return Ok(true) };
+    let expected = ktab::table_is_canonical(first)?;
+    for path in &paths[1..] {
+        if ktab::table_is_canonical(path)? != expected {
+            let name = |c: bool| if c { "canonical" } else { "non-canonical (--no-canonical)" };
+            return Err(FastDnaError::InvalidConfig {
+                parameter: "input tables",
+                reason: format!(
+                    "{} is {}, but {} is {} -- a set operation needs every input counted the \
+                     same way, since the two disagree about what a key means",
+                    path.display(),
+                    name(!expected),
+                    first.display(),
+                    name(expected)
+                ),
+            });
+        }
+    }
+    Ok(expected)
+}
+
 fn shared_table_key(paths: &[PathBuf]) -> Result<ktab::TableKey> {
     let Some(first) = paths.first() else {
         return Ok(ktab::TableKey::Narrow);
@@ -914,18 +960,19 @@ fn run_union(args: UnionArgs) -> Result<()> {
     // widths use different readers and different writers, and the pairing
     // of the two is the thing worth being able to read at a glance.
     // `tables[0]` cannot panic -- `--input` has `num_args = 2..`.
+    let canonical = shared_canonical(&args.input)?;
     let written = match shared_table_key(&args.input)? {
         ktab::TableKey::Narrow => {
             let tables = open_tables(&args.input)?;
             let k = tables[0].k();
             let rows = setops::union(&tables, args.combine.into())?;
-            export::export_pairs_parquet(rows, &args.output, k)?
+            export::export_pairs_parquet(rows, &args.output, k, canonical)?
         }
         ktab::TableKey::Wide => {
             let tables = open_wide_tables(&args.input)?;
             let k = tables[0].k();
             let rows = setops::union(&tables, args.combine.into())?;
-            export::export_wide_pairs_parquet(rows, &args.output, k)?
+            export::export_wide_pairs_parquet(rows, &args.output, k, canonical)?
         }
     };
     let elapsed = start.elapsed().as_secs_f64();
@@ -949,18 +996,19 @@ fn run_intersect(args: IntersectArgs) -> Result<()> {
     println!("--------------------------------------------------");
 
     let start = Instant::now();
+    let canonical = shared_canonical(&args.input)?;
     let written = match shared_table_key(&args.input)? {
         ktab::TableKey::Narrow => {
             let tables = open_tables(&args.input)?;
             let k = tables[0].k();
             let rows = setops::intersect(&tables, args.combine.into())?;
-            export::export_pairs_parquet(rows, &args.output, k)?
+            export::export_pairs_parquet(rows, &args.output, k, canonical)?
         }
         ktab::TableKey::Wide => {
             let tables = open_wide_tables(&args.input)?;
             let k = tables[0].k();
             let rows = setops::intersect(&tables, args.combine.into())?;
-            export::export_wide_pairs_parquet(rows, &args.output, k)?
+            export::export_wide_pairs_parquet(rows, &args.output, k, canonical)?
         }
     };
     let elapsed = start.elapsed().as_secs_f64();
@@ -987,20 +1035,21 @@ fn run_diff(args: DiffArgs) -> Result<()> {
     println!("--------------------------------------------------");
 
     let start = Instant::now();
+    let canonical = shared_canonical(&all_inputs)?;
     let written = match shared_table_key(&all_inputs)? {
         ktab::TableKey::Narrow => {
             let a = KmerTable::open(&args.input)?;
             let subtract = open_tables(&args.subtract)?;
             let k = a.k();
             let rows = setops::diff(&a, &subtract, args.max_subtract_count)?;
-            export::export_pairs_parquet(rows, &args.output, k)?
+            export::export_pairs_parquet(rows, &args.output, k, canonical)?
         }
         ktab::TableKey::Wide => {
             let a = WideKmerTable::open(&args.input)?;
             let subtract = open_wide_tables(&args.subtract)?;
             let k = a.k();
             let rows = setops::diff(&a, &subtract, args.max_subtract_count)?;
-            export::export_wide_pairs_parquet(rows, &args.output, k)?
+            export::export_wide_pairs_parquet(rows, &args.output, k, canonical)?
         }
     };
     let elapsed = start.elapsed().as_secs_f64();
@@ -1032,7 +1081,9 @@ fn run_similarity(args: SimilarityArgs) -> Result<()> {
     let labels: Vec<String> = args.input.iter().map(|p| p.display().to_string()).collect();
 
     // Same routing as the set operations: one footer read decides the
-    // width, and every input must agree on it.
+    // width, another the counting convention, and every input must agree on
+    // both.
+    let _ = shared_canonical(&args.input)?;
     let pairs = match shared_table_key(&args.input)? {
         ktab::TableKey::Narrow => similarity::pairwise_similarity(&open_tables(&args.input)?)?,
         ktab::TableKey::Wide => similarity::pairwise_similarity(&open_wide_tables(&args.input)?)?,
@@ -1311,6 +1362,12 @@ fn run_matrix(args: MatrixArgs) -> Result<()> {
         num_threads: threads,
         progress_interval: default_config.progress_interval,
         hpc: false,
+        // Canonical, and `matrix` deliberately does not expose
+        // `--no-canonical`: a cohort matrix's whole point is that a column
+        // means the same k-mer in every sample, and a run that mixed
+        // conventions across samples would compare things that are not
+        // comparable while looking perfectly well formed.
+        canonical: true,
     };
 
     let pb = spinner("Counting cohort samples...");

@@ -430,6 +430,21 @@ pub struct CountArgs {
     #[arg(long)]
     pub with_sequence: bool,
 
+    /// Count each k-mer as it reads forward instead of folding it with its
+    /// reverse complement (KMC3's `-b`).
+    ///
+    /// Off by default, and the default is right for ordinary shotgun data:
+    /// a fragment is sequenced from an arbitrary end, so a k-mer and its
+    /// reverse complement are two views of one observation and canonical
+    /// counting is what makes them one count. Turn this on for
+    /// strand-specific input, where they are two different observations.
+    ///
+    /// A table counted this way records `fastdna.canonical=false` in its
+    /// footer, and `query` reads that rather than canonicalising a query
+    /// that would then never match.
+    #[arg(long)]
+    pub no_canonical: bool,
+
     /// Collapse homopolymer runs (e.g. "AAAAAA" -> "A") before extracting
     /// k-mers. Off by default: with the flag absent, output is byte-for-byte
     /// identical to today's. Turn it on for long-read input (Oxford Nanopore,

@@ -30,6 +30,7 @@ fn config(k: usize) -> PipelineConfig {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 100_000,
+        canonical: true,
         hpc: false,
     }
 }
@@ -79,7 +80,8 @@ fn pipeline_hpc_flag_absorbs_a_run_internal_indel_end_to_end() {
     )
     .expect("valid input");
 
-    let with_hpc_config = PipelineConfig { hpc: true, ..config(k) };
+    let with_hpc_config = PipelineConfig { canonical: true,
+        hpc: true, ..config(k) };
     let (with_hpc, _qc, _reads) = process_stream_parallel(
         reader_for(&fastq),
         with_hpc_config,
@@ -206,6 +208,7 @@ fn progress_callback_receives_a_final_event() {
         batch_size: 8,
         num_threads: 2,
         progress_interval: 20,
+        canonical: true,
         hpc: false,
     };
 

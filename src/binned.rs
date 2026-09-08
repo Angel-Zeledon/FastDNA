@@ -101,12 +101,29 @@ pub struct BinnedConfig {
     pub num_bins: usize,
     /// Bytes per chunk; at least [`MIN_CHUNK_BYTES`].
     pub chunk_bytes: usize,
+    /// Fold each k-mer with its reverse complement (`true`, the default) or
+    /// count it as it reads forward (`false`, `--no-canonical`).
+    ///
+    /// Only the *expansion* in phase 2 reads this. Bin assignment does not:
+    /// a signature is a function of the k-mer's own bases, so the same
+    /// forward k-mer always routes to the same bin whether or not the count
+    /// is canonicalised. (It also means a k-mer and its reverse complement
+    /// share a bin, since the m-mer order key is strand-symmetric -- true
+    /// but irrelevant here, because under `canonical = false` they are two
+    /// different keys that merely happen to be neighbours.)
+    pub canonical: bool,
 }
 
 impl BinnedConfig {
     /// The defaults, for a given `k`.
     pub fn new(k: usize) -> Self {
-        Self { k, m: DEFAULT_M, num_bins: DEFAULT_NUM_BINS, chunk_bytes: DEFAULT_CHUNK_BYTES }
+        Self {
+            k,
+            m: DEFAULT_M,
+            num_bins: DEFAULT_NUM_BINS,
+            chunk_bytes: DEFAULT_CHUNK_BYTES,
+            canonical: true,
+        }
     }
 
     /// Clamps the fields whose violation would be a silent wrong answer
@@ -330,7 +347,11 @@ impl BinStore {
         scratch.expanded.clear();
         for chunk in &chunks {
             for record in records(chunk.filled()) {
-                record.expand_canonical_into(k, &mut scratch.expanded);
+                if self.config.canonical {
+                    record.expand_canonical_into(k, &mut scratch.expanded);
+                } else {
+                    record.expand_forward_into(k, &mut scratch.expanded);
+                }
             }
         }
         // The chunks are dead the moment they have been expanded, and a
@@ -858,7 +879,7 @@ mod tests {
                     if m > k {
                         continue;
                     }
-                    let config = BinnedConfig { k, m, num_bins, chunk_bytes };
+                    let config = BinnedConfig { k, m, num_bins, chunk_bytes, canonical: true };
                     let got = count_records(&parsed, config);
 
                     assert_eq!(
@@ -1044,7 +1065,7 @@ mod tests {
                 let (expected_entries, expected_total) = reference(&parsed, k);
 
                 for (num_bins, sample_records) in [(DEFAULT_NUM_BINS, 50usize), (8, 10_000), (64, 0)] {
-                    let config = BinnedConfig { k, m: DEFAULT_M, num_bins, chunk_bytes: DEFAULT_CHUNK_BYTES };
+                    let config = BinnedConfig { k, m: DEFAULT_M, num_bins, chunk_bytes: DEFAULT_CHUNK_BYTES, canonical: true };
                     let got = count_records_adaptive(&parsed, config, sample_records);
 
                     assert_eq!(
@@ -1157,7 +1178,7 @@ mod tests {
         let k = 21usize;
         let (expected_entries, expected_total) = reference(&parsed, k);
 
-        let config = BinnedConfig { k, m: DEFAULT_M, num_bins: 8, chunk_bytes: MIN_CHUNK_BYTES };
+        let config = BinnedConfig { k, m: DEFAULT_M, num_bins: 8, chunk_bytes: MIN_CHUNK_BYTES, canonical: true };
         let got = count_records(&parsed, config);
         assert_eq!(got.total_occurrences, expected_total);
         assert_eq!(got.entries, expected_entries);
@@ -1260,7 +1281,7 @@ mod tests {
     /// intent is unambiguous.
     #[test]
     fn the_config_is_sanitized_where_a_bad_value_would_be_silent() {
-        let c = BinnedConfig { k: 31, m: 0, num_bins: 0, chunk_bytes: 1 }.sanitized();
+        let c = BinnedConfig { k: 31, m: 0, num_bins: 0, chunk_bytes: 1, canonical: true }.sanitized();
         assert_eq!(c.m, 1);
         assert_eq!(c.num_bins, 1);
         assert_eq!(c.chunk_bytes, MIN_CHUNK_BYTES);

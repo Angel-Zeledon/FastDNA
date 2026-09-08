@@ -96,6 +96,15 @@ jobs:
       # `--engine wide` at k=31 runs the wide engine inside the OVERLAP,
       # where KMC3 answers directly instead of the check bottoming out at
       # "the two engines agree with each other".
+      # `--no-canonical` against `kmc -b`. The two flags are supposed to
+      # mean the same thing, and nothing but this checks that they do: a
+      # counter that quietly canonicalised anyway would agree with KMC3 on
+      # every canonical run and only diverge here.
+      - name: Non-canonical counting is exactly KMC3's -b
+        run: |
+          python scripts/validation/kmc3_equivalence.py \
+            --no-canonical --json "${RUNNER_TEMP}/kmc3_nocanonical.json"
+
       - name: Counting above k=32 is exactly KMC3's too
         run: |
           for k in 33 64; do

@@ -200,6 +200,7 @@ mod tests {
             num_threads: 2,
             progress_interval: 100_000,
             hpc: false,
+            canonical: true,
         }
     }
 

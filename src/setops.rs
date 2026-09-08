@@ -529,7 +529,7 @@ mod tests {
         let path = temp_path(name);
         let mut counter = KmerCounter::new();
         counter.insert_batch(entries);
-        export::export_counts_parquet(&counter, &path, k, 1, false).unwrap();
+        export::export_counts_parquet(&counter, &path, k, 1, false, true).unwrap();
         (KmerTable::open(&path).unwrap(), path)
     }
 
@@ -822,7 +822,7 @@ mod tests {
 
         let union_rows = union(&[a, b], CombineOp::Sum).unwrap();
         let union_path = temp_path("compose_union_out");
-        export::export_pairs_parquet(union_rows, &union_path, 4).unwrap();
+        export::export_pairs_parquet(union_rows, &union_path, 4, true).unwrap();
         let union_table = KmerTable::open(&union_path).unwrap();
         assert_eq!(collect(union_table.iter().unwrap()), vec![(1, 2), (2, 2), (3, 1)]);
 

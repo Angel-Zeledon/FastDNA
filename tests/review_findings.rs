@@ -24,7 +24,7 @@ fn scratch(name: &str) -> PathBuf {
 fn write_table(path: &std::path::Path, k: usize, entries: &[u64]) {
     let mut c = KmerCounter::new();
     c.insert_batch(entries);
-    export::export_counts_parquet(&c, path, k, 1, false).unwrap();
+    export::export_counts_parquet(&c, path, k, 1, false, true).unwrap();
 }
 
 /// Writes `pairs` verbatim, in whatever order they are given, claiming
@@ -172,7 +172,7 @@ fn export_pairs_parquet_must_not_claim_sorted_by_for_an_unsorted_stream() {
 
     // Deliberately descending.
     let pairs: Vec<fastdna_core::Result<(u64, u32)>> = vec![Ok((50, 1)), Ok((10, 2)), Ok((30, 3))];
-    let result = export::export_pairs_parquet(pairs, &out, 4);
+    let result = export::export_pairs_parquet(pairs, &out, 4, true);
 
     assert!(
         result.is_err(),

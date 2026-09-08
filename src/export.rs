@@ -74,6 +74,25 @@ pub fn counts_schema(with_sequence: bool) -> Arc<Schema> {
     Arc::new(Schema::new(fields))
 }
 
+/// The footer key-value pairs every k-mer table carries: the sort column,
+/// `k`, and -- only when it is not the default -- the counting convention.
+///
+/// `CANONICAL_KEY` is appended rather than always written so a canonical
+/// table's footer is byte-for-byte what it was before the key existed;
+/// `ktab::table_is_canonical` reads an absent key as `true` for the same
+/// reason. Writing it always, even with a null value, would change every
+/// existing table's bytes to record the default.
+fn table_metadata(sorted_by: &str, k: usize, canonical: bool) -> Vec<KeyValue> {
+    let mut pairs = vec![
+        KeyValue::new(ktab::SORTED_BY_KEY.to_string(), Some(sorted_by.to_string())),
+        KeyValue::new(ktab::K_KEY.to_string(), Some(k.to_string())),
+    ];
+    if !canonical {
+        pairs.push(KeyValue::new(ktab::CANONICAL_KEY.to_string(), Some("false".to_string())));
+    }
+    pairs
+}
+
 /// The Parquet schema of a **wide** count table (`33 <= k <= 64`).
 ///
 /// `kmer_bits` is a 16-byte fixed-size binary column, not a `u64`: Arrow
@@ -114,6 +133,7 @@ pub fn export_wide_counts_parquet<P: AsRef<Path>>(
     output_path: P,
     k: usize,
     with_sequence: bool,
+    canonical: bool,
 ) -> Result<usize> {
     let path = output_path.as_ref();
     let (file, pending) = AtomicFile::create(path)?;
@@ -121,13 +141,7 @@ pub fn export_wide_counts_parquet<P: AsRef<Path>>(
 
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
-        .set_key_value_metadata(Some(vec![
-            KeyValue::new(
-                ktab::SORTED_BY_KEY.to_string(),
-                Some(ktab::SORTED_BY_WIDE_VALUE.to_string()),
-            ),
-            KeyValue::new(ktab::K_KEY.to_string(), Some(k.to_string())),
-        ]))
+        .set_key_value_metadata(Some(table_metadata(ktab::SORTED_BY_WIDE_VALUE, k, canonical)))
         .build();
 
     let mut writer =
@@ -224,7 +238,7 @@ fn flush_wide_chunk(
 /// its own order. Returning early leaves the destination untouched:
 /// `AtomicFile`'s `Drop` removes the temp file, and `pending.commit()` is
 /// never reached.
-pub fn export_wide_pairs_parquet<P, I>(pairs: I, output_path: P, k: usize) -> Result<usize>
+pub fn export_wide_pairs_parquet<P, I>(pairs: I, output_path: P, k: usize, canonical: bool) -> Result<usize>
 where
     P: AsRef<Path>,
     I: IntoIterator<Item = Result<(u128, u32)>>,
@@ -235,13 +249,7 @@ where
 
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
-        .set_key_value_metadata(Some(vec![
-            KeyValue::new(
-                ktab::SORTED_BY_KEY.to_string(),
-                Some(ktab::SORTED_BY_WIDE_VALUE.to_string()),
-            ),
-            KeyValue::new(ktab::K_KEY.to_string(), Some(k.to_string())),
-        ]))
+        .set_key_value_metadata(Some(table_metadata(ktab::SORTED_BY_WIDE_VALUE, k, canonical)))
         .build();
 
     let mut writer =
@@ -449,6 +457,7 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
     k: usize,
     min_count: u32,
     with_sequence: bool,
+    canonical: bool,
 ) -> Result<usize> {
     let path = output_path.as_ref();
     let (file, pending) = AtomicFile::create(path)?;
@@ -456,10 +465,7 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
 
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
-        .set_key_value_metadata(Some(vec![
-            KeyValue::new(ktab::SORTED_BY_KEY.to_string(), Some(ktab::SORTED_BY_VALUE.to_string())),
-            KeyValue::new(ktab::K_KEY.to_string(), Some(k.to_string())),
-        ]))
+        .set_key_value_metadata(Some(table_metadata(ktab::SORTED_BY_VALUE, k, canonical)))
         .build();
 
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
@@ -524,7 +530,7 @@ pub fn export_counts_parquet<P: AsRef<Path>>(
 /// Sharing the chunking/writer machinery (`ChunkBuffers`, `write_chunk`)
 /// with `export_counts_parquet` rather than duplicating it means the two
 /// can never drift on row-group size, compression, or footer metadata.
-pub fn export_pairs_parquet<P, I>(pairs: I, output_path: P, k: usize) -> Result<usize>
+pub fn export_pairs_parquet<P, I>(pairs: I, output_path: P, k: usize, canonical: bool) -> Result<usize>
 where
     P: AsRef<Path>,
     I: IntoIterator<Item = Result<(u64, u32)>>,
@@ -535,10 +541,7 @@ where
 
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
-        .set_key_value_metadata(Some(vec![
-            KeyValue::new(ktab::SORTED_BY_KEY.to_string(), Some(ktab::SORTED_BY_VALUE.to_string())),
-            KeyValue::new(ktab::K_KEY.to_string(), Some(k.to_string())),
-        ]))
+        .set_key_value_metadata(Some(table_metadata(ktab::SORTED_BY_VALUE, k, canonical)))
         .build();
 
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| export_err(path, e))?;
@@ -771,7 +774,10 @@ pub fn export_parquet<P: AsRef<Path>>(
     min_count: u32,
     with_sequence: bool,
 ) -> Result<usize> {
-    export_counts_parquet(counter, output_path, k, min_count, with_sequence)
+    // Canonical: this is the older, narrower alias, and every caller of it
+    // predates `--no-canonical`. A caller that needs the other convention
+    // uses `export_counts_parquet` directly and says so.
+    export_counts_parquet(counter, output_path, k, min_count, with_sequence, true)
 }
 
 /// Takes the chunk by value so every buffer reaches Arrow as a move.
@@ -1121,7 +1127,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("counts.parquet");
 
-        let written = export_counts_parquet(&counter, &path, k, 1, true).unwrap();
+        let written = export_counts_parquet(&counter, &path, k, 1, true, true).unwrap();
         assert_eq!(written, counter.distinct_kmers());
 
         let file = File::open(&path).unwrap();
@@ -1169,8 +1175,8 @@ mod tests {
         let lean_path = dir.join("lean.parquet");
         let full_path = dir.join("full.parquet");
 
-        export_counts_parquet(&counter, &lean_path, k, 1, false).unwrap();
-        export_counts_parquet(&counter, &full_path, k, 1, true).unwrap();
+        export_counts_parquet(&counter, &lean_path, k, 1, false, true).unwrap();
+        export_counts_parquet(&counter, &full_path, k, 1, true, true).unwrap();
 
         let file = File::open(&lean_path).unwrap();
         let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
@@ -1208,7 +1214,7 @@ mod tests {
         let path = dir.join("pairs.parquet");
 
         let pairs: Vec<Result<(u64, u32)>> = vec![Ok((1, 5)), Ok((2, 7)), Ok((100, 1))];
-        let written = export_pairs_parquet(pairs, &path, 4).unwrap();
+        let written = export_pairs_parquet(pairs, &path, 4, true).unwrap();
         assert_eq!(written, 3);
 
         let table = KmerTable::open(&path).unwrap();
@@ -1234,7 +1240,7 @@ mod tests {
         let path = dir.join("empty_pairs.parquet");
 
         let pairs: Vec<Result<(u64, u32)>> = Vec::new();
-        let written = export_pairs_parquet(pairs, &path, 4).unwrap();
+        let written = export_pairs_parquet(pairs, &path, 4, true).unwrap();
         assert_eq!(written, 0);
 
         let table = KmerTable::open(&path).unwrap();
@@ -1255,7 +1261,7 @@ mod tests {
 
         let pairs: Vec<Result<(u64, u32)>> =
             vec![Ok((1, 1)), Err(FastDnaError::Internal { detail: "boom".to_string() })];
-        let result = export_pairs_parquet(pairs, &path, 4);
+        let result = export_pairs_parquet(pairs, &path, 4, true);
         assert!(matches!(result, Err(FastDnaError::Internal { .. })));
 
         let _ = std::fs::remove_file(&path);

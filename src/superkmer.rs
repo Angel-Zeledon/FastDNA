@@ -321,6 +321,46 @@ impl<'a> SuperKmerRecord<'a> {
         }
     }
 
+    /// [`expand_canonical_into`](Self::expand_canonical_into) without the
+    /// canonicalisation: each k-mer as it reads forward, which is what
+    /// `--no-canonical` counts. Appends, like its sibling.
+    ///
+    /// Kept as a separate method rather than a `canonical: bool` inside the
+    /// expansion loop: the branch would sit in the innermost loop of phase
+    /// 2, evaluated once per k-mer of every bin, to answer a question fixed
+    /// for the whole run.
+    pub fn expand_forward_into(&self, k: usize, out: &mut Vec<u64>) {
+        if k == 0 || k > 32 || self.n_bases < k {
+            return;
+        }
+        out.reserve(self.n_bases - k + 1);
+
+        let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+        // No reverse register: there is nothing to take a `min` against, so
+        // this is strictly less work per base than the canonical form.
+        let mut fwd: u64 = 0;
+
+        let mut remaining = self.n_bases;
+        let mut index = 0usize;
+        for &byte in self.packed {
+            // The final byte of a record can hold fewer than four bases; its
+            // padding must not be rolled in as `A`.
+            let take = remaining.min(4);
+            for slot in 0..take {
+                let bits = ((byte >> (6 - 2 * slot)) & 0b11) as u64;
+                fwd = ((fwd << 2) | bits) & mask;
+                index += 1;
+                if index >= k {
+                    out.push(fwd);
+                }
+            }
+            remaining -= take;
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+
     /// Appends this record's bases as ASCII `ACGT` to `out`. Used by tests
     /// and by any future diagnostic that needs to look at a bin's contents.
     pub fn decode_bases_into(&self, out: &mut Vec<u8>) {

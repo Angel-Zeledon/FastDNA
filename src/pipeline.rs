@@ -43,6 +43,16 @@ pub struct PipelineConfig {
     /// are the dominant error mode; short-read Illumina data has no need
     /// for this and should leave it off.
     pub hpc: bool,
+    /// Count each k-mer as it reads forward, instead of folding it together
+    /// with its reverse complement. `true` (canonical) by default: every
+    /// existing caller keeps today's output byte-for-byte, and canonical is
+    /// the right answer for ordinary shotgun data, where a fragment is
+    /// sequenced from an arbitrary end.
+    ///
+    /// `false` is `--no-canonical` on the CLI and KMC3's `-b`, and is for
+    /// strand-specific input, where a k-mer and its reverse complement are
+    /// two different observations rather than two views of one.
+    pub canonical: bool,
 }
 
 impl Default for PipelineConfig {
@@ -55,6 +65,7 @@ impl Default for PipelineConfig {
             num_threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             progress_interval: PROGRESS_INTERVAL,
             hpc: false,
+            canonical: true,
         }
     }
 }
@@ -515,7 +526,11 @@ trait CountSink: Send {
     /// body: it is allocated once per worker and refilled per record,
     /// which is the allocation the `_into` extraction forms exist for, and
     /// its element type is the one thing that differs between widths.
-    fn absorb(&mut self, seq: &[u8], k: usize);
+    /// Extracts `seq`'s k-mers and folds them in. `canonical` picks which
+    /// extraction: `true` folds each k-mer with its reverse complement (the
+    /// default and what shotgun data wants), `false` counts it as it reads
+    /// forward (`--no-canonical`, KMC3's `-b`).
+    fn absorb(&mut self, seq: &[u8], k: usize, canonical: bool);
 
     /// Folds every worker's sink into the run's answer.
     fn merge_all(sinks: Vec<Self>) -> Self::Output
@@ -538,8 +553,12 @@ impl CountSink for NarrowSink {
         Self { counter: KmerCounter::with_capacity(131_072), scratch: Vec::new() }
     }
 
-    fn absorb(&mut self, seq: &[u8], k: usize) {
-        kmer::extract_canonical_kmers_into(seq, k, &mut self.scratch);
+    fn absorb(&mut self, seq: &[u8], k: usize, canonical: bool) {
+        if canonical {
+            kmer::extract_canonical_kmers_into(seq, k, &mut self.scratch);
+        } else {
+            kmer::extract_forward_kmers_into(seq, k, &mut self.scratch);
+        }
         self.counter.insert_batch(&self.scratch);
     }
 
@@ -562,8 +581,12 @@ impl CountSink for WideSink {
         Self { counter: crate::wide_counter::WideKmerCounter::new(), scratch: Vec::new() }
     }
 
-    fn absorb(&mut self, seq: &[u8], k: usize) {
-        crate::wide_kmer::extract_canonical_kmers_into(seq, k, &mut self.scratch);
+    fn absorb(&mut self, seq: &[u8], k: usize, canonical: bool) {
+        if canonical {
+            crate::wide_kmer::extract_canonical_kmers_into(seq, k, &mut self.scratch);
+        } else {
+            crate::wide_kmer::extract_forward_kmers_into(seq, k, &mut self.scratch);
+        }
         self.counter.insert_batch(&self.scratch);
     }
 
@@ -637,6 +660,7 @@ fn process_stream_parallel_with_sink<S: RecordSource, C: CountSink>(
     let qual_win = config.quality_window;
     let progress_interval = config.progress_interval;
     let hpc = config.hpc;
+    let canonical = config.canonical;
 
     // 1. Producer thread. Returns the read count, or the record it choked on.
     //    `cancel` is cloned rather than borrowed: the reader thread is
@@ -738,7 +762,7 @@ fn process_stream_parallel_with_sink<S: RecordSource, C: CountSink>(
                         } else {
                             &record.seq
                         };
-                        sink.absorb(seq, k);
+                        sink.absorb(seq, k, canonical);
                     }
 
                     // Hand the record buffers back so the producer can refill
@@ -1180,6 +1204,7 @@ fn process_stream_parallel_disk<S: RecordSource>(
     let qual_win = config.quality_window;
     let progress_interval = config.progress_interval;
     let hpc = config.hpc;
+    let canonical = config.canonical;
 
     // 1. Producer thread -- the same one the in-memory strategy uses. This
     // is the one piece the two strategies share, because it is the one
@@ -1257,7 +1282,11 @@ fn process_stream_parallel_disk<S: RecordSource>(
                         } else {
                             &record.seq
                         };
-                        kmer::extract_canonical_kmers_into(seq, k, &mut canon_kmers);
+                        if canonical {
+                            kmer::extract_canonical_kmers_into(seq, k, &mut canon_kmers);
+                        } else {
+                            kmer::extract_forward_kmers_into(seq, k, &mut canon_kmers);
+                        }
                         batch_occurrences += canon_kmers.len() as u64;
                         spill.insert_batch(&canon_kmers)?;
                     }
@@ -1407,7 +1436,8 @@ fn process_stream_parallel_binned<S: RecordSource>(
     let qual_win = config.quality_window;
     let progress_interval = config.progress_interval;
     let hpc = config.hpc;
-    let binned_config = BinnedConfig::new(k).sanitized();
+    let canonical = config.canonical;
+    let binned_config = BinnedConfig { canonical, ..BinnedConfig::new(k) }.sanitized();
 
     // Nothing downstream of the warm-up or the main pipeline reads
     // `FastqRecord::id` (see `spawn_producer`'s doc comment for the
@@ -1925,6 +1955,7 @@ mod tests {
                 num_threads: 3,
                 progress_interval: 1,
                 hpc: false,
+                canonical: true,
             };
             let reader = FastqReader::new(Cursor::new(text.into_bytes()));
             let (counter, qc, total_reads) =

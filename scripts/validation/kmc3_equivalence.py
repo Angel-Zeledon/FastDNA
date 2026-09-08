@@ -41,6 +41,7 @@ Usage:
     python scripts/validation/kmc3_equivalence.py --file r.fastq.gz --k 21
     python scripts/validation/kmc3_equivalence.py --k 41            # the u128 engine
     python scripts/validation/kmc3_equivalence.py --k 31 --engine wide   # u128 in the overlap
+    python scripts/validation/kmc3_equivalence.py --no-canonical        # vs kmc -b
     python scripts/validation/kmc3_equivalence.py --keep       # keep the downloaded data
 
 Requirements: Docker (for KMC3) and a release build of FastDNA
@@ -124,7 +125,7 @@ def fetch_reads(url: str, dest: Path) -> Path:
     return dest
 
 
-def run_kmc3(reads: Path, k: int, threads: int) -> tuple[int, int, int]:
+def run_kmc3(reads: Path, k: int, threads: int, canonical: bool = True) -> tuple[int, int, int]:
     """Returns (distinct, total, reads) as reported by KMC3 itself."""
     workdir = reads.parent / "kmc_work"
     workdir.mkdir(exist_ok=True)
@@ -142,8 +143,12 @@ def run_kmc3(reads: Path, k: int, threads: int) -> tuple[int, int, int]:
         "-w", "/data",
         KMC_IMAGE,
         "kmc", f"-k{k}", "-ci1", "-fq", f"-t{threads}", "-m8",
-        reads.name, "kmc_out", "kmc_work",
     ]
+    if not canonical:
+        # `-b` turns off the transformation into canonical form -- the flag
+        # FastDNA's `--no-canonical` mirrors.
+        command.append("-b")
+    command += [reads.name, "kmc_out", "kmc_work"]
     started = time.monotonic()
     proc = subprocess.run(command, capture_output=True, text=True)
     elapsed = time.monotonic() - started
@@ -163,7 +168,9 @@ def run_kmc3(reads: Path, k: int, threads: int) -> tuple[int, int, int]:
     return distinct, total, n_reads
 
 
-def run_fastdna(binary: Path, reads: Path, k: int, engine: str) -> tuple[int, int, int]:
+def run_fastdna(
+    binary: Path, reads: Path, k: int, engine: str, canonical: bool = True
+) -> tuple[int, int, int]:
     out = reads.parent / "fastdna_out.parquet"
     qc = reads.parent / "fastdna_qc.json"
 
@@ -178,6 +185,8 @@ def run_fastdna(binary: Path, reads: Path, k: int, engine: str) -> tuple[int, in
         "--qc", str(qc), "-k", str(k), "-q", "0", "-m", "1",
         "--engine", engine,
     ]
+    if not canonical:
+        command.append("--no-canonical")
     started = time.monotonic()
     proc = subprocess.run(command, capture_output=True, text=True)
     elapsed = time.monotonic() - started
@@ -218,6 +227,16 @@ def main() -> int:
     parser.add_argument("--url", default=DEFAULT_URL, help="ENA URL to download when --file is absent")
     parser.add_argument("--k", type=int, default=31, help="k-mer length (default: 31)")
     parser.add_argument(
+        "--no-canonical",
+        action="store_true",
+        help=(
+            "count each k-mer as it reads forward instead of folding it with its reverse "
+            "complement, on BOTH sides -- FastDNA's --no-canonical against KMC3's -b. The "
+            "two flags have to mean the same thing for the comparison to be worth making, "
+            "and this is what checks that they do."
+        ),
+    )
+    parser.add_argument(
         "--engine",
         choices=("auto", "narrow", "wide"),
         default="auto",
@@ -246,13 +265,15 @@ def main() -> int:
         reads = fetch_reads(args.url, args.workdir / f"{DEFAULT_ACCESSION}_1.fastq.gz")
 
     engine_note = "" if args.engine == "auto" else f", --engine {args.engine}"
+    canonical = not args.no_canonical
+    form_note = "" if canonical else ", non-canonical (fastdna --no-canonical / kmc -b)"
     print(
-        f"\ncomparing at k={args.k}{engine_note}, singletons included, "
+        f"\ncomparing at k={args.k}{engine_note}{form_note}, singletons included, "
         "quality trimming disabled"
     )
     print("-" * 78)
-    kmc = run_kmc3(reads, args.k, args.threads)
-    fastdna = run_fastdna(binary, reads, args.k, args.engine)
+    kmc = run_kmc3(reads, args.k, args.threads, canonical)
+    fastdna = run_fastdna(binary, reads, args.k, args.engine, canonical)
     print("-" * 78)
 
     labels = ("distinct k-mers", "total k-mers", "reads")
@@ -264,6 +285,7 @@ def main() -> int:
         args.json.write_text(json.dumps({
             "k": args.k,
             "engine": args.engine,
+            "canonical": canonical,
             "input": str(reads),
             "kmc3": dict(zip(labels, kmc)),
             "fastdna": dict(zip(labels, fastdna)),
