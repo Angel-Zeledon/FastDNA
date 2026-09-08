@@ -137,7 +137,10 @@ def test_repr_reports_k_and_length(tmp_path):
     write_kmer_table(path, k=4, rows=[(27, 3)])
 
     table = fastdna.KmerTable.open(str(path))
-    assert repr(table) == "KmerTable(k=4, len=1)"
+    # `engine` joined the repr when `KmerTable` learned to open wide
+    # (`kmer_bits`) tables too: with two widths behind one type, "which one
+    # is this" is the first thing a repr has to answer.
+    assert repr(table) == "KmerTable(k=4, len=1, engine=narrow)"
 
 
 def test_open_of_an_empty_table_reports_zero_length_and_every_lookup_misses(tmp_path):

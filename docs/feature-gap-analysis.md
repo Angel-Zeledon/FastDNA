@@ -398,11 +398,19 @@ at the end). Companion documents: `ml-genomics-roadmap.md` (ML side),
     untouched, and the wide one sits beside it. The cascade the paragraph
     feared is real, which is why nothing generic was attempted.
 
+    **Since 2026-09-07** the engine is reachable from Python too
+    (`fastdna.count(engine=...)`, `KmerCounts.engine`), and a wide table
+    can be read back by `fastdna query` and `fastdna.KmerTable`
+    (`src/wide_ktab.rs`) -- both picking their reader from the file's own
+    footer via `ktab::table_key`.
+
     Still narrow-only, and refused by name rather than misread
-    (`ktab::SORTED_BY_WIDE_VALUE`): `query`, `union`/`intersect`/`diff`,
-    `filter`, `similarity`, sketching, and the Python API. A wide table is
-    a Parquet file keyed on 16 big-endian bytes; those operations are all
-    `u64`-keyed.
+    (`ktab::SORTED_BY_WIDE_VALUE`): `union`/`intersect`/`diff`, `filter`,
+    `similarity` and sketching. A wide table is a
+    Parquet file keyed on 16 big-endian bytes; those operations are all
+    `u64`-keyed end to end -- `setops::MultiTableMerge`'s heap and
+    `read_filter::ReferenceIndex`'s binary search over a `Vec<u64>` are
+    where that is load-bearing, not incidental.
 
   - **The original deferral, for the record**: k > 32 support via `u128`
     k-mers. This would require changing the 2-bit-per-base `u64` k-mer

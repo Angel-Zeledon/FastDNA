@@ -143,11 +143,23 @@ La superficie con compatibilidad garantizada es:
   lector y caer al otro: cuando fallan los dos, un fallback reporta
   necesariamente el error equivocado de los dos.
 
+  **`fastdna.KmerTable` también abre las dos.** `open()` enruta por el
+  mismo footer, `table.engine` dice cuál tienes, y `get`/`[]`/`in`
+  funcionan igual en ambas -- la clave empaquetada viaja como `int` de
+  Python, que es de precisión arbitraria, así que un `kmer_bits` crudo
+  vuelve intacto. `repr` gana `engine=`: con dos anchos detrás de un solo
+  tipo, "cuál de los dos es este" es lo primero que un repr tiene que
+  contestar.
+
   **Lo que sigue sin forma ancha, dicho en vez de descubierto**:
   `union`/`intersect`/`diff`, `filter` y `similarity` -- el heap de
   `setops::MultiTableMerge` y la búsqueda binaria de
-  `read_filter::ReferenceIndex` sobre un `Vec<u64>` -- y el `KmerTable` de
-  Python. Todos la siguen rechazando por nombre.
+  `read_filter::ReferenceIndex` sobre un `Vec<u64>`, donde la clave `u64`
+  es estructural, no incidental. Rechazan una tabla ancha con un
+  `ValueError` que nombra el fichero y aclara que las búsquedas sí
+  funcionan sobre ella. El rechazo vive en un solo sitio
+  (`PyKmerTable::narrow`), para que los ocho puntos de llamada no inventen
+  cada uno su redacción ni se olviden de rechazar.
 
 - **Python: `fastdna.count(..., engine="auto"|"narrow"|"wide")`.** El motor
   ancho (`k` hasta 64) deja de ser exclusivo del CLI. `auto` es el default

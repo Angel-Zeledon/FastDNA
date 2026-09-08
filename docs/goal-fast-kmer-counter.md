@@ -23,7 +23,10 @@ containment and abundance-weighted Bray-Curtis between counted tables --
 checkable against `kmc_tools`' own set operations, and it agrees exactly)
 and the `k > 32` engine (`--engine`, up to k=64 -- checkable against the
 narrow engine, which they agree with k-mer for k-mer wherever both are
-defined).
+defined). The wide engine is reachable from Python as well
+(`count(engine=...)`), and `query` reads the tables it writes; the set
+operations, `filter` and `similarity` still do not, and say so rather
+than misreading one.
 
 The machine-learning layer is **removed**, not frozen: the scikit-learn
 vectorizer, lineage-aware cross-validation, the leakage audit, feature

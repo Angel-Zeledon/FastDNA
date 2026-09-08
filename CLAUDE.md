@@ -20,11 +20,13 @@ the CLI surface (`count`, `sketch`, `dist`, `card`, `peek`, `query`,
 `union`, `intersect`, `diff`, `similarity`, `filter`, `matrix`, `profile`,
 `spectrum`) and the Python API mirroring it -- including
 `count(engine="auto"|"narrow"|"wide")`, which reaches `k = 64` the same
-way the CLI's `--engine` does. One gap remains: `query` reads a wide
-(`kmer_bits`) table, but **the set operations, `filter` and `similarity`
-do not** -- they are `u64`-keyed end to end (`setops::MultiTableMerge`'s
-heap, `read_filter::ReferenceIndex`'s binary search over a `Vec<u64>`) and
-reject one by name rather than misreading it.
+way the CLI's `--engine` does. One gap remains: `query` and
+`fastdna.KmerTable` read a wide (`kmer_bits`) table, but **the set
+operations, `filter` and `similarity` do not** -- they are `u64`-keyed end
+to end (`setops::MultiTableMerge`'s heap, `read_filter::ReferenceIndex`'s
+binary search over a `Vec<u64>`) and reject one by name rather than
+misreading it. On the Python side that refusal lives in one place,
+`PyKmerTable::narrow`.
 
 **The machine-learning layer was removed on 2026-09-05** — 31 Python
 modules and 4 Rust modules (`sklearn`, `audit`, `cv`, `explain`, `gwas`,

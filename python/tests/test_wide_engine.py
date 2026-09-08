@@ -9,7 +9,9 @@ core; this makes it through the binding, which is where the routing,
 the Arrow column type and the decoding actually live.
 """
 
+import pathlib
 import random
+import shutil
 
 import pyarrow as pa
 import pytest
@@ -175,8 +177,95 @@ def test_build_info_reports_both_ceilings():
 
 def test_the_u64_keyed_surface_still_stops_at_32(reads):
     """The honest limit of this feature: counting reaches 64, but
-    sketching -- and every other k-mer-table operation -- does not. Pinned
-    so the day one of them grows a wide form, this test is what says so.
+    sketching does not. Pinned so the day it grows a wide form, this test
+    is what says so.
     """
     with pytest.raises(InvalidKError):
         fastdna.sketch(reads, k=41)
+
+
+def _count_to_parquet(reads, tmp_path, k):
+    """Writes a table through the CLI, because `fastdna.count()` returns an
+    in-memory `KmerCounts` and cannot write a file carrying the footer
+    metadata `KmerTable.open` requires -- the same limitation
+    `KmerTable`'s own docstring states.
+    """
+    import subprocess
+
+    binary = shutil.which("fastdna")
+    if binary is None:
+        for candidate in ("target/release/fastdna", "target/debug/fastdna"):
+            if pathlib.Path(candidate).exists():
+                binary = candidate
+                break
+    if binary is None:
+        pytest.skip("the fastdna binary is not built; run `cargo build --release`")
+
+    out = tmp_path / f"table_k{k}.parquet"
+    subprocess.run(
+        [
+            binary, "count",
+            "--input", str(reads),
+            "-k", str(k),
+            "-o", str(out),
+            # Redirected out of the current directory on purpose: `--qc`
+            # defaults to `qc_report.json` relative to the CWD and is
+            # written unconditionally, so a test that leaves the default
+            # alone drops a file in whatever directory pytest was run from.
+            "--qc", str(tmp_path / "qc.json"),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return out
+
+
+def test_a_wide_table_opens_and_answers_lookups(reads, tmp_path):
+    """The other half of reaching k>32 from Python: a table counted above
+    32 has to be readable back, not just writable.
+    """
+    counts = fastdna.count(reads, k=41).with_sequence()
+    expected = dict(
+        zip(
+            counts.table.column("kmer_sequence").to_pylist(),
+            counts.table.column("frequency").to_pylist(),
+        )
+    )
+
+    table = fastdna.KmerTable.open(_count_to_parquet(reads, tmp_path, 41))
+    assert table.engine == "wide"
+    assert table.k == 41
+    assert len(table) == len(expected)
+
+    for kmer, frequency in list(expected.items())[:20]:
+        assert table.get(kmer) == frequency
+        assert table[kmer] == frequency
+        assert kmer in table
+
+    absent = "A" * 41
+    assert absent not in expected
+    assert table.get(absent) is None
+    with pytest.raises(KeyError):
+        table[absent]
+
+
+def test_a_narrow_table_still_opens_as_narrow(reads, tmp_path):
+    table = fastdna.KmerTable.open(_count_to_parquet(reads, tmp_path, 21))
+    assert table.engine == "narrow"
+    assert table.k == 21
+    assert len(table) > 0
+
+
+def test_set_operations_refuse_a_wide_table_by_name(reads, tmp_path):
+    """`union`/`intersect`/`difference` are u64-keyed end to end. Refusing
+    is the honest answer; what this pins is that the refusal names the
+    file and says lookups still work, rather than failing obscurely.
+    """
+    wide = fastdna.KmerTable.open(_count_to_parquet(reads, tmp_path, 41))
+
+    for operation in ("union", "intersect", "difference"):
+        with pytest.raises(ValueError) as excinfo:
+            getattr(wide, operation)(wide, output=str(tmp_path / "out.parquet"))
+        message = str(excinfo.value)
+        assert "wide" in message, message
+        assert "kmer_bits" in message, message

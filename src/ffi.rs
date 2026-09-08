@@ -1405,7 +1405,38 @@ fn load_frac_sketch(path: String) -> PyResult<PyFracSketch> {
 /// conversion step exists, see `ktab.rs`'s module doc comment.
 #[pyclass(name = "KmerTable", module = "fastdna._core")]
 struct PyKmerTable {
-    inner: KmerTable,
+    inner: TableRepr,
+}
+
+/// The opened table behind a Python `KmerTable`, in whichever width the
+/// file on disk was written in.
+///
+/// One Python type over both, for the same reason `CountsRepr` gives: the
+/// lookup methods (`get`, `__getitem__`, `__contains__`, `__len__`, `k`)
+/// mean the same thing either way, and a second class would push an
+/// `isinstance` check into code whose real question is "what is this
+/// k-mer's count". What a caller *does* need to distinguish is the set
+/// operations, which have no wide form -- and those say so by name
+/// (`narrow` below) rather than by the caller having to check first.
+enum TableRepr {
+    Narrow(KmerTable),
+    Wide(crate::wide_ktab::WideKmerTable),
+}
+
+impl TableRepr {
+    fn k(&self) -> usize {
+        match self {
+            TableRepr::Narrow(t) => t.k(),
+            TableRepr::Wide(t) => t.k(),
+        }
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            TableRepr::Narrow(t) => t.len(),
+            TableRepr::Wide(t) => t.len(),
+        }
+    }
 }
 
 /// Accepts either a Python `int` (the table's raw `kmer_u64` encoding,
@@ -1427,6 +1458,22 @@ fn extract_kmer_arg(kmer: &Bound<'_, PyAny>, k: usize) -> PyResult<u64> {
     Ok(ktab::encode_query_kmer(&sequence, k)?)
 }
 
+/// `extract_kmer_arg` for a wide table: the same contract, with the packed
+/// encoding a `u128`. Python's `int` is arbitrary-precision, so a raw key
+/// read out of a `kmer_bits` column round-trips through it unchanged --
+/// there is no second, lossier form to warn about here.
+fn extract_wide_kmer_arg(kmer: &Bound<'_, PyAny>, k: usize) -> PyResult<u128> {
+    if let Ok(raw) = kmer.extract::<u128>() {
+        return Ok(raw);
+    }
+    let sequence: String = kmer.extract().map_err(|_| {
+        PyValueError::new_err(
+            "kmer must be a DNA sequence (str) of length k, or the table's raw kmer_bits encoding (a non-negative int)",
+        )
+    })?;
+    Ok(crate::wide_ktab::encode_query_wide_kmer(&sequence, k)?)
+}
+
 #[pymethods]
 impl PyKmerTable {
     /// Opens `path` and validates it as a queryable k-mer table (footer
@@ -1435,13 +1482,35 @@ impl PyKmerTable {
     /// `LoadError` for a file that is not a FastDNA k-mer table.
     #[staticmethod]
     fn open(py: Python<'_>, path: String) -> PyResult<Self> {
-        let inner = py.allow_threads(|| KmerTable::open(path))?;
+        // Routed by the file's own footer, one read, exactly as `fastdna
+        // query` does it -- see `ktab::table_key` for why this is not an
+        // open-and-fall-back.
+        let inner = py.allow_threads(|| -> Result<TableRepr, FastDnaError> {
+            match ktab::table_key(&path)? {
+                ktab::TableKey::Narrow => Ok(TableRepr::Narrow(KmerTable::open(path)?)),
+                ktab::TableKey::Wide => {
+                    Ok(TableRepr::Wide(crate::wide_ktab::WideKmerTable::open(path)?))
+                }
+            }
+        })?;
         Ok(Self { inner })
     }
 
     #[getter]
     fn k(&self) -> usize {
         self.inner.k()
+    }
+
+    /// `"narrow"` or `"wide"` -- which key column this table is stored
+    /// with, and therefore whether the set operations accept it. Reported
+    /// rather than left to be inferred from `k`, so a caller can check
+    /// before calling one instead of catching the error afterwards.
+    #[getter]
+    fn engine(&self) -> &'static str {
+        match self.inner {
+            TableRepr::Narrow(_) => "narrow",
+            TableRepr::Wide(_) => "wide",
+        }
     }
 
     /// Total row count (the table's distinct-k-mer count), read once from
@@ -1454,8 +1523,17 @@ impl PyKmerTable {
     /// The frequency recorded for `kmer`, or `None` if it is absent from the
     /// table. See `extract_kmer_arg` for what `kmer` may be.
     fn get(&self, py: Python<'_>, kmer: &Bound<'_, PyAny>) -> PyResult<Option<u32>> {
-        let encoded = extract_kmer_arg(kmer, self.inner.k())?;
-        Ok(py.allow_threads(|| self.inner.get(encoded))?)
+        let k = self.inner.k();
+        match &self.inner {
+            TableRepr::Narrow(table) => {
+                let encoded = extract_kmer_arg(kmer, k)?;
+                Ok(py.allow_threads(|| table.get(encoded))?)
+            }
+            TableRepr::Wide(table) => {
+                let encoded = extract_wide_kmer_arg(kmer, k)?;
+                Ok(py.allow_threads(|| table.get(encoded))?)
+            }
+        }
     }
 
     /// Same lookup as `get`, but raises `KeyError` instead of returning
@@ -1474,7 +1552,35 @@ impl PyKmerTable {
     }
 
     fn __repr__(&self) -> String {
-        format!("KmerTable(k={}, len={})", self.inner.k(), self.inner.len())
+        format!("KmerTable(k={}, len={}, engine={})", self.inner.k(), self.inner.len(), self.engine())
+    }
+}
+
+impl PyKmerTable {
+    /// The underlying narrow table, or a `ValueError` naming the problem.
+    ///
+    /// Every set operation and `filter_reads` is `u64`-keyed end to end --
+    /// `setops::MultiTableMerge`'s heap and `read_filter::ReferenceIndex`'s
+    /// binary search over a `Vec<u64>` are built on the concrete key type,
+    /// not incidentally typed that way. A wide table has to be refused, and
+    /// refusing it here, in one place, is what keeps the eight call sites
+    /// from each inventing their own wording (or forgetting to refuse).
+    ///
+    /// Clones rather than borrows because every caller hands the table to
+    /// `py.allow_threads`, which cannot hold a `PyRef` across the GIL
+    /// release. `KmerTable` is a path plus a row-group index, so the clone
+    /// is cheap and reopens nothing.
+    fn narrow(&self) -> PyResult<KmerTable> {
+        match &self.inner {
+            TableRepr::Narrow(table) => Ok(table.clone()),
+            TableRepr::Wide(table) => Err(PyValueError::new_err(format!(
+                "{} is a wide (k>32) k-mer table, keyed on kmer_bits. Set operations, \
+                 read filtering and similarity are u64-keyed and have no wide form: they \
+                 accept only tables counted at k<=32. Lookups (get/__getitem__/in) do work \
+                 on this table",
+                table.path().display()
+            ))),
+        }
     }
 }
 
@@ -1539,7 +1645,7 @@ fn filter_reads(
     min_fraction: f64,
 ) -> PyResult<PyFilterStats> {
     let mode = parse_filter_mode(mode)?;
-    let table_inner = table.inner.clone();
+    let table_inner = table.narrow()?;
     let input_specs: Vec<crate::fastq::InputSpec> =
         inputs.iter().map(|p| crate::fastq::InputSpec::from_arg(std::path::Path::new(p))).collect();
     let output_path = PathBuf::from(output);
@@ -1610,7 +1716,7 @@ fn filter_reads_paired(
     min_fraction: f64,
 ) -> PyResult<PyPairedFilterStats> {
     let mode = parse_filter_mode(mode)?;
-    let table_inner = table.inner.clone();
+    let table_inner = table.narrow()?;
     let inputs_r1: Vec<crate::fastq::InputSpec> =
         inputs.iter().map(|p| crate::fastq::InputSpec::from_arg(std::path::Path::new(p))).collect();
     let inputs_r2: Vec<crate::fastq::InputSpec> =
@@ -1674,7 +1780,7 @@ fn profile_reads(
     output: String,
     summary: String,
 ) -> PyResult<PyProfileStats> {
-    let table_inner = table.inner.clone();
+    let table_inner = table.narrow()?;
     let input_specs: Vec<crate::fastq::InputSpec> =
         inputs.iter().map(|p| crate::fastq::InputSpec::from_arg(std::path::Path::new(p))).collect();
     let output_path = PathBuf::from(output);
@@ -1725,7 +1831,7 @@ fn parse_combine_op(combine: &str) -> PyResult<setops::CombineOp> {
 #[pyo3(signature = (tables, output, combine="sum"))]
 fn ktab_union(py: Python<'_>, tables: Vec<PyRef<'_, PyKmerTable>>, output: String, combine: &str) -> PyResult<PyKmerTable> {
     let combine = parse_combine_op(combine)?;
-    let inner: Vec<KmerTable> = tables.iter().map(|t| t.inner.clone()).collect();
+    let inner: Vec<KmerTable> = tables.iter().map(|t| t.narrow()).collect::<PyResult<_>>()?;
     let opened = py.allow_threads(|| -> Result<KmerTable, FastDnaError> {
         let input_paths: Vec<&Path> = inner.iter().map(KmerTable::path).collect();
         setops::guard_against_output_overwrite(&input_paths, Path::new(&output))?;
@@ -1734,7 +1840,7 @@ fn ktab_union(py: Python<'_>, tables: Vec<PyRef<'_, PyKmerTable>>, output: Strin
         export::export_pairs_parquet(rows, &output, k)?;
         KmerTable::open(&output)
     })?;
-    Ok(PyKmerTable { inner: opened })
+    Ok(PyKmerTable { inner: TableRepr::Narrow(opened) })
 }
 
 /// Intersection of several k-mer tables, written to `output` and reopened
@@ -1751,7 +1857,7 @@ fn ktab_intersect(
     combine: &str,
 ) -> PyResult<PyKmerTable> {
     let combine = parse_combine_op(combine)?;
-    let inner: Vec<KmerTable> = tables.iter().map(|t| t.inner.clone()).collect();
+    let inner: Vec<KmerTable> = tables.iter().map(|t| t.narrow()).collect::<PyResult<_>>()?;
     let opened = py.allow_threads(|| -> Result<KmerTable, FastDnaError> {
         let input_paths: Vec<&Path> = inner.iter().map(KmerTable::path).collect();
         setops::guard_against_output_overwrite(&input_paths, Path::new(&output))?;
@@ -1760,7 +1866,7 @@ fn ktab_intersect(
         export::export_pairs_parquet(rows, &output, k)?;
         KmerTable::open(&output)
     })?;
-    Ok(PyKmerTable { inner: opened })
+    Ok(PyKmerTable { inner: TableRepr::Narrow(opened) })
 }
 
 /// Asymmetric difference (`a` minus `subtract`), written to `output` and
@@ -1778,8 +1884,9 @@ fn ktab_diff(
     output: String,
     max_subtract_count: u32,
 ) -> PyResult<PyKmerTable> {
-    let a_inner = a.inner.clone();
-    let subtract_inner: Vec<KmerTable> = subtract.iter().map(|t| t.inner.clone()).collect();
+    let a_inner = a.narrow()?;
+    let subtract_inner: Vec<KmerTable> =
+        subtract.iter().map(|t| t.narrow()).collect::<PyResult<_>>()?;
     let opened = py.allow_threads(|| -> Result<KmerTable, FastDnaError> {
         let input_paths: Vec<&Path> =
             std::iter::once(a_inner.path()).chain(subtract_inner.iter().map(KmerTable::path)).collect();
@@ -1788,7 +1895,7 @@ fn ktab_diff(
         export::export_pairs_parquet(rows, &output, a_inner.k())?;
         KmerTable::open(&output)
     })?;
-    Ok(PyKmerTable { inner: opened })
+    Ok(PyKmerTable { inner: TableRepr::Narrow(opened) })
 }
 
 /// Estimates the number of distinct canonical k-mers across an *entire*

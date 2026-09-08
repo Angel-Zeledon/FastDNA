@@ -479,7 +479,7 @@ Parquet files `count` itself writes:
 
 | Subcommand | What it does | Equivalent Python call |
 |---|---|---|
-| `fastdna query --table FILE --kmer SEQ` | Point-lookup of one k-mer's count, pruning row groups by their key statistics. Reads both table widths -- `kmer_u64` (k≤32) and `kmer_bits` (k>32) -- picking the reader from the file's own footer | `fastdna.KmerTable.open(...).get(...)` (narrow only) |
+| `fastdna query --table FILE --kmer SEQ` | Point-lookup of one k-mer's count, pruning row groups by their key statistics. Reads both table widths -- `kmer_u64` (k≤32) and `kmer_bits` (k>32) -- picking the reader from the file's own footer | `fastdna.KmerTable.open(...).get(...)` |
 | `fastdna union --input A B ... -o OUT` | Every k-mer in any input table, counts combined | -- |
 | `fastdna intersect --input A B ... -o OUT` | Only k-mers present in every input | -- |
 | `fastdna diff --input A B ... -o OUT` | K-mers in the first table and absent from the rest (host/contaminant subtraction) | -- |
@@ -991,10 +991,10 @@ who needs that code can take it from the git history at `60b5f82`.
 Still ahead:
 
 - A wide form for the remaining k-mer-table operations. `fastdna query`
-  reads a `kmer_bits` table, but `union`/`intersect`/`diff`, `filter` and
-  `similarity` are still `u64`-keyed end to end and reject one by name --
-  as does the Python `KmerTable`. Set operations above k=32 therefore
-  still have to happen outside FastDNA.
+  and `fastdna.KmerTable` read a `kmer_bits` table, but
+  `union`/`intersect`/`diff`, `filter` and `similarity` are still
+  `u64`-keyed end to end and reject one by name. Set operations above k=32
+  therefore still have to happen outside FastDNA.
 - A `strategy=`/`max_ram=` parameter on `fastdna.count()`, so the Python
   binding can use the disk strategy and automatic chooser without the
   `FASTDNA_STRATEGY` environment variable.

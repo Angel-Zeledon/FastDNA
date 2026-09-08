@@ -869,9 +869,18 @@ class KmerTable:
 
     Behaves like a read-only mapping from a canonical k-mer to its
     frequency: `table["ACGT..."]`/`table.get(...)` accept either a DNA
-    sequence of exactly `table.k` bases or the table's raw `kmer_u64`
-    integer encoding directly, `len(table)` is the distinct-k-mer count,
-    and `kmer in table` tests presence without raising.
+    sequence of exactly `table.k` bases or the table's raw packed integer
+    encoding directly, `len(table)` is the distinct-k-mer count, and
+    `kmer in table` tests presence without raising.
+
+    Opens both widths. A table counted at `k <= 32` is keyed on `kmer_u64`
+    and one counted above it on `kmer_bits` (16 big-endian bytes); which
+    one you have is `table.engine`, and the reader is picked from the
+    file's own footer rather than from anything the caller passes. Lookups
+    work identically on both. **The set operations below do not**:
+    `union`, `intersect` and `difference`, like `filter_reads` and
+    `similarity`, are `u64`-keyed end to end and raise `ValueError` naming
+    the file if handed a wide table.
 
     Point lookups (`get`/`__getitem__`) decode at most one Parquet row
     group per call, pruned via that row group's own min/max k-mer
@@ -901,6 +910,15 @@ class KmerTable:
     def k(self) -> int:
         return self._raw.k
 
+    @property
+    def engine(self) -> str:
+        """`"narrow"` or `"wide"` -- which key column this table is stored
+        with, and so whether the set operations accept it. Reported so a
+        caller can check before calling one, instead of catching the error
+        afterwards.
+        """
+        return self._raw.engine
+
     def get(self, kmer: Union[str, int]) -> Optional[int]:
         """The frequency recorded for `kmer`, or `None` if it is absent."""
         return self._raw.get(kmer)
@@ -915,7 +933,7 @@ class KmerTable:
         return len(self._raw)
 
     def __repr__(self) -> str:
-        return f"KmerTable(k={self.k}, len={len(self)})"
+        return f"KmerTable(k={self.k}, len={len(self)}, engine={self.engine})"
 
     def union(self, *others: "KmerTable", output: _PathLike, combine: str = "sum") -> "KmerTable":
         """Every k-mer present in `self` or any of `others`, written to
