@@ -88,7 +88,6 @@
 //! *occurrences* but is tiny in *distinct* k-mers, so it costs sort time,
 //! not memory.
 
-use std::collections::VecDeque;
 
 use crate::kmer::{canonical_kmer_u64, complement_bits};
 
@@ -346,53 +345,99 @@ impl MmerRoller {
 /// deliberate deviation from Roberts et al. 2004's "each of the smallest
 /// k-mers is a minimizer", and it is what makes a super-k-mer a single
 /// well-defined run rather than an overlapping set.
-#[derive(Debug, Clone, Default)]
+/// # Storage: a fixed inline ring buffer, not a `VecDeque`
+///
+/// The deque never holds more than `k - m + 1` entries -- every entry is
+/// inside the current window by the eviction invariant -- and `k <= 32` on
+/// this path (the binned strategy is `u64`-keyed; `SignatureScanner::new`
+/// asserts the range). So the maximum is 32 slots, which fits inline in the
+/// scanner rather than behind a heap pointer, and a power-of-two capacity
+/// turns the wrap into a mask.
+///
+/// This replaced a `VecDeque<(u64, usize)>` after `SignatureScanner::push`
+/// measured as the largest single consumer of a binned run (31.8% of work,
+/// `docs/BENCHMARKS.md`). Positions narrow to `u32` at the same time: a
+/// position is an offset within one unambiguous stretch of one read, which
+/// `kmer::extract_canonical_kmers_with_positions_into` already caps at
+/// `u32::MAX` for the same reason.
+#[derive(Debug, Clone)]
 pub struct WindowMin {
-    entries: VecDeque<(u64, usize)>,
+    /// Ring buffer. Only `entries[(head + i) & MASK]` for `i < len` is live.
+    entries: [(u64, u32); Self::CAPACITY],
+    head: usize,
+    len: usize,
+}
+
+impl Default for WindowMin {
+    fn default() -> Self {
+        Self { entries: [(0, 0); Self::CAPACITY], head: 0, len: 0 }
+    }
 }
 
 impl WindowMin {
+    /// `k - m + 1 <= k <= 32`, rounded to a power of two so the wrap is a
+    /// mask rather than a compare-and-subtract.
+    const CAPACITY: usize = 32;
+    const MASK: usize = Self::CAPACITY - 1;
+
+    /// `capacity` is accepted for source compatibility with the `VecDeque`
+    /// form and checked rather than used: the buffer is always
+    /// [`Self::CAPACITY`] slots, and a caller asking for more would be
+    /// asking for a window this path cannot produce.
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { entries: VecDeque::with_capacity(capacity) }
+        debug_assert!(
+            capacity <= Self::CAPACITY,
+            "WindowMin: window of {capacity} exceeds the {} slots k <= 32 can need",
+            Self::CAPACITY
+        );
+        Self::default()
     }
 
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.head = 0;
+        self.len = 0;
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len == 0
     }
 
     /// Admits `(key, position)`. Positions must be pushed in increasing
     /// order; skipping positions is allowed and is exactly how an ineligible
     /// m-mer is excluded from the candidate set.
+    #[inline]
     pub fn push(&mut self, key: u64, position: usize) {
-        while let Some(&(back_key, _)) = self.entries.back() {
-            if back_key > key {
-                self.entries.pop_back();
-            } else {
-                break;
-            }
+        // Ties keep the earlier position: `>` and not `>=`, so an equal key
+        // already in the deque survives in front of the new one. See this
+        // type's doc comment for why that rule is load-bearing.
+        while self.len > 0 && self.entries[(self.head + self.len - 1) & Self::MASK].0 > key {
+            self.len -= 1;
         }
-        self.entries.push_back((key, position));
+        debug_assert!(self.len < Self::CAPACITY, "WindowMin overflow: window wider than k <= 32 allows");
+        self.entries[(self.head + self.len) & Self::MASK] = (key, position as u32);
+        self.len += 1;
     }
 
     /// Drops every entry whose position is below `first_position`.
+    #[inline]
     pub fn evict_before(&mut self, first_position: usize) {
-        while let Some(&(_, pos)) = self.entries.front() {
-            if pos < first_position {
-                self.entries.pop_front();
-            } else {
-                break;
-            }
+        let first = first_position as u32;
+        while self.len > 0 && self.entries[self.head].1 < first {
+            self.head = (self.head + 1) & Self::MASK;
+            self.len -= 1;
         }
     }
 
     /// The minimum key currently in the window, with the position that
     /// produced it, or `None` if no candidate is in the window.
+    #[inline]
     pub fn min(&self) -> Option<(u64, usize)> {
-        self.entries.front().copied()
+        if self.len == 0 {
+            None
+        } else {
+            let (key, pos) = self.entries[self.head];
+            Some((key, pos as usize))
+        }
     }
 }
 
@@ -504,6 +549,197 @@ impl SignatureScanner {
 mod tests {
     use super::*;
     use crate::kmer::{base_to_bits, reverse_complement_u64};
+
+    /// The `VecDeque`-backed `WindowMin` this module used before the inline
+    /// ring buffer replaced it, kept as both a correctness oracle and the
+    /// other arm of `window_min_ab`.
+    ///
+    /// Two implementations of a monotonic deque can agree on every
+    /// `min()` and still differ on a tie rule or an eviction boundary, and
+    /// the tie rule here is load-bearing (it is what makes a super-k-mer a
+    /// single run). `ring_and_deque_windows_agree_on_real_sequence` drives
+    /// both from the same bases and requires the same answer at every step.
+    #[derive(Debug, Clone, Default)]
+    struct DequeWindowMin {
+        entries: std::collections::VecDeque<(u64, usize)>,
+    }
+
+    impl DequeWindowMin {
+        fn clear(&mut self) {
+            self.entries.clear();
+        }
+
+        fn push(&mut self, key: u64, position: usize) {
+            while let Some(&(back_key, _)) = self.entries.back() {
+                if back_key > key {
+                    self.entries.pop_back();
+                } else {
+                    break;
+                }
+            }
+            self.entries.push_back((key, position));
+        }
+
+        fn evict_before(&mut self, first_position: usize) {
+            while let Some(&(_, pos)) = self.entries.front() {
+                if pos < first_position {
+                    self.entries.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        fn min(&self) -> Option<(u64, usize)> {
+            self.entries.front().copied()
+        }
+    }
+
+    /// Deterministic ACGT bases, the shape a real read gives the scanner.
+    fn bench_bases(n: usize, seed: u64) -> Vec<u64> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) & 0b11
+            })
+            .collect()
+    }
+
+    /// Drives both window implementations through the identical sequence of
+    /// `push`/`evict_before`/`min` calls a `k`-window scan makes, and
+    /// requires the same answer every time.
+    ///
+    /// This is the check the A/B rests on: a faster window that answers
+    /// differently is not a faster window, it is a different bin function,
+    /// and `tests/dual_strategy.rs` would only catch that at whole-file
+    /// granularity.
+    #[test]
+    fn ring_and_deque_windows_agree_on_real_sequence() {
+        for (k, m) in [(31usize, 7usize), (31, 9), (21, 7), (32, 1), (8, 7)] {
+            let width = k - m + 1;
+            let mut ring = WindowMin::with_capacity(width);
+            let mut deque = DequeWindowMin::default();
+            let mut roller = MmerRoller::new(m);
+
+            for (i, bits) in bench_bases(4_000, 0xBEEF ^ k as u64).into_iter().enumerate() {
+                if let Some(canonical) = roller.push(bits) {
+                    let position = i + 1 - m;
+                    if let Some(key) = mmer_order_key(canonical, m) {
+                        ring.push(key, position);
+                        deque.push(key, position);
+                    }
+                }
+                if i + 1 >= k {
+                    let first = i + 1 - k;
+                    ring.evict_before(first);
+                    deque.evict_before(first);
+                    assert_eq!(ring.min(), deque.min(), "k={k} m={m} at base {i}");
+                    assert_eq!(ring.is_empty(), deque.min().is_none(), "k={k} m={m} at base {i}");
+                }
+            }
+            ring.clear();
+            deque.clear();
+            assert_eq!(ring.min(), deque.min());
+        }
+    }
+
+    /// A/B measurement, not an assertion. `#[ignore]`d; run by hand with
+    /// `cargo test --release window_min_ab -- --ignored --nocapture`.
+    ///
+    /// `SignatureScanner::push` measured as the largest single consumer of
+    /// a binned run (31.8% of work, `docs/BENCHMARKS.md`), and the window is
+    /// the part of it that was a heap-allocated `VecDeque`. Whether an
+    /// inline ring buffer is actually faster is a question two whole-binary
+    /// runs could not answer -- they disagreed, 1.104x one way and 0.939x
+    /// the other, because a ~9 s run on a loaded host has a wider spread
+    /// than the effect. This isolates it.
+    #[test]
+    #[ignore]
+    fn window_min_ab() {
+        use std::time::Instant;
+
+        const BASES: usize = 4_000_000;
+        const REPEATS: usize = 15;
+        let (k, m) = (31usize, DEFAULT_M);
+        let bases = bench_bases(BASES, 0x5EED);
+
+        fn median(mut v: Vec<f64>) -> f64 {
+            v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+            v[v.len() / 2]
+        }
+
+        // The window driven exactly as `SignatureScanner::push` drives it,
+        // minus the roller, so the measurement is the window and not the
+        // m-mer arithmetic both arms share.
+        let keys: Vec<(usize, u64)> = {
+            let mut roller = MmerRoller::new(m);
+            let mut out = Vec::with_capacity(bases.len());
+            for (i, &bits) in bases.iter().enumerate() {
+                if let Some(canonical) = roller.push(bits) {
+                    if let Some(key) = mmer_order_key(canonical, m) {
+                        out.push((i + 1 - m, key));
+                    }
+                }
+            }
+            out
+        };
+
+        let mut ring_times = Vec::new();
+        let mut deque_times = Vec::new();
+
+        for _ in 0..REPEATS {
+            // Interleaved, so drift in host load hits both arms.
+            let mut ring = WindowMin::with_capacity(k - m + 1);
+            let t = Instant::now();
+            let mut acc = 0u64;
+            let mut next = 0usize;
+            for i in 0..bases.len() {
+                if let Some(&(pos, key)) = keys.get(next) {
+                    if pos + m == i + 1 {
+                        ring.push(key, pos);
+                        next += 1;
+                    }
+                }
+                if i + 1 >= k {
+                    ring.evict_before(i + 1 - k);
+                    if let Some((v, _)) = ring.min() {
+                        acc ^= v;
+                    }
+                }
+            }
+            ring_times.push(t.elapsed().as_secs_f64());
+            std::hint::black_box(acc);
+
+            let mut deque = DequeWindowMin::default();
+            let t = Instant::now();
+            let mut acc = 0u64;
+            let mut next = 0usize;
+            for i in 0..bases.len() {
+                if let Some(&(pos, key)) = keys.get(next) {
+                    if pos + m == i + 1 {
+                        deque.push(key, pos);
+                        next += 1;
+                    }
+                }
+                if i + 1 >= k {
+                    deque.evict_before(i + 1 - k);
+                    if let Some((v, _)) = deque.min() {
+                        acc ^= v;
+                    }
+                }
+            }
+            deque_times.push(t.elapsed().as_secs_f64());
+            std::hint::black_box(acc);
+        }
+
+        let (r, d) = (median(ring_times), median(deque_times));
+        println!("\nwindow_min A/B -- {BASES} bases, k={k} m={m}, {REPEATS} interleaved repeats");
+        println!("  VecDeque     {d:.4} s");
+        println!("  inline ring  {r:.4} s   {:.2}x\n", d / r);
+    }
 
     /// Fixed-seed xorshift64, the same generator `tests/dual_strategy.rs`
     /// uses, so every test here is exactly reproducible with no RNG

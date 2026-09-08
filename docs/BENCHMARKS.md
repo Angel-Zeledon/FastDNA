@@ -398,6 +398,50 @@ a routine already tested and measured for `counter.rs`.
 interleaving is what makes the *ratio* usable; the wall times are not
 comparable to the 9.88 s recorded below, which was taken separately.
 
+## The minimizer window: an inline ring buffer (2026-09-07)
+
+The profile above put `SignatureScanner::push` at **31.8%** of a binned
+run, the largest single item. The part of it that was a heap-allocated
+`VecDeque<(u64, usize)>` is the sliding-window minimum, and the deque
+never holds more than `k - m + 1` entries -- at most 32, since `k <= 32` on
+this path. That fits inline in the scanner with a power-of-two mask instead
+of a heap pointer and wrap arithmetic.
+
+**Isolated** (`minimizer::tests::window_min_ab`, 4,000,000 bases, k=31
+m=7, 15 interleaved repeats, two runs):
+
+| | |
+|---|---:|
+| `VecDeque` | 0.0306 s / 0.0307 s |
+| inline ring buffer | 0.0283 s / 0.0281 s |
+| | **1.08x / 1.09x** |
+
+**End to end it could not be measured on this host, and the attempt is
+worth recording as a negative result.** Two release binaries differing only
+in this, 9 and 11 interleaved runs each on the 2.14 GB file:
+
+| run | host load | median ratio | min-to-min |
+|---|---:|---:|---:|
+| first | 6.3 | 1.104x (ring faster) | 1.164x |
+| second | 13.2 | 0.939x (ring *slower*) | 1.038x |
+
+The two disagree in direction. A ~9 s run on a host carrying unrelated
+load of 6-13 has a spread (8.5-12.9 s) far wider than an effect this size,
+and no number from it is usable. The isolated benchmark is the only
+measurement here that means anything, and what it measures is the window,
+not the 31.8%: the m-mer roll and the eligibility key are the rest of
+`push` and are untouched.
+
+Kept anyway, on three grounds and not on a speed claim: it is consistently
+faster in isolation, its output is byte-identical (SHA-256 checked against
+the previous binary on real reads), and it arrived with an equivalence
+test the `VecDeque` version never had --
+`ring_and_deque_windows_agree_on_real_sequence` drives both implementations
+through the same push/evict/min sequence across five `(k, m)` pairs and
+requires identical answers at every step. Two monotonic deques can agree on
+most inputs and still differ on the tie rule, and the tie rule here decides
+where super-k-mers break.
+
 ## Strategy comparison on Apple silicon (2026-09-05)
 
 A second machine, and the first measurement of all three strategies against
