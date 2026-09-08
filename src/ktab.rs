@@ -104,11 +104,11 @@ pub const SORTED_BY_VALUE: &str = "kmer_u64";
 ///
 /// `KmerTable::open` accepts only `SORTED_BY_VALUE`, so a wide table is
 /// rejected by name rather than misread as a narrow one. A wide table is
-/// read by [`crate::wide_ktab::WideKmerTable`] instead, which `query`, the
-/// set operations and `similarity` select via [`table_key`]. The two
-/// operations with no wide form are `filter` and `profile`: they index the
-/// reference as a `Vec<u64>` and binary-search it once per read, so the key
-/// type there is the data structure rather than an annotation.
+/// read by [`crate::wide_ktab::WideKmerTable`] instead, which every
+/// table-reading operation -- `query`, the set operations, `similarity`,
+/// `filter`, `profile` -- selects via [`table_key`]. Nothing that opens a
+/// k-mer table is narrow-only any more; what still stops at `k = 32` is
+/// sketching and the estimators, which never open one.
 pub const SORTED_BY_WIDE_VALUE: &str = "kmer_bits";
 /// Parquet key-value metadata key recording the `k` every row's `kmer_u64`
 /// was packed with. Needed because a raw `u64` cannot be decoded (or a
@@ -267,12 +267,12 @@ impl KmerTable {
                 load_reason(
                     &path,
                     "missing a non-nullable kmer_u64: uint64 column. A table written at k>32 \
-                     keys on a 16-byte kmer_bits column instead (see SORTED_BY_WIDE_VALUE) and \
-                     is read by wide_ktab::WideKmerTable, which query, the set operations and \
-                     similarity all select for themselves via `table_key`. Only read filtering \
-                     and profiling have no wide form -- they index the reference as a Vec<u64> \
-                     -- so reaching this message means one of those was asked for a wide \
-                     table. Anything else is not a FastDNA k-mer table at all"
+                     keys on a 16-byte kmer_bits column instead (see SORTED_BY_WIDE_VALUE) \
+                     and is read by wide_ktab::WideKmerTable. Every operation that reads a \
+                     k-mer table supports both widths and picks its reader from the file's \
+                     own footer via ktab::table_key, so reaching this message means \
+                     something opened the file with the narrow reader without routing \
+                     first. Anything else is not a FastDNA k-mer table at all"
                         .to_string(),
                 )
             })?;

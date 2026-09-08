@@ -1139,9 +1139,10 @@ fn build_info(py: Python<'_>) -> PyResult<PyObject> {
     // the wide engine's own ceiling rather than the narrow 32 this used to
     // report. `max_k_sketch` is reported alongside it because the ceiling
     // is not uniform across the module: sketching, cardinality estimation
-    // and every k-mer-table operation are u64-keyed and still stop at 32,
-    // so a caller that reads `max_k` and hands 41 to `sketch()` would
-    // otherwise be misled by a number that is true only of counting.
+    // and spectrum estimation hash straight from FASTQ with a `u64` k-mer
+    // and still stop at 32, so a caller that reads `max_k` and hands 41 to
+    // `sketch()` would otherwise be misled by a number that is true of
+    // counting and of every k-mer-table operation, but not of those.
     dict.set_item("max_k", wide_kmer::MAX_WIDE_K)?;
     dict.set_item("max_k_sketch", 32usize)?;
     dict.set_item("avx2", avx2_is_live())?;
@@ -1411,13 +1412,14 @@ struct PyKmerTable {
 /// The opened table behind a Python `KmerTable`, in whichever width the
 /// file on disk was written in.
 ///
-/// One Python type over both, for the same reason `CountsRepr` gives: the
-/// lookup methods (`get`, `__getitem__`, `__contains__`, `__len__`, `k`)
-/// mean the same thing either way, and a second class would push an
+/// One Python type over both, for the same reason `CountsRepr` gives: every
+/// method means the same thing either way, and a second class would push an
 /// `isinstance` check into code whose real question is "what is this
-/// k-mer's count". What a caller *does* need to distinguish is the set
-/// operations, which have no wide form -- and those say so by name
-/// (`narrow` below) rather than by the caller having to check first.
+/// k-mer's count". Nothing needs to distinguish them any more -- lookups,
+/// the set operations, `similarity`, filtering and profiling all take
+/// either width -- and `KmerTable.engine` reports which one a caller has
+/// for the cases where it matters (a set operation's inputs must share a
+/// width, since two widths never share a `k`).
 #[derive(Clone)]
 enum TableRepr {
     Narrow(KmerTable),

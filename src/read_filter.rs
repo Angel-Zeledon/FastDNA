@@ -366,6 +366,9 @@ pub fn matching_fraction(
     index: &ReferenceIndex,
     scratch: &mut KmerScratch,
 ) -> Option<f64> {
+    // Each arm binary-searches its own `keys` directly rather than going
+    // through `contains_narrow`/`contains_wide`: those re-match on the
+    // width once per k-mer, and this is the per-read hot loop.
     let (matched, total) = match &index.keys {
         IndexKeys::Narrow(keys) => {
             kmer::extract_canonical_kmers_into(seq, index.k(), &mut scratch.narrow);
@@ -377,9 +380,6 @@ pub fn matching_fraction(
             let found = scratch.wide.iter().filter(|km| keys.binary_search(km).is_ok()).count();
             (found, scratch.wide.len())
         }
-        // The two arms binary-search their own `keys` directly rather than
-        // going through `contains_narrow`/`contains_wide`: those re-match
-        // on the width once per k-mer, and this is the per-read hot loop.
     };
     if total == 0 {
         return None;
