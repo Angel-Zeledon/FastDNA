@@ -486,14 +486,20 @@ without writing Python:
 | `fastdna peek --input FILE [--n-reads 10000]` | Quick preview: read length stats, GC content, a suggested k | `fastdna.peek(...)` |
 
 Nine more expose the operations built on counted k-mer tables -- the
-Parquet files `count` itself writes:
+Parquet files `count` itself writes.
+
+**Every one of them reads both table widths** -- `kmer_u64` (k≤32) and the
+16-byte `kmer_bits` (k>32) -- picking its reader from the file's own footer
+rather than from a flag. Inputs to one operation must share a width, which
+is not a restriction in practice: two widths never share a `k`, and mixing
+them is refused by name.
 
 | Subcommand | What it does | Equivalent Python call |
 |---|---|---|
-| `fastdna query --table FILE --kmer SEQ` | Point-lookup of one k-mer's count, pruning row groups by their key statistics. Reads both table widths -- `kmer_u64` (k≤32) and `kmer_bits` (k>32) -- picking the reader from the file's own footer | `fastdna.KmerTable.open(...).get(...)` |
-| `fastdna union --input A B ... -o OUT` | Every k-mer in any input table, counts combined | -- |
-| `fastdna intersect --input A B ... -o OUT` | Only k-mers present in every input | -- |
-| `fastdna diff --input A B ... -o OUT` | K-mers in the first table and absent from the rest (host/contaminant subtraction) | -- |
+| `fastdna query --table FILE --kmer SEQ` | Point-lookup of one k-mer's count, pruning row groups by their key statistics | `fastdna.KmerTable.open(...).get(...)` |
+| `fastdna union --input A B ... -o OUT` | Every k-mer in any input table, counts combined | `KmerTable.union(...)` |
+| `fastdna intersect --input A B ... -o OUT` | Only k-mers present in every input | `KmerTable.intersect(...)` |
+| `fastdna diff --input A B ... -o OUT` | K-mers in the first table and absent from the rest (host/contaminant subtraction) | `KmerTable.difference(...)` |
 | `fastdna filter --input READS --table REF -o OUT` | Streams reads and keeps those matching a reference table | -- |
 | `fastdna similarity --input A B ...` | Exact Jaccard, containment (both directions) and abundance-weighted Bray-Curtis between tables | `fastdna.similarity(...)` |
 | `fastdna matrix --input DIR -o OUT` | Cohort-wide presence/count matrix across many samples | -- |
