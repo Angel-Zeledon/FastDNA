@@ -451,6 +451,23 @@ jobs:
       # zero, so this doubles as a check on the paragraph above: if skips
       # reappear, the log names the missing import instead of leaving a
       # green tick over 40 tests that never ran.
+      # `maturin develop` above builds the extension module and nothing
+      # else -- not the `[[bin]]`. Nine Python tests need the real CLI to
+      # produce a k-mer table (the Python API returns an in-memory
+      # `KmerCounts` and cannot write one with the footer metadata
+      # `KmerTable.open` requires), and they `pytest.skip` when it is
+      # absent. Without this step they skip *here* too, and since the rust
+      # job runs on a different runner with its own `target/`, they would
+      # never execute anywhere in CI -- green, reported by `-rs`, and
+      # never run.
+      #
+      # Cheap: the dependency tree is already compiled by `maturin
+      # develop`, so this only compiles the binary crate itself. Debug, not
+      # release, because these tests check behaviour and not speed.
+      - name: Build the CLI the Python tests shell out to
+        shell: bash
+        run: cargo build --bin fastdna
+
       - name: pytest
         shell: bash
         run: python -m pytest python/tests -q -rs
