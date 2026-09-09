@@ -1079,6 +1079,14 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
                     CountStrategy::Binned
                 } else if sized_input && in_memory_peak_bytes > budget_bytes {
                     CountStrategy::Disk
+                } else if !sized_input && config.num_threads >= BINNED_BLIND_MIN_THREADS {
+                    // An unsized input (a stream: `-`, a pipe) used to land
+                    // on `InMemory` here, on the reasoning that the strategy
+                    // needing no estimate to be safe should run blind. That
+                    // reasoning was right and the conclusion was backwards:
+                    // it is `Binned` that needs no estimate, above a thread
+                    // count -- see `BINNED_BLIND_MIN_THREADS`.
+                    CountStrategy::Binned
                 } else {
                     CountStrategy::InMemory
                 };
@@ -1850,6 +1858,45 @@ const BIN_BALANCE_SAMPLE_RECORDS: usize = ADAPTIVE_SAMPLE_RECORDS;
 /// input that would have been fine is one run at the old speed, and the
 /// cost of accepting it on an input like the amplicon is a run that is
 /// slower *and* heavier than every alternative.
+/// Thread count from which `Binned` is the right blind choice for an input
+/// whose size is unknown -- a stream, a pipe, `--input -`.
+///
+/// The chooser normally compares both strategies' predicted peaks against
+/// the budget, which needs the input's size. A stream has none, so before
+/// this constant existed the fallback was `InMemory`: "the strategy that
+/// needs no estimate to be safe is the one that should run blind."
+///
+/// That is exactly backwards, and the models say so. `estimate_peak_bytes`
+/// scales its dominant term with **occurrences x threads**;
+/// `estimate_binned_peak_bytes` scales its with occurrences alone (only the
+/// open-chunk term touches threads, and it is bounded). Sweeping both from
+/// 1,000 to 4,000,000,000 occurrences at the crate's own constants, the
+/// input size at which `Binned` first becomes the *heavier* of the two is:
+///
+/// ```text
+///  1 thread    191,712,358 occurrences  (~0.5 GB of FASTQ)
+///  2 threads   431,352,805 occurrences  (~1.0 GB)
+///  4 threads   never, anywhere in the swept range
+///  8 threads   never
+/// 11 threads   never
+/// 16 threads   never
+/// ```
+///
+/// So at four threads or more, `Binned` is predicted lighter than
+/// `InMemory` at *every* input size, which is what makes it safe to choose
+/// without knowing the size. It is also the faster of the two by a
+/// measured margin -- 3.2x on the 390 MB head-to-head, 2.9x on 840M
+/// occurrences (`docs/BENCHMARKS.md`) -- so the old fallback was picking
+/// the slower and heavier path for every piped run.
+///
+/// Below four threads the crossover is real and this rule declines to
+/// apply, leaving those runs on `InMemory` exactly as before.
+///
+/// The bin-balance guard is unaffected and still runs: `sample_bin_balance`
+/// buffers the records it samples and replays them, so a stream gets the
+/// same skew check and the same downgrade a file does.
+const BINNED_BLIND_MIN_THREADS: usize = 4;
+
 const MAX_ACCEPTABLE_BIN_SKEW: f64 = 3.0;
 
 /// Streams a FASTQ source and returns its canonical k-mer counts, choosing
@@ -2036,15 +2083,28 @@ mod tests {
         for threads in [1usize, 8, 64] {
             let config = PipelineConfig { num_threads: threads, ..PipelineConfig::default() };
 
-            // Unknown size: never binned, whatever the budget says.
+            // Unknown size: binned from `BINNED_BLIND_MIN_THREADS` up,
+            // in-memory below it, whatever the budget says -- the budget
+            // cannot be compared against a peak nothing can estimate.
+            //
+            // This assertion used to read "never binned, whatever the
+            // budget says", which pinned the old fallback. It is inverted
+            // rather than deleted because the case still needs pinning:
+            // see `BINNED_BLIND_MIN_THREADS` for the sweep showing binned
+            // is the lighter of the two at every input size from four
+            // threads up, which is what makes the blind choice safe.
+            let expected_blind = if threads >= BINNED_BLIND_MIN_THREADS {
+                CountStrategy::Binned
+            } else {
+                CountStrategy::InMemory
+            };
             for max_ram in [None, Some(0u64), Some(1), Some(1 << 40)] {
                 let policy =
                     MemoryPolicy { strategy: None, max_ram_bytes: max_ram, estimated_input_bytes: None };
                 let decision = resolve_strategy(&policy, &config);
-                assert_ne!(
-                    decision.strategy,
-                    CountStrategy::Binned,
-                    "auto chose binned for an input of unknown size ({threads} threads, \
+                assert_eq!(
+                    decision.strategy, expected_blind,
+                    "wrong blind choice for an unsized input ({threads} threads, \
                      budget {max_ram:?})"
                 );
             }

@@ -302,6 +302,57 @@ counting happens as a one-time sort-and-compact pass on first read (see
 not new hardware, not a smaller test file -- is the entire difference
 between 920.7 s / 6.96 GB and ~101 s / 8.02 GB.
 
+## Piped input was getting the slowest strategy (2026-09-08)
+
+`resolve_strategy` compares both strategies' predicted peaks against the
+budget, which needs the input's size. A stream -- `--input -`, a pipe --
+has none, and the fallback was `InMemory`, on the reasoning that "the
+strategy that needs no estimate to be safe is the one that should run
+blind".
+
+The reasoning was right and the conclusion was backwards. The two models do
+not have the same shape: `estimate_peak_bytes` scales its dominant term
+with **occurrences x threads**, while `estimate_binned_peak_bytes` scales
+its with occurrences alone. Sweeping both from 1,000 to 4,000,000,000
+occurrences at the crate's own constants, the size at which `Binned` first
+becomes the *heavier* of the two is:
+
+| threads | binned becomes heavier at |
+|---:|---|
+| 1 | 191,712,358 occurrences (~0.5 GB of FASTQ) |
+| 2 | 431,352,805 occurrences (~1.0 GB) |
+| 4 | never, anywhere in the swept range |
+| 8 | never |
+| 11 | never |
+| 16 | never |
+
+From four threads up `Binned` is predicted lighter at *every* input size,
+so it needs no estimate to be safe -- and it is also the faster of the two
+by a measured margin. The old fallback was handing every piped run the
+slower and heavier path.
+
+**Measured on the 2.14 GB file, piped in, 5 interleaved runs each:**
+
+| | median | range | peak RSS |
+|---|---:|---:|---:|
+| before (`memory`) | 39.96 s | 34.50-47.36 s | 4.76 GB |
+| **after (`binned`)** | **12.28 s** | 9.86-14.11 s | **2.79 GB** |
+| | **3.25x** | ranges do not overlap | 0.59x |
+
+Output byte-identical to the same file counted from disk (SHA-256
+`5c1a51924554a883...`), and the bin-balance guard still runs on a stream:
+`sample_bin_balance` buffers what it samples and replays it, so skewed
+input still downgrades exactly as it does for a file.
+
+Below four threads the crossover is real and the rule declines to apply,
+leaving those runs where they were.
+
+**A second, smaller fix in the same place**: with no input size there are no
+occurrences to estimate from, so the reported "estimated peak" was just the
+model's fixed overhead -- a precise-looking number describing nothing. A
+2.14 GB stream was announcing `estimated peak 1.33GB` while heading for
+roughly 7. Streams now print `size unknown, no estimate` instead.
+
 ## The head-to-head against KMC3, native on both sides (2026-09-08)
 
 The first FastDNA-vs-KMC3 measurement since the 2026-08-25 retraction that

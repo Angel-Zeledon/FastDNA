@@ -245,20 +245,33 @@ fn all_strategies_agree_on_reads_that_yield_no_kmers() {
 /// crosses as well as in `pipeline.rs`'s own unit tests.
 ///
 /// Binned was promoted on 2026-09-05 (measured at 2.9x the in-memory
-/// strategy's speed and half its peak, `docs/BENCHMARKS.md`), so this no
-/// longer asserts that `auto` cannot reach it. Two rules survive and are
-/// what this pins now: an input of unknown size never gets binned, and an
-/// input that fits nothing still falls back to disk.
+/// strategy's speed and half its peak, `docs/BENCHMARKS.md`), and promoted
+/// again on 2026-09-08 to cover streams, so this pins two rules: an
+/// unsized input gets binned from `BINNED_BLIND_MIN_THREADS` threads up and
+/// in-memory below, and an input that fits nothing still falls back to
+/// disk.
+///
+/// The unsized case used to assert the opposite ("never binned"), which was
+/// correct while the fallback was in-memory. It is inverted rather than
+/// deleted: the case still needs pinning, and inverting it here is what
+/// makes the change visible at the seam a user crosses rather than only in
+/// `pipeline.rs`'s own tests.
 #[test]
 fn the_automatic_chooser_respects_the_promotion_rules_for_binned() {
     let _guard = SERIALIZE_TESTS.lock().unwrap_or_else(|p| p.into_inner());
     for max_ram in [None, Some(1u64), Some(1 << 40)] {
         let policy =
             MemoryPolicy { strategy: None, max_ram_bytes: max_ram, estimated_input_bytes: None };
-        assert_ne!(
+        // 8 threads is above the blind threshold; 2 is below it.
+        assert_eq!(
             resolve_strategy(&policy, &config(31, 8)).strategy,
             CountStrategy::Binned,
-            "auto chose binned for an input of unknown size against {max_ram:?}"
+            "auto should pick binned for an unsized input at 8 threads, budget {max_ram:?}"
+        );
+        assert_eq!(
+            resolve_strategy(&policy, &config(31, 2)).strategy,
+            CountStrategy::InMemory,
+            "auto should stay in-memory for an unsized input at 2 threads, budget {max_ram:?}"
         );
     }
 

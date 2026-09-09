@@ -363,12 +363,25 @@ fn run(args: CountArgs) -> Result<()> {
     }
 
     let preview_decision = fastdna_core::pipeline::resolve_strategy(&policy, &config);
-    println!(
-        "Strategy:       {} (estimated peak {}, budget {})",
-        preview_decision.strategy.as_str(),
-        format_bytes(preview_decision.estimated_peak_bytes),
-        format_bytes(preview_decision.budget_bytes),
-    );
+    // With no input size there are no occurrences to estimate from, so the
+    // "peak" is just the model's fixed overhead -- a precise-looking number
+    // that describes nothing. Printing it invited exactly the wrong reading
+    // (a 2.14 GB stream reported "estimated peak 1.33GB"), so a stream says
+    // it does not know instead.
+    if policy.estimated_input_bytes.is_some() {
+        println!(
+            "Strategy:       {} (estimated peak {}, budget {})",
+            preview_decision.strategy.as_str(),
+            format_bytes(preview_decision.estimated_peak_bytes),
+            format_bytes(preview_decision.budget_bytes),
+        );
+    } else {
+        println!(
+            "Strategy:       {} (streaming input: size unknown, no estimate; budget {})",
+            preview_decision.strategy.as_str(),
+            format_bytes(preview_decision.budget_bytes),
+        );
+    }
     println!("--------------------------------------------------");
 
     let start_time = Instant::now();
