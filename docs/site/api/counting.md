@@ -30,6 +30,8 @@ colliding into one count.
 
 ::: fastdna.estimate_cardinality
 
+::: fastdna.estimate_spectrum
+
 ::: fastdna.build_info
 
 ## Choosing a `min_count` threshold

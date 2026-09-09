@@ -161,4 +161,5 @@ nav:
   - API reference:
       - Counting: api/counting.md
       - Sketching and comparison: api/sketching.md
+      - K-mer tables: api/tables.md
       - Cohorts: api/cohorts.md
