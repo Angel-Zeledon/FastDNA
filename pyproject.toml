@@ -23,6 +23,8 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 description = "Fast canonical k-mer counting from FASTQ, with a zero-copy Arrow bridge to Python"
+authors = [{ name = "Angel Zeledon" }]
+
 readme = "README.md"
 keywords = ["bioinformatics", "genomics", "kmer", "fastq", "arrow"]
 dependencies = ["pyarrow>=14"]
@@ -55,6 +57,16 @@ dynamic = ["version"]
 # The scikit-learn/scipy/shap/umap-learn/biopython/matplotlib/pandas stack
 # that used to live here went with the ML layer (2026-09-05, see CHANGELOG):
 # nothing in this package imports any of them any more.
+# Shown on the PyPI page as the "Project links" sidebar. Without these the
+# page is a dead end: no route from the package back to the source, the
+# benchmarks or a place to report a bug.
+[project.urls]
+Homepage = "https://github.com/Angel-Zeledon/FastDNA"
+Source = "https://github.com/Angel-Zeledon/FastDNA"
+Issues = "https://github.com/Angel-Zeledon/FastDNA/issues"
+Changelog = "https://github.com/Angel-Zeledon/FastDNA/blob/master/CHANGELOG.md"
+Benchmarks = "https://github.com/Angel-Zeledon/FastDNA/blob/master/docs/BENCHMARKS.md"
+
 [project.optional-dependencies]
 test = [
     "duckdb>=1.0",

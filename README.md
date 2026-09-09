@@ -13,10 +13,15 @@ disk-partitioned counting strategy instead of failing -- see
 **FastDNA has not been published yet.** There is no release on PyPI, no
 crate on crates.io, and no Bioconda package, so `pip install fastdna` fails
 today with `No matching distribution found`. Building from source is the
-only way to install it right now, and it is the first path below; the
-`pip install` route is documented as what will happen once the first release
-lands, not as something that works today. What is still ahead is tracked in
-[Roadmap](#roadmap).
+only way to install it right now, and it is the first path below.
+
+The packaging itself is ready and verified:
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds
+wheels for five platforms plus a source distribution and publishes them on
+a pushed `v*` tag, and the source distribution has been checked to install
+and import in a clean environment. What has not happened is the deliberate
+part -- a PyPI project with a trusted publisher configured, and a tag. That
+workflow's header documents exactly what those are.
 
 ### From source (works today)
 
@@ -45,8 +50,11 @@ wheel per platform covers CPython 3.8 through 3.13+. CI
 ([`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)) already
 builds and tests wheels for five platforms: manylinux x86_64, manylinux
 aarch64 (cross-compiled, built but not test-executed in CI), macOS x86_64,
-macOS arm64, and Windows x86_64 -- it deliberately has no publish step yet,
-which is why there is nothing on PyPI to install. The wheels are tagged
+macOS arm64, and Windows x86_64. That workflow deliberately has no publish
+step -- publishing lives in
+[`release.yml`](.github/workflows/release.yml), fires only on a `v*` tag,
+and needs a trusted publisher configured on PyPI first, so nothing can
+reach PyPI by accident. The wheels are tagged
 `cp38-abi3` (`requires-python = ">=3.8"`), though the CI test matrix
 currently runs on Python 3.11, so 3.8 support is declared but not exercised
 by CI. A Bioconda recipe is drafted but not yet submitted -- see

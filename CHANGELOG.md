@@ -12,7 +12,45 @@ La superficie con compatibilidad garantizada es:
 - Rust: los módulos declarados `pub mod` en `src/lib.rs`.
 - CLI: los flags y subcomandos documentados en `fastdna --help`.
 
-## [Unreleased]
+## [0.1.0] -- sin publicar todavía
+
+Lo que sería la primera versión, descrito por lo que **es** y no por el
+camino que costó llegar. El registro de desarrollo completo sigue debajo,
+bajo *Historial previo a la primera versión*, y buena parte de él describe
+código que se eliminó antes de que ninguna versión lo publicara: leerlo como
+"lo que trae 0.1.0" daría una idea equivocada del paquete.
+
+**Un contador de k-mers exacto, y las operaciones que son contar.**
+
+- `count` -- k-mers canónicos desde FASTQ/FASTA(.gz) o stdin, con recorte
+  por calidad, en paralelo, y salida Parquet ordenada. **Exactamente igual a
+  KMC3** sobre lecturas reales: k=15/21/31 en el motor `u64` y k=33/41/64 en
+  el `u128`, en las tres cifras.
+- Dos motores: `u64` hasta k=32, `u128` de 33 a 64, elegidos por `--engine`
+  o automáticamente. Toda operación que lee una tabla acepta las dos
+  anchuras.
+- Tres estrategias de conteo -- en memoria, particionada por minimizadores,
+  y en disco -- elegidas contra un presupuesto de RAM (`--max-ram`) por un
+  estimador calibrado, con **salida byte-idéntica** entre las tres.
+- `--no-canonical`, exactamente la `-b` de KMC3, con la convención grabada
+  en el footer de la tabla para que nada la suponga.
+- Operaciones sobre tablas: `query`, `union`, `intersect`, `diff`,
+  `similarity` (Jaccard, contención y Bray-Curtis exactos, validados contra
+  `kmc_tools`), `filter`, `profile`, `matrix`.
+- Estimación: `sketch`/`dist` (MinHash, r=0.997 contra Mash 2.3), `card`
+  (HyperLogLog, -0,26%), `spectrum` (ntCard, ±2%).
+- API de Python con Arrow sin copia -- sin subproceso ni serialización -- y
+  WASM.
+
+**Velocidad**: 1,38x más rápida que KMC3 en 0,47x la memoria sobre la carga
+medida (390 MB, k=31, ambas nativas, rangos sin solape). Una carga, una
+arquitectura: las condiciones y lo que *no* demuestra están en
+`docs/BENCHMARKS.md`.
+
+**Lo que no hace**: k por encima de 64, entrada BAM, salida KFF, y no está
+medida a escala out-of-core. Sketching y estimadores paran en k=32.
+
+## Historial previo a la primera versión
 
 > **Aviso, 2026-09-05.** Muchas de las entradas de *Added*, *Changed* y
 > *Fixed* de abajo describen la capa de ML, que se eliminó el 2026-09-05

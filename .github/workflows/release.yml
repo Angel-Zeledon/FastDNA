@@ -1,0 +1,147 @@
+# Publishes a release to PyPI. The only workflow in this repository that
+# sends anything outside it.
+#
+# ## What triggers it, and what cannot
+#
+# A pushed tag matching `v*`, and nothing else. Not a branch push, not a
+# pull request, not a schedule. `wheels.yml` builds the same wheels on every
+# push and deliberately has no publish step; this one exists so that
+# publishing is a separate, deliberate act with a version number attached to
+# it.
+#
+# ## Before the first run, three things have to be true
+#
+# 1. **A PyPI project exists, or the name is free.** As of 2026-09-09
+#    `fastdna` is unclaimed (pypi.org/project/fastdna returns 404).
+# 2. **A trusted publisher is configured on PyPI** for this repository and
+#    this workflow filename, under the project's "Publishing" settings.
+#    That is what makes the `id-token: write` permission below sufficient
+#    and is why there is no API token anywhere in this file: a leaked token
+#    is a credential someone else can use, and an OIDC exchange is not.
+# 3. **The `pypi` environment exists on GitHub** (Settings -> Environments).
+#    Add a required reviewer to it and every publish waits for a human to
+#    approve; leave it empty and it publishes as soon as the build is green.
+#
+# Until (2) is done the publish step fails and the wheels are still built
+# and attached to the run as artifacts, so a misconfigured first attempt
+# costs a red job and nothing else.
+#
+# ## Why an sdist as well as wheels
+#
+# A wheel exists for the five platforms below. A source distribution is what
+# every other platform installs from -- and what a distro packager, a
+# reproducibility check or `pip download --no-binary` expects to find. PyPI
+# accepts a wheels-only project; it just leaves everyone else with nothing.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Buildable by hand without publishing, so the packaging can be exercised
+  # before a tag is cut. The publish job below refuses to run this way.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Same matrix as `wheels.yml`. Duplicated rather than factored into a
+  # reusable workflow on purpose: this one must keep working exactly as
+  # written on the day a release is cut, and an edit to a shared file made
+  # for CI's benefit is the kind of thing that breaks a release six months
+  # later.
+  wheels:
+    name: wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: manylinux-x86_64,  os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu,  manylinux: auto }
+          - { name: manylinux-aarch64, os: ubuntu-22.04,   target: aarch64-unknown-linux-gnu, manylinux: auto }
+          - { name: macos-x86_64,      os: macos-15-intel, target: x86_64-apple-darwin,       manylinux: "" }
+          - { name: macos-arm64,       os: macos-latest,   target: aarch64-apple-darwin,      manylinux: "" }
+          - { name: windows-x86_64,    os: windows-latest, target: x86_64-pc-windows-msvc,    manylinux: "" }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --features python --out dist
+
+      # The tag and the version in the built artifact must agree. They can
+      # drift in one direction that nothing else catches -- tagging v0.2.0
+      # without bumping Cargo.toml -- and the result is a file on PyPI whose
+      # name contradicts the release it came from. PyPI will not let that be
+      # corrected afterwards: a version number, once uploaded, is burned.
+      - name: Assert the tag matches the built version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          built="$(ls dist/*.whl | head -n1 | sed -E 's/.*-([0-9][^-]*)-.*/\1/')"
+          if [ "$tag" != "$built" ]; then
+            echo "tag v$tag but the wheel says $built -- bump Cargo.toml or fix the tag" >&2
+            exit 1
+          fi
+          echo "tag v$tag matches the built version"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: publish to PyPI
+    # A tag only. `workflow_dispatch` builds everything above and stops
+    # here, which is how the packaging gets exercised without burning a
+    # version number.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [wheels, sdist]
+    runs-on: ubuntu-22.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Show what is about to be published
+        run: ls -la dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # No `password:`. Trusted publishing exchanges the job's OIDC
+          # token for a short-lived, single-project upload credential; see
+          # this file's header for the one-time PyPI-side setup that makes
+          # it work.
+          print-hash: true
