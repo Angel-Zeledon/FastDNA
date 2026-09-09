@@ -34,11 +34,25 @@ such escape, so `--with-fastk` keeps the guard.
 
 What that does *not* fix is a busy or small machine. Measured on an M3 Pro
 with an 11-core, 7.7 GB Docker VM and unrelated host load, consecutive runs
-of the **same** tool on the same file varied by up to 7x (KMC3: 19.95 s
+of the **same** tool on the 2.14 GB file varied by up to 7x (KMC3: 19.95 s
 then 150.92 s; FastDNA binned: 18.01 s then 105.91 s). No median over a
-handful of runs survives that. Architecture was one blocker; a quiet host
-with room for the working set is the other, and this script cannot supply
-it.
+handful of runs survives that.
+
+Two things make the result usable anyway, and both are in this script:
+
+* **Repeats, interleaved** (`--repeats`, default 5). Round-robin rather
+  than a block per tool, because host load drifts over minutes and a block
+  would hand one tool the quiet stretch.
+* **Separation, not just medians.** After the table it reports every pair
+  whose observed ranges do not overlap -- every run of A faster than every
+  run of B. Noise widens a range; it does not separate two of them. A
+  non-overlapping pair over N runs is an ordering the host's noise cannot
+  have produced, and it is the only kind of ordering this script will claim
+  when the spread is wide.
+
+The default input (a 6 Mbp genome at 30x, ~390 MB) is sized to fit a CI
+runner *and* to leave headroom on a small VM, which is most of why it
+measures more stably than the 2.14 GB file did.
 
 ## What is compared, and on what terms
 
@@ -77,6 +91,7 @@ import sys
 import tarfile
 import time
 import urllib.request
+from typing import Callable
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -229,12 +244,12 @@ def generate_reads(out: Path, genome_size: int, coverage: int, read_len: int, se
 
 
 def count_fastdna(binary: Path, reads: Path, workdir: Path, k: int, threads: int,
-                  strategy: str) -> dict:
+                  strategy: str, max_ram_gb: int) -> dict:
     output = workdir / f"fastdna_{strategy}.parquet"
     elapsed, peak, stdout = timed([
         str(binary), "--input", str(reads), "--output", str(output),
         "-k", str(k), "-m", "1", "-q", "0", "-t", str(threads),
-        "--strategy", strategy,
+        "--strategy", strategy, "--max-ram", f"{max_ram_gb}G",
     ])
     distinct = re.search(r"Distinct k-mers:\s*(\d+)", stdout)
     used = re.search(r"Strategy Used:\s*(\S+)", stdout)
@@ -247,11 +262,18 @@ def count_fastdna(binary: Path, reads: Path, workdir: Path, k: int, threads: int
     }
 
 
-def count_kmc(binary: Path, reads: Path, workdir: Path, k: int, threads: int) -> dict:
+def count_kmc(binary: Path, reads: Path, workdir: Path, k: int, threads: int,
+              max_ram_gb: int) -> dict:
     scratch = workdir / "kmc_work"
     scratch.mkdir(exist_ok=True)
+    # The same budget FastDNA is given. This used to be a hardcoded `-m4`
+    # while FastDNA got none at all, which is not a comparison: FastDNA's
+    # estimator would see whatever the machine happened to have free and,
+    # on a small VM, correctly pick its slowest strategy while KMC3 ran with
+    # 4 GB. Measured on 2026-09-08: default budget 1,009 MB -> `auto` chose
+    # `disk`; `--max-ram 5G` -> `auto` chose `binned`.
     elapsed, peak, stdout = timed([
-        str(binary), f"-k{k}", "-ci1", "-fq", f"-t{threads}", "-m4",
+        str(binary), f"-k{k}", "-ci1", "-fq", f"-t{threads}", f"-m{max_ram_gb}",
         str(reads), str(workdir / "kmc_out"), str(scratch),
     ])
     match = re.search(r"No\. of unique counted k-mers\s*:\s*(\d+)", stdout)
@@ -275,6 +297,33 @@ def count_fastk(binary: Path, reads: Path, workdir: Path, k: int, threads: int) 
     return {"tool": "fastk", "seconds": round(elapsed, 2), "peak_bytes": peak, "distinct": None}
 
 
+def summarise(label: str, runs: list[dict]) -> dict:
+    """Collapses N runs of one tool into a row, keeping the spread.
+
+    The median is the headline, but `min` and `max` ride along and the
+    caller prints them, because a benchmark on a machine doing other work
+    can produce a 7x spread between consecutive runs of the same tool --
+    measured, on 2026-09-08 -- and a median quoted without that range is
+    the kind of number this project has had to retract before.
+    """
+    times = sorted(r["seconds"] for r in runs)
+    peaks = sorted(r["peak_bytes"] for r in runs)
+    distinct = {r["distinct"] for r in runs if r["distinct"] is not None}
+    if len(distinct) > 1:
+        die(f"{label} did not produce the same count every run: {sorted(distinct)}")
+    strategies = {r.get("strategy_used") for r in runs if r.get("strategy_used")}
+    return {
+        "tool": label,
+        "runs": len(runs),
+        "seconds": times[len(times) // 2],
+        "seconds_min": times[0],
+        "seconds_max": times[-1],
+        "peak_bytes": peaks[len(peaks) // 2],
+        "distinct": next(iter(distinct), None),
+        "strategy_used": next(iter(strategies), None) if len(strategies) == 1 else None,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--workdir", type=Path, default=Path.home() / ".fastdna" / "headtohead")
@@ -291,6 +340,23 @@ def main() -> int:
                         help="time FASTK on a non-x86-64 host anyway, under emulation; "
                              "see the module docstring. KMC3 no longer needs this -- it is "
                              "built from source there instead")
+    parser.add_argument(
+        "--repeats", type=int, default=5,
+        help=(
+            "runs per tool, interleaved (default 5). One run per tool is not a measurement "
+            "on any machine doing other work: consecutive runs of the same tool have been "
+            "seen to differ by 7x. The median is reported with its min and max."
+        ),
+    )
+    parser.add_argument(
+        "--max-ram", type=int, default=4,
+        help=(
+            "memory budget in GB, given to BOTH tools (KMC3's -m, FastDNA's --max-ram). "
+            "They must match: FastDNA picks a counting strategy against its budget, so an "
+            "unset one lets it discover a starved machine and choose its slowest path while "
+            "the competitor runs with an explicit allowance."
+        ),
+    )
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
 
@@ -326,23 +392,85 @@ def main() -> int:
     kmc = fetch_kmc(tools)
     fastk = build_fastk(tools) if args.with_fastk else None
 
-    print(f"\ncounting (k={args.k}, {threads} threads, singletons kept)")
-    rows = [
-        count_fastdna(binary, reads, args.workdir, args.k, threads, "auto"),
-        count_fastdna(binary, reads, args.workdir, args.k, threads, "binned"),
-        count_fastdna(binary, reads, args.workdir, args.k, threads, "memory"),
-        count_kmc(kmc, reads, args.workdir, args.k, threads),
+    print(
+        f"\ncounting (k={args.k}, {threads} threads, {args.max_ram} GB budget each, "
+        f"singletons kept, {args.repeats} interleaved repeats)"
+    )
+
+    # Interleaved, not tool-by-tool: whatever else the host is doing drifts
+    # over minutes, and a block of runs per tool would hand one of them the
+    # quiet stretch. Round-robin gives every tool the same share of every
+    # condition.
+    measurements: dict[str, list[dict]] = {}
+    order: list[tuple[str, Callable[[], dict]]] = [
+        ("fastdna (auto)",
+         lambda: count_fastdna(binary, reads, args.workdir, args.k, threads, "auto", args.max_ram)),
+        ("fastdna (binned)",
+         lambda: count_fastdna(binary, reads, args.workdir, args.k, threads, "binned", args.max_ram)),
+        ("fastdna (memory)",
+         lambda: count_fastdna(binary, reads, args.workdir, args.k, threads, "memory", args.max_ram)),
+        ("kmc3", lambda: count_kmc(kmc, reads, args.workdir, args.k, threads, args.max_ram)),
     ]
     if fastk is not None:
-        rows.append(count_fastk(fastk, reads, args.workdir, args.k, threads))
+        order.append(
+            ("fastk", lambda: count_fastk(fastk, reads, args.workdir, args.k, threads))
+        )
 
-    print(f"\n{'tool':<22}{'time':>9}{'peak RSS':>12}{'distinct k-mers':>18}")
+    for repeat in range(args.repeats):
+        for label, measure in order:
+            print(f"  run {repeat + 1}/{args.repeats}: {label}", flush=True)
+            measurements.setdefault(label, []).append(measure())
+
+    rows = [summarise(label, runs) for label, runs in measurements.items()]
+
+    print(
+        f"\n{'tool':<20}{'median':>9}{'min':>8}{'max':>8}{'peak RSS':>11}{'distinct k-mers':>18}"
+    )
     for row in sorted(rows, key=lambda r: r["seconds"]):
         peak = f"{row['peak_bytes'] / 1e9:.2f} GB" if row["peak_bytes"] else "n/a"
         distinct = f"{row['distinct']:,}" if row["distinct"] is not None else "-"
-        print(f"{row['tool']:<22}{row['seconds']:>8.2f}s{peak:>12}{distinct:>18}")
-    if emulated:
-        print("\nWARNING: emulated host -- these timings compare nothing. See --allow-emulation.")
+        print(
+            f"{row['tool']:<20}{row['seconds']:>8.2f}s{row['seconds_min']:>7.2f}s"
+            f"{row['seconds_max']:>7.2f}s{peak:>11}{distinct:>18}"
+        )
+
+    # A spread this wide means the host, not the tools, decided the order.
+    # Saying so is the difference between a benchmark and a retraction.
+    worst = max((r["seconds_max"] / r["seconds_min"]) for r in rows if r["seconds_min"] > 0)
+    noisy = worst >= 1.5
+    if noisy:
+        print(
+            f"\nnote: the widest run-to-run spread for a single tool is {worst:.1f}x, so the "
+            "medians above cannot rank anything on their own."
+        )
+
+    # What *can* survive a noisy host: two tools whose observed ranges do
+    # not overlap at all. If every run of A beat every run of B across N
+    # repeats, the host's noise did not produce that ordering -- noise
+    # widens ranges, it does not separate them. Reported per pair, because
+    # the pair that matters may be separable even when another tool's
+    # spread is what triggered the note above.
+    print("\nseparation (every run of A faster than every run of B):")
+    ranked = sorted(rows, key=lambda r: r["seconds"])
+    any_separated = False
+    for i, faster in enumerate(ranked):
+        for slower in ranked[i + 1:]:
+            if faster["seconds_max"] < slower["seconds_min"]:
+                ratio = slower["seconds"] / faster["seconds"]
+                print(
+                    f"  {faster['tool']} < {slower['tool']}: "
+                    f"[{faster['seconds_min']:.2f}, {faster['seconds_max']:.2f}] vs "
+                    f"[{slower['seconds_min']:.2f}, {slower['seconds_max']:.2f}]  "
+                    f"-> {ratio:.2f}x on medians, {faster['runs']} runs each"
+                )
+                any_separated = True
+    if not any_separated:
+        print("  none -- every pair of ranges overlaps; this run ranks nothing.")
+    elif noisy:
+        print(
+            "  the pairs listed above are the only orderings this run supports. "
+            "Anything not listed is a tie as far as this host can tell."
+        )
 
     # The one thing that must hold. Everything above is a measurement; this
     # is an assertion, because two counters that disagree on the answer are
@@ -356,7 +484,8 @@ def main() -> int:
     if args.json:
         args.json.write_text(json.dumps({
             "machine": machine,
-            "emulated": emulated,
+            "repeats": args.repeats,
+            "max_ram_gb": args.max_ram,
             "k": args.k,
             "threads": threads,
             "input_bytes": reads.stat().st_size,

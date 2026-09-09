@@ -213,14 +213,20 @@ code they checked is gone.
 
 ### Should you use this instead of KMC3?
 
-Often not. The honest comparison, with every row checked against
-`kmc --help` (3.2.4) rather than recalled:
+Sometimes. On the one workload measured head to head -- 390 MB of reads at
+k=31, both tools native -- FastDNA is 1.38x faster in less than half the
+memory, and both report the identical count. That is a real result and it
+is one workload: KMC3 is still ahead on `k` range, input formats,
+out-of-core scale and a decade of use, and none of those is a benchmark
+question.
+
+The honest comparison, with every row checked against `kmc --help` (3.2.4)
+rather than recalled:
 
 **Where KMC3 is ahead**
 
 | | KMC3 | FastDNA |
 |---|---|---|
-| Speed | 110.4 s on the 2.14 GB file | 388.2 s on the same file, same machine -- a default path FastDNA no longer has. A native-vs-native rerun on 2026-09-08 put the two in the same range once FastDNA was given a comparable memory budget, but the host's run-to-run spread reached 7x for *both* tools, so it settled nothing. KMC3 is still the one with a trustworthy number |
 | `k` | 1-256 | 1-64. Two bits per base in 128 of them is 64 bases; past that needs a byte-string key that changes the sort order, the Parquet schema and every comparison in the counter |
 | Out-of-core at scale | 729 gigabases of human reads in 33-34 GB (Kokot et al., *Bioinformatics*, 2017) | a disk strategy that is newer, less tuned, and **never benchmarked at that scale** |
 | Counter cap and DB size | `-cs` caps the stored counter; `--opt-out-size` shrinks the database | neither |
@@ -238,21 +244,35 @@ Often not. The honest comparison, with every row checked against
 | Non-canonical counting | `--no-canonical` matches KMC3's `-b` exactly (23,570,343 distinct against KMC3's 23,570,343 on `DRR002015` at k=31), and the table records the convention in its footer so `query`, `filter` and `profile` follow it instead of assuming. KMC3 has the flag but nothing that reads the database back knows which way it was written |
 | What ships in one tool | MinHash sketching and Mash distance, HyperLogLog cardinality, ntCard spectrum estimation, per-read coverage profiles, abundance-weighted Bray-Curtis, `peek`, a QC report. `kmc_tools` covers the set operations and a histogram; the rest has no KMC equivalent |
 | Choosing a strategy | `--max-ram` plus an estimator that predicts peak RSS and picks in-memory, binned or disk-partitioned on its own. KMC3's `-m`/`-sm` set a budget you must choose; this one is chosen for you and says which it picked |
+| Speed, on one measured workload | **1.38x faster than KMC3 in 0.47x the memory** -- 2.20 s at 0.94 GB against 3.04 s at 2.02 GB, on a 390 MB read set at k=31, both tools native `aarch64`, both given a 4 GB budget, 9 interleaved runs each with non-overlapping ranges. Conditions and what it does not prove: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). This is one workload on one architecture, not a general claim |
 
-**What is not settled either way**: the speed comparison. The table above
-predates the default becoming super-k-mer partitioned, which took the same
-file from 24.10 s to 9.88 s on an M3 Pro. Whether that closes a 3.5x gap,
-halves it, or overturns it is not something this repository knows yet.
+**The speed comparison, as of 2026-09-08.** The 2.14 GB benchmark earlier
+on this page predates the default becoming super-k-mer partitioned, and on
+a smaller workload that change is now measured as decisive. Both tools
+built native for `aarch64`,
+same container, same 4 GB budget, 390 MB read set, k=31, 9 interleaved runs
+each:
 
-An attempt on 2026-09-08 got closer without arriving: KMC 3.2.4 builds for
-`aarch64` from its own Makefile, so `scripts/bench/head_to_head.py` now
-compiles it there instead of refusing, and both tools run native on one
-machine. On that footing they land in the same range once FastDNA is given
-a comparable memory budget -- but consecutive runs of the *same* tool
-varied by up to 7x on the machine available, so no median from it is
-usable. `docs/BENCHMARKS.md` has the numbers and why they do not count.
-`.github/workflows/validation.yml`'s `benchmark` job, on a quiet x86-64
-runner, is still what answers this.
+| tool | median | range | peak RSS |
+|---|---:|---:|---:|
+| **FastDNA (`binned`)** | **1.99 s** | 1.90-2.19 s | **0.95 GB** |
+| **FastDNA (`auto`)** | **2.20 s** | 1.97-2.38 s | **0.94 GB** |
+| KMC3 3.2.4 | 3.04 s | 2.92-3.19 s | 2.02 GB |
+| FastDNA (`memory`) | 6.45 s | 6.00-7.19 s | 1.91 GB |
+
+All four agree exactly on 9,213,849 distinct k-mers. The ranges do not
+overlap: every FastDNA run beat every KMC3 run, which is what makes this
+usable despite an unrelated host load of 6-11 throughout -- noise widens a
+range, it does not separate two of them.
+
+**What it does not say**: it does not overturn the 2.14 GB x86-64 table
+above (different architecture, a file 5.5x larger, and a default path
+FastDNA no longer has), it says nothing about out-of-core scale where
+KMC3's published result is 729 gigabases in 33-34 GB, and FastDNA's
+`memory` strategy remains 2.12x *slower* than KMC3 on the same input.
+`docs/BENCHMARKS.md` states each of those, and
+`.github/workflows/validation.yml`'s `benchmark` job re-runs the whole
+thing on x86-64.
 
 Counting itself is not in question on either side: FastDNA is **exactly
 equal to KMC3** on real reads at every `k` tested, in both engines (see the

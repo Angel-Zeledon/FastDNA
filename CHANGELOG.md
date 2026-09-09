@@ -25,6 +25,51 @@ La superficie con compatibilidad garantizada es:
 
 ### Changed
 
+- **La comparación con KMC3, medida por fin: FastDNA es 1,38x más rápido en
+  0,47x la memoria** sobre la carga probada. Es el primer resultado
+  frente a KMC3 que este proyecto sostiene desde la retractación del
+  2026-08-25, y el primero que gana.
+
+  Las dos herramientas **nativas** en la misma máquina: el Makefile de KMC
+  3.2.4 contempla `aarch64`, así que se compila desde fuente en vez de
+  emularse. Entrada de 390 MB (genoma de 6 Mbp a 30x), k=31, singletons
+  incluidos, sin recorte, 11 hilos, **4 GB de presupuesto a cada una**, 9
+  repeticiones intercaladas:
+
+  | herramienta | mediana | rango | pico RSS |
+  |---|---:|---:|---:|
+  | **FastDNA `binned`** | **1,99 s** | 1,90-2,19 s | **0,95 GB** |
+  | **FastDNA `auto`** | **2,20 s** | 1,97-2,38 s | **0,94 GB** |
+  | KMC3 3.2.4 | 3,04 s | 2,92-3,19 s | 2,02 GB |
+  | FastDNA `memory` | 6,45 s | 6,00-7,19 s | 1,91 GB |
+
+  Las cuatro coinciden exactamente en 9.213.849 k-mers distintos.
+
+  **Por qué vale pese a un host ocupado** (carga 6-11 todo el rato): los
+  rangos **no se solapan**. Cada una de las nueve corridas de FastDNA fue
+  más rápida que cada una de las nueve de KMC3. El ruido ensancha un rango;
+  no separa dos. `head_to_head.py` reporta ahora exactamente esos pares sin
+  solape y se niega a ordenar nada más.
+
+  **Lo que no dice, y queda escrito**: no invalida la tabla histórica de
+  2,14 GB en x86-64 (otra arquitectura, fichero 5,5x mayor, y medía un
+  camino por defecto que ya no existe); no dice nada de escala out-of-core,
+  donde KMC3 tiene publicados 729 gigabases en 33-34 GB; y la estrategia
+  `memory` de FastDNA sigue siendo **2,12x más lenta** que KMC3.
+
+- **Un sesgo de equidad en `head_to_head.py`, corregido.** Le daba a KMC3
+  un `-m4` fijo y a FastDNA ningún presupuesto. Eso no es una comparación:
+  el estimador de FastDNA lee lo que la máquina tiene libre y elige
+  estrategia contra eso, así que en una VM pequeña elegía `disk` -- su
+  camino más lento -- mientras el competidor corría con 4 GB explícitos.
+  Medido: con presupuesto por defecto de 1.009 MB, `auto` eligió `disk`;
+  con `--max-ram 5G`, eligió `binned`. Ahora ambas reciben el mismo
+  `--max-ram`. La tabla histórica de WSL tiene la misma forma de problema.
+
+  El script gana además `--repeats` (5 por defecto, intercaladas) y reporta
+  mediana con mínimo y máximo. Una sola corrida por herramienta no es una
+  medición en ninguna máquina que esté haciendo otra cosa.
+
 - **El sort por bin usa la partición MSD que ya estaba medida** y que el
   camino por defecto no aprovechaba. `counter.rs` particiona su buffer en
   1024 cubetas ascendentes y ordena cada una desde que eso midió 1,23-1,37x

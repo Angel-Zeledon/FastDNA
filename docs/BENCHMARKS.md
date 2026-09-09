@@ -302,6 +302,91 @@ counting happens as a one-time sort-and-compact pass on first read (see
 not new hardware, not a smaller test file -- is the entire difference
 between 920.7 s / 6.96 GB and ~101 s / 8.02 GB.
 
+## The head-to-head against KMC3, native on both sides (2026-09-08)
+
+The first FastDNA-vs-KMC3 measurement since the 2026-08-25 retraction that
+this project is willing to stand behind, and the first that FastDNA wins.
+It replaces the "attempted" section that follows it, which recorded the run
+that failed to settle anything and why.
+
+### Conditions
+
+| | |
+|---|---|
+| Host | Apple M3 Pro, Linux arm64 container, 11 cores, 7.7 GB, **not idle** (host load 6-11 from unrelated processes) |
+| Both tools | native `aarch64`, same container, same compiler toolchain generation |
+| KMC3 | 3.2.4, **built from source** at the `v3.2.4` tag (its Makefile handles `aarch64`); not the x86-64 release binary, which cannot run here |
+| FastDNA | `cargo build --release` from this tree |
+| Input | 6 Mbp genome at 30x, 150 bp reads -> 1,200,000 reads, 180,000,000 bases, ~390 MB |
+| Settings | k=31, singletons kept (`-ci1` / `-m 1`), no quality trimming (`-q 0`), 11 threads, **4 GB budget to each** (`-m4` / `--max-ram 4G`) |
+| Method | 9 repeats per tool, interleaved round-robin, median with full range |
+
+### Result
+
+| tool | median | min | max | peak RSS | distinct k-mers |
+|---|---:|---:|---:|---:|---:|
+| **FastDNA `binned`** | **1.99 s** | 1.90 s | 2.19 s | **0.95 GB** | 9,213,849 |
+| **FastDNA `auto`** | **2.20 s** | 1.97 s | 2.38 s | **0.94 GB** | 9,213,849 |
+| KMC3 3.2.4 | 3.04 s | 2.92 s | 3.19 s | 2.02 GB | 9,213,849 |
+| FastDNA `memory` | 6.45 s | 6.00 s | 7.19 s | 1.91 GB | 9,213,849 |
+
+All four agree exactly on 9,213,849 distinct k-mers.
+
+**FastDNA's default is 1.38x faster than KMC3 here, in less than half the
+memory** (0.94 GB against 2.02 GB). Forcing `binned` -- what `auto` picks
+anyway on a larger input -- makes it 1.53x.
+
+### Why this survives a noisy host
+
+The medians alone would not be worth much: the machine was carrying an
+unrelated load average of 6-11 throughout, and an earlier attempt on the
+2.14 GB file saw the *same* tool vary by 7x between consecutive runs. What
+makes this reportable is that **the ranges do not overlap**. Every one of
+the nine FastDNA runs was faster than every one of the nine KMC3 runs:
+
+```text
+fastdna (binned) < kmc3:  [1.90, 2.19] vs [2.92, 3.19]   1.53x on medians
+fastdna (auto)   < kmc3:  [1.97, 2.38] vs [2.92, 3.19]   1.38x on medians
+kmc3 < fastdna (memory):  [2.92, 3.19] vs [6.00, 7.19]   2.12x on medians
+```
+
+Noise widens a range; it does not separate two of them. `head_to_head.py`
+now reports exactly these non-overlapping pairs and refuses to rank
+anything else, which is the only ordering a busy machine can support.
+
+Three independent runs, one of 5 repeats and two of 9, all put the same
+three tools in the same order with non-overlapping or near-non-overlapping
+ranges.
+
+### What this does *not* say
+
+- **It does not overturn the 2.14 GB x86-64 table below.** Different
+  architecture, a file 5.5x smaller, and that table measured a default path
+  FastDNA no longer has. The two are not comparable and neither supersedes
+  the other.
+- **It is arm64, not x86-64.** KMC3's published binaries and most of its
+  reported numbers are x86-64; a source build for a different ISA is a fair
+  comparison on *this* machine and not necessarily elsewhere.
+- **FastDNA's `memory` strategy is 2.12x slower than KMC3** on the same
+  input, and is listed above so that stays visible. What is fast is the
+  minimizer-partitioned path, which has been the default since 2026-09-05.
+- **It says nothing about out-of-core scale.** KMC3's published result is
+  729 gigabases in 33-34 GB. FastDNA's disk strategy has never been
+  benchmarked anywhere near that, and this 390 MB file does not begin to
+  probe it.
+
+### The fairness bug this run also fixed
+
+`head_to_head.py` used to hand KMC3 a hardcoded `-m4` while giving FastDNA
+no budget at all. That is not a comparison: FastDNA's estimator reads what
+the machine has free and picks a strategy against it, so on a small VM it
+would correctly choose `disk` -- its slowest path -- while the competitor
+ran with an explicit 4 GB allowance. Measured on this machine: default
+budget 1,009 MB -> `auto` chose `disk`; `--max-ram 5G` -> `auto` chose
+`binned`. Both tools now take the same `--max-ram`, and the historical WSL
+table below has the same shape of problem (FastDNA peaked at 10.34 GB in a
+12 GB VM while the other two did not).
+
 ## The head-to-head against KMC3, attempted natively (2026-09-08)
 
 `README.md` has carried "the speed comparison is not settled" since the
