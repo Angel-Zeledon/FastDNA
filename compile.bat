@@ -26,8 +26,12 @@ echo.
 echo Your optimized executable is ready at:
 echo   -\target\release\fastdna.exe
 echo.
-echo [Next Step]: 
-echo Copy that "fastdna.exe" file and paste it into the "bin/" folder
-echo of your other project (fastdna-research) to use it with Python and Docker.
+echo [Next Step]:
+echo Run it directly, or add target\release to your PATH:
+echo   target\release\fastdna.exe --input reads.fastq --output counts.parquet
+echo.
+echo For the Python extension instead of the CLI, use maturin:
+echo   pip install maturin
+echo   maturin develop --release --features python
 echo.
 pause

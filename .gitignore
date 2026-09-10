@@ -1,14 +1,15 @@
+# Rust build output.
 /target
 
-# Generated CLI outputs
+# What a CLI run drops in the working directory if you do not redirect it.
+# `--qc` in particular defaults to `qc_report.json` relative to the current
+# directory and is written on every count.
 counts.parquet
 qc_report.json
 hist.csv
 
-# Subagent-driven development scratch workspace
-.superpowers/
-
-# maturin develop / pytest artifacts left inside python/fastdna
+# Python: the compiled extension `maturin develop` installs in place, plus
+# the usual bytecode and pytest caches.
 python/fastdna/*.pyd
 python/fastdna/*.so
 python/fastdna/*.pdb
@@ -16,21 +17,46 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Local virtualenvs used for wheel testing
+# Virtualenvs. `.venv/` is the project's own; the others turn up when
+# testing a built wheel in isolation.
 .venv/
+.venv-test/
 venv/
 
-# Agent worktrees (full checkouts, never part of the repo)
-.claude/worktrees/
+# Build and packaging output.
+/dist/
+/wheelhouse/
+*.whl
+*.tar.gz
 
-# Stray atomic-write temp files from interrupted agent runs
-*.py.tmp.*
+# Documentation site output (`mkdocs build`), regenerated on demand and
+# published by .github/workflows/docs.yml, never committed.
+/site/
 
-# Scratch workspace for ad hoc analysis/repro scripts and downloaded data
+# Benchmark and validation working data. `scripts/bench/head_to_head.py`
+# and everything under `scripts/validation/` download reference tools and
+# generate multi-GB read sets; the default workdir is under `~/.fastdna`,
+# but these catch a `--workdir` pointed here.
+/bench/
+/headtohead/
+*.fastq.gz
+!test.fastq
+bench_*.fastq
+large.fastq
+huge.fastq
+
+# KMC's own output and scratch, if a comparison is run in the repo.
+*.kmc_pre
+*.kmc_suf
+kmc_work/
+
+# Scratch space for ad hoc analysis and repro scripts.
 /scratch/
 
-# scripts/validation/leakage_survey.py: counted cohorts (~150 MB each) and
-# the study's own output. Both are reproducible from the script.
-cache/
-leakage_survey*.json
-survey*.json
+# Agent working directories: full checkouts and session state, never part
+# of the repository.
+.claude/worktrees/
+.superpowers/
+
+# Stray atomic-write temp files from an interrupted run.
+*.py.tmp.*

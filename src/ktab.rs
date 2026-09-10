@@ -58,7 +58,7 @@
 //! asked about) over calling `get` in a tight loop. Building a persistent,
 //! reusable reader/cache is a reasonable follow-up once a real access
 //! pattern justifies it -- not built here on a guess, per this crate's own
-//! "measure before extending" standard (`docs/superpowers/plans/
+//! "measure before extending" standard (`docs/history/superpowers/plans/
 //! 2026-08-24-completeness-phase.md`, Task 1's closing bullet).
 //!
 //! # Scope: the in-memory counting strategy's output only

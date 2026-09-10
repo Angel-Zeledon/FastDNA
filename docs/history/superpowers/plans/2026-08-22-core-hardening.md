@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021, clap 4.5 (derive), rayon 1.10, crossbeam-channel 0.5, rustc-hash 2.0, arrow/parquet 53.4, indicatif 0.17 (binary only). No new dependencies are added by this plan.
 
-**Spec:** `docs/superpowers/specs/2026-08-22-fastdna-python-design.md` (phases A, B, H of §15)
+**Spec:** `docs/history/superpowers/specs/2026-08-22-fastdna-python-design.md` (phases A, B, H of §15)
 
 ## Global Constraints
 

@@ -3,7 +3,7 @@
 This module re-exports the small FFI surface defined in `src/ffi.rs`
 (compiled as the `fastdna._core` extension module) and adds nothing heavy:
 anything that can be expressed in pure Python lives here instead of crossing
-the Rust/Python boundary, per the packaging design (docs/superpowers/specs/
+the Rust/Python boundary, per the packaging design (docs/history/superpowers/specs/
 2026-08-22-fastdna-python-design.md, §9).
 """
 

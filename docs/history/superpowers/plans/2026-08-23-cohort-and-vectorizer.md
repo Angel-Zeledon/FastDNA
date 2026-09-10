@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021 (rayon, rustc-hash, arrow), PyO3, scikit-learn (Python-side only, as a soft dependency).
 
-**Spec:** `docs/superpowers/specs/2026-08-22-fastdna-python-design.md` — §7 (cohort engine), §7.8 (vocabulary projection), §9.3/§9.6 (Cohort and KmerVectorizer). Phases E and F of §15.
+**Spec:** `docs/history/superpowers/specs/2026-08-22-fastdna-python-design.md` — §7 (cohort engine), §7.8 (vocabulary projection), §9.3/§9.6 (Cohort and KmerVectorizer). Phases E and F of §15.
 
 **Depends on:** the packaging phase (`2026-08-22-python-packaging-v1.md`) being complete, since everything here crosses the FFI boundary it establishes.
 

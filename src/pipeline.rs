@@ -1121,7 +1121,7 @@ pub fn resolve_strategy(policy: &MemoryPolicy, config: &PipelineConfig) -> Strat
     // number for it -- the whole point of spilling is that peak RSS stops
     // tracking `threads * distinct_kmers` -- but building and justifying a
     // disk model is not this change's subject, and substituting a guess
-    // would be exactly the invented number `docs/PERFORMANCE_PLAN.md`
+    // would be exactly the invented number `docs/history/PERFORMANCE_PLAN.md`
     // forbids. It is left visibly as it was rather than quietly improved.
     let estimated_peak_bytes = match strategy {
         CountStrategy::Binned => {

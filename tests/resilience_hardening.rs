@@ -1,7 +1,7 @@
 //! Resilience contract for the I/O layer: atomic output replacement, the
 //! input-overwrite guard, multi-member gzip support in `from_path`, and
 //! trim safety on malformed records. Each test pins a defect found by the
-//! 2026-08-24 full review (see docs/superpowers/plans/2026-08-24-*.md).
+//! 2026-08-24 full review (see docs/history/superpowers/plans/2026-08-24-*.md).
 
 #![allow(clippy::unwrap_used)]
 

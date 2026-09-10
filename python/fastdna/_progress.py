@@ -1,6 +1,6 @@
 """Progress adapter for `fastdna.count`.
 
-The core's callback contract (docs/superpowers/specs/2026-08-22-fastdna-
+The core's callback contract (docs/history/superpowers/specs/2026-08-22-fastdna-
 python-design.md, "Callback contract") requires any Python-side consumer to
 handle two things the Rust core does not guarantee on its own:
 

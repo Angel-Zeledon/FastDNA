@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021, PyO3 with `abi3-py38` + `extension-module`, maturin as the build backend, arrow 53.4 with its `pyarrow` feature, pytest. No change to the existing core.
 
-**Spec:** `docs/superpowers/specs/2026-08-22-fastdna-python-design.md` — §9 (public Python surface), §11 (cross-platform distribution). This plan implements phases C and D of §15.
+**Spec:** `docs/history/superpowers/specs/2026-08-22-fastdna-python-design.md` — §9 (public Python surface), §11 (cross-platform distribution). This plan implements phases C and D of §15.
 
 ## Global Constraints
 

@@ -20,7 +20,7 @@
 > `docs/goal-most-complete-genomics-ml-library.md`'s instruction to verify
 > before executing anything on this list. Several items this doc listed as
 > missing on 2026-08-24 had already shipped by 2026-08-27 (confirmed exactly
-> the pattern `docs/CHECKPOINT-2026-08-26.md` warned about); Q4 was
+> the pattern `docs/history/CHECKPOINT-2026-08-26.md` warned about); Q4 was
 > genuinely missing and was implemented in this pass. The analysis and
 > reasoning below are otherwise unchanged from the original 2026-08-24
 > research -- this is a status correction, not a rewrite.
@@ -44,7 +44,7 @@ at the end). Companion documents: `ml-genomics-roadmap.md` (ML side),
 
 - **S1. Binary k-mer database + random-access query API.** **Shipped
   (this pass, 2026-08-27).** `src/ktab.rs`'s `KmerTable` implements exactly
-  the design `docs/superpowers/plans/2026-08-24-completeness-phase.md`'s
+  the design `docs/history/superpowers/plans/2026-08-24-completeness-phase.md`'s
   Task 1 reasoned through: no new file format -- the sorted Parquet
   `export.rs` already writes is declared the k-mer table format, and
   `export_counts_parquet` now always attaches `fastdna.sorted_by=
@@ -416,9 +416,13 @@ at the end). Companion documents: `ml-genomics-roadmap.md` (ML side),
     16 bytes per k-mer instead of 8. That closes the gap entirely --
     **every operation that reads a k-mer table now takes both widths.**
 
-    What still stops at k=32 is sketching and the estimators (`sketch`,
-    `dist`, `card`, `spectrum`), which hash straight from FASTQ and never
-    open a table at all.
+    Sketching and the estimators (`sketch`, `dist`, `card`, `spectrum`)
+    followed on 2026-09-09, which closes this entirely: a sketch stores
+    `u64` hashes rather than k-mers, so the width was only ever in the
+    extraction. **The whole package reaches k=64.** The single exception is
+    `sketch_from_kmers`, capped at 32 by its `Vec<u64>` argument -- a u64
+    cannot hold a longer k-mer -- which is that signature's limit and not
+    sketching's.
 
   - **The original deferral, for the record**: k > 32 support via `u128`
     k-mers. This would require changing the 2-bit-per-base `u64` k-mer
@@ -468,7 +472,7 @@ ops before filtering") is unchanged, just re-anchored to what remains:
    `docs/goal-most-complete-genomics-ml-library.md` publishability is now a
    completeness blocker, not a nice-to-have.
 2. **S1** (binary k-mer database + query API) -- a concrete plan already
-   exists (`docs/superpowers/plans/2026-08-24-completeness-phase.md`);
+   exists (`docs/history/superpowers/plans/2026-08-24-completeness-phase.md`);
    nothing else in this list can start without it.
 3. **S2 → S4** (set operations, then filtering). Both landed: S2 this pass
    (`src/setops.rs`), S4 (the read-filtering CLI/Python surface,

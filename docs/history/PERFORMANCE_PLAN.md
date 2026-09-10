@@ -9,7 +9,7 @@ left unedited so it can still be read as the prediction it was.
 This document records the plan agreed
 on 2026-08-25 before any of the work below was executed, so progress can be
 checked against it honestly later. It builds directly on `docs/design-minimizer-counting.md`
-and `docs/CHECKPOINT-2026-08-25.md` — read those first for the underlying
+and `docs/history/CHECKPOINT-2026-08-25.md` — read those first for the underlying
 diagnosis and measured numbers this plan is based on.
 
 ## Goal
@@ -67,7 +67,7 @@ the adaptive bin map, the paired-end CLI mode, and the MIC regression module.
    threshold. The existing `lto = "fat"` / `codegen-units = 1` setting stays
    untouched — it is already deliberately unbenchmarked, and documented as
    such, because this machine's own timing is unreliable across Docker/WSL
-   (see `docs/CHECKPOINT-2026-08-25.md` and this repo's benchmark notes).
+   (see `docs/history/CHECKPOINT-2026-08-25.md` and this repo's benchmark notes).
 3. **`src/fastq.rs`** — reduce roughly 21 million per-record allocations
    measured in the real profiling run; investigate block reads in place of
    four `read_until` calls per FASTQ record, without weakening malformed-record

@@ -103,7 +103,7 @@ Complete within FastDNA's own territory, not across every subfield of
 bioinformatics. The concrete plan already exists and reuses the actual
 engine: a query layer over the sorted Parquet output, set operations
 between k-mer tables, read filtering by k-mer content, per-read k-mer
-profiles (`docs/superpowers/plans/2026-08-24-completeness-phase.md`). None
+profiles (`docs/history/superpowers/plans/2026-08-24-completeness-phase.md`). None
 of that has a Gene Myers-caliber incumbent waiting — it is mapped territory
 this project already owns. The ML layer is the other real differentiator:
 no other k-mer library derives cross-validation groups from the samples'

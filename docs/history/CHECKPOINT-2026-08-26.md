@@ -63,7 +63,7 @@ including a whole separate roadmap:
   `interpret.py`, `anomaly.py`, `active_learning.py`, `multiomics.py`, plus
   ecosystem glue), and a full competitive/performance analysis against
   KMC3/FastK/Jellyfish/Mash.
-- `docs/CHECKPOINT-2026-08-25.md`, `docs/PERFORMANCE_PLAN.md` — a benchmark
+- `docs/history/CHECKPOINT-2026-08-25.md`, `docs/history/PERFORMANCE_PLAN.md` — a benchmark
   session against KMC3/FastK on real data (WSL2, a different machine
   referenced as `C:\Users\Jahir\Documents\DNA-Rust\bench\`), with its own
   "Outcome" section recording what shipped (MSD-partition sort in

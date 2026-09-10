@@ -176,7 +176,7 @@ struct Inner {
 /// sorts; lowering it trades the other way. This is a starting point,
 /// not a value proven optimal by a sweep across input shapes.
 /// **Swept, and deliberately left where it was.**
-/// `docs/PERFORMANCE_PLAN.md` workstream 2 asks for this threshold to be
+/// `docs/history/PERFORMANCE_PLAN.md` workstream 2 asks for this threshold to be
 /// swept empirically rather than left at its original reasoned guess. It
 /// was, over 500k / 1M / 2M / 4M / 8M / 16M, pushing 40,000,000 occurrences
 /// through the real compaction path (MSD partition, per-bucket sort,
@@ -204,7 +204,7 @@ struct Inner {
 /// which is the direct input to `consolidate`'s cost and to the width of the
 /// final k-way merge -- and that half cannot be measured in a loop like
 /// this one, only over a real file end to end, which needs the native
-/// Windows release build `docs/PERFORMANCE_PLAN.md` requires benchmark
+/// Windows release build `docs/history/PERFORMANCE_PLAN.md` requires benchmark
 /// numbers to come from and which this environment does not have. Moving a
 /// tuning constant on a measurement that covers one side of its trade and
 /// disagrees with itself across inputs would be worse than leaving it: 2M
@@ -396,7 +396,7 @@ const MSD_SIGNIFICANT_BITS: u32 = 62;
 /// # What these numbers are not
 ///
 /// They are from a Linux container on this machine, not the native Windows
-/// release build `docs/PERFORMANCE_PLAN.md` requires benchmark numbers to
+/// release build `docs/history/PERFORMANCE_PLAN.md` requires benchmark numbers to
 /// come from -- there is no Rust toolchain installed on the Windows host, so
 /// that measurement could not be taken. The plan's constraint exists because
 /// whole-run wall times on this machine swing 25-90 s on identical input;
@@ -783,7 +783,7 @@ fn merge_slices(sources: &[&[(u64, u32)]]) -> Vec<(u64, u32)> {
 ///
 /// # Measured
 ///
-/// See this module's doc comment history / `docs/PERFORMANCE_PLAN.md` for
+/// See this module's doc comment history / `docs/history/PERFORMANCE_PLAN.md` for
 /// the isolated, in-container benchmark this representation change was
 /// shipped on: a standalone harness outside this crate (so it could use
 /// `println!`, which this crate's `[lints]` deny) reproducing this

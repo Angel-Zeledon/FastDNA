@@ -4,7 +4,7 @@ Written because the interactive session driving this work was ending mid-task
 (background agent still running when the session was about to close). Verify
 live-agent status first (`ListAgents`) before assuming anything below is
 still in flight — it may have finished, or died with the session, same
-uncertainty `docs/CHECKPOINT-2026-08-26.md` flagged for its own agents.
+uncertainty `docs/history/CHECKPOINT-2026-08-26.md` flagged for its own agents.
 
 ## What changed this session
 
@@ -75,18 +75,18 @@ uncertainty `docs/CHECKPOINT-2026-08-26.md` flagged for its own agents.
   agent dispatched this session was explicitly told not to touch them).
 - No local Rust/Python toolchain — verification is Docker-only, and Docker
   **must** be invoked from a PowerShell tool, never Bash (path mangling).
-  See the repo's own verification memory / `docs/CHECKPOINT-2026-08-26.md`
+  See the repo's own verification memory / `docs/history/CHECKPOINT-2026-08-26.md`
   for the exact working `docker run` command pattern.
 - Baseline to not regress below: Rust 364 lib tests + 522 integration
   tests, 0 failed, 1 ignored; clippy exactly 8 warnings (locations listed
-  in `docs/CHECKPOINT-2026-08-26.md`); Python 712 passed, 40 skipped, 1
+  in `docs/history/CHECKPOINT-2026-08-26.md`); Python 712 passed, 40 skipped, 1
   xfailed, 0 failed with the container's default extras.
 
 ## In flight — S1: binary k-mer database + random-access query API
 
 First dispatch failed immediately with "You've hit your session limit ·
 resets 4:20pm (America/Guatemala)" — an account-level API rate limit, the
-same kind `docs/CHECKPOINT-2026-08-26.md` already documented hitting once
+same kind `docs/history/CHECKPOINT-2026-08-26.md` already documented hitting once
 before (that time, a bare relaunch with the same prompt succeeded once the
 limit cleared). It died mid-research, before writing any code — no commits
 exist anywhere from this attempt; nothing is lost by simply redispatching
