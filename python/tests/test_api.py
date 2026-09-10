@@ -201,3 +201,82 @@ def test_build_info_reports_avx2(tmp_path):
     # estimators still stopped at 32. They reach 64 now, so a second
     # ceiling would describe a discrepancy that no longer exists.
     assert "max_k_sketch" not in info
+
+
+def test_progress_true_drives_a_tqdm_bar(tmp_path):
+    """`count(progress=True)` is a documented feature whose entire
+    implementation -- `_progress._tqdm_sink` -- was never executed by any
+    test. Coverage put `_progress.py` at 55% with this block the bulk of
+    the gap.
+
+    What is checked is that the bar advances to the real read count, not
+    merely that the call returns: a sink that swallowed every event would
+    pass a smoke test and show a bar stuck at zero.
+    """
+    tqdm = pytest.importorskip("tqdm")
+
+    reads = ["ACGTACGTACGTACGTACGTACGT"] * 500
+    path = write_fastq(tmp_path, reads)
+
+    seen = []
+
+    class RecordingBar(tqdm.tqdm):
+        def update(self, n=1):
+            seen.append(n)
+            return super().update(n)
+
+    # The sink builds its own bar with `tqdm.tqdm(...)`, so the class is
+    # swapped rather than an instance injected.
+    original = tqdm.tqdm
+    tqdm.tqdm = RecordingBar
+    try:
+        result = fastdna.count(path, k=21, progress=True, progress_interval=50)
+    finally:
+        tqdm.tqdm = original
+
+    assert result.total_kmers > 0
+    assert seen, "progress=True produced no bar updates at all"
+    assert sum(seen) == len(reads), (
+        f"the bar must advance to every read: {sum(seen)} of {len(reads)}"
+    )
+
+
+def test_progress_true_without_tqdm_is_silent_not_an_error(tmp_path, monkeypatch):
+    """tqdm is optional. `progress=True` without it must count normally and
+    simply not draw anything -- never raise.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_tqdm(name, *args, **kwargs):
+        if name == "tqdm" or name.startswith("tqdm."):
+            raise ImportError("tqdm blocked for this test")
+        return real_import(name, *args, **kwargs)
+
+    path = write_fastq(tmp_path, ["ACGTACGTACGTACGTACGT"] * 20)
+    monkeypatch.setattr(builtins, "__import__", no_tqdm)
+    try:
+        result = fastdna.count(path, k=11, progress=True)
+    finally:
+        monkeypatch.setattr(builtins, "__import__", real_import)
+    assert result.distinct_kmers > 0
+
+
+def test_progress_rejects_a_non_callable(tmp_path):
+    path = write_fastq(tmp_path, ["ACGTACGTACGT"] * 5)
+    with pytest.raises(TypeError):
+        fastdna.count(path, k=11, progress="yes please")
+
+
+def test_to_polars_round_trips_the_table(tmp_path):
+    """`to_polars()` is public and was never executed by a test."""
+    pl = pytest.importorskip("polars")
+
+    path = write_fastq(tmp_path, ["ACGTACGTACGTACGTACGT"] * 10)
+    counts = fastdna.count(path, k=11)
+    frame = counts.to_polars()
+
+    assert isinstance(frame, pl.DataFrame)
+    assert frame.columns == counts.table.column_names
+    assert frame.height == counts.table.num_rows

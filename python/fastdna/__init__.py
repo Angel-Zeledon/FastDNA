@@ -184,33 +184,6 @@ def _decode_wide_kmers(keys, k):
     return [row.tobytes().decode("ascii") for row in codes]
 
 
-def _pair_positions(table, paths):
-    """Row and column indices, into `paths`, for every row of a
-    :func:`compare_all` long-format table.
-
-    Every consumer of that table (`embed`, `cv`, `gwas.kinship_matrix`)
-    needs the same thing: turn each `(sample_a, sample_b)` pair of path
-    strings into the pair of positions it occupies in a dense `n x n`
-    matrix. Doing it here, once, with Arrow's own hash lookup resolves all
-    `n*(n-1)/2` rows in two C++ passes instead of two Python dict lookups
-    per row -- a 200-sample cohort has 19,900 of those rows.
-
-    Raises `KeyError` naming the offending path if the table mentions a
-    sample that is not in `paths`, which is what the dict lookup this
-    replaced did (silently mapping it to nothing would leave a row of the
-    matrix all zeros).
-    """
-    value_set = pa.array([str(p) for p in paths], type=pa.string())
-    positions = []
-    for column_name in ("sample_a", "sample_b"):
-        samples = _column_as_array(table.column(column_name))
-        found = pc.index_in(samples, value_set=value_set)
-        if found.null_count:
-            raise KeyError(pc.filter(samples, pc.is_null(found))[0].as_py())
-        positions.append(found.to_numpy(zero_copy_only=False))
-    return positions[0], positions[1]
-
-
 def _fallback_table_html(table):
     """A minimal hand-built HTML `<table>` over a small `pyarrow.Table`,
     used by `_repr_html_` methods when `pandas` (their preferred renderer)

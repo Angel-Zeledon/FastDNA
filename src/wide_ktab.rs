@@ -578,6 +578,151 @@ mod tests {
         }
     }
 
+    /// Writes a `kmer_bits` Parquet with whatever footer metadata and
+    /// schema the caller asks for, however wrong. Coverage put this
+    /// module's rejection paths at 0% executed -- every `.ok_or_else(...)`
+    /// in `open` is a refusal that had never fired, which is the worst
+    /// place for that to be true: they are the only thing standing between
+    /// a corrupt file and a silently misread one.
+    fn write_malformed(
+        name: &str,
+        metadata: Vec<(&str, &str)>,
+        nullable_key: bool,
+        with_statistics: bool,
+    ) -> PathBuf {
+        use arrow::array::FixedSizeBinaryBuilder;
+        use arrow::datatypes::{Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+        use parquet::format::KeyValue;
+        use std::sync::Arc;
+
+        let path = temp_path(name);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("kmer_bits", DataType::FixedSizeBinary(16), nullable_key),
+            Field::new("frequency", DataType::UInt32, false),
+        ]));
+
+        let mut keys = FixedSizeBinaryBuilder::with_capacity(4, 16);
+        for value in [10u128, 20, 30] {
+            keys.append_value(wide_kmer::to_key_bytes(value)).unwrap();
+        }
+
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(if with_statistics {
+                EnabledStatistics::Chunk
+            } else {
+                EnabledStatistics::None
+            })
+            .set_key_value_metadata(Some(
+                metadata
+                    .into_iter()
+                    .map(|(k, v)| KeyValue::new(k.to_string(), Some(v.to_string())))
+                    .collect(),
+            ))
+            .build();
+
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(keys.finish()), Arc::new(UInt32Array::from(vec![1u32, 2, 3]))],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
+    const GOOD_META: [(&str, &str); 2] = [("fastdna.sorted_by", "kmer_bits"), ("fastdna.k", "41")];
+
+    #[test]
+    fn a_table_with_no_k_metadata_is_refused() {
+        let path = write_malformed("no_k", vec![GOOD_META[0]], false, true);
+        let _cleanup = Cleanup(path.clone());
+        let err = WideKmerTable::open(&path).unwrap_err().to_string();
+        assert!(err.contains("fastdna.k"), "the error must name the missing key: {err}");
+    }
+
+    #[test]
+    fn a_table_with_unparsable_k_is_refused() {
+        let path = write_malformed(
+            "bad_k",
+            vec![GOOD_META[0], ("fastdna.k", "cuarenta y uno")],
+            false,
+            true,
+        );
+        let _cleanup = Cleanup(path.clone());
+        let err = WideKmerTable::open(&path).unwrap_err().to_string();
+        assert!(err.contains("fastdna.k"), "{err}");
+    }
+
+    #[test]
+    fn a_table_sorted_by_something_else_is_refused() {
+        let path = write_malformed(
+            "wrong_sort",
+            vec![("fastdna.sorted_by", "frequency"), GOOD_META[1]],
+            false,
+            true,
+        );
+        let _cleanup = Cleanup(path.clone());
+        let err = WideKmerTable::open(&path).unwrap_err().to_string();
+        assert!(err.contains("kmer_bits"), "the error must name what it expected: {err}");
+    }
+
+    /// The one that matters most. Arrow's `Array::value(i)` returns an
+    /// unspecified payload for a null slot rather than erroring, so a
+    /// nullable key column would let a table answer a lookup with a
+    /// *different row's* count. Rejecting the schema is the only thing
+    /// that closes it, and until now nothing checked that it did.
+    #[test]
+    fn a_nullable_key_column_is_refused_before_a_row_is_read() {
+        let path = write_malformed("nullable", GOOD_META.to_vec(), true, true);
+        let _cleanup = Cleanup(path.clone());
+        let err = WideKmerTable::open(&path).unwrap_err().to_string();
+        assert!(err.contains("non-nullable"), "{err}");
+        assert!(err.contains("kmer_bits"), "{err}");
+    }
+
+    /// Without per-row-group statistics there is nothing to prune with and
+    /// nothing to verify the sort against, so the table is not queryable
+    /// even though every row in it is fine.
+    #[test]
+    fn a_table_without_row_group_statistics_is_refused() {
+        let path = write_malformed("no_stats", GOOD_META.to_vec(), false, false);
+        let _cleanup = Cleanup(path.clone());
+        let err = WideKmerTable::open(&path).unwrap_err().to_string();
+        assert!(err.contains("statistics"), "the error must say what is missing: {err}");
+    }
+
+    #[test]
+    fn a_table_with_a_nonsense_canonical_flag_is_refused() {
+        let path = write_malformed(
+            "bad_canonical",
+            vec![GOOD_META[0], GOOD_META[1], ("fastdna.canonical", "maybe")],
+            false,
+            true,
+        );
+        let _cleanup = Cleanup(path.clone());
+        let err = WideKmerTable::open(&path).unwrap_err().to_string();
+        assert!(err.contains("canonical"), "{err}");
+    }
+
+    /// The happy path through the same builder, so a failure above means
+    /// "this specific defect is rejected" and not "this helper writes
+    /// files nothing can open".
+    #[test]
+    fn the_malformed_writer_produces_a_readable_table_when_nothing_is_wrong() {
+        let path = write_malformed("well_formed", GOOD_META.to_vec(), false, true);
+        let _cleanup = Cleanup(path.clone());
+        let table = WideKmerTable::open(&path).expect("a well-formed file must open");
+        assert_eq!(table.k(), 41);
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.get(20).unwrap(), Some(2));
+        assert_eq!(table.get(25).unwrap(), None);
+    }
+
     #[test]
     fn a_narrow_table_is_refused_by_name() {
         // The mirror of `KmerTable::open`'s refusal of a wide table: each
