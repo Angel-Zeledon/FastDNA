@@ -98,7 +98,27 @@ def _decode_kmers(bits, k):
     packed k-mer -- the same layout `kmer::decode_kmer_into` unpacks in
     Rust, most significant bits first.
     """
-    import numpy as np
+    # numpy is a *fast path*, not a requirement. It is not in this
+    # package's runtime dependencies (`pyproject.toml` declares pyarrow and
+    # nothing else), so a plain `pip install fastdna` does not have it --
+    # and `KmerCounts.with_sequence()`, which the README documents as a
+    # headline convenience, reaches here. Importing it unconditionally made
+    # that call raise `ModuleNotFoundError` for exactly the install everyone
+    # gets. The pure-Python branch below is slower per row and always
+    # correct; the two are pinned against each other by
+    # `test_decoding_agrees_with_and_without_numpy`.
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+
+    if np is None:
+        if isinstance(bits, (pa.Array, pa.ChunkedArray)):
+            bits = bits.to_pylist()
+        return [
+            "".join("ACGT"[(int(value) >> (2 * i)) & 0b11] for i in range(k - 1, -1, -1))
+            for value in bits
+        ]
 
     # `pyarrow.Array`/`ChunkedArray` -> numpy via their own `to_numpy()`
     # (uniform across the pyarrow>=14 versions this package supports,
@@ -130,7 +150,22 @@ def _decode_wide_kmers(keys, k):
     puts the least significant byte last, so those bits are in byte
     `15 - p // 4` of the row, at shift `2 * (p % 4)`.
     """
-    import numpy as np
+    # See `_decode_kmers` for why numpy is optional here.
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+
+    if np is None:
+        # `to_pylist()` gives one `bytes` of length 16 per row and handles
+        # the array's own offset, so a sliced view decodes correctly
+        # without the manual buffer arithmetic the numpy path needs.
+        return [
+            "".join(
+                "ACGT"[(row[15 - p // 4] >> (2 * (p % 4))) & 0b11] for p in range(k - 1, -1, -1)
+            )
+            for row in keys.to_pylist()
+        ]
 
     if isinstance(keys, pa.ChunkedArray):
         keys = keys.combine_chunks()
@@ -771,11 +806,19 @@ def sketch_from_kmers(kmers, *, k: int = 21, sketch_size: int = 1000) -> Sketch:
     -------
     Sketch
     """
-    import numpy as np
-
+    # numpy is a convenience here (it accepts numpy arrays, pyarrow
+    # arrays and plain sequences uniformly), never a requirement -- see
+    # `_decode_kmers`. Without it this function raised
+    # `ModuleNotFoundError` on a plain `pip install fastdna`, which is the
+    # only install most users have.
     if isinstance(kmers, (pa.Array, pa.ChunkedArray)):
-        kmers = kmers.to_numpy(zero_copy_only=False)
-    kmers_list = np.asarray(kmers, dtype=np.uint64).tolist()
+        kmers = kmers.to_pylist()
+    try:
+        import numpy as np
+
+        kmers_list = np.asarray(kmers, dtype=np.uint64).tolist()
+    except ImportError:
+        kmers_list = [int(value) for value in kmers]
     return Sketch(_core.sketch_from_kmers(kmers_list, k, sketch_size))
 
 

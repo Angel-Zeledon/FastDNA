@@ -432,3 +432,62 @@ def test_a_table_records_its_counting_convention(reads, tmp_path):
     with pytest.raises(ValueError) as excinfo:
         tables["canonical"].union(tables["forward"], output=str(tmp_path / "mixed.parquet"))
     assert "canonical" in str(excinfo.value)
+
+
+def test_decoding_agrees_with_and_without_numpy(reads, tmp_path, monkeypatch):
+    """numpy is a fast path in `_decode_kmers`/`_decode_wide_kmers`, not a
+    requirement -- it is not in this package's runtime dependencies, so a
+    plain `pip install fastdna` does not have it.
+
+    Both branches must produce identical strings. This blocks the import
+    the way a bare install does and compares the two, rather than trusting
+    that two implementations of the same bit layout agree.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_numpy(name, *args, **kwargs):
+        if name == "numpy" or name.startswith("numpy."):
+            raise ImportError("numpy blocked for this test")
+        return real_import(name, *args, **kwargs)
+
+    for k in (21, 41):
+        with_numpy = fastdna.count(reads, k=k).with_sequence()
+        expected = with_numpy.table.column("kmer_sequence").to_pylist()
+        assert expected, "the fixture must produce k-mers"
+
+        monkeypatch.setattr(builtins, "__import__", no_numpy)
+        try:
+            without = fastdna.count(reads, k=k).with_sequence()
+            got = without.table.column("kmer_sequence").to_pylist()
+        finally:
+            monkeypatch.setattr(builtins, "__import__", real_import)
+
+        assert got == expected, f"k={k}: the two decoders disagree"
+
+
+def test_sketch_from_kmers_works_without_numpy(monkeypatch):
+    """Same reason: this reached for numpy unconditionally and raised
+    `ModuleNotFoundError` on the install everyone gets.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_numpy(name, *args, **kwargs):
+        if name == "numpy" or name.startswith("numpy."):
+            raise ImportError("numpy blocked for this test")
+        return real_import(name, *args, **kwargs)
+
+    kmers = [17, 42, 99, 17, 1234567]
+    expected = fastdna.sketch_from_kmers(kmers, k=21, sketch_size=8)
+
+    monkeypatch.setattr(builtins, "__import__", no_numpy)
+    try:
+        got = fastdna.sketch_from_kmers(kmers, k=21, sketch_size=8)
+    finally:
+        monkeypatch.setattr(builtins, "__import__", real_import)
+
+    assert got.k == expected.k
+    assert abs(got.jaccard(expected) - 1.0) < 1e-12, "the two paths must sketch identically"

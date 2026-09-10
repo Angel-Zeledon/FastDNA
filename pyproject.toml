@@ -118,7 +118,14 @@ python-source = "python"
 # depending on which interpreters touched the directory before building.
 # CI does a clean checkout, so this only manifests in manual builds --
 # exactly the case of a hand-done release upload.
-exclude = ["**/__pycache__/**", "**/*.pyc"]
+#
+# `docs/history/**` is excluded for a different reason: those fifteen files
+# are working documents from states the project has passed through, and
+# `docs/history/README.md` opens by saying nothing in there describes the
+# current code. They are 22% of the source distribution's bytes. Git keeps
+# them; a published artifact should not carry a fifth of its weight in
+# documentation of deleted features.
+exclude = ["**/__pycache__/**", "**/*.pyc", "docs/history/**"]
 # `python/fastdna/py.typed` (the empty PEP 561 marker) is already included:
 # it lives inside `python-source` above, and neither exclude pattern above
 # matches it (only `__pycache__/` directories and `.pyc` files do). It is

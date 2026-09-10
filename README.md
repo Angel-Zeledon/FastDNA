@@ -23,6 +23,7 @@ schedule rather than once:
 | | against | result |
 |---|---|---|
 | k-mer counts | KMC3 3.2.4 | **exactly equal** -- both engines (k=15 to 64), both canonical and `-b`-style non-canonical |
+| the published wheel | a clean venv on CPython 3.8, 3.9, 3.10, 3.11, 3.12 and 3.13 | one `abi3` wheel, identical results on all six -- the `requires-python = ">=3.8"` claim, exercised rather than declared |
 | exact Jaccard and containment | `kmc_tools` | **exactly equal**, every set size and every derived ratio |
 | MinHash distances | Mash 2.3 | r = 0.997, no systematic bias |
 | HyperLogLog cardinality | the exact count | −0.26% |

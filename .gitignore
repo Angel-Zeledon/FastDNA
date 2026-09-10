@@ -52,6 +52,7 @@ kmc_work/
 
 # Scratch space for ad hoc analysis and repro scripts.
 /scratch/
+/logs/
 
 # Agent working directories: full checkouts and session state, never part
 # of the repository.

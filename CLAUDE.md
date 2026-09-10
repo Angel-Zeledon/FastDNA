@@ -252,9 +252,16 @@ Deliberately small — four modules, and three of them are thin:
 pure-Python part at all (`ffi::pairwise_similarity`); it is listed in
 `__all__` like the rest.
 
-`numpy` is the only optional package anything reaches for, and it is
-imported lazily inside the functions that need it, so `import fastdna`
-works without it. `python/tests/conftest.py` registers a stub
+`numpy` is a *fast path*, never a requirement: `pyproject.toml` declares
+`pyarrow` and nothing else, so a plain `pip install fastdna` has no numpy,
+and `_decode_kmers`, `_decode_wide_kmers` and `sketch_from_kmers` each
+carry a pure-Python branch for that case. They used to `import numpy`
+unconditionally, which made `KmerCounts.with_sequence()` -- a documented
+headline convenience -- raise `ModuleNotFoundError` on exactly the install
+everyone gets. `test_decoding_agrees_with_and_without_numpy` blocks the
+import and pins the two branches against each other. `pandas`/`polars` are
+different: `to_pandas`/`to_polars` say so in their own docstrings and are
+opt-in by name. `python/tests/conftest.py` registers a stub
 `fastdna._core` when the compiled extension is missing — which means a
 broken `maturin develop` can look like a passing (partial) suite locally;
 CI explicitly asserts the real compiled extension is imported before
