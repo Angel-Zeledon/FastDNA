@@ -222,8 +222,8 @@ fn estimate_cardinality_from_reader<R: BufRead>(
     precision: u32,
     source: &Path,
 ) -> Result<f64> {
-    if k == 0 || k > 32 {
-        return Err(FastDnaError::InvalidK { k, max: 32 });
+    if k == 0 || k > crate::wide_kmer::MAX_WIDE_K {
+        return Err(FastDnaError::InvalidK { k, max: crate::wide_kmer::MAX_WIDE_K });
     }
 
     let mut hll = HyperLogLog::new(precision)?;
@@ -233,8 +233,18 @@ fn estimate_cardinality_from_reader<R: BufRead>(
         match reader.next_record() {
             Ok(Some(record)) => {
                 record_number += 1;
-                for kmer_bits in kmer::extract_canonical_kmers(&record.seq, k) {
-                    hll.insert(kmer_bits);
+                // Both engines feed the same estimator: HyperLogLog
+                // consumes a hash, and `sketch::finalize_hash_wide` agrees
+                // with the narrow hash wherever both are defined, so a
+                // cardinality estimate does not change at the boundary.
+                if k <= 32 {
+                    for kmer_bits in kmer::extract_canonical_kmers(&record.seq, k) {
+                        hll.insert(kmer_bits);
+                    }
+                } else {
+                    for kmer_bits in crate::wide_kmer::extract_canonical_kmers(&record.seq, k) {
+                        hll.insert(crate::sketch::finalize_hash_wide(kmer_bits));
+                    }
                 }
             }
             Ok(None) => break,

@@ -38,7 +38,8 @@ código que se eliminó antes de que ninguna versión lo publicara: leerlo como
   `similarity` (Jaccard, contención y Bray-Curtis exactos, validados contra
   `kmc_tools`), `filter`, `profile`, `matrix`.
 - Estimación: `sketch`/`dist` (MinHash, r=0.997 contra Mash 2.3), `card`
-  (HyperLogLog, -0,26%), `spectrum` (ntCard, ±2%).
+  (HyperLogLog, -0,26%), `spectrum` (ntCard, ±2%) -- **hasta k=64 también**,
+  con el mismo error medido a k=41 que a k=31.
 - API de Python con Arrow sin copia -- sin subproceso ni serialización -- y
   WASM.
 
@@ -48,7 +49,7 @@ arquitectura: las condiciones y lo que *no* demuestra están en
 `docs/BENCHMARKS.md`.
 
 **Lo que no hace**: k por encima de 64, entrada BAM, salida KFF, y no está
-medida a escala out-of-core. Sketching y estimadores paran en k=32.
+medida a escala out-of-core.
 
 ## Historial previo a la primera versión
 
@@ -62,6 +63,43 @@ medida a escala out-of-core. Sketching y estimadores paran en k=32.
 > lista, se refiere a código que ya no existe.
 
 ### Changed
+
+- **Sketching y los estimadores llegan a k=64.** Eran la última
+  inconsistencia: todo lo que lee una tabla aceptaba las dos anchuras desde
+  el 2026-09-07, pero `sketch`, `dist`, `card` y `spectrum` seguían
+  parando en 32.
+
+  Resultó ser un cambio pequeño porque **un sketch guarda hashes `u64`, no
+  k-mers**: `jaccard`, `containment` y `mash_distance` comparan hashes y no
+  cambian en absoluto. La anchura solo estaba en la extracción. Sale
+  `sketch::finalize_hash_wide`, que pliega un `u128` a `u64` y **coincide
+  con el hash estrecho donde ambos están definidos** -- la mitad alta de un
+  k-mer de k≤32 es cero, y esa rama devuelve exactamente `finalize_hash` --
+  así que un sketch a k=31 es comparable lo construyera quien lo
+  construyera, la misma propiedad de solape que tienen los dos motores de
+  conteo.
+
+  **La comprobación que importa** no es un test: HyperLogLog a k=41 sobre
+  `DRR002015` estima 18.703.733 contra los 18.752.097 exactos verificados
+  con KMC3 -- **−0,26%**, idéntico al error documentado a k=31. Un mezclador
+  malo se habría notado justo ahí.
+
+  **Un fallo silencioso que esto destapó y cierra**: con k limitado a 32, un
+  sketch vacío solo podía venir de un k fuera de rango, que se rechazaba
+  antes. Ahora `sketch(lecturas_de_30bp, k=41)` es legal, no produce ningún
+  k-mer, y `containment` habría contestado `0.0` -- indistinguible de "estas
+  dos muestras no comparten nada". `GenomeSketch::from_reader` lo rechaza
+  nombrando el problema. **No así `FracSketch`**, donde vacío es un
+  resultado normal: su acumulador filtra por umbral de escala, y una
+  entrada pequeña con `scale` alto legítimamente no guarda nada. Los dos
+  acumuladores no significan lo mismo por "vacío", y la guarda va solo
+  donde no hay ambigüedad -- lo pilló la suite de Python, no yo.
+
+  **Cambio rompedor**: `build_info()` deja de devolver `max_k_sketch`. Se
+  reportó dos días, mientras el techo no era uniforme; fijarlo en 64 habría
+  hecho pensar que la discrepancia sigue. La única entrada que aún para en
+  32 es `sketch_from_kmers`, y es el límite de su argumento `Vec<u64>` --un
+  u64 no puede contener un k-mer más largo-- no de sketching.
 
 - **La comparación con KMC3, medida por fin: FastDNA es 1,38x más rápido en
   0,47x la memoria** sobre la carga probada. Es el primer resultado

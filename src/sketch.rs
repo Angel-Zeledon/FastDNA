@@ -45,6 +45,36 @@ pub(crate) fn finalize_hash(kmer: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// [`finalize_hash`] for a wide (`33 <= k <= 64`) k-mer.
+///
+/// A sketch stores hashes, not k-mers, so nothing downstream cares how wide
+/// the key was: `jaccard`, `containment` and `mash_distance` compare `u64`
+/// hashes either way and need no change at all. Only the extraction had a
+/// width, which is the whole of why sketching stopped at k=32.
+///
+/// **Agrees with the narrow hash wherever both are defined.** A `u128`
+/// holding a `k <= 32` k-mer has a zero high half, and that branch returns
+/// exactly `finalize_hash(low)` -- so a sketch built through the wide path
+/// at k=31 is comparable with one built through the narrow path at k=31,
+/// the same overlap property the two counting engines have. Above k=32 the
+/// high half is never zero (k=33 already uses 66 bits), so the two branches
+/// partition cleanly at the engine boundary rather than overlapping.
+///
+/// The wide branch folds the high half through the mixer before xoring it
+/// into the low one, rather than xoring the halves raw: the raw fold would
+/// make `(hi, lo)` and `(lo, hi)` collide, and 2-bit-packed k-mers are full
+/// of such transpositions.
+#[inline(always)]
+pub(crate) fn finalize_hash_wide(kmer: u128) -> u64 {
+    let low = kmer as u64;
+    let high = (kmer >> 64) as u64;
+    if high == 0 {
+        finalize_hash(low)
+    } else {
+        finalize_hash(low ^ finalize_hash(high))
+    }
+}
+
 /// The bottom-`capacity` working set: the `capacity` smallest *distinct*
 /// hashes seen so far, evicting the current maximum once full. Shared by
 /// `from_kmers` (in-memory) and `from_reader` (streaming) so both
@@ -126,6 +156,13 @@ impl BottomK {
     /// Consumes the working set into the ascending, deduplicated hash list
     /// `GenomeSketch` stores -- `BTreeSet`'s iteration order, so no sort is
     /// needed here.
+    /// Whether nothing has been admitted yet. Lets the constructors tell
+    /// "no k-mers came out of this file at all" from "these k-mers sketch
+    /// to few hashes", which are different facts with different fixes.
+    fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
     fn into_hashes(self) -> Vec<u64> {
         self.set.into_iter().collect()
     }
@@ -183,8 +220,8 @@ impl GenomeSketch {
         // to zero hashes and every later comparison quietly reports 0.0 --
         // silent garbage instead of the error `count()` and
         // `estimate_cardinality` already raise for the same mistake.
-        if k == 0 || k > 32 {
-            return Err(FastDnaError::InvalidK { k, max: 32 });
+        if k == 0 || k > crate::wide_kmer::MAX_WIDE_K {
+            return Err(FastDnaError::InvalidK { k, max: crate::wide_kmer::MAX_WIDE_K });
         }
         if sketch_size == 0 {
             return Err(FastDnaError::InvalidConfig {
@@ -200,8 +237,18 @@ impl GenomeSketch {
             match reader.next_record() {
                 Ok(Some(record)) => {
                     record_count += 1;
-                    for kmer in kmer::extract_canonical_kmers(&record.seq, k) {
-                        bottom_k.insert(finalize_hash(kmer));
+                    // Same routing rule as `pipeline::resolve_engine`: the
+                    // u64 extractor to k=32, the u128 one above it. The
+                    // hashes they produce agree wherever both are defined
+                    // (see `finalize_hash_wide`).
+                    if k <= 32 {
+                        for kmer in kmer::extract_canonical_kmers(&record.seq, k) {
+                            bottom_k.insert(finalize_hash(kmer));
+                        }
+                    } else {
+                        for kmer in crate::wide_kmer::extract_canonical_kmers(&record.seq, k) {
+                            bottom_k.insert(finalize_hash_wide(kmer));
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -219,6 +266,27 @@ impl GenomeSketch {
                     });
                 }
             }
+        }
+
+        // A file with records but no k-mers is always a mistake, and until
+        // sketching reached k=64 the `k > 32` range check hid it: an
+        // out-of-range k was rejected before it could produce nothing. Now
+        // `k = 41` is legal, so `sketch(reads_30bp, k=41)` is reachable --
+        // every read shorter than k yields no k-mer at all, the sketch
+        // comes out empty, and `containment` answers `0.0` for it. Zero
+        // similarity and "your k is longer than your reads" are different
+        // facts and must not arrive as the same number.
+        if bottom_k.is_empty() && record_count > 0 {
+            return Err(FastDnaError::InvalidConfig {
+                parameter: "k",
+                reason: format!(
+                    "k={k} produced no k-mers from {record_count} reads of {}: every read is \
+                     shorter than k, or every read is entirely ambiguous bases. An empty sketch \
+                     compares as 0.0 against everything, which is indistinguishable from a real \
+                     answer",
+                    source.display()
+                ),
+            });
         }
 
         Ok(Self { sketch_size, k, hashes: bottom_k.into_hashes() })
@@ -495,9 +563,9 @@ impl GenomeSketch {
 /// `hashes.last()` is not actually the sketch's true ceiling -- both
 /// return quiet nonsense instead of an error.
 fn validate_sketch_invariants(sketch: &GenomeSketch) -> std::result::Result<(), String> {
-    if sketch.k == 0 || sketch.k > 32 {
+    if sketch.k == 0 || sketch.k > crate::wide_kmer::MAX_WIDE_K {
         return Err(format!(
-            "k is {}, outside the 1..=32 range 2-bit packing supports",
+            "k is {}, outside the 1..=64 range 2-bit packing supports",
             sketch.k
         ));
     }
@@ -636,8 +704,8 @@ impl FracSketch {
         k: usize,
         source: &Path,
     ) -> Result<Self> {
-        if k == 0 || k > 32 {
-            return Err(FastDnaError::InvalidK { k, max: 32 });
+        if k == 0 || k > crate::wide_kmer::MAX_WIDE_K {
+            return Err(FastDnaError::InvalidK { k, max: crate::wide_kmer::MAX_WIDE_K });
         }
         if scale == 0 {
             return Err(FastDnaError::InvalidConfig {
@@ -653,8 +721,14 @@ impl FracSketch {
             match reader.next_record() {
                 Ok(Some(record)) => {
                     record_count += 1;
-                    for kmer in kmer::extract_canonical_kmers(&record.seq, k) {
-                        acc.insert(finalize_hash(kmer));
+                    if k <= 32 {
+                        for kmer in kmer::extract_canonical_kmers(&record.seq, k) {
+                            acc.insert(finalize_hash(kmer));
+                        }
+                    } else {
+                        for kmer in crate::wide_kmer::extract_canonical_kmers(&record.seq, k) {
+                            acc.insert(finalize_hash_wide(kmer));
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -671,6 +745,15 @@ impl FracSketch {
             }
         }
 
+        // No guard here, unlike `GenomeSketch::from_reader`. An empty
+        // `FracSketch` is an ordinary outcome, not a mistake: this
+        // accumulator keeps only hashes below a scale-derived threshold, so
+        // a small input at a high `scale` legitimately keeps nothing --
+        // `frac_sketch(five_20bp_reads, k=9, scale=50)` is expected to.
+        // Bottom-k has no such filter (it admits everything until full), so
+        // there "empty" really does mean "no k-mers at all" and is worth
+        // refusing. The two accumulators disagree about what empty means,
+        // and the guard belongs only to the one where it is unambiguous.
         Ok(Self { scale, k, hashes: acc.into_hashes() })
     }
 
@@ -821,9 +904,9 @@ impl FracSketch {
 /// `sketch_size` cap check -- a `FracSketch` has no fixed capacity to
 /// exceed.
 fn validate_frac_sketch_invariants(sketch: &FracSketch) -> std::result::Result<(), String> {
-    if sketch.k == 0 || sketch.k > 32 {
+    if sketch.k == 0 || sketch.k > crate::wide_kmer::MAX_WIDE_K {
         return Err(format!(
-            "k is {}, outside the 1..=32 range 2-bit packing supports",
+            "k is {}, outside the 1..=64 range 2-bit packing supports",
             sketch.k
         ));
     }
@@ -1049,12 +1132,84 @@ mod tests {
 
     #[test]
     fn from_reader_rejects_an_out_of_range_k_instead_of_an_empty_sketch() {
-        for bad_k in [0usize, 33] {
+        // 33 used to be out of range and is not any more (sketching reaches
+        // 64 since 2026-09-09), so the boundary value moved to 65.
+        for bad_k in [0usize, 65] {
             match GenomeSketch::from_reader(reader_over(&["ACGTACGT"]), 128, bad_k, Path::new("s.fastq")) {
                 Err(FastDnaError::InvalidK { k, .. }) => assert_eq!(k, bad_k),
                 other => panic!("k={bad_k} must be InvalidK, got {other:?}"),
             }
         }
+    }
+
+    /// The failure the widening made reachable, and the reason this test
+    /// exists at all: `k = 33` is legal now, so an 8-base read yields no
+    /// k-mers and the sketch comes out empty -- which `containment` would
+    /// answer `0.0` for, indistinguishable from a real "these two share
+    /// nothing". The constructor refuses instead.
+    #[test]
+    fn a_k_longer_than_every_read_is_an_error_not_an_empty_sketch() {
+        let err = GenomeSketch::from_reader(reader_over(&["ACGTACGT"]), 128, 33, Path::new("s.fastq"))
+            .expect_err("k=33 over 8-base reads must not produce an empty sketch");
+        match err {
+            FastDnaError::InvalidConfig { parameter, reason } => {
+                assert_eq!(parameter, "k");
+                assert!(reason.contains("33"), "the message must name k: {reason}");
+                assert!(reason.contains("shorter than k"), "and say why: {reason}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        // And the same k over reads long enough for it works, which is what
+        // makes the check about the reads rather than about k.
+        let long = "ACGTTGCAAGGCTTACCGATCGATTACAGCATCGGATCCAT";
+        assert_eq!(long.len(), 41);
+        let ok = GenomeSketch::from_reader(reader_over(&[long]), 128, 33, Path::new("s.fastq"))
+            .expect("k=33 over 41-base reads is fine");
+        assert!(!ok.hashes.is_empty());
+        assert_eq!(ok.k, 33);
+    }
+
+    /// A wide sketch is comparable with itself and self-consistent: the
+    /// same file sketched twice at k=41 gives jaccard 1.0, and two
+    /// different files give something strictly between 0 and 1. Neither
+    /// number depends on the hash being any particular function -- only on
+    /// it being a function.
+    #[test]
+    fn sketching_works_above_k32() {
+        let a: Vec<String> = (0..40)
+            .map(|i| {
+                let mut state = 0x2545_F491_4F6C_DD1Du64 ^ i;
+                (0..150)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        b"ACGT"[(state >> 33) as usize % 4] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&str> = a.iter().map(String::as_str).collect();
+
+        let one = GenomeSketch::from_reader(reader_over(&refs), 256, 41, Path::new("a.fastq"))
+            .expect("k=41 sketch");
+        let same = GenomeSketch::from_reader(reader_over(&refs), 256, 41, Path::new("a.fastq"))
+            .expect("k=41 sketch again");
+        assert_eq!(one.hashes, same.hashes, "sketching must be deterministic");
+        assert!((one.jaccard(&same).expect("same k") - 1.0).abs() < 1e-12);
+
+        let other_reads: Vec<&str> = refs[..20].to_vec();
+        let subset = GenomeSketch::from_reader(reader_over(&other_reads), 256, 41, Path::new("b.fastq"))
+            .expect("k=41 subset sketch");
+        let j = one.jaccard(&subset).expect("same k");
+        assert!(j > 0.0 && j < 1.0, "half the reads should overlap partially, got {j}");
+
+        // The subset's k-mers are a subset of the whole, so containment of
+        // the subset in the whole is 1.0 -- a property of the sets, not of
+        // this implementation.
+        let c = subset.containment(&one).expect("same k");
+        assert!(c > 0.95, "the subset is contained in the whole, got {c}");
     }
 
     #[test]

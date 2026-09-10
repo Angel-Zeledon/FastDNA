@@ -148,7 +148,7 @@ const EXCEPTION_HIERARCHY_SOURCE: &str = "\
 class MalformedFastqError(FastDnaError, ValueError):
     '''A FASTQ record that could not be parsed.'''
 class InvalidKError(FastDnaError, ValueError):
-    '''k is outside the 1..=32 range 2-bit packing allows.'''
+    '''k is outside the range 2-bit packing allows (1..=64, or 1..=32 where a u64 key is passed in).'''
 class MismatchedKError(FastDnaError, ValueError):
     '''Two sketches built with different k cannot be compared.'''
 class MismatchedScaleError(FastDnaError, ValueError):
@@ -1141,16 +1141,18 @@ fn peek(py: Python<'_>, path: String, n_reads: usize) -> PyResult<PyPreview> {
 fn build_info(py: Python<'_>) -> PyResult<PyObject> {
     let dict = PyDict::new_bound(py);
     dict.set_item("version", env!("CARGO_PKG_VERSION"))?;
-    // What `count()` can reach, which since `engine="wide"` exists here is
-    // the wide engine's own ceiling rather than the narrow 32 this used to
-    // report. `max_k_sketch` is reported alongside it because the ceiling
-    // is not uniform across the module: sketching, cardinality estimation
-    // and spectrum estimation hash straight from FASTQ with a `u64` k-mer
-    // and still stop at 32, so a caller that reads `max_k` and hands 41 to
-    // `sketch()` would otherwise be misled by a number that is true of
-    // counting and of every k-mer-table operation, but not of those.
+    // One ceiling again, for the first time since the wide engine landed:
+    // counting, every k-mer-table operation, sketching, cardinality and
+    // spectrum estimation all reach 64.
+    //
+    // `max_k_sketch` was reported here for two days, while sketching and
+    // the estimators still stopped at 32. It is gone rather than pinned at
+    // 64, because a key whose only job was to warn about a discrepancy
+    // reads as if the discrepancy remains. The one entry point still
+    // limited to 32 is `sketch_from_kmers`, and that is its `Vec[int]`
+    // argument's limit -- a u64 cannot hold a longer k-mer -- not a
+    // property of sketching worth a build_info field.
     dict.set_item("max_k", wide_kmer::MAX_WIDE_K)?;
-    dict.set_item("max_k_sketch", 32usize)?;
     dict.set_item("avx2", avx2_is_live())?;
     Ok(dict.into())
 }
@@ -1312,8 +1314,12 @@ fn load_sketch(path: String) -> PyResult<PySketch> {
 #[pyo3(signature = (kmers, k=21, sketch_size=1000))]
 fn sketch_from_kmers(py: Python<'_>, kmers: Vec<u64>, k: usize, sketch_size: usize) -> PyResult<PySketch> {
     if k == 0 || k > 32 {
-        // 32, not the wide engine's 64: sketching is `u64`-keyed
-        // throughout (`sketch.rs`), so this really is the limit here.
+        // 32 here, and 64 in `sketch()`, which is not an inconsistency:
+        // this entry point takes `Vec<u64>` -- k-mers the caller already
+        // packed -- and a `u64` cannot hold a k-mer longer than 32 bases at
+        // two bits each. The limit is the argument type, not sketching.
+        // `sketch(path, k=41)` reads the file and packs them itself, so it
+        // has no such constraint.
         return Err(FastDnaError::InvalidK { k, max: 32 }.into());
     }
     if sketch_size == 0 {

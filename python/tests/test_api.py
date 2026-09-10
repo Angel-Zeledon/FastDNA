@@ -193,9 +193,11 @@ def test_build_info_reports_avx2(tmp_path):
     assert "version" in info and "avx2" in info
     assert isinstance(info["avx2"], bool)
     assert info["version"] == fastdna.__version__
-    # 64, not 32: `count(engine="wide")` reaches the u128 engine from
-    # Python, so `max_k` reports 64 and `max_k_sketch` carries the u64
-    # ceiling the rest of the module still has. See
-    # `test_wide_engine.py::test_build_info_reports_both_ceilings`.
+    # 64, and one number for the whole package since sketching and the
+    # estimators reached it too. See
+    # `test_wide_engine.py::test_build_info_reports_one_ceiling`.
     assert info["max_k"] == 64
-    assert info["max_k_sketch"] == 32
+    # `max_k_sketch` was reported for two days, while sketching and the
+    # estimators still stopped at 32. They reach 64 now, so a second
+    # ceiling would describe a discrepancy that no longer exists.
+    assert "max_k_sketch" not in info

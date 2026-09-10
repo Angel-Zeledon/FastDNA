@@ -28,8 +28,13 @@ hold their keys in an enum rather than a type parameter, because the width
 belongs to the reference *file* and no caller chooses it. Routing is always
 one footer read, `ktab::table_key`.
 
-What still stops at `k = 32` is sketching and the estimators (`sketch`,
-`dist`, `card`, `spectrum`) -- they hash from FASTQ, never from a table.
+Sketching and the estimators (`sketch`, `dist`, `card`, `spectrum`) reach
+64 as well, since 2026-09-09: a sketch stores `u64` *hashes*, not k-mers,
+so only the extraction ever had a width. `sketch::finalize_hash_wide`
+folds a `u128` down and agrees with the narrow hash wherever both are
+defined, so a k=31 sketch is comparable whichever path built it. **The one
+entry point still capped at 32 is `sketch_from_kmers`**, and that is its
+`Vec<u64>` argument's limit, not sketching's.
 
 **Counting convention**: `--no-canonical` (`PipelineConfig::canonical`,
 `count(canonical=False)`) counts each k-mer as it reads forward instead of

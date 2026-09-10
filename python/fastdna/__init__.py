@@ -564,11 +564,11 @@ def count(
 
     A wide count's `.table` keys on `kmer_bits` -- 16 big-endian bytes,
     since Arrow has no 128-bit integer -- instead of `kmer_u64`, and
-    `.engine` reports which you have. **The rest of this package is u64-
-    keyed**: `sketch`, `estimate_cardinality`, `estimate_spectrum`,
-    `KmerTable` and every set operation stop at `k = 32`, so a wide count
-    is something to export or read in Python, not something to feed back
-    into them. `build_info()["max_k_sketch"]` reports that second ceiling.
+    `.engine` reports which you have. Everything else in this package
+    reaches 64 too: `KmerTable` and the set operations read both widths,
+    and `sketch`, `estimate_cardinality` and `estimate_spectrum` store
+    hashes rather than k-mers, so the width was only ever in the
+    extraction.
     """
     adapter = make_progress_adapter(progress)
     raw = _core.count(
@@ -602,14 +602,15 @@ def peek(path: _PathLike, *, n_reads: int = 10_000) -> "_core.Preview":
 
 
 def build_info() -> Dict[str, Any]:
-    """Reports the installed version, the two maximum-k ceilings, and
-    whether AVX2 is live on *this* CPU -- without which "it's slow on my
-    Mac" is undiagnosable remotely.
+    """Reports the installed version, the maximum k, and whether AVX2 is
+    live on *this* CPU -- without which "it's slow on my Mac" is
+    undiagnosable remotely.
 
-    `max_k` is what `count()` reaches (64, via `engine="wide"`);
-    `max_k_sketch` is the u64 ceiling of 32 that `sketch`,
-    `estimate_cardinality`, `estimate_spectrum` and `KmerTable` still
-    have. Two numbers because the ceiling is not uniform.
+    `max_k` is 64 and covers the whole package: counting, the k-mer-table
+    operations, sketching and the estimators. The single exception is
+    `sketch_from_kmers`, capped at 32 by its `Vec[int]` argument -- a u64
+    cannot hold a longer k-mer -- which is a property of that signature
+    rather than of sketching, and so is not reported here.
     """
     return _core.build_info()
 

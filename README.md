@@ -768,15 +768,15 @@ tuned, and not yet benchmarked against them at that scale.
 
 ### Other limits
 
-- `max_k` is 64, and only for counting. `fastdna.count(..., engine="wide")`
-  reaches the `u128` engine the CLI's `--engine wide` uses, but everything
-  keyed on a `u64` -- `sketch`, `estimate_cardinality`, `estimate_spectrum`,
-  `KmerTable` and every set operation -- still stops at 32, which
-  `build_info()['max_k_sketch']` reports. A wide count is something to
-  export or read in Python, not something to feed back into those. Beyond
-  64 (KMC3 reaches 256) is out of scope: two bits per base in 128 of them
-  is 64 bases, and going further needs a byte-string key that changes the
-  sort order, the Parquet schema and every comparison in the counter.
+- `max_k` is 64, and it is one number for the whole package: counting,
+  every k-mer-table operation, sketching, cardinality and spectrum
+  estimation all reach it. The single exception is
+  `sketch_from_kmers(kmers, k=...)`, capped at 32 because its argument is a
+  list of `u64`-packed k-mers and a `u64` cannot hold a longer one -- the
+  limit of the argument, not of sketching. Beyond 64 (KMC3 reaches 256) is
+  out of scope: two bits per base in 128 of them is 64 bases, and going
+  further needs a byte-string key that changes the sort order, the Parquet
+  schema and every comparison in the counter.
 - Each worker's raw buffer is bounded at 2,000,000 buffered instances
   before an eager compaction; the measured effect of that bound -- helpful
   on low-diversity input, a wash-to-loss on high-diversity input -- is
@@ -930,13 +930,14 @@ r = fastdna.count("sample.fastq.gz", k=p.suggest_k())
 
 ```python
 >>> fastdna.build_info()
-{'version': '0.1.0', 'max_k': 64, 'max_k_sketch': 32, 'avx2': True}
+{'version': '0.1.0', 'max_k': 64, 'avx2': True}
 ```
 
-`max_k` is what `count()` reaches; `max_k_sketch` is the `u64` ceiling
-`sketch`, `estimate_cardinality`, `estimate_spectrum` and `KmerTable`
-still have. Two numbers because the ceiling is not uniform, and one number
-would mislead whoever read it and then called `sketch(k=41)`.
+`max_k` is the whole package's ceiling: counting, the table operations,
+sketching and the estimators all reach it. A `max_k_sketch` key was
+reported alongside it for two days, while sketching still stopped at 32;
+it is gone rather than pinned at 64, because a key whose only job was to
+warn about a discrepancy reads as if the discrepancy remains.
 
 `avx2` is a **runtime** check on the machine actually running the code, not
 a compile-time flag -- the same wheel ships everywhere, so a build-time-only
@@ -1089,9 +1090,10 @@ who needs that code can take it from the git history at `60b5f82`.
 
 Still ahead:
 
-- A wide form for sketching and the estimators (`sketch`, `dist`, `card`,
-  `spectrum`). Every operation that reads a k-mer *table* takes both widths
-  now; these four hash straight from FASTQ and still stop at k=32.
+- Benchmarking the disk strategy against KMC3/FASTK at out-of-RAM scale.
+  KMC3's published result is 729 gigabases in 33-34 GB; FastDNA has never
+  been run on anything larger than 2.14 GB, so the strategy that exists for
+  exactly that case is the least tested thing in the project.
 - A `strategy=`/`max_ram=` parameter on `fastdna.count()`, so the Python
   binding can use the disk strategy and automatic chooser without the
   `FASTDNA_STRATEGY` environment variable.

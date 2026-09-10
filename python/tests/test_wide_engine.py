@@ -165,23 +165,35 @@ def test_an_unknown_engine_name_is_rejected(reads):
     assert "auto" in str(excinfo.value)
 
 
-def test_build_info_reports_both_ceilings():
-    """`max_k` is what `count()` reaches; `max_k_sketch` is the u64
-    ceiling the rest of the package still has. Two numbers because a
-    caller who read one and handed 41 to `sketch()` would be misled.
+def test_build_info_reports_one_ceiling():
+    """One number again: counting, the table operations, sketching and the
+    estimators all reach 64.
+
+    This asserted two ceilings for two days, while sketching stopped at 32.
+    A `max_k_sketch` pinned at 64 would read as if the discrepancy were
+    still there, so the key is gone rather than updated.
     """
     info = fastdna.build_info()
     assert info["max_k"] == 64
-    assert info["max_k_sketch"] == 32
+    assert "max_k_sketch" not in info
 
 
-def test_the_u64_keyed_surface_still_stops_at_32(reads):
-    """The honest limit of this feature: counting reaches 64, but
-    sketching does not. Pinned so the day it grows a wide form, this test
-    is what says so.
+def test_sketching_reaches_64_too(reads):
+    """Sketching used to stop at 32 while counting reached 64, and this
+    test pinned that. It is inverted rather than deleted: a sketch stores
+    hashes, not k-mers, so the width was only ever in the extraction --
+    `jaccard` and `containment` compare `u64` hashes either way.
     """
+    wide = fastdna.sketch(reads, k=41, sketch_size=256)
+    assert wide.k == 41
+    same = fastdna.sketch(reads, k=41, sketch_size=256)
+    assert abs(wide.jaccard(same) - 1.0) < 1e-12, "a file is identical to itself"
+
+    # The one entry point still capped at 32, and for a reason that is not
+    # about sketching: its argument is a list of `u64`-packed k-mers, and a
+    # u64 cannot hold one longer than 32 bases.
     with pytest.raises(InvalidKError):
-        fastdna.sketch(reads, k=41)
+        fastdna.sketch_from_kmers([1, 2, 3], k=41)
 
 
 def _count_to_parquet(reads, tmp_path, k):

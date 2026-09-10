@@ -369,21 +369,31 @@ fn estimate_spectrum_from_source<S: RecordSource>(
     precision: u32,
     max_frequency: Option<u32>,
 ) -> Result<SpectrumEstimate> {
-    if k == 0 || k > 32 {
-        return Err(FastDnaError::InvalidK { k, max: 32 });
+    if k == 0 || k > crate::wide_kmer::MAX_WIDE_K {
+        return Err(FastDnaError::InvalidK { k, max: crate::wide_kmer::MAX_WIDE_K });
     }
 
     let mut sketch = NtCardSketch::new(precision)?;
     let mut kmer_buf: Vec<u64> = Vec::new();
+    let mut wide_buf: Vec<u128> = Vec::new();
     let mut reads_processed: u64 = 0;
 
     loop {
         match reader.next_record() {
             Ok(Some(record)) => {
                 reads_processed += 1;
-                kmer::extract_canonical_kmers_into(&record.seq, k, &mut kmer_buf);
-                for &kmer_bits in &kmer_buf {
-                    sketch.insert(kmer_bits);
+                // See `hll::estimate_from_reader` for why routing here
+                // leaves the estimate unchanged at the k=32 boundary.
+                if k <= 32 {
+                    kmer::extract_canonical_kmers_into(&record.seq, k, &mut kmer_buf);
+                    for &kmer_bits in &kmer_buf {
+                        sketch.insert(kmer_bits);
+                    }
+                } else {
+                    crate::wide_kmer::extract_canonical_kmers_into(&record.seq, k, &mut wide_buf);
+                    for &kmer_bits in &wide_buf {
+                        sketch.insert(crate::sketch::finalize_hash_wide(kmer_bits));
+                    }
                 }
             }
             Ok(None) => break,
@@ -614,8 +624,10 @@ mod tests {
     fn estimate_spectrum_from_source_rejects_k_out_of_range() {
         let reader = reader_over(&["ACGT"]);
         assert!(estimate_spectrum_from_source(reader, 0, 10, None).is_err());
+        // 33 is in range now (spectrum estimation reaches 64 since
+        // 2026-09-09); 65 is the boundary.
         let reader = reader_over(&["ACGT"]);
-        assert!(estimate_spectrum_from_source(reader, 33, 10, None).is_err());
+        assert!(estimate_spectrum_from_source(reader, 65, 10, None).is_err());
     }
 
     #[test]
