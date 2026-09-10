@@ -83,7 +83,20 @@ for _name in list(sys.modules):
     if _name.split(".")[0] in _BLOCKED:
         del sys.modules[_name]
 
-sys.path.insert(0, {source_root!r})
+# Appended, never prepended. `python/` holds the *source* package, whose
+# `__init__.py` does `from . import _core` -- and the compiled `_core` only
+# sits beside it after `maturin develop`. Installed from a wheel it lives in
+# site-packages instead, so prepending the source root shadowed the real
+# package with one that cannot finish importing:
+#
+#   ImportError: cannot import name '_core' from partially initialized
+#   module 'fastdna' ... (python/fastdna/__init__.py)
+#
+# which is exactly the environment `.github/workflows/wheels.yml` builds and
+# this file's own docstring says it targets. Appending keeps the fallback
+# for a checkout with nothing installed while letting a real installation
+# win, which is the case that matters.
+sys.path.append({source_root!r})
 """
 
 
