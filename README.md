@@ -8,6 +8,33 @@ When a run is predicted not to fit in RAM, the CLI can switch to a
 disk-partitioned counting strategy instead of failing -- see
 [Memory use and limitations](#memory-use-and-limitations).
 
+```python
+import fastdna
+counts = fastdna.count("sample.fastq.gz", k=31)
+counts.table           # a pyarrow.Table: kmer_u64, frequency
+counts.distinct_kmers  # 19_062_700 on ENA DRR002015 -- the same digits KMC3 gives
+```
+
+**What is checked, and against what.** Every claim below is measured
+against a tool outside this repository, on real sequencing data, by
+scripts in [`scripts/validation/`](scripts/validation/) that run on a
+schedule rather than once:
+
+| | against | result |
+|---|---|---|
+| k-mer counts | KMC3 3.2.4 | **exactly equal** -- both engines (k=15 to 64), both canonical and `-b`-style non-canonical |
+| exact Jaccard and containment | `kmc_tools` | **exactly equal**, every set size and every derived ratio |
+| MinHash distances | Mash 2.3 | r = 0.997, no systematic bias |
+| HyperLogLog cardinality | the exact count | −0.26% |
+| ntCard spectrum | the exact histogram | within ±2% |
+| speed and memory | KMC3 3.2.4, both native, same machine | 1.38x faster in 0.47x the memory *on one measured workload* -- see [Benchmarks](#benchmarks) for the conditions and what it does not prove |
+
+**What it is not.** `k` stops at 64 where KMC3 reaches 256; there is no
+BAM input and no KFF output; and the disk strategy has never been run on
+anything larger than 2.14 GB, where KMC3 has 729 gigabases published. The
+honest side-by-side is
+[Should you use this instead of KMC3?](#should-you-use-this-instead-of-kmc3).
+
 ## Installation
 
 **FastDNA has not been published yet.** There is no release on PyPI, no
