@@ -238,3 +238,98 @@ fn a_truncated_gzip_is_an_error_not_a_silent_short_read() {
     ]);
     assert!(!ok, "a truncated gzip must fail rather than count the prefix:\n{text}");
 }
+
+/// A malformed record must name the file it came from.
+///
+/// Found 2026-09-15 by feeding the CLI hostile input: `fastdna count -i
+/// garbage.fastq` printed `malformed FASTQ in  at record 1` -- the filename
+/// blank. `sample_bin_balance` built both of its error arms with
+/// `PathBuf::new()` (the only two in `src/`), and that function runs
+/// *ahead* of the producer whenever the strategy chooser picks `Binned` on
+/// its own, so it is what a user with a corrupt file actually reaches. The
+/// producer's own arms were correct all along, which is why no existing
+/// test saw this.
+///
+/// `-t 4` is deliberate: `BINNED_BLIND_MIN_THREADS` gates blind binned
+/// selection at four threads, and the bug lives only on the auto-selected
+/// binned path. Asserting the message rather than the code path means this
+/// still passes on a machine where the chooser picks something else -- the
+/// contract is the same either way -- while pinning the fix where it is
+/// reachable.
+#[test]
+fn a_malformed_record_names_the_file_it_came_from() {
+    let dir = ScratchDir::new("malformed_names_file");
+    let bad = dir.path("corrupt.fastq");
+    std::fs::write(&bad, "this is not a fastq at all\nnor is this\n").expect("write");
+
+    let (ok, text) = run(&[
+        "count",
+        "-i",
+        bad.to_str().unwrap(),
+        "-k",
+        "21",
+        "-t",
+        "4",
+        "-o",
+        dir.path("out.parquet").to_str().unwrap(),
+    ]);
+    assert!(!ok, "a corrupt FASTQ must fail the run:\n{text}");
+    assert!(
+        text.contains("corrupt.fastq"),
+        "the error must name the file it was reading; got:\n{text}"
+    );
+    assert!(
+        !text.contains("FASTQ in  at"),
+        "the filename is blank in the message:\n{text}"
+    );
+}
+
+/// With several inputs, the error must name the file that actually holds
+/// the bad record, and number it within *that* file.
+///
+/// This is the case `failing_location`'s own doc comment argues for --
+/// "told 'record 3 of lane4.fastq.gz', a user can find it; told 'record
+/// 4,000,003 of <inputs>', they cannot" -- and the case that makes a wrong
+/// answer worse than no answer: naming the first input would send someone
+/// to inspect a file that is fine.
+#[test]
+fn with_several_inputs_the_error_names_the_offending_one() {
+    let dir = ScratchDir::new("malformed_multi_input");
+    let good = dir.path("fine.fastq");
+    write_reads(&good, 8);
+    let bad = dir.path("broken.fastq");
+    std::fs::write(&bad, "not a header\nACGT\n").expect("write");
+
+    let (ok, text) = run(&[
+        "count",
+        "-i",
+        good.to_str().unwrap(),
+        bad.to_str().unwrap(),
+        "-k",
+        "21",
+        "-t",
+        "4",
+        "-o",
+        dir.path("out.parquet").to_str().unwrap(),
+    ]);
+    assert!(!ok, "a corrupt second input must fail the run:\n{text}");
+    // The banner echoes every input path, so the assertions below are made
+    // against the error line alone -- otherwise "does it mention
+    // fine.fastq" is answered by the header rather than by the diagnosis.
+    let error_line = text
+        .lines()
+        .find(|line| line.contains("error:"))
+        .unwrap_or_else(|| panic!("no error line in output:\n{text}"));
+    assert!(
+        error_line.contains("broken.fastq"),
+        "the error must name the offending file, not the first input; got:\n{error_line}"
+    );
+    assert!(
+        !error_line.contains("fine.fastq"),
+        "the error blames a file that parsed cleanly:\n{error_line}"
+    );
+    assert!(
+        error_line.contains("at record 1"),
+        "the record must be numbered within its own file, not across the run; got:\n{error_line}"
+    );
+}

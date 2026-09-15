@@ -1720,6 +1720,7 @@ fn process_stream_parallel_binned<S: RecordSource>(
 fn sample_bin_balance<S: RecordSource>(
     reader: &mut S,
     config: &PipelineConfig,
+    source: &Path,
 ) -> Result<(Vec<FastqRecord>, Option<f64>)> {
     let binned_config = BinnedConfig::new(config.k).sanitized();
     let mut histogram = SignatureHistogram::new();
@@ -1747,15 +1748,28 @@ fn sample_bin_balance<S: RecordSource>(
             // fail a moment later in the producer, and reporting it now
             // keeps the failure attributable to the file rather than to the
             // sampling.
+            //
+            // `failing_location` is what does that, and it is the same call
+            // the producer makes -- so a failure caught during sampling now
+            // reads identically to the same failure caught a moment later,
+            // naming the file actually being read and numbering the record
+            // within *that* file.
+            //
+            // Until 2026-09-15 both arms built the error with
+            // `PathBuf::new()`. This function runs ahead of the producer
+            // whenever the chooser picks `Binned` on its own -- i.e. on most
+            // real runs -- so it, not the producer, is what a user with a
+            // corrupt file actually hit, and it printed `malformed FASTQ in
+            // at record 1` with the filename missing entirely. These two
+            // were the only `PathBuf::new()` in `src/`; every other
+            // construction site already passed a real path.
             Err(FastqReadError::Io(source_err)) => {
-                return Err(FastDnaError::Io { path: PathBuf::new(), source: source_err })
+                let (path, _) = failing_location(reader, source, sampled.len() as u64);
+                return Err(FastDnaError::Io { path, source: source_err });
             }
             Err(FastqReadError::Malformed(reason)) => {
-                return Err(FastDnaError::MalformedFastq {
-                    path: PathBuf::new(),
-                    record: sampled.len() as u64 + 1,
-                    reason,
-                })
+                let (path, record) = failing_location(reader, source, sampled.len() as u64);
+                return Err(FastDnaError::MalformedFastq { path, record, reason });
             }
         }
     }
@@ -1937,7 +1951,7 @@ pub fn process_stream_parallel_with_policy<S: RecordSource>(
     // second opinion.
     let mut prefix: Vec<FastqRecord> = Vec::new();
     if decision.strategy == CountStrategy::Binned && decision.auto_selected {
-        let (sampled, balance) = sample_bin_balance(&mut reader, &config)?;
+        let (sampled, balance) = sample_bin_balance(&mut reader, &config, source)?;
         prefix = sampled;
         match balance {
             Some(skew) if skew > MAX_ACCEPTABLE_BIN_SKEW => {
