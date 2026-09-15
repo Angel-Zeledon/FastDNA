@@ -61,3 +61,12 @@ kmc_work/
 
 # Stray atomic-write temp files from an interrupted run.
 *.py.tmp.*
+
+# Coverage output. `.coverage` is a pytest-cov SQLite database and was
+# committed by accident during the 2026-09-09 coverage pass; it is a
+# per-run artifact, not a source file.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+lcov.info
