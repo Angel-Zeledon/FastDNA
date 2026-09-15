@@ -77,6 +77,21 @@ jobs:
           ./.venv/bin/python -m pip install --upgrade pip
           ./.venv/bin/python -m pip install "maturin>=1.5,<2.0"
           ./.venv/bin/maturin develop --release --features python --extras test
+          # scipy is used by exactly one thing in this repository --
+          # `sketch_vs_mash.py`'s `pearsonr`/`spearmanr` -- and it is
+          # deliberately not in the `test` extra: no test imports it, and
+          # putting it there would make every contributor install a heavy
+          # scientific stack to run `pytest`.
+          #
+          # It used to arrive here anyway, as a transitive dependency of the
+          # machine-learning layer's own test extras. That layer was removed
+          # on 2026-09-05; this workflow's first scheduled run was
+          # 2026-09-10, and every run since failed at "Sketch distances
+          # agree with Mash" with `ModuleNotFoundError: No module named
+          # 'scipy'`. It never went red on a push, because it only runs on a
+          # schedule, and it never failed locally, because a development
+          # `.venv` created before the removal still has scipy in it.
+          ./.venv/bin/python -m pip install "scipy>=1.10"
 
       # Each step is separate so the checks list names which reference tool
       # disagreed, rather than reporting one opaque "validation failed".
