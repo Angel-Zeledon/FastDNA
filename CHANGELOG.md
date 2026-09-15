@@ -12,9 +12,9 @@ La superficie con compatibilidad garantizada es:
 - Rust: los módulos declarados `pub mod` en `src/lib.rs`.
 - CLI: los flags y subcomandos documentados en `fastdna --help`.
 
-## [0.1.0] -- sin publicar todavía
+## [0.1.0] -- 2026-09-15
 
-Lo que sería la primera versión, descrito por lo que **es** y no por el
+La primera versión, descrita por lo que **es** y no por el
 camino que costó llegar. El registro de desarrollo completo sigue debajo,
 bajo *Historial previo a la primera versión*, y buena parte de él describe
 código que se eliminó antes de que ninguna versión lo publicara: leerlo como
