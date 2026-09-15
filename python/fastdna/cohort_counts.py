@@ -146,7 +146,20 @@ class CohortCounts:
             missing samples would produce a plausible-looking score
             computed over the wrong cohort.
         """
-        import numpy as np
+        # numpy is a *fast path* here, not a requirement, for the same
+        # reason `_decode_kmers` carries a pure-Python branch: this package
+        # declares pyarrow and nothing else, so a plain `pip install
+        # fastdna` has no numpy, and `subset()` is the headline use of this
+        # type -- "count a cohort once, slice it per sample". Importing it
+        # unconditionally raised `ModuleNotFoundError` on exactly the
+        # install everyone gets, and nothing caught it because
+        # `test_cohort_counts.py` skips wholesale without numpy (its
+        # fixtures use it). Pinned by
+        # `test_cohort_counts_subsets_with_no_optional_packages_installed`.
+        try:
+            import numpy as np
+        except ImportError:
+            np = None
 
         position = {sid: i for i, sid in enumerate(self.sample_ids)}
         missing = [s for s in sample_ids if s not in position]
@@ -158,15 +171,29 @@ class CohortCounts:
                 f"The cohort has {len(self.sample_ids)} samples."
             )
 
-        starts = self.offsets
-        if sample_ids:
-            take = np.concatenate(
-                [np.arange(starts[position[s]], starts[position[s] + 1]) for s in sample_ids]
-            )
-        else:
-            take = np.empty(0, dtype=np.int64)
+        # Deliberately not `self.offsets`, which returns an `ndarray` by
+        # documented contract and would drag numpy back in. One entry per
+        # sample, so building it in Python costs nothing measurable even
+        # for a cohort of thousands.
+        starts = [0]
+        for rows in self.row_counts:
+            starts.append(starts[-1] + rows)
 
-        indices = pa.array(take, type=pa.int64())
+        if np is None:
+            take = [
+                row
+                for s in sample_ids
+                for row in range(starts[position[s]], starts[position[s] + 1])
+            ]
+            indices = pa.array(take, type=pa.int64())
+        else:
+            if sample_ids:
+                take = np.concatenate(
+                    [np.arange(starts[position[s]], starts[position[s] + 1]) for s in sample_ids]
+                )
+            else:
+                take = np.empty(0, dtype=np.int64)
+            indices = pa.array(take, type=pa.int64())
         return CohortCounts(
             sample_ids=tuple(sample_ids),
             kmers=self.kmers.take(indices),
@@ -192,10 +219,24 @@ class CohortCounts:
         The format is the same two columns the rest of this project already
         writes (`kmer_u64`, `frequency`, see `export.rs`), with the cohort
         structure carried in Parquet's own footer metadata under a
-        `fastdna.` prefix -- the convention `src/ktab.rs` established for
-        `fastdna.k`/`fastdna.sorted_by`. That means the file is readable by
-        any Parquet reader, and a tool that does not know about
-        `CohortCounts` still sees a valid k-mer table.
+        `fastdna.` prefix -- the naming convention `src/ktab.rs`
+        established. Any Parquet reader can therefore read the two columns
+        without knowing anything about `CohortCounts`.
+
+        It is deliberately **not** a `fastdna.KmerTable`, and `fastdna.k`
+        is written while `fastdna.sorted_by` is not. This file is the
+        per-sample tables stacked end to end, so `kmer_u64` ascends within
+        each sample and then restarts at the next -- it is not globally
+        sorted, and it holds the same k-mer once per sample that has it.
+        `KmerTable` relies on `fastdna.sorted_by` being *true* to prune
+        row groups by their key statistics; declaring it here would not
+        make the file a k-mer table, it would make `KmerTable.get`/`range`
+        skip row groups that do contain the key and return confidently
+        wrong answers. `KmerTable.open` rejecting this file by name is the
+        intended behaviour, and `load()` is how it is meant to be read.
+        (Corrected 2026-09-15: this docstring previously claimed a reader
+        that had never heard of the type "still sees a valid k-mer table",
+        which was false in exactly the way that mattered.)
 
         Written to a temporary file in the same directory and renamed into
         place, so an interrupted save leaves the previous file intact rather

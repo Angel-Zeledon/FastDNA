@@ -271,3 +271,77 @@ def test_the_test_suite_itself_collects_in_the_environment_ci_builds():
         + "\n--- tail of collection output ---\n"
         + "\n".join(proc.stdout.splitlines()[-25:])
     )
+
+
+def test_cohort_counts_subsets_with_no_optional_packages_installed():
+    """`CohortCounts.subset()` must work on a bare `pip install fastdna`.
+
+    Found 2026-09-15 by running the wheel's own test suite in a clean
+    environment and noticing that `test_cohort_counts.py` contributes
+    *zero* tests there: its fixtures use `numpy.random`, so line 21's
+    module-scope `pytest.importorskip("numpy")` skips the file whole. That
+    left the entire type untested in exactly the environment where the
+    analogous `KmerCounts.with_sequence()` defect had already been found
+    and fixed once (commit ff32b88).
+
+    It was broken the same way. `subset()` opened with an unguarded
+    `import numpy as np`, and reached `self.offsets`, which returns an
+    `ndarray` by contract -- so the headline use this type exists for,
+    "count a cohort once, slice it per sample", raised
+    `ModuleNotFoundError` for every user who installed the package
+    normally.
+
+    `save`/`load` are exercised here too, for the same reason: they are on
+    the same documented path and nothing else covers them bare.
+    """
+    result = _run_without(
+        _OPTIONAL_PACKAGES,
+        """
+        import json
+        import pathlib
+        import tempfile
+
+        import fastdna
+
+        directory = pathlib.Path(tempfile.mkdtemp())
+        read = "ACGTACGTACGTACGTACGTACGTACGTACG"
+        for index in range(3):
+            (directory / ("S%d.fastq" % index)).write_text(
+                "".join(
+                    "@r%d\\n%s\\n+\\n%s\\n" % (row, read, "I" * len(read))
+                    for row in range(20)
+                )
+            )
+
+        cohort = fastdna.count_cohort(str(directory), k=21)
+        one = cohort.subset([cohort.sample_ids[0]])
+        none = cohort.subset([])
+        reordered = cohort.subset(list(reversed(cohort.sample_ids)))
+
+        path = directory / "cohort.parquet"
+        cohort.save(str(path))
+        loaded = fastdna.CohortCounts.load(str(path))
+        loaded_one = loaded.subset([loaded.sample_ids[0]])
+
+        print(json.dumps({
+            "sample_ids": list(cohort.sample_ids),
+            "one_ids": list(one.sample_ids),
+            "one_rows": len(one.kmers),
+            "expected_one_rows": cohort.row_counts[0],
+            "none_rows": len(none.kmers),
+            "reordered_ids": list(reordered.sample_ids),
+            "reordered_rows": len(reordered.kmers),
+            "total_rows": len(cohort.kmers),
+            "loaded_ids": list(loaded.sample_ids),
+            "round_trips": loaded_one.kmers.to_pylist() == one.kmers.to_pylist(),
+        }))
+        """,
+    )
+    assert result["sample_ids"] == ["S0", "S1", "S2"]
+    assert result["one_ids"] == ["S0"]
+    assert result["one_rows"] == result["expected_one_rows"]
+    assert result["none_rows"] == 0, "an empty selection must slice to an empty cohort"
+    assert result["reordered_ids"] == ["S2", "S1", "S0"], "subset must honour the given order"
+    assert result["reordered_rows"] == result["total_rows"]
+    assert result["loaded_ids"] == result["sample_ids"]
+    assert result["round_trips"], "a saved-then-loaded cohort must slice to the same rows"

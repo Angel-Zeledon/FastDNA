@@ -241,8 +241,13 @@ Deliberately small — four modules, and three of them are thin:
   `CohortCounts`/`count_cohort` re-exported from `cohort_counts.py`.
 - `cohort_counts.py` — `CohortCounts`, the counted-cohort artifact: count a
   cohort once, slice it per sample, `save()`/`load()` it as one Parquet
-  file that is still a valid k-mer table to a reader that has never heard
-  of the type.
+  file whose two columns any Parquet reader can read. It is **not** a
+  `KmerTable` and does not claim to be: the file is the per-sample tables
+  stacked, so it is not globally sorted by key and deliberately omits
+  `fastdna.sorted_by`, which `KmerTable` trusts for row-group pruning.
+  `KmerTable.open` rejects it by name, on purpose. (This entry said the
+  opposite until 2026-09-15, when a clean-room check found the claim was
+  false; `save()`'s own docstring records the correction.)
 - `spectrum.py` — backs `KmerCounts.suggest_min_count()`'s valley-finding
   logic; see its module docstring for the exact rule before changing it.
 - `_progress.py` — the `progress=True` callback plumbing (`tqdm` is a soft
